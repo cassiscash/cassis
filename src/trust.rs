@@ -12,8 +12,6 @@ pub struct Trust {
     sig: k256::schnorr::SignatureBytes,
 }
 
-const SIZE: usize = 4 + 4 + 32 + 4 + 64;
-
 impl Default for Trust {
     fn default() -> Self {
         Trust {
@@ -26,11 +24,11 @@ impl Default for Trust {
     }
 }
 
-impl std::fmt::Display for Trust {
+impl fmt::Display for Trust {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{}=[{}]=>{} at {}",
+            "<trust {}-[{}]->{} at {}>",
             self.from,
             self.amount,
             hex::encode(self.to.to_bytes()),
@@ -40,21 +38,25 @@ impl std::fmt::Display for Trust {
 }
 
 impl Trust {
+    pub const TAG: u8 = b't';
+
+    const SIZE: usize = 1 + 4 + 4 + 32 + 4 + 64;
+
     fn sighash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        let nosig = &Trust::as_bytes(self)[0..SIZE - 64];
+        let nosig = &Trust::as_bytes(self)[0..Trust::SIZE - 64];
         hasher.update(nosig);
         let digest = hasher.finalize();
         digest.into()
     }
 }
 
-impl Value for Trust {
+impl redb::Value for Trust {
     fn type_name() -> redb::TypeName {
         redb::TypeName::new("trust")
     }
 
-    type AsBytes<'a> = [u8; SIZE];
+    type AsBytes<'a> = [u8; Trust::SIZE];
     type SelfType<'a> = Trust;
 
     fn as_bytes<'a, 'b: 'a>(t: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -62,19 +64,20 @@ impl Value for Trust {
         Self: 'a,
         Self: 'b,
     {
-        let mut buf = [0; SIZE];
+        let mut buf = [0; Trust::SIZE];
 
-        LE::write_u32(&mut buf[0..4], t.ts);
-        LE::write_u32(&mut buf[4..8], t.from);
-        buf[8..40].copy_from_slice(t.to.to_bytes().as_ref());
-        LE::write_u32(&mut buf[40..44], t.amount);
-        buf[44..108].copy_from_slice(&t.sig);
+        buf[0] = Trust::TAG;
+        LE::write_u32(&mut buf[1..5], t.ts);
+        LE::write_u32(&mut buf[5..9], t.from);
+        buf[9..41].copy_from_slice(t.to.to_bytes().as_ref());
+        LE::write_u32(&mut buf[41..45], t.amount);
+        buf[45..109].copy_from_slice(&t.sig);
 
         buf
     }
 
     fn fixed_width() -> Option<usize> {
-        Some(SIZE)
+        Some(Trust::SIZE)
     }
 
     fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
@@ -82,11 +85,11 @@ impl Value for Trust {
         Self: 'a,
     {
         Trust {
-            ts: LE::read_u32(&data[0..4]),
-            from: LE::read_u32(&data[4..0]),
-            to: k256::schnorr::VerifyingKey::from_bytes(&data[8..]).unwrap(),
-            amount: LE::read_u32(&data[40..44]),
-            sig: k256::schnorr::SignatureBytes::from_bytes(&data[44..108]),
+            ts: LE::read_u32(&data[1..5]),
+            from: LE::read_u32(&data[5..9]),
+            to: k256::schnorr::VerifyingKey::from_bytes(&data[9..41]).unwrap(),
+            amount: LE::read_u32(&data[41..45]),
+            sig: k256::schnorr::SignatureBytes::from_bytes(&data[45..109]),
         }
     }
 }

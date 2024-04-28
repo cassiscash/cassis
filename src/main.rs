@@ -5,15 +5,17 @@ use axum::{
 use lazy_static::lazy_static;
 use redb::{Database, TableDefinition};
 
+mod operation;
+mod transfer;
 mod trust;
 
-use trust::Trust;
+use operation::Operation;
 
 lazy_static! {
     static ref DB: Database = Database::create("db.redb").expect("failed to open database");
 }
 
-const LOG_TABLE: TableDefinition<u64, Trust> = TableDefinition::new("log");
+const LOG_TABLE: TableDefinition<u64, Operation> = TableDefinition::new("log");
 
 #[tokio::main]
 async fn main() {
@@ -29,9 +31,10 @@ async fn main() {
 
 async fn append_op() -> String {
     let write_txn = DB.begin_write().unwrap();
+    let op = Operation::Trust(trust::Trust::default());
     {
         let mut table = write_txn.open_table(LOG_TABLE).unwrap();
-        table.insert(&1, Trust::default()).unwrap();
+        table.insert(&1, op).unwrap();
     }
     let _ = write_txn.commit().expect("failed to create log table");
 
