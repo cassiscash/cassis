@@ -55,65 +55,28 @@ pub fn init() -> Result<State, anyhow::Error> {
         state.op_serial = serial;
 
         let op = operation.value();
-        process(&mut state, op)?;
+        process(&mut state, op);
     }
     txn.close()?;
     Ok(state)
 }
 
-pub fn process(state: &mut State, op: Operation) -> Result<(), anyhow::Error> {
+// just check if everything is ok to be applied
+pub fn validate(state: &State, op: Operation) -> Result<(), anyhow::Error> {
     match op {
         Operation::Unknown => return Err(anyhow!("Unknown shouldn't have been stored")),
         Operation::Trust(t) => {
             // get idx of _to_ key or add new key to list
-            let to_idx = match state.key_indexes.entry(t.to.to_bytes().try_into()?) {
-                Entry::Occupied(entry) => {
-                    let idx = *entry.get();
-
+            let key: [u8; 32] = t.to.to_bytes().try_into()?;
+            match state.key_indexes.get(&key) {
+                Some(idx) => {
                     // can't trust yourself
-                    if idx == t.from {
+                    if *idx == t.from {
                         return Err(anyhow!("can't trust yourself"));
                     }
-
-                    idx
                 }
-                Entry::Vacant(entry) => {
-                    // add new key to the end of list
-                    let next = state.keys.len() as u32;
-                    state.keys.push(t.to);
-                    entry.insert(next);
-                    next
-                }
-            };
-
-            // update line state or create new
-            match state.lines.entry(Line::build_key(to_idx, t.from)) {
-                Entry::Occupied(mut entry) => {
-                    let line = entry.get_mut();
-
-                    if t.from < to_idx {
-                        line.trust.0 = t.amount;
-                    } else {
-                        line.trust.1 = t.amount;
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(if t.from < to_idx {
-                        Line {
-                            peers: (t.from, to_idx),
-                            trust: (0, t.amount),
-                            balance: 0,
-                        }
-                    } else {
-                        Line {
-                            peers: (to_idx, t.from),
-                            trust: (t.amount, 0),
-                            balance: 0,
-                        }
-                    });
-                }
+                None => {}
             }
-
             Ok(())
         }
         Operation::Transfer(t) => {
@@ -191,7 +154,57 @@ pub fn process(state: &mut State, op: Operation) -> Result<(), anyhow::Error> {
                 }
             }
 
-            // all is ok, so apply the changes
+            Ok(())
+        }
+    }
+}
+
+// just apply the changes
+pub fn process(state: &mut State, op: Operation) {
+    match op {
+        Operation::Unknown => {}
+        Operation::Trust(t) => {
+            // get idx of _to_ key or add new key to list
+            let to_idx = match state.key_indexes.entry(t.to.to_bytes().try_into().unwrap()) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    // add new key to the end of list
+                    let next = state.keys.len() as u32;
+                    state.keys.push(t.to);
+                    entry.insert(next);
+                    next
+                }
+            };
+
+            // update line state or create new
+            match state.lines.entry(Line::build_key(to_idx, t.from)) {
+                Entry::Occupied(mut entry) => {
+                    let line = entry.get_mut();
+
+                    if t.from < to_idx {
+                        line.trust.0 = t.amount;
+                    } else {
+                        line.trust.1 = t.amount;
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(if t.from < to_idx {
+                        Line {
+                            peers: (t.from, to_idx),
+                            trust: (0, t.amount),
+                            balance: 0,
+                        }
+                    } else {
+                        Line {
+                            peers: (to_idx, t.from),
+                            trust: (t.amount, 0),
+                            balance: 0,
+                        }
+                    });
+                }
+            }
+        }
+        Operation::Transfer(t) => {
             for hop in t.hops.iter() {
                 let line = state
                     .lines
@@ -205,8 +218,6 @@ pub fn process(state: &mut State, op: Operation) -> Result<(), anyhow::Error> {
                         -(hop.amount as i64)
                     }
             }
-
-            Ok(())
         }
     }
 }
