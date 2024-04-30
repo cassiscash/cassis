@@ -1,12 +1,13 @@
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
 mod transfer;
 mod trust;
 
 pub use transfer::Transfer;
 pub use trust::Trust;
 
-use std::fmt;
-
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum Operation {
     Trust(Trust),
     Transfer(Transfer),

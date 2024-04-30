@@ -1,15 +1,22 @@
 use byteorder::{ByteOrder, LE};
-use secp256k1::XOnlyPublicKey;
-
 use redb::Value;
+use secp256k1::XOnlyPublicKey;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug)]
+use crate::helpers;
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Trust {
     pub ts: u32,
     pub from: u32,
+    #[serde(
+        serialize_with = "helpers::serialize_xonlypubkey",
+        deserialize_with = "helpers::deserialize_xonlypubkey"
+    )]
     pub to: XOnlyPublicKey,
     pub amount: u32,
+    #[serde(with = "hex::serde")]
     pub sig: [u8; 64],
 }
 

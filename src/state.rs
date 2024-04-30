@@ -7,6 +7,7 @@ use secp256k1::{
 use std::{
     collections::{hash_map::Entry, HashMap},
     hash::BuildHasherDefault,
+    sync::RwLock,
 };
 
 use crate::db;
@@ -16,7 +17,7 @@ pub struct State {
     pub keys: Vec<XOnlyPublicKey>,
     key_indexes: HashMap<[u8; 32], u32>,
     pub lines: HashMap<u64, Line, BuildHasherDefault<nohash_hasher::NoHashHasher<u64>>>,
-    op_serial: u64,
+    pub op_serial: u64,
 }
 
 pub struct Line {
@@ -40,7 +41,7 @@ impl Line {
     }
 }
 
-pub fn init() -> Result<State, anyhow::Error> {
+pub fn init() -> Result<RwLock<State>, anyhow::Error> {
     let mut state = State {
         keys: vec![],
         key_indexes: HashMap::with_capacity(500),
@@ -49,25 +50,26 @@ pub fn init() -> Result<State, anyhow::Error> {
     };
 
     let txn = db::DB.begin_read()?;
-    let table = txn.open_table(db::LOG)?;
-    for (i, row) in table.range(0..)?.enumerate() {
-        let (key, operation) = row.with_context(|| format!("at row index {}", i))?;
+    {
+        let table = txn.open_table(db::LOG)?;
+        for (i, row) in table.range(0..)?.enumerate() {
+            let (key, operation) = row.with_context(|| format!("at row index {}", i))?;
 
-        let serial = key.value();
-        if i as u64 != serial {
-            return Err(anyhow!("row index != serial key"));
+            let serial = key.value();
+            if i as u64 != serial {
+                return Err(anyhow!("row index != serial key"));
+            }
+            state.op_serial = serial;
+
+            let op = operation.value();
+            process(&mut state, &op);
         }
-        state.op_serial = serial;
-
-        let op = operation.value();
-        process(&mut state, op);
     }
-    txn.close()?;
-    Ok(state)
+    Ok(RwLock::new(state))
 }
 
 // just check if everything is ok to be applied
-pub fn validate(state: &State, op: Operation) -> Result<(), anyhow::Error> {
+pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
     match op {
         Operation::Unknown => return Err(anyhow!("Unknown shouldn't have been stored")),
         Operation::Trust(t) => {
@@ -203,7 +205,7 @@ pub fn validate(state: &State, op: Operation) -> Result<(), anyhow::Error> {
 }
 
 // just apply the changes
-pub fn process(state: &mut State, op: Operation) {
+pub fn process(state: &mut State, op: &Operation) {
     match op {
         Operation::Unknown => {}
         Operation::Trust(t) => {

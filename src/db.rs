@@ -9,3 +9,11 @@ lazy_static! {
 }
 
 pub const LOG: TableDefinition<u64, Operation> = TableDefinition::new("log");
+
+pub fn ensure_tables() {
+    let txn = DB.begin_write().unwrap();
+    {
+        let _ = txn.open_table(LOG);
+    }
+    txn.commit().unwrap();
+}

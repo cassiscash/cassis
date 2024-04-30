@@ -1,23 +1,29 @@
 use axum::{
+    http::status::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
-    Router,
 };
-use std::sync::Arc;
+use db::DB;
+use operation::Operation;
+use state::{process, validate, State};
+use std::{
+    cmp::min,
+    sync::{Arc, RwLock},
+};
 
 mod db;
+mod helpers;
 mod operation;
 mod state;
 
-use db::DB;
-use operation::Operation;
-use state::State;
-
 #[tokio::main]
 async fn main() {
+    db::ensure_tables();
+
     let state = state::init().expect("failed to init state from db");
     let shared_state = Arc::new(state);
 
-    let app = Router::new()
+    let app = axum::Router::new()
         .route("/", get(|| async { "cassis" }))
         .route("/append", post(append_op).with_state(shared_state.clone()))
         .route("/log", get(get_log).with_state(shared_state.clone()));
@@ -27,29 +33,77 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn append_op(axum::extract::State(_state): axum::extract::State<Arc<State>>) -> String {
-    let write_txn = DB.begin_write().unwrap();
-    let op = Operation::Trust(operation::Trust::default());
-    {
-        let mut table = write_txn.open_table(db::LOG).unwrap();
-        table.insert(&1, op).unwrap();
-    }
-    let _ = write_txn.commit().expect("failed to create log table");
+async fn append_op(
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+    axum::extract::Json(op): axum::extract::Json<Operation>,
+) -> axum::response::Response {
+    let mut state = state.write().unwrap();
 
-    format!("")
+    // validate this operation
+    let _ = match validate(&state, &op) {
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        _ => {}
+    };
+
+    // once we know it's ok we save it
+    if DB
+        .begin_write()
+        .map_err(|err| anyhow::Error::from(err))
+        .and_then(|txn| {
+            {
+                let mut table = txn.open_table(db::LOG)?;
+                table.insert(&1, &op)?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // and then we apply the changes
+    process(&mut state, &op);
+
+    StatusCode::OK.into_response()
 }
 
-async fn get_log(axum::extract::State(_state): axum::extract::State<Arc<State>>) -> String {
-    let txn = DB.begin_read().unwrap();
-    let table = txn
-        .open_table(db::LOG)
-        .expect("failed to open table when reading log");
+#[derive(serde::Deserialize)]
+struct GetLogParams {
+    since: Option<u64>,
+}
 
-    let mut res = String::with_capacity(150);
-    for row in table.range(0..).expect("failed to open iterator") {
-        let (_, v) = row.unwrap();
-        res.push_str(format!("{}", v.value()).as_str());
-        res.push_str(",");
+async fn get_log(
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+    axum::extract::Query(qs): axum::extract::Query<GetLogParams>,
+) -> axum::response::Response {
+    let state = state.read().unwrap();
+    let mut res: Vec<operation::Operation> = Vec::with_capacity(150);
+
+    // fetch from start to end, but limit to 50 results
+    let (start, end): (u64, u64) = match qs.since {
+        Some(since) => (since, min(since + 50, state.op_serial)),
+        None if state.op_serial > 50 => (state.op_serial - 50, state.op_serial),
+        None => (0, state.op_serial),
+    };
+
+    if DB
+        .begin_read()
+        .map_err(|err| anyhow::Error::from(err))
+        .and_then(|txn| {
+            {
+                let table = txn.open_table(db::LOG)?;
+                for row in table.range(start..end)? {
+                    let (_, v) = row.unwrap();
+                    res.push(v.value());
+                }
+            }
+            Ok(())
+        })
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    res
+
+    axum::response::Json(res).into_response()
 }
