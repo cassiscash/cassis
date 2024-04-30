@@ -1,5 +1,6 @@
 use byteorder::{ByteOrder, LE};
-use k256::sha2::{Digest, Sha256};
+use secp256k1::XOnlyPublicKey;
+
 use redb::Value;
 use std::fmt;
 
@@ -7,9 +8,9 @@ use std::fmt;
 pub struct Trust {
     pub ts: u32,
     pub from: u32,
-    pub to: k256::schnorr::VerifyingKey,
+    pub to: XOnlyPublicKey,
     pub amount: u32,
-    pub sig: k256::schnorr::SignatureBytes,
+    pub sig: [u8; 64],
 }
 
 impl Default for Trust {
@@ -17,7 +18,7 @@ impl Default for Trust {
         Trust {
             ts: 0,
             from: 0,
-            to: k256::schnorr::VerifyingKey::from_bytes(&[0; 32]).unwrap(),
+            to: XOnlyPublicKey::from_slice(&[0; 32]).unwrap(),
             amount: 1,
             sig: [0; 64],
         }
@@ -31,7 +32,7 @@ impl fmt::Display for Trust {
             "<trust {}-[{}]->{} at {}>",
             self.from,
             self.amount,
-            hex::encode(self.to.to_bytes()),
+            hex::encode(self.to.serialize()),
             self.ts
         )
     }
@@ -42,12 +43,12 @@ impl Trust {
 
     const SIZE: usize = 1 + 4 + 4 + 32 + 4 + 64;
 
-    fn sighash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        let nosig = &Trust::as_bytes(self)[0..Trust::SIZE - 64];
-        hasher.update(nosig);
-        let digest = hasher.finalize();
-        digest.into()
+    pub fn write_serialized(&self, w: &mut Vec<u8>) {
+        w.copy_from_slice(&Trust::as_bytes(self)[0..self.size_nosig()])
+    }
+
+    pub fn size_nosig(&self) -> usize {
+        Trust::SIZE - 64
     }
 }
 
@@ -69,7 +70,7 @@ impl redb::Value for Trust {
         buf[0] = Trust::TAG;
         LE::write_u32(&mut buf[1..5], t.ts);
         LE::write_u32(&mut buf[5..9], t.from);
-        buf[9..41].copy_from_slice(t.to.to_bytes().as_ref());
+        buf[9..41].copy_from_slice(&t.to.serialize());
         LE::write_u32(&mut buf[41..45], t.amount);
         buf[45..109].copy_from_slice(&t.sig);
 
@@ -87,9 +88,9 @@ impl redb::Value for Trust {
         Trust {
             ts: LE::read_u32(&data[1..5]),
             from: LE::read_u32(&data[5..9]),
-            to: k256::schnorr::VerifyingKey::from_bytes(&data[9..41]).unwrap(),
+            to: XOnlyPublicKey::from_slice(&data[9..41]).unwrap(),
             amount: LE::read_u32(&data[41..45]),
-            sig: k256::schnorr::SignatureBytes::from_bytes(&data[45..109]),
+            sig: data[45..109].try_into().unwrap(),
         }
     }
 }

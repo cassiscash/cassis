@@ -1,5 +1,4 @@
 use byteorder::{ByteOrder, LE};
-use k256::sha2::{Digest, Sha256};
 use redb::Value;
 use std::fmt;
 
@@ -33,15 +32,11 @@ impl fmt::Display for Transfer {
 impl Transfer {
     pub const TAG: u8 = b'x';
 
-    pub fn sighash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        let nosig = &Transfer::as_bytes(self)[0..self.size_nosig()];
-        hasher.update(nosig);
-        let digest = hasher.finalize();
-        digest.into()
+    pub fn write_serialized(&self, w: &mut Vec<u8>) {
+        w.copy_from_slice(&Transfer::as_bytes(self)[0..self.size_nosig()])
     }
 
-    fn size_nosig(&self) -> usize {
+    pub fn size_nosig(&self) -> usize {
         return 1 + 4 + self.hops.len() * Hop::SIZE;
     }
 
@@ -158,7 +153,7 @@ impl std::fmt::Display for Hop {
 #[derive(Debug)]
 pub struct PeerSig {
     pub peer_idx: u32,
-    pub sig: k256::schnorr::SignatureBytes,
+    pub sig: [u8; 64],
 }
 
 impl PeerSig {
@@ -167,7 +162,7 @@ impl PeerSig {
     fn from_bytes(data: &[u8]) -> PeerSig {
         PeerSig {
             peer_idx: LE::read_u32(&data[0..4]),
-            sig: k256::schnorr::SignatureBytes::from_bytes(&data[4..68]),
+            sig: data[4..68].try_into().unwrap(),
         }
     }
 
