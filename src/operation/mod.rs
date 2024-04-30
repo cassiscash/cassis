@@ -1,7 +1,10 @@
-use std::fmt;
+mod transfer;
+mod trust;
 
-use crate::transfer::Transfer;
-use crate::trust::Trust;
+pub use transfer::Transfer;
+pub use trust::Trust;
+
+use std::fmt;
 
 #[derive(Debug)]
 pub enum Operation {

@@ -5,9 +5,9 @@ use std::fmt;
 
 #[derive(Debug)]
 pub struct Transfer {
-    ts: u32,
-    hops: Vec<Hop>,
-    sigs: Vec<HopSig>,
+    pub ts: u32,
+    pub hops: Vec<Hop>,
+    pub sigs: Vec<PeerSig>,
 }
 
 impl Default for Transfer {
@@ -46,7 +46,7 @@ impl Transfer {
     }
 
     fn size(&self) -> usize {
-        return self.size_nosig() + self.sigs.len() * HopSig::SIZE;
+        return self.size_nosig() + self.sigs.len() * PeerSig::SIZE;
     }
 }
 
@@ -84,7 +84,7 @@ impl redb::Value for Transfer {
 
         let start: usize = 7 + t.hops.len() * Hop::SIZE;
         for (i, hsig) in t.sigs.iter().enumerate() {
-            hsig.write_to(&mut buf[start + i * HopSig::SIZE..start + (i + 1) * HopSig::SIZE]);
+            hsig.write_to(&mut buf[start + i * PeerSig::SIZE..start + (i + 1) * PeerSig::SIZE]);
         }
 
         buf
@@ -112,8 +112,8 @@ impl redb::Value for Transfer {
         let nsigs = data[6].into();
         let mut sigs = Vec::with_capacity(nsigs);
         while i < nhops {
-            sigs.push(HopSig::from_bytes(&data[start + i..]));
-            i += HopSig::SIZE;
+            sigs.push(PeerSig::from_bytes(&data[start + i..]));
+            i += PeerSig::SIZE;
         }
 
         Transfer {
@@ -125,10 +125,10 @@ impl redb::Value for Transfer {
 }
 
 #[derive(Debug)]
-struct Hop {
-    from: u32,
-    to: u32,
-    amount: u32,
+pub struct Hop {
+    pub from: u32,
+    pub to: u32,
+    pub amount: u32,
 }
 
 impl Hop {
@@ -156,23 +156,23 @@ impl std::fmt::Display for Hop {
 }
 
 #[derive(Debug)]
-struct HopSig {
-    hop_index: u8,
-    sig: k256::schnorr::SignatureBytes,
+pub struct PeerSig {
+    pub peer_idx: u32,
+    pub sig: k256::schnorr::SignatureBytes,
 }
 
-impl HopSig {
-    const SIZE: usize = 65;
+impl PeerSig {
+    const SIZE: usize = 68;
 
-    fn from_bytes(data: &[u8]) -> HopSig {
-        HopSig {
-            hop_index: data[0],
-            sig: k256::schnorr::SignatureBytes::from_bytes(&data[1..]),
+    fn from_bytes(data: &[u8]) -> PeerSig {
+        PeerSig {
+            peer_idx: LE::read_u32(&data[0..4]),
+            sig: k256::schnorr::SignatureBytes::from_bytes(&data[4..68]),
         }
     }
 
     fn write_to(&self, buf: &mut [u8]) {
-        buf[0] = self.hop_index;
-        buf[1..].copy_from_slice(&self.sig);
+        LE::write_u32(&mut buf[0..4], self.peer_idx);
+        buf[4..68].copy_from_slice(&self.sig);
     }
 }

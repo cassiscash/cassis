@@ -5,11 +5,11 @@ use std::fmt;
 
 #[derive(Debug)]
 pub struct Trust {
-    ts: u32,
-    from: u32,
-    to: k256::schnorr::VerifyingKey,
-    amount: u32,
-    sig: k256::schnorr::SignatureBytes,
+    pub ts: u32,
+    pub from: u32,
+    pub to: k256::schnorr::VerifyingKey,
+    pub amount: u32,
+    pub sig: k256::schnorr::SignatureBytes,
 }
 
 impl Default for Trust {
