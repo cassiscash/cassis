@@ -78,7 +78,6 @@ async fn get_log(
     axum::extract::Query(qs): axum::extract::Query<GetLogParams>,
 ) -> axum::response::Response {
     let state = state.read().unwrap();
-    let mut res: Vec<operation::Operation> = Vec::with_capacity(150);
 
     // fetch from start to end, but limit to 50 results
     let (start, end): (u64, u64) = match qs.since {
@@ -87,23 +86,18 @@ async fn get_log(
         None => (0, state.op_serial),
     };
 
-    if DB
-        .begin_read()
-        .map_err(|err| anyhow::Error::from(err))
-        .and_then(|txn| {
-            {
-                let table = txn.open_table(db::LOG)?;
-                for row in table.range(start..end)? {
+    match DB.begin_read().map_err(|err| anyhow::Error::from(err)) {
+        Ok(txn) => {
+            let table = txn.open_table(db::LOG).unwrap();
+            let stream = async_stream::stream! {
+                for row in table.range(start..end).unwrap() {
                     let (_, v) = row.unwrap();
-                    res.push(v.value());
+                    yield v.value()
                 }
-            }
-            Ok(())
-        })
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+            };
 
-    axum::response::Json(res).into_response()
+            axum_streams::StreamBodyAs::json_nl(stream).into_response()
+        }
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
 }
