@@ -1,5 +1,4 @@
 use byteorder::{ByteOrder, LE};
-use redb::Value;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -33,8 +32,23 @@ impl fmt::Display for Transfer {
 impl Transfer {
     pub const TAG: u8 = b'x';
 
-    pub fn write_serialized(&self, w: &mut Vec<u8>) {
-        w.copy_from_slice(&Transfer::as_bytes(self)[0..self.size_nosig()])
+    pub fn write_serialized(&self, buf: &mut Vec<u8>) {
+        buf[0] = Transfer::TAG;
+        LE::write_u32(&mut buf[1..5], self.ts);
+        buf[5] = self
+            .hops
+            .len()
+            .try_into()
+            .expect("can'self have more than 128 hops");
+        buf[6] = self
+            .sigs
+            .len()
+            .try_into()
+            .expect("can'self have more than 128 hops");
+
+        for (i, hop) in self.hops.iter().enumerate() {
+            hop.write_to(&mut buf[7 + i * Hop::SIZE..7 + (i + 1) * Hop::SIZE]);
+        }
     }
 
     pub fn size_nosig(&self) -> usize {
@@ -46,6 +60,7 @@ impl Transfer {
     }
 }
 
+#[cfg(feature = "redb")]
 impl redb::Value for Transfer {
     fn type_name() -> redb::TypeName {
         redb::TypeName::new("transfer")
@@ -60,24 +75,7 @@ impl redb::Value for Transfer {
         Self: 'b,
     {
         let mut buf = vec![0; t.size()];
-
-        buf[0] = Transfer::TAG;
-        LE::write_u32(&mut buf[1..5], t.ts);
-        buf[5] = t
-            .hops
-            .len()
-            .try_into()
-            .expect("can't have more than 128 hops");
-        buf[6] = t
-            .sigs
-            .len()
-            .try_into()
-            .expect("can't have more than 128 hops");
-
-        for (i, hop) in t.hops.iter().enumerate() {
-            hop.write_to(&mut buf[7 + i * Hop::SIZE..7 + (i + 1) * Hop::SIZE]);
-        }
-
+        t.write_serialized(&mut buf);
         let start: usize = 7 + t.hops.len() * Hop::SIZE;
         for (i, hsig) in t.sigs.iter().enumerate() {
             hsig.write_to(&mut buf[start + i * PeerSig::SIZE..start + (i + 1) * PeerSig::SIZE]);

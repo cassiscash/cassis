@@ -24,6 +24,7 @@ impl fmt::Display for Operation {
     }
 }
 
+#[cfg(feature = "redb")]
 impl redb::Value for Operation {
     fn type_name() -> redb::TypeName {
         redb::TypeName::new("operation")

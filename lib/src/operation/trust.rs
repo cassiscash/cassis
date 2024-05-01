@@ -1,5 +1,4 @@
 use byteorder::{ByteOrder, LE};
-use redb::Value;
 use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -50,8 +49,12 @@ impl Trust {
 
     const SIZE: usize = 1 + 4 + 4 + 32 + 4 + 64;
 
-    pub fn write_serialized(&self, w: &mut Vec<u8>) {
-        w.copy_from_slice(&Trust::as_bytes(self)[0..self.size_nosig()])
+    pub fn write_serialized(&self, buf: &mut Vec<u8>) {
+        buf[0] = Trust::TAG;
+        LE::write_u32(&mut buf[1..5], self.ts);
+        LE::write_u32(&mut buf[5..9], self.from);
+        buf[9..41].copy_from_slice(&self.to.serialize());
+        LE::write_u32(&mut buf[41..45], self.amount);
     }
 
     pub fn size_nosig(&self) -> usize {
@@ -59,12 +62,13 @@ impl Trust {
     }
 }
 
+#[cfg(feature = "redb")]
 impl redb::Value for Trust {
     fn type_name() -> redb::TypeName {
         redb::TypeName::new("trust")
     }
 
-    type AsBytes<'a> = [u8; Trust::SIZE];
+    type AsBytes<'a> = Vec<u8>;
     type SelfType<'a> = Trust;
 
     fn as_bytes<'a, 'b: 'a>(t: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -72,15 +76,9 @@ impl redb::Value for Trust {
         Self: 'a,
         Self: 'b,
     {
-        let mut buf = [0; Trust::SIZE];
-
-        buf[0] = Trust::TAG;
-        LE::write_u32(&mut buf[1..5], t.ts);
-        LE::write_u32(&mut buf[5..9], t.from);
-        buf[9..41].copy_from_slice(&t.to.serialize());
-        LE::write_u32(&mut buf[41..45], t.amount);
+        let mut buf = vec![0; Trust::SIZE];
+        t.write_serialized(&mut buf);
         buf[45..109].copy_from_slice(&t.sig);
-
         buf
     }
 
