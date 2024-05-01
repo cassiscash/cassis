@@ -1,0 +1,12 @@
+[package]
+name = "cassis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+secp256k1 = { workspace = true }
+redb = { workspace = true }
+byteorder = "1.5.0"

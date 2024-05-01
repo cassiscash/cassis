@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context};
+use cassis::operation::Operation;
 use secp256k1::{
     hashes::{sha256, Hash},
     schnorr::Signature,
@@ -11,7 +12,6 @@ use std::{
 };
 
 use crate::db;
-use crate::operation::Operation;
 
 pub struct State {
     pub keys: Vec<XOnlyPublicKey>,
