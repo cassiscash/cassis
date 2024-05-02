@@ -8,6 +8,6 @@ tokio = { version = "1.37.0", features = ["rt-multi-thread"] }
 serde_json = "1.0.116"
 hex = { version = "0.4.3", features = ["serde"] }
 anyhow = "1.0.82"
-secp256k1 = { version = "0.29.0", features = ["hashes-std", "global-context"] }
+secp256k1 = { version = "0.29.0", features = ["hashes-std", "global-context", "rand-std"] }
 futures = "0.3.30"
 redb = "2.1.0"

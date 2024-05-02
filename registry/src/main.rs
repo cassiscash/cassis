@@ -5,28 +5,45 @@ use axum::{
 };
 use cassis::operation::Operation;
 use db::DB;
+use lazy_static::lazy_static;
 use state::{process, validate, State};
 use std::{
     cmp::min,
+    env,
     sync::{Arc, RwLock},
 };
 
 mod db;
 mod state;
 
+lazy_static! {
+    static ref SERVER_KEY: cassis::SecretKey =
+        cassis::SecretKey::from_hex(&env::var("SECRET_KEY").unwrap_or(
+            "c668bcc0d81d647f2c9ac035df7a6d7e672de709abb8bbd5fe5bb8778f748263".to_string(),
+        ))
+        .expect("invalid SECRET_KEY");
+}
+
 #[tokio::main]
 async fn main() {
     db::ensure_tables();
 
-    let state = state::init().expect("failed to init state from db");
+    let state = state::init(SERVER_KEY.public()).expect("failed to init state from db");
     let shared_state = Arc::new(state);
 
     let app = axum::Router::new()
         .route("/", get(|| async { "cassis" }))
         .route("/append", post(append_op).with_state(shared_state.clone()))
-        .route("/log", get(get_log).with_state(shared_state.clone()));
+        .route("/log", get(get_log).with_state(shared_state.clone()))
+        .route(
+            "/key/:pubkey",
+            get(get_key_id).with_state(shared_state.clone()),
+        );
 
-    println!("listening on http://localhost:3000");
+    println!(
+        "listening on http://localhost:3000 with key {}",
+        SERVER_KEY.public()
+    );
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -97,5 +114,25 @@ async fn get_log(
             axum_streams::StreamBodyAs::json_nl(stream).into_response()
         }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_key_id(
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+    axum::extract::Path(pubkey): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let state = state.read().unwrap();
+
+    let mut pk_slice = [0u8; 32];
+    if hex::decode_to_slice(pubkey, &mut pk_slice).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    match state.key_indexes.get(&pk_slice) {
+        Some(idx_ref) => {
+            let idx = *idx_ref;
+            format!("{}", idx).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }

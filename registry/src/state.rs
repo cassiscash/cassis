@@ -3,7 +3,7 @@ use cassis::operation::Operation;
 use secp256k1::{
     hashes::{sha256, Hash},
     schnorr::Signature,
-    Message, XOnlyPublicKey,
+    Message,
 };
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -14,8 +14,8 @@ use std::{
 use crate::db;
 
 pub struct State {
-    pub keys: Vec<XOnlyPublicKey>,
-    key_indexes: HashMap<[u8; 32], u32>,
+    pub keys: Vec<cassis::PublicKey>,
+    pub key_indexes: HashMap<[u8; 32], u32>,
     pub lines: HashMap<u64, Line, BuildHasherDefault<nohash_hasher::NoHashHasher<u64>>>,
     pub op_serial: u64,
 }
@@ -41,13 +41,15 @@ impl Line {
     }
 }
 
-pub fn init() -> Result<RwLock<State>, anyhow::Error> {
+pub fn init(initial_key: cassis::PublicKey) -> Result<RwLock<State>, anyhow::Error> {
     let mut state = State {
-        keys: vec![],
+        keys: vec![initial_key],
         key_indexes: HashMap::with_capacity(500),
         lines: HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::default()),
         op_serial: 0,
     };
+
+    state.key_indexes.insert(initial_key.serialize(), 0);
 
     let txn = db::DB.begin_read()?;
     {
@@ -90,12 +92,12 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
                 None => return Err(anyhow!("from key doesn't exist")),
                 Some(key) => {
                     // verify signature
-                    let mut nosig = Vec::with_capacity(t.size_nosig());
+                    let mut nosig = vec![0u8; t.size_nosig()];
                     t.write_serialized(&mut nosig);
                     let digest = sha256::Hash::hash(&nosig);
                     let message = Message::from_digest(digest.to_byte_array());
                     if Signature::from_slice(&t.sig)
-                        .and_then(|s| s.verify(&message, key))
+                        .and_then(|sig| key.verify(&sig, &message))
                         .is_err()
                     {
                         return Err(anyhow!("invalid signature"));
@@ -181,7 +183,7 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
             }
 
             // verify all signatures
-            let mut nosig = Vec::with_capacity(t.size_nosig());
+            let mut nosig = vec![0u8; t.size_nosig()];
             t.write_serialized(&mut nosig);
             let digest = sha256::Hash::hash(&nosig);
             let message = Message::from_digest(digest.to_byte_array());
@@ -190,7 +192,7 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
                     None => return Err(anyhow!("signing key doesn't exist")),
                     Some(key) => {
                         if Signature::from_slice(&isig.sig)
-                            .and_then(|s| s.verify(&message, key))
+                            .and_then(|sig| key.verify(&sig, &message))
                             .is_err()
                         {
                             return Err(anyhow!("invalid signature"));
@@ -215,7 +217,7 @@ pub fn process(state: &mut State, op: &Operation) {
                 Entry::Vacant(entry) => {
                     // add new key to the end of list
                     let next = state.keys.len() as u32;
-                    state.keys.push(t.to);
+                    state.keys.push(t.to.to_owned());
                     entry.insert(next);
                     next
                 }

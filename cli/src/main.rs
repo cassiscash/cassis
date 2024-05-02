@@ -1,4 +1,4 @@
-use cassis::operation;
+use cassis::operation::Trust;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -7,7 +7,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .about("talks to cassis servers")
         .arg(
             clap::Arg::new("registry_address")
-                .short('h')
                 .long("host")
                 .value_name("DOMAIN")
                 .help("domain name of the cassis registry")
@@ -15,47 +14,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .arg(
             clap::Arg::new("secret_key")
-                .long("sk")
+                .long("key")
                 .value_name("HEX-PRIVATE-KEY")
-                .help("private key to use in the operation"),
+                .help("private key to use in the operation")
+                .required(true),
         )
         .subcommand(
             clap::Command::new("trust")
                 .about("makes it so the receiver of the trust can send payments through you")
                 .arg(
                     clap::Arg::new("trustee")
-                        .short('t')
-                        .long("trustee")
                         .value_name("HEX-PUBLIC-KEY")
-                        .required(true),
+                        .required(true)
+                        .index(1),
                 )
                 .arg(
                     clap::Arg::new("amount")
-                        .short('a')
-                        .long("amount")
                         .value_name("SATOSHIS")
-                        .required(true),
+                        .required(true)
+                        .index(2),
                 ),
         )
         .get_matches();
 
-    let host = matches.get_one("registry_address").unwrap();
-    let sk = matches
-        .get_one::<&str>("secret_key")
-        .unwrap()
-        .parse::<u32>()?;
+    let host = matches.get_one::<String>("registry_address").unwrap();
+    let sk = cassis::SecretKey::from_hex(matches.get_one::<String>("secret_key").unwrap())
+        .expect("invalid private key");
 
     let client = reqwest::Client::new();
 
     if let Some(matches) = matches.subcommand_matches("trust") {
-        let trustee = matches.get_one("trustee").unwrap();
-        let amount = matches.get_one("amount").unwrap();
+        let to = cassis::PublicKey::from_hex(matches.get_one("trustee").unwrap())
+            .expect("invalid trustee public key");
+        let amount = matches
+            .get_one::<String>("amount")
+            .unwrap()
+            .parse::<u32>()?;
 
-        let data = operation::Trust {};
+        // get our key index from server
+        let from = client
+            .get(format!("https://{}/key/{}", host, sk.public()))
+            .send()
+            .await?
+            .text()
+            .await?
+            .parse::<u32>()?;
 
+        // build trust operation
+        let data = Trust::new(sk, from, to, amount);
+
+        // send to server
         let response = client
             .post(format!("https://{}/append", host))
-            .body(&data)
+            .body(serde_json::to_string(&data)?)
+            .header("Content-Type", "application/json")
             .send()
             .await?;
 

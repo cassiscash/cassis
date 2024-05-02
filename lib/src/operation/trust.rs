@@ -1,19 +1,21 @@
 use byteorder::{ByteOrder, LE};
-use secp256k1::XOnlyPublicKey;
+use secp256k1::{
+    hashes::{sha256, Hash},
+    XOnlyPublicKey,
+};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use crate::helpers;
+use crate::key::{PublicKey, SecretKey};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Trust {
     pub ts: u32,
     pub from: u32,
-    #[serde(
-        serialize_with = "helpers::serialize_xonlypubkey",
-        deserialize_with = "helpers::deserialize_xonlypubkey"
-    )]
-    pub to: XOnlyPublicKey,
+    pub to: PublicKey,
     pub amount: u32,
     #[serde(with = "hex::serde")]
     pub sig: [u8; 64],
@@ -24,7 +26,7 @@ impl Default for Trust {
         Trust {
             ts: 0,
             from: 0,
-            to: XOnlyPublicKey::from_slice(&[0; 32]).unwrap(),
+            to: PublicKey(XOnlyPublicKey::from_slice(&[0; 32]).unwrap()),
             amount: 1,
             sig: [0; 64],
         }
@@ -60,6 +62,39 @@ impl Trust {
     pub fn size_nosig(&self) -> usize {
         Trust::SIZE - 64
     }
+
+    pub fn new(secret_key: SecretKey, from: u32, to: PublicKey, amount: u32) -> Self {
+        Self::new_with_time(secret_key, SystemTime::now(), from, to, amount)
+    }
+
+    pub fn new_with_time(
+        secret_key: SecretKey,
+        when: SystemTime,
+        from: u32,
+        to: PublicKey,
+        amount: u32,
+    ) -> Self {
+        // build
+        let mut t = Trust {
+            ts: when
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_secs() as u32,
+            from,
+            to,
+            amount,
+            sig: [0; 64],
+        };
+
+        // sign
+        let mut nosig = vec![0; t.size_nosig()];
+        t.write_serialized(&mut nosig);
+        let digest = sha256::Hash::hash(&nosig);
+        let message = secp256k1::Message::from_digest(digest.to_byte_array());
+        t.sig = secret_key.0.sign_schnorr(message).serialize();
+
+        t
+    }
 }
 
 #[cfg(feature = "redb")]
@@ -93,7 +128,7 @@ impl redb::Value for Trust {
         Trust {
             ts: LE::read_u32(&data[1..5]),
             from: LE::read_u32(&data[5..9]),
-            to: XOnlyPublicKey::from_slice(&data[9..41]).unwrap(),
+            to: PublicKey(XOnlyPublicKey::from_slice(&data[9..41]).unwrap()),
             amount: LE::read_u32(&data[41..45]),
             sig: data[45..109].try_into().unwrap(),
         }
