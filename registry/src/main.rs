@@ -41,10 +41,10 @@ async fn main() {
         );
 
     println!(
-        "listening on http://localhost:3000 with key {}",
+        "listening on http://localhost:6000 with key {}",
         SERVER_KEY.public()
     );
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:6000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 

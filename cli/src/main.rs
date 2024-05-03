@@ -1,4 +1,4 @@
-use cassis::operation::Trust;
+use cassis::operation::{Operation, Trust};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,6 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_matches();
 
     let host = matches.get_one::<String>("registry_address").unwrap();
+    let base = if host.starts_with("localhost") {
+        format!("http://{}", host)
+    } else {
+        format!("https://{}", host)
+    };
     let sk = cassis::SecretKey::from_hex(matches.get_one::<String>("secret_key").unwrap())
         .expect("invalid private key");
 
@@ -49,29 +54,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let amount = matches
             .get_one::<String>("amount")
             .unwrap()
-            .parse::<u32>()?;
+            .parse::<u32>()
+            .expect("amount is not a valid integer");
 
         // get our key index from server
         let from = client
-            .get(format!("https://{}/key/{}", host, sk.public()))
+            .get(format!("{}/key/{}", base, sk.public()))
             .send()
             .await?
+            .error_for_status()?
             .text()
             .await?
-            .parse::<u32>()?;
+            .parse::<u32>()
+            .expect("response from /key call is not a valid integer");
 
         // build trust operation
-        let data = Trust::new(sk, from, to, amount);
+        let data = Operation::Trust(Trust::new(sk, from, to, amount));
 
         // send to server
-        let response = client
-            .post(format!("https://{}/append", host))
+        let _ = client
+            .post(format!("{}/append", base))
             .body(serde_json::to_string(&data)?)
             .header("Content-Type", "application/json")
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
-        println!("{}", response.text().await?);
+        println!("success!");
     }
 
     Ok(())
