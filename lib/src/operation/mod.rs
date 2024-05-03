@@ -8,9 +8,13 @@ pub use transfer::Transfer;
 pub use trust::Trust;
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "tag")]
 pub enum Operation {
+    #[serde(rename = "t")]
     Trust(Trust),
+    #[serde(rename = "x")]
     Transfer(Transfer),
+    #[serde(rename = "u")]
     Unknown,
 }
 
