@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // get our key index from server
         let from = client
-            .get(format!("{}/key/{}", base, sk.public()))
+            .get(format!("{}/idx/{}", base, sk.public()))
             .send()
             .await?
             .error_for_status()?

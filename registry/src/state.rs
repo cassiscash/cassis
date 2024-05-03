@@ -20,6 +20,7 @@ pub struct State {
     pub op_serial: u64,
 }
 
+#[derive(serde::Serialize, Debug)]
 pub struct Line {
     // peers sorted by serial number
     pub peers: (u32, u32),
@@ -59,7 +60,7 @@ pub fn init(initial_key: cassis::PublicKey) -> Result<RwLock<State>, anyhow::Err
 
             let serial = key.value();
             if i as u64 != serial {
-                return Err(anyhow!("row index != serial key"));
+                return Err(anyhow!("row index ({}) != serial key ({})", i, serial));
             }
             state.op_serial = serial;
 

@@ -1,6 +1,6 @@
 use axum::{
     http::status::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Json},
     routing::{get, post},
 };
 use cassis::operation::Operation;
@@ -36,9 +36,10 @@ async fn main() {
         .route("/append", post(append_op).with_state(shared_state.clone()))
         .route("/log", get(get_log).with_state(shared_state.clone()))
         .route(
-            "/key/:pubkey",
+            "/idx/:pubkey",
             get(get_key_id).with_state(shared_state.clone()),
-        );
+        )
+        .route("/lines", get(get_lines).with_state(shared_state.clone()));
 
     println!(
         "listening on http://localhost:6000 with key {}",
@@ -67,7 +68,7 @@ async fn append_op(
         .and_then(|txn| {
             {
                 let mut table = txn.open_table(db::LOG)?;
-                table.insert(&1, &op)?;
+                table.insert(&state.op_serial, &op)?;
             }
             txn.commit()?;
             Ok(())
@@ -135,4 +136,11 @@ async fn get_key_id(
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn get_lines(
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+) -> axum::response::Response {
+    let state = state.read().unwrap();
+    Json(&state.lines).into_response()
 }
