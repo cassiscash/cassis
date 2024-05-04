@@ -6,7 +6,6 @@ use axum::{
 use cassis::operation::Operation;
 use db::DB;
 use lazy_static::lazy_static;
-use state::{process, validate, State};
 use std::{
     cmp::min,
     env,
@@ -50,13 +49,13 @@ async fn main() {
 }
 
 async fn append_op(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
     axum::extract::Json(op): axum::extract::Json<Operation>,
 ) -> axum::response::Response {
     let mut state = state.write().unwrap();
 
     // validate this operation
-    let _ = match validate(&state, &op) {
+    let _ = match cassis::state::validate(&state, &op) {
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
         _ => {}
     };
@@ -79,7 +78,7 @@ async fn append_op(
     }
 
     // and then we apply the changes
-    process(&mut state, &op);
+    cassis::state::process(&mut state, &op);
 
     StatusCode::OK.into_response()
 }
@@ -90,7 +89,7 @@ struct GetLogParams {
 }
 
 async fn get_log(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
     axum::extract::Query(qs): axum::extract::Query<GetLogParams>,
 ) -> axum::response::Response {
     let state = state.read().unwrap();
@@ -119,7 +118,7 @@ async fn get_log(
 }
 
 async fn get_key_id(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
     axum::extract::Path(pubkey): axum::extract::Path<String>,
 ) -> axum::response::Response {
     let state = state.read().unwrap();
@@ -139,7 +138,7 @@ async fn get_key_id(
 }
 
 async fn get_lines(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<State>>>,
+    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
 ) -> axum::response::Response {
     let state = state.read().unwrap();
     Json(&state.lines).into_response()
