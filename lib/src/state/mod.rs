@@ -160,6 +160,8 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
 
 // just apply the changes
 pub fn process(state: &mut State, op: &Operation) {
+    state.op_serial += 1;
+
     match op {
         Operation::Unknown => {}
         Operation::Trust(t) => {
