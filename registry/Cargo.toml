@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 cassis = { path = "../lib", features = ["redb"] }
 serde = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
@@ -17,3 +17,4 @@ axum = "0.7.5"
 lazy_static = "1.4.0"
 axum-streams = { version = "0.14.2", features = ["json"] }
 async-stream = "0.3.5"
+tokio-stream = { version = "0.1.15", features = ["sync"] }

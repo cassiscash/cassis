@@ -3,14 +3,16 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{get, post},
 };
-use cassis::operation::Operation;
+use cassis::Operation;
 use db::DB;
+use futures::StreamExt;
 use lazy_static::lazy_static;
 use std::{
     cmp::min,
     env,
     sync::{Arc, RwLock},
 };
+use tokio::sync::broadcast;
 
 mod db;
 mod state;
@@ -30,15 +32,19 @@ async fn main() {
     let state = state::init(SERVER_KEY.public()).expect("failed to init state from db");
     let shared_state = Arc::new(state);
 
+    let (streamer, listener) = broadcast::channel::<serde_json::Value>(12);
+    let shared_listener = Arc::new(listener);
+
     let app = axum::Router::new()
         .route("/", get(|| async { "cassis" }))
-        .route("/append", post(append_op).with_state(shared_state.clone()))
-        .route("/log", get(get_log).with_state(shared_state.clone()))
+        .route("/append", post(append_op).layer(axum::Extension(streamer)))
+        .route("/log", get(get_log).layer(axum::Extension(shared_listener)))
         .route(
             "/idx/:pubkey",
             get(get_key_id).with_state(shared_state.clone()),
         )
-        .route("/lines", get(get_lines).with_state(shared_state.clone()));
+        .route("/lines", get(get_lines).with_state(shared_state.clone()))
+        .with_state(shared_state.clone());
 
     println!(
         "listening on http://localhost:6000 with key {}",
@@ -50,6 +56,9 @@ async fn main() {
 
 async fn append_op(
     axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
+    axum::extract::Extension(streamer): axum::extract::Extension<
+        broadcast::Sender<serde_json::Value>,
+    >,
     axum::extract::Json(op): axum::extract::Json<Operation>,
 ) -> axum::response::Response {
     let mut state = state.write().unwrap();
@@ -80,16 +89,26 @@ async fn append_op(
     // and then we apply the changes
     cassis::state::process(&mut state, &op);
 
+    // dispatch to listeners
+    let value = serde_json::to_value(op).unwrap();
+    streamer
+        .send(value.clone())
+        .expect("failed to send through channel");
+
     StatusCode::OK.into_response()
 }
 
 #[derive(serde::Deserialize)]
 struct GetLogParams {
     since: Option<u64>,
+    live: Option<bool>,
 }
 
 async fn get_log(
     axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
+    axum::extract::Extension(shared_listener): axum::extract::Extension<
+        Arc<broadcast::Receiver<serde_json::Value>>,
+    >,
     axum::extract::Query(qs): axum::extract::Query<GetLogParams>,
 ) -> axum::response::Response {
     let state = state.read().unwrap();
@@ -104,14 +123,23 @@ async fn get_log(
     match DB.begin_read().map_err(|err| anyhow::Error::from(err)) {
         Ok(txn) => {
             let table = txn.open_table(db::LOG).unwrap();
-            let stream = async_stream::stream! {
+            let past_stream = async_stream::stream! {
                 for row in table.range(start..end).unwrap() {
                     let (_, v) = row.unwrap();
-                    yield v.value()
+                    yield serde_json::to_value(v.value()).unwrap()
                 }
             };
 
-            axum_streams::StreamBodyAs::json_nl(stream).into_response()
+            if qs.live == Some(true) {
+                let listener = shared_listener.resubscribe();
+                let future_stream =
+                    tokio_stream::wrappers::BroadcastStream::new(listener).map(|res| res.unwrap());
+
+                axum_streams::StreamBodyAs::json_nl(past_stream.chain(future_stream))
+                    .into_response()
+            } else {
+                axum_streams::StreamBodyAs::json_nl(past_stream).into_response()
+            }
         }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
