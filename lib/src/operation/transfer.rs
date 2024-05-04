@@ -1,8 +1,7 @@
 use byteorder::{ByteOrder, LE};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Transfer {
     pub ts: u32,
     pub hops: Vec<Hop>,
@@ -118,7 +117,7 @@ impl redb::Value for Transfer {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Hop {
     pub from: u32,
     pub to: u32,
@@ -149,7 +148,7 @@ impl std::fmt::Display for Hop {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct PeerSig {
     pub peer_idx: u32,
     #[serde(with = "hex::serde")]

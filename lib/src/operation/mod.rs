@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 mod transfer;
@@ -7,7 +6,7 @@ mod trust;
 pub use transfer::Transfer;
 pub use trust::Trust;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "tag")]
 pub enum Operation {
     #[serde(rename = "t")]

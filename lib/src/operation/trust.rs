@@ -3,7 +3,6 @@ use secp256k1::{
     hashes::{sha256, Hash},
     XOnlyPublicKey,
 };
-use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     time::{SystemTime, UNIX_EPOCH},
@@ -11,7 +10,7 @@ use std::{
 
 use crate::key::{PublicKey, SecretKey};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Trust {
     pub ts: u32,
     pub from: u32,
