@@ -12,16 +12,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("domain name of the cassis registry")
                 .default_value("registry.cassis.cash"),
         )
-        .arg(
-            clap::Arg::new("secret_key")
-                .long("key")
-                .value_name("HEX-PRIVATE-KEY")
-                .help("private key to use in the operation")
-                .required(true),
+        .subcommand(
+            clap::Command::new("log")
+                .about("listens to all operations happening on a registry")
+                .arg(
+                    clap::Arg::new("since")
+                        .long("since")
+                        .short('s')
+                        .value_name("OPERATION-INDEX"),
+                )
+                .arg(
+                    clap::Arg::new("live")
+                        .long("live")
+                        .action(clap::ArgAction::SetTrue),
+                ),
         )
         .subcommand(
             clap::Command::new("trust")
                 .about("makes it so the receiver of the trust can send payments through you")
+                .arg(
+                    clap::Arg::new("secret_key")
+                        .long("key")
+                        .value_name("HEX-PRIVATE-KEY")
+                        .help("private key to use in the operation")
+                        .required(true),
+                )
                 .arg(
                     clap::Arg::new("trustee")
                         .value_name("HEX-PUBLIC-KEY")
@@ -43,13 +58,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         format!("https://{}", host)
     };
-    let sk = cassis::SecretKey::from_hex(matches.get_one::<String>("secret_key").unwrap())
-        .expect("invalid private key");
 
     let client = reqwest::Client::new();
 
-    if let Some(matches) = matches.subcommand_matches("trust") {
-        let to = cassis::PublicKey::from_hex(matches.get_one("trustee").unwrap())
+    if let Some(matches) = matches.subcommand_matches("log") {
+        let live = matches.get_flag("live");
+        let since = matches.get_one::<String>("since");
+
+        let mut req = client.get(format!("{}/log", base));
+        if live {
+            req = req.query(&[("live", "true")]);
+        }
+        match since {
+            Some(s) => {
+                req = req.query(&[("since", s)]);
+            }
+            None => {}
+        }
+
+        let mut response = req.send().await?;
+        while let Some(chunk) = response.chunk().await? {
+            print!(
+                "{}",
+                String::from_utf8(chunk.to_vec()).unwrap_or("<broken-data>".to_string())
+            )
+        }
+    } else if let Some(matches) = matches.subcommand_matches("trust") {
+        let sk = cassis::SecretKey::from_hex(matches.get_one::<String>("secret_key").unwrap())
+            .expect("invalid private key");
+        let to = cassis::PublicKey::from_hex(matches.get_one::<String>("trustee").unwrap())
             .expect("invalid trustee public key");
         let amount = matches
             .get_one::<String>("amount")
