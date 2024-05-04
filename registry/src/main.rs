@@ -8,7 +8,6 @@ use db::DB;
 use futures::StreamExt;
 use lazy_static::lazy_static;
 use std::{
-    cmp::min,
     env,
     sync::{Arc, RwLock},
 };
@@ -100,8 +99,8 @@ async fn append_op(
 
 #[derive(serde::Deserialize)]
 struct GetLogParams {
-    since: Option<u64>,
-    live: Option<bool>,
+    since: Option<i64>,
+    pub live: Option<bool>,
 }
 
 async fn get_log(
@@ -109,15 +108,28 @@ async fn get_log(
     axum::extract::Extension(shared_listener): axum::extract::Extension<
         Arc<broadcast::Receiver<serde_json::Value>>,
     >,
-    axum::extract::Query(qs): axum::extract::Query<GetLogParams>,
+    axum::extract::Query(mut qs): axum::extract::Query<GetLogParams>,
 ) -> axum::response::Response {
     let state = state.read().unwrap();
 
     // fetch from start to end, but limit to 50 results
-    let (start, end): (u64, u64) = match qs.since {
-        Some(since) => (since, min(since + 50, state.op_serial)),
-        None if state.op_serial > 50 => (state.op_serial - 50, state.op_serial),
-        None => (0, state.op_serial),
+    let start: u64 = match qs.since {
+        Some(since) => {
+            if since < 0 {
+                state.op_serial + since.abs() as u64
+            } else {
+                since as u64
+            }
+        }
+        None if state.op_serial > 50 => state.op_serial - 50,
+        None => 0,
+    };
+
+    let end = if state.op_serial - start > 1000 {
+        qs.live = Some(false);
+        start + 500
+    } else {
+        state.op_serial
     };
 
     match DB.begin_read().map_err(|err| anyhow::Error::from(err)) {

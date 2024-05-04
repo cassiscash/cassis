@@ -268,8 +268,10 @@ checksum = "7b02b629252fe8ef6460461409564e2c21d0c8e77e0944f3d189ff06c4e932ad"
 name = "cassis"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "byteorder",
  "hex",
+ "nohash-hasher",
  "redb",
  "secp256k1",
  "serde",
@@ -301,7 +303,26 @@ dependencies = [
  "futures",
  "hex",
  "lazy_static",
- "nohash-hasher",
+ "redb",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "cassis-router"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "axum-streams",
+ "cassis",
+ "futures",
+ "hex",
+ "lazy_static",
  "redb",
  "secp256k1",
  "serde",
@@ -1335,6 +1356,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
