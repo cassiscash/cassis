@@ -316,14 +316,13 @@ name = "cassis-router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "axum",
- "axum-streams",
  "cassis",
  "futures",
  "hex",
  "lazy_static",
  "redb",
+ "reqwest",
  "secp256k1",
  "serde",
  "serde_json",

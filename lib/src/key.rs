@@ -1,3 +1,4 @@
+use secp256k1::{schnorr::Signature, Message};
 use std::fmt;
 
 #[derive(Debug)]
@@ -25,6 +26,12 @@ impl SecretKey {
         let (pk, _) = self.0.x_only_public_key();
         PublicKey(pk)
     }
+
+    pub fn sign(&self, digest: [u8; 32]) -> [u8; 64] {
+        self.0
+            .sign_schnorr(Message::from_digest(digest))
+            .serialize()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,11 +56,15 @@ impl PublicKey {
         self.0.serialize()
     }
 
-    pub fn verify(
-        &self,
-        sig: &secp256k1::schnorr::Signature,
-        msg: &secp256k1::Message,
-    ) -> Result<(), secp256k1::Error> {
+    pub fn verify(&self, sig: [u8; 64], digest: [u8; 32]) -> Result<(), secp256k1::Error> {
+        let message = Message::from_digest(digest);
+        if Signature::from(&sig)
+            .and_then(|sig| self.0.verify(&sig, &message))
+            .is_err()
+        {
+            return Err(anyhow!("invalid signature"));
+        }
+
         sig.verify(&msg, &self.0)
     }
 }

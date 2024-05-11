@@ -1,3 +1,4 @@
+use secp256k1::hashes::{sha256, Hash};
 use std::fmt;
 
 mod transfer;
@@ -17,12 +18,36 @@ pub enum Operation {
     Unknown,
 }
 
+pub trait OperationOps {
+    const TAG: u8;
+
+    fn write_serialized(&self, buf: &mut Vec<u8>);
+    fn size_nosig(&self) -> usize;
+
+    fn sighash(&self) -> [u8; 32] {
+        let mut nosig = vec![0u8; self.size_nosig()];
+        self.write_serialized(&mut nosig);
+        let digest = sha256::Hash::hash(&nosig);
+        digest.to_byte_array()
+    }
+}
+
 impl fmt::Display for Operation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Operation::Transfer(t) => Transfer::fmt(t, f),
             Operation::Trust(t) => Trust::fmt(t, f),
             Operation::Unknown => write!(f, "<unknown>"),
+        }
+    }
+}
+
+impl Operation {
+    pub fn sighash(&self) -> [u8; 32] {
+        match self {
+            Operation::Transfer(t) => t.sighash(),
+            Operation::Trust(t) => t.sighash(),
+            Operation::Unknown => [0u8; 32],
         }
     }
 }

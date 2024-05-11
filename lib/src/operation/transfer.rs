@@ -1,6 +1,8 @@
 use byteorder::{ByteOrder, LE};
 use std::fmt;
 
+use crate::OperationOps;
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Transfer {
     pub ts: u32,
@@ -28,10 +30,10 @@ impl fmt::Display for Transfer {
     }
 }
 
-impl Transfer {
-    pub const TAG: u8 = b'x';
+impl OperationOps for Transfer {
+    const TAG: u8 = b'x';
 
-    pub fn write_serialized(&self, buf: &mut Vec<u8>) {
+    fn write_serialized(&self, buf: &mut Vec<u8>) {
         buf[0] = Transfer::TAG;
         LE::write_u32(&mut buf[1..5], self.ts);
         buf[5] = self
@@ -50,10 +52,12 @@ impl Transfer {
         }
     }
 
-    pub fn size_nosig(&self) -> usize {
+    fn size_nosig(&self) -> usize {
         return 1 + 4 + self.hops.len() * Hop::SIZE;
     }
+}
 
+impl Transfer {
     fn size(&self) -> usize {
         return self.size_nosig() + self.sigs.len() * PeerSig::SIZE;
     }

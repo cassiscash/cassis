@@ -1,18 +1,15 @@
 use anyhow::anyhow;
-use secp256k1::{
-    hashes::{sha256, Hash},
-    schnorr::Signature,
-    Message,
-};
+use secp256k1::{schnorr::Signature, Message};
 use std::{
     collections::{hash_map::Entry, HashMap},
     hash::BuildHasherDefault,
 };
 
 pub mod line;
+
 pub use line::Line;
 
-use crate::operation::Operation;
+use crate::operation::{Operation, OperationOps};
 use crate::PublicKey;
 
 pub struct State {
@@ -20,6 +17,7 @@ pub struct State {
     pub key_indexes: HashMap<[u8; 32], u32>,
     pub lines: HashMap<u64, Line, BuildHasherDefault<nohash_hasher::NoHashHasher<u64>>>,
     pub op_serial: u64,
+    pub latest_op_hash: [u8; 32],
 }
 
 // just check if everything is ok to be applied
@@ -44,10 +42,7 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
                 None => return Err(anyhow!("from key doesn't exist")),
                 Some(key) => {
                     // verify signature
-                    let mut nosig = vec![0u8; t.size_nosig()];
-                    t.write_serialized(&mut nosig);
-                    let digest = sha256::Hash::hash(&nosig);
-                    let message = Message::from_digest(digest.to_byte_array());
+                    let message = Message::from_digest(t.sighash());
                     if Signature::from_slice(&t.sig)
                         .and_then(|sig| key.verify(&sig, &message))
                         .is_err()
@@ -135,10 +130,7 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
             }
 
             // verify all signatures
-            let mut nosig = vec![0u8; t.size_nosig()];
-            t.write_serialized(&mut nosig);
-            let digest = sha256::Hash::hash(&nosig);
-            let message = Message::from_digest(digest.to_byte_array());
+            let message = Message::from_digest(t.sighash());
             for isig in t.sigs.iter() {
                 let _ = match state.keys.get(isig.peer_idx as usize) {
                     None => return Err(anyhow!("signing key doesn't exist")),

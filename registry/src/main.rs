@@ -35,7 +35,7 @@ async fn main() {
     let shared_listener = Arc::new(listener);
 
     let app = axum::Router::new()
-        .route("/", get(|| async { "cassis" }))
+        .route("/", get(|| async { "cassis-registry" }))
         .route("/append", post(append_op).layer(axum::Extension(streamer)))
         .route("/log", get(get_log).layer(axum::Extension(shared_listener)))
         .route(

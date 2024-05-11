@@ -9,6 +9,7 @@ use std::{
 };
 
 use crate::key::{PublicKey, SecretKey};
+use crate::OperationOps;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Trust {
@@ -45,12 +46,10 @@ impl fmt::Display for Trust {
     }
 }
 
-impl Trust {
-    pub const TAG: u8 = b't';
+impl OperationOps for Trust {
+    const TAG: u8 = b't';
 
-    const SIZE: usize = 1 + 4 + 4 + 32 + 4 + 64;
-
-    pub fn write_serialized(&self, buf: &mut Vec<u8>) {
+    fn write_serialized(&self, buf: &mut Vec<u8>) {
         buf[0] = Trust::TAG;
         LE::write_u32(&mut buf[1..5], self.ts);
         LE::write_u32(&mut buf[5..9], self.from);
@@ -58,9 +57,13 @@ impl Trust {
         LE::write_u32(&mut buf[41..45], self.amount);
     }
 
-    pub fn size_nosig(&self) -> usize {
+    fn size_nosig(&self) -> usize {
         Trust::SIZE - 64
     }
+}
+
+impl Trust {
+    const SIZE: usize = 1 + 4 + 4 + 32 + 4 + 64;
 
     pub fn new(secret_key: SecretKey, from: u32, to: PublicKey, amount: u32) -> Self {
         Self::new_with_time(secret_key, SystemTime::now(), from, to, amount)
