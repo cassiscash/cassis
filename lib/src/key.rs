@@ -56,16 +56,10 @@ impl PublicKey {
         self.0.serialize()
     }
 
-    pub fn verify(&self, sig: [u8; 64], digest: [u8; 32]) -> Result<(), secp256k1::Error> {
-        let message = Message::from_digest(digest);
-        if Signature::from(&sig)
-            .and_then(|sig| self.0.verify(&sig, &message))
-            .is_err()
-        {
-            return Err(anyhow!("invalid signature"));
-        }
-
-        sig.verify(&msg, &self.0)
+    pub fn verify(&self, sig: &[u8; 64], digest: &[u8; 32]) -> Result<(), secp256k1::Error> {
+        let message = Message::from_digest(*digest);
+        Signature::from_slice(sig)
+            .and_then(|sig| self.0.verify(secp256k1::global::SECP256K1, &message, &sig))
     }
 }
 

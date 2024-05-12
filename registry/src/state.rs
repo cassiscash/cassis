@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use secp256k1::{
     hashes::{sha256, Hash},
     Message,
@@ -13,7 +13,6 @@ pub fn init(initial_key: cassis::PublicKey) -> Result<RwLock<cassis::State>, any
         key_indexes: HashMap::with_capacity(500),
         lines: HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::default()),
         op_serial: 0,
-        latest_op_hash: [0u8; 32],
     };
 
     state.key_indexes.insert(initial_key.serialize(), 0);
@@ -41,10 +40,10 @@ pub fn hash_and_sign_log_entry(
     secret_key: cassis::SecretKey,
     op: &cassis::Operation,
     previous_entry_hash: [u8; 32],
-) -> [u8; 32] {
+) -> cassis::SecretKey {
     let op_sighash = sha256::Hash::hash(&op.sighash());
     let mut concat = [0u8; 64];
-    concat[0..32].copy_from_slice(digest.as_byte_array());
+    concat[0..32].copy_from_slice(op_sighash.as_byte_array());
     concat[32..64].copy_from_slice(&previous_entry_hash);
     let digest = sha256::Hash::hash(&concat);
     let message = Message::from_digest(digest.to_byte_array());

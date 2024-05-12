@@ -10,7 +10,7 @@ hex = { workspace = true }
 secp256k1 = { workspace = true }
 redb = { workspace = true, optional = true }
 anyhow = { workspace = true }
-byteorder = "1.5.0"
+byteorder = { workspace = true }
 nohash-hasher = "0.2.0"
 
 [features]

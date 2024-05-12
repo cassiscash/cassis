@@ -60,6 +60,20 @@ impl OperationOps for Trust {
     fn size_nosig(&self) -> usize {
         Trust::SIZE - 64
     }
+
+    fn size(&self) -> usize {
+        Trust::SIZE
+    }
+
+    fn deserialize(buf: &[u8]) -> Self {
+        Trust {
+            ts: LE::read_u32(&buf[1..5]),
+            from: LE::read_u32(&buf[5..9]),
+            to: PublicKey(XOnlyPublicKey::from_slice(&buf[9..41]).unwrap()),
+            amount: LE::read_u32(&buf[41..45]),
+            sig: buf[45..109].try_into().unwrap(),
+        }
+    }
 }
 
 impl Trust {
@@ -127,12 +141,6 @@ impl redb::Value for Trust {
     where
         Self: 'a,
     {
-        Trust {
-            ts: LE::read_u32(&data[1..5]),
-            from: LE::read_u32(&data[5..9]),
-            to: PublicKey(XOnlyPublicKey::from_slice(&data[9..41]).unwrap()),
-            amount: LE::read_u32(&data[41..45]),
-            sig: data[45..109].try_into().unwrap(),
-        }
+        Self::deserialize(data)
     }
 }

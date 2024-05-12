@@ -22,6 +22,8 @@ pub trait OperationOps {
     const TAG: u8;
 
     fn write_serialized(&self, buf: &mut Vec<u8>);
+
+    fn size(&self) -> usize;
     fn size_nosig(&self) -> usize;
 
     fn sighash(&self) -> [u8; 32] {
@@ -30,6 +32,8 @@ pub trait OperationOps {
         let digest = sha256::Hash::hash(&nosig);
         digest.to_byte_array()
     }
+
+    fn deserialize(buf: &[u8]) -> Self;
 }
 
 impl fmt::Display for Operation {
@@ -48,6 +52,30 @@ impl Operation {
             Operation::Transfer(t) => t.sighash(),
             Operation::Trust(t) => t.sighash(),
             Operation::Unknown => [0u8; 32],
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            Operation::Transfer(t) => t.size(),
+            Operation::Trust(t) => t.size(),
+            Operation::Unknown => 0,
+        }
+    }
+
+    pub fn write_serialized(&self, buf: &mut Vec<u8>) {
+        match self {
+            Operation::Transfer(t) => t.write_serialized(buf),
+            Operation::Trust(t) => t.write_serialized(buf),
+            Operation::Unknown => {}
+        }
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Self {
+        match buf[0] {
+            Transfer::TAG => Operation::Transfer(Transfer::deserialize(buf)),
+            Trust::TAG => Operation::Trust(Trust::deserialize(buf)),
+            _ => Operation::Unknown,
         }
     }
 }
@@ -81,10 +109,6 @@ impl redb::Value for Operation {
     where
         Self: 'a,
     {
-        match data[0] {
-            Transfer::TAG => Operation::Transfer(Transfer::from_bytes(data)),
-            Trust::TAG => Operation::Trust(Trust::from_bytes(data)),
-            _ => Operation::Unknown,
-        }
+        Self::deserialize(data)
     }
 }

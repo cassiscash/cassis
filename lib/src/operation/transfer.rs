@@ -52,14 +52,38 @@ impl OperationOps for Transfer {
         }
     }
 
+    fn size(&self) -> usize {
+        return self.size_nosig() + self.sigs.len() * PeerSig::SIZE;
+    }
+
     fn size_nosig(&self) -> usize {
         return 1 + 4 + self.hops.len() * Hop::SIZE;
     }
-}
 
-impl Transfer {
-    fn size(&self) -> usize {
-        return self.size_nosig() + self.sigs.len() * PeerSig::SIZE;
+    fn deserialize(buf: &[u8]) -> Self {
+        let mut i = 0;
+
+        let nhops = buf[5].into();
+        let mut hops = Vec::with_capacity(nhops);
+        while i < nhops {
+            hops.push(Hop::from_bytes(&buf[7 + i..]));
+            i += Hop::SIZE;
+        }
+
+        i = 0;
+        let start: usize = 7 + nhops * Hop::SIZE;
+        let nsigs = buf[6].into();
+        let mut sigs = Vec::with_capacity(nsigs);
+        while i < nhops {
+            sigs.push(PeerSig::from_bytes(&buf[start + i..]));
+            i += PeerSig::SIZE;
+        }
+
+        Transfer {
+            ts: LE::read_u32(&buf[1..5]),
+            hops,
+            sigs,
+        }
     }
 }
 
@@ -95,29 +119,7 @@ impl redb::Value for Transfer {
     where
         Self: 'a,
     {
-        let mut i = 0;
-
-        let nhops = data[5].into();
-        let mut hops = Vec::with_capacity(nhops);
-        while i < nhops {
-            hops.push(Hop::from_bytes(&data[7 + i..]));
-            i += Hop::SIZE;
-        }
-
-        i = 0;
-        let start: usize = 7 + nhops * Hop::SIZE;
-        let nsigs = data[6].into();
-        let mut sigs = Vec::with_capacity(nsigs);
-        while i < nhops {
-            sigs.push(PeerSig::from_bytes(&data[start + i..]));
-            i += PeerSig::SIZE;
-        }
-
-        Transfer {
-            ts: LE::read_u32(&data[1..5]),
-            hops,
-            sigs,
-        }
+        Self::deserialize(data)
     }
 }
 

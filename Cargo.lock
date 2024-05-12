@@ -299,6 +299,7 @@ dependencies = [
  "async-stream",
  "axum",
  "axum-streams",
+ "byteorder",
  "cassis",
  "futures",
  "hex",

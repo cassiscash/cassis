@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use secp256k1::{schnorr::Signature, Message};
 use std::{
     collections::{hash_map::Entry, HashMap},
     hash::BuildHasherDefault,
@@ -17,7 +16,6 @@ pub struct State {
     pub key_indexes: HashMap<[u8; 32], u32>,
     pub lines: HashMap<u64, Line, BuildHasherDefault<nohash_hasher::NoHashHasher<u64>>>,
     pub op_serial: u64,
-    pub latest_op_hash: [u8; 32],
 }
 
 // just check if everything is ok to be applied
@@ -40,16 +38,7 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
             // check existence of t.from
             let _ = match state.keys.get(t.from as usize) {
                 None => return Err(anyhow!("from key doesn't exist")),
-                Some(key) => {
-                    // verify signature
-                    let message = Message::from_digest(t.sighash());
-                    if Signature::from_slice(&t.sig)
-                        .and_then(|sig| key.verify(&sig, &message))
-                        .is_err()
-                    {
-                        return Err(anyhow!("invalid signature"));
-                    }
-                }
+                Some(key) => key.verify(&t.sig, &t.sighash()),
             };
 
             Ok(())
@@ -130,18 +119,10 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
             }
 
             // verify all signatures
-            let message = Message::from_digest(t.sighash());
             for isig in t.sigs.iter() {
                 let _ = match state.keys.get(isig.peer_idx as usize) {
                     None => return Err(anyhow!("signing key doesn't exist")),
-                    Some(key) => {
-                        if Signature::from_slice(&isig.sig)
-                            .and_then(|sig| key.verify(&sig, &message))
-                            .is_err()
-                        {
-                            return Err(anyhow!("invalid signature"));
-                        }
-                    }
+                    Some(key) => key.verify(&isig.sig, &t.sighash()),
                 };
             }
 

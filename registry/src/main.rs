@@ -4,7 +4,6 @@ use axum::{
     routing::{get, post},
 };
 use cassis::Operation;
-use db::DB;
 use futures::StreamExt;
 use lazy_static::lazy_static;
 use std::{
