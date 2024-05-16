@@ -15,7 +15,6 @@ pub struct State {
     pub keys: Vec<PublicKey>,
     pub key_indexes: HashMap<[u8; 32], u32>,
     pub lines: HashMap<u64, Line, BuildHasherDefault<nohash_hasher::NoHashHasher<u64>>>,
-    pub op_serial: u64,
 }
 
 // just check if everything is ok to be applied
@@ -133,8 +132,6 @@ pub fn validate(state: &State, op: &Operation) -> Result<(), anyhow::Error> {
 
 // just apply the changes
 pub fn process(state: &mut State, op: &Operation) {
-    state.op_serial += 1;
-
     match op {
         Operation::Unknown => {}
         Operation::Trust(t) => {

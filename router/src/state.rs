@@ -1,7 +1,5 @@
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use std::{collections::HashMap, hash::BuildHasherDefault, sync::RwLock};
-
-use crate::db;
 
 pub fn init(initial_key: cassis::PublicKey) -> Result<RwLock<cassis::State>, anyhow::Error> {
     let mut state = cassis::State {
@@ -13,21 +11,17 @@ pub fn init(initial_key: cassis::PublicKey) -> Result<RwLock<cassis::State>, any
 
     state.key_indexes.insert(initial_key.serialize(), 0);
 
-    let txn = db::DB.begin_read()?;
-    {
-        let table = txn.open_table(db::LOG)?;
-        for (i, row) in table.range(0..)?.enumerate() {
-            let (key, operation) = row.with_context(|| format!("at row index {}", i))?;
+    for (i, row) in LOG.iter().enumerate() {
+        let (key, operation) = row.with_context(|| format!("at row index {}", i))?;
 
-            let serial = key.value();
-            if i as u64 != serial {
-                return Err(anyhow!("row index ({}) != serial key ({})", i, serial));
-            }
-            state.op_serial = serial;
-
-            let op = operation.value();
-            cassis::state::process(&mut state, &op);
+        let serial = key.value();
+        if i as u64 != serial {
+            return Err(anyhow!("row index ({}) != serial key ({})", i, serial));
         }
+        state.op_serial = serial;
+
+        let op = operation.value();
+        cassis::state::process(&mut state, &op);
     }
     Ok(RwLock::new(state))
 }

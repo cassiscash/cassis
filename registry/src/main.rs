@@ -16,16 +16,24 @@ mod db;
 mod state;
 
 lazy_static! {
-    static ref SERVER_KEY: cassis::SecretKey =
-        cassis::SecretKey::from_hex(&env::var("SECRET_KEY").unwrap_or(
+    static ref SERVER_KEY: cassis::SecretKey = {
+        let hexkey = env::var("SECRET_KEY").unwrap_or(
             "c668bcc0d81d647f2c9ac035df7a6d7e672de709abb8bbd5fe5bb8778f748263".to_string(),
-        ))
-        .expect("invalid SECRET_KEY");
+        );
+        cassis::SecretKey::from_hex(&hexkey).expect("invalid SECRET_KEY")
+    };
 }
 
 #[tokio::main]
 async fn main() {
-    db::ensure_tables();
+    let subscriber = tracing_subscriber::fmt()
+        .compact()
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(true)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let state = state::init(SERVER_KEY.public()).expect("failed to init state from db");
     let shared_state = Arc::new(state);
@@ -68,20 +76,11 @@ async fn append_op(
     };
 
     // once we know it's ok we save it
-    if DB
-        .begin_write()
-        .map_err(|err| anyhow::Error::from(err))
-        .and_then(|txn| {
-            {
-                let mut table = txn.open_table(db::LOG)?;
-                table.insert(&state.op_serial, &op)?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    match LOG.append_operation(&op) {
+        Err(err) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        }
+        _ => {}
     }
 
     // and then we apply the changes
@@ -98,46 +97,30 @@ async fn append_op(
 
 #[derive(serde::Deserialize)]
 struct GetLogParams {
-    since: Option<i64>,
+    from: Option<u32>,
+    to: Option<u32>,
     pub live: Option<bool>,
 }
 
 async fn get_log(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
+    axum::extract::State(_state): axum::extract::State<Arc<RwLock<cassis::State>>>,
     axum::extract::Extension(shared_listener): axum::extract::Extension<
         Arc<broadcast::Receiver<serde_json::Value>>,
     >,
-    axum::extract::Query(mut qs): axum::extract::Query<GetLogParams>,
+    axum::extract::Query(qs): axum::extract::Query<GetLogParams>,
 ) -> axum::response::Response {
-    let state = state.read().unwrap();
-
-    // fetch from start to end, but limit to 50 results
-    let start: u64 = match qs.since {
-        Some(since) => {
-            if since < 0 {
-                state.op_serial + since.abs() as u64
-            } else {
-                since as u64
-            }
-        }
-        None if state.op_serial > 50 => state.op_serial - 50,
-        None => 0,
+    let iter_res = match (qs.from, qs.to) {
+        (None, None) => LOG.range(..),
+        (Some(from), None) => LOG.range(from as u64..),
+        (None, Some(to)) => LOG.range(..to as u64),
+        (Some(from), Some(to)) => LOG.range(from as u64..to as u64),
     };
 
-    let end = if state.op_serial - start > 1000 {
-        qs.live = Some(false);
-        start + 500
-    } else {
-        state.op_serial
-    };
-
-    match DB.begin_read().map_err(|err| anyhow::Error::from(err)) {
-        Ok(txn) => {
-            let table = txn.open_table(db::LOG).unwrap();
+    match iter_res {
+        Ok(range) => {
             let past_stream = async_stream::stream! {
-                for row in table.range(start..end).unwrap() {
-                    let (_, v) = row.unwrap();
-                    yield serde_json::to_value(v.value()).unwrap()
+                for operation in range {
+                    yield serde_json::to_value(operation).unwrap()
                 }
             };
 

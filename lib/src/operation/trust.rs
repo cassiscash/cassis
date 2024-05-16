@@ -49,7 +49,7 @@ impl fmt::Display for Trust {
 impl OperationOps for Trust {
     const TAG: u8 = b't';
 
-    fn write_serialized(&self, buf: &mut Vec<u8>) {
+    fn write_serialized(&self, buf: &mut [u8]) {
         buf[0] = Trust::TAG;
         LE::write_u32(&mut buf[1..5], self.ts);
         LE::write_u32(&mut buf[5..9], self.from);

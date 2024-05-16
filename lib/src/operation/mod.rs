@@ -21,14 +21,14 @@ pub enum Operation {
 pub trait OperationOps {
     const TAG: u8;
 
-    fn write_serialized(&self, buf: &mut Vec<u8>);
+    fn write_serialized(&self, buf: &mut [u8]);
 
     fn size(&self) -> usize;
     fn size_nosig(&self) -> usize;
 
     fn sighash(&self) -> [u8; 32] {
         let mut nosig = vec![0u8; self.size_nosig()];
-        self.write_serialized(&mut nosig);
+        self.write_serialized(&mut nosig.as_mut_slice());
         let digest = sha256::Hash::hash(&nosig);
         digest.to_byte_array()
     }
@@ -63,7 +63,7 @@ impl Operation {
         }
     }
 
-    pub fn write_serialized(&self, buf: &mut Vec<u8>) {
+    pub fn write_serialized(&self, buf: &mut [u8]) {
         match self {
             Operation::Transfer(t) => t.write_serialized(buf),
             Operation::Trust(t) => t.write_serialized(buf),

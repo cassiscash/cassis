@@ -33,7 +33,7 @@ impl fmt::Display for Transfer {
 impl OperationOps for Transfer {
     const TAG: u8 = b'x';
 
-    fn write_serialized(&self, buf: &mut Vec<u8>) {
+    fn write_serialized(&self, buf: &mut [u8]) {
         buf[0] = Transfer::TAG;
         LE::write_u32(&mut buf[1..5], self.ts);
         buf[5] = self
