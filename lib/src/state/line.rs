@@ -1,6 +1,6 @@
 use byteorder::{ByteOrder, LE};
 
-#[derive(serde::Serialize, Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Line {
     // peers sorted by serial number
     pub peers: (u32, u32),

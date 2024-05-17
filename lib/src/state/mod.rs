@@ -11,6 +11,7 @@ pub use line::Line;
 use crate::operation::{Operation, OperationOps};
 use crate::PublicKey;
 
+#[derive(Debug)]
 pub struct State {
     pub keys: Vec<PublicKey>,
     pub key_indexes: HashMap<[u8; 32], u32>,

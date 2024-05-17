@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::OperationOps;
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Transfer {
     pub ts: u32,
     pub hops: Vec<Hop>,
@@ -123,7 +123,7 @@ impl redb::Value for Transfer {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Hop {
     pub from: u32,
     pub to: u32,
@@ -154,7 +154,7 @@ impl std::fmt::Display for Hop {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PeerSig {
     pub peer_idx: u32,
     #[serde(with = "hex::serde")]

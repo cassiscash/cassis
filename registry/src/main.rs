@@ -6,14 +6,10 @@ use axum::{
 use cassis::Operation;
 use futures::StreamExt;
 use lazy_static::lazy_static;
-use std::{
-    env,
-    sync::{Arc, RwLock},
-};
+use std::{env, sync::Arc};
 use tokio::sync::broadcast;
 
-mod db;
-mod state;
+mod background;
 
 lazy_static! {
     static ref SERVER_KEY: cassis::SecretKey = {
@@ -22,6 +18,10 @@ lazy_static! {
         );
         cassis::SecretKey::from_hex(&hexkey).expect("invalid SECRET_KEY")
     };
+}
+
+struct GlobalContext {
+    requester: background::Requester,
 }
 
 #[tokio::main]
@@ -35,8 +35,9 @@ async fn main() {
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
-    let state = state::init(SERVER_KEY.public()).expect("failed to init state from db");
-    let shared_state = Arc::new(state);
+    let requester = background::start(SERVER_KEY.public());
+
+    let shared_state = Arc::new(GlobalContext { requester });
 
     let (streamer, listener) = broadcast::channel::<serde_json::Value>(12);
     let shared_listener = Arc::new(listener);
@@ -61,30 +62,18 @@ async fn main() {
 }
 
 async fn append_op(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
+    axum::extract::State(ctx): axum::extract::State<Arc<GlobalContext>>,
     axum::extract::Extension(streamer): axum::extract::Extension<
         broadcast::Sender<serde_json::Value>,
     >,
     axum::extract::Json(op): axum::extract::Json<Operation>,
 ) -> axum::response::Response {
-    let mut state = state.write().unwrap();
-
-    // validate this operation
-    let _ = match cassis::state::validate(&state, &op) {
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-        _ => {}
-    };
-
-    // once we know it's ok we save it
-    match LOG.append_operation(&op) {
+    match ctx.requester.append_operation(op.clone()).await {
         Err(err) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
         }
         _ => {}
-    }
-
-    // and then we apply the changes
-    cassis::state::process(&mut state, &op);
+    };
 
     // dispatch to listeners
     let value = serde_json::to_value(op).unwrap();
@@ -103,23 +92,16 @@ struct GetLogParams {
 }
 
 async fn get_log(
-    axum::extract::State(_state): axum::extract::State<Arc<RwLock<cassis::State>>>,
+    axum::extract::State(ctx): axum::extract::State<Arc<GlobalContext>>,
     axum::extract::Extension(shared_listener): axum::extract::Extension<
         Arc<broadcast::Receiver<serde_json::Value>>,
     >,
     axum::extract::Query(qs): axum::extract::Query<GetLogParams>,
 ) -> axum::response::Response {
-    let iter_res = match (qs.from, qs.to) {
-        (None, None) => LOG.range(..),
-        (Some(from), None) => LOG.range(from as u64..),
-        (None, Some(to)) => LOG.range(..to as u64),
-        (Some(from), Some(to)) => LOG.range(from as u64..to as u64),
-    };
-
-    match iter_res {
-        Ok(range) => {
+    match ctx.requester.list(qs.from, qs.to).await {
+        Ok(ops) => {
             let past_stream = async_stream::stream! {
-                for operation in range {
+                for operation in ops {
                     yield serde_json::to_value(operation).unwrap()
                 }
             };
@@ -140,28 +122,23 @@ async fn get_log(
 }
 
 async fn get_key_id(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
+    axum::extract::State(ctx): axum::extract::State<Arc<GlobalContext>>,
     axum::extract::Path(pubkey): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    let state = state.read().unwrap();
-
-    let mut pk_slice = [0u8; 32];
-    if hex::decode_to_slice(pubkey, &mut pk_slice).is_err() {
+    let mut pk = [0u8; 32];
+    if hex::decode_to_slice(pubkey, &mut pk).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    match state.key_indexes.get(&pk_slice) {
-        Some(idx_ref) => {
-            let idx = *idx_ref;
-            format!("{}", idx).into_response()
-        }
+    match ctx.requester.get_key_id(pk).await {
+        Some(idx) => format!("{}", idx).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 async fn get_lines(
-    axum::extract::State(state): axum::extract::State<Arc<RwLock<cassis::State>>>,
+    axum::extract::State(ctx): axum::extract::State<Arc<GlobalContext>>,
 ) -> axum::response::Response {
-    let state = state.read().unwrap();
-    Json(&state.lines).into_response()
+    let lines = ctx.requester.get_lines().await;
+    Json(lines).into_response()
 }

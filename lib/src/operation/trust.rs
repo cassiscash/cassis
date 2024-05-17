@@ -11,7 +11,7 @@ use std::{
 use crate::key::{PublicKey, SecretKey};
 use crate::OperationOps;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Trust {
     pub ts: u32,
     pub from: u32,

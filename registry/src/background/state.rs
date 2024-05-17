@@ -1,12 +1,9 @@
-use secp256k1::{
-    hashes::{sha256, Hash},
-    Message,
-};
-use std::{collections::HashMap, hash::BuildHasherDefault, sync::RwLock};
+use secp256k1::hashes::{sha256, Hash};
+use std::{collections::HashMap, hash::BuildHasherDefault};
 
-use crate::db::LOG;
+use crate::background::LogStore;
 
-pub fn init(initial_key: cassis::PublicKey) -> Result<RwLock<cassis::State>, anyhow::Error> {
+pub fn init(initial_key: cassis::PublicKey, ls: &LogStore) -> Result<cassis::State, anyhow::Error> {
     let mut state = cassis::State {
         keys: vec![initial_key],
         key_indexes: HashMap::with_capacity(500),
@@ -15,10 +12,10 @@ pub fn init(initial_key: cassis::PublicKey) -> Result<RwLock<cassis::State>, any
 
     state.key_indexes.insert(initial_key.serialize(), 0);
 
-    for op in LOG.iter() {
+    for op in ls.iter() {
         cassis::state::process(&mut state, &op);
     }
-    Ok(RwLock::new(state))
+    Ok(state)
 }
 
 pub fn hash_and_sign_log_entry(
@@ -30,7 +27,7 @@ pub fn hash_and_sign_log_entry(
     let mut concat = [0u8; 64];
     concat[0..32].copy_from_slice(op_sighash.as_byte_array());
     concat[32..64].copy_from_slice(&previous_entry_hash);
-    let digest = sha256::Hash::hash(&concat);
-    let message = Message::from_digest(digest.to_byte_array());
+    // let digest = sha256::Hash::hash(&concat);
+    // let message = Message::from_digest(digest.to_byte_array());
     secret_key
 }

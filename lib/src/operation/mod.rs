@@ -7,7 +7,7 @@ mod trust;
 pub use transfer::Transfer;
 pub use trust::Trust;
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "tag")]
 pub enum Operation {
     #[serde(rename = "t")]

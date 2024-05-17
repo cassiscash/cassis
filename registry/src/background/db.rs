@@ -1,22 +1,8 @@
 use anyhow::Context;
 use byteorder::{ByteOrder, LE};
-use secp256k1::hashes::{sha256, Hash};
-use std::{env, ops::RangeBounds, path::Path, thread};
-
 use cassis::Operation;
-
-pub fn start() {
-    let _join = thread::spawn(|| {
-        let log: LogStore = {
-            let logstore_path = env::var("STORE_PATH").unwrap_or("logstore".to_string());
-            let ls =
-                LogStore::init(&Path::new(&logstore_path)).expect("failed to instantiate logstore");
-            ls.check_and_heal()
-                .expect("failed to check and heal logstore");
-            ls
-        };
-    });
-}
+use secp256k1::hashes::{sha256, Hash};
+use std::{ops::RangeBounds, path::Path};
 
 pub struct LogStore {
     offset_mmap: mmap_simple::Mmap,
@@ -36,12 +22,12 @@ impl LogStore {
         })
     }
 
-    pub fn check_and_heal(&self) -> Result<(), anyhow::Error> {
+    pub fn check_and_heal(&mut self) -> Result<(), anyhow::Error> {
         // check how many offsets we have written
         let mut offsetlen = self.offset_mmap.size as usize;
 
         // this is the size of the log file -- we'll see if this is correct
-        let mut loglen = self.log_mmap.size as usize;
+        let mut loglen;
 
         // now check if we have access to the latest log we should according to the offsets file
         let mut already_read_at_least_one_size = false;
@@ -79,7 +65,7 @@ impl LogStore {
                 loglen = offset + 2 + (op_size as usize);
 
                 self.log_mmap
-                    .read_with(offset + 2, op_size as usize, |buf| ())
+                    .read_with(offset + 2, op_size as usize, |_| ())
                     .context("failed to read last log operation")?;
 
                 Ok(())
@@ -113,20 +99,19 @@ impl LogStore {
         Ok(())
     }
 
-    pub fn append_operation(&self, op: &Operation) -> Result<(), anyhow::Error> {
+    pub fn append_operation(&mut self, op: &Operation) -> Result<(), anyhow::Error> {
         self.offset_mmap.append_with(4, |w| {
             LE::write_u32(w, self.log_mmap.size as u32);
         })?;
 
-        let mut hash: &[u8; 32];
         self.log_mmap.append_with(2 + op.size() as usize, |w| {
             LE::write_u16(w, op.size() as u16);
             op.write_serialized(&mut w[2..]);
 
-            hash = sha256::Hash::hash(&w[2..]).as_byte_array();
+            let x = sha256::Hash::hash(&w[2..]);
+            let hash = x.as_byte_array();
+            self.hash_mmap.append(hash);
         })?;
-
-        self.hash_mmap.append(hash)?;
         Ok(())
     }
 
@@ -153,14 +138,14 @@ impl LogStore {
             })
             .with_context(|| format!("failed to read log_file at {}", offset))?;
 
-        let mut op: Operation;
+        let mut op: Option<Operation> = None;
         self.log_mmap
             .read_with(offset as usize + 2, size as usize, |r| {
-                op = Operation::deserialize(r);
+                op = Some(Operation::deserialize(r));
             })
             .with_context(|| format!("failed to read log_file at {}", offset + 2))?;
 
-        Ok((op, offset + 2 + size as u32))
+        Ok((op.unwrap(), offset + 2 + size as u32))
     }
 
     pub fn iter(&self) -> LogStoreIter<'_> {
@@ -197,8 +182,8 @@ pub(crate) struct LogStoreIter<'a> {
     offset_end: Option<u32>,
 }
 
-impl<'a> Iterator for LogStoreIter<'a> {
-    type Item = &'a Operation;
+impl Iterator for LogStoreIter<'_> {
+    type Item = Operation;
 
     fn next(&mut self) -> Option<Self::Item> {
         if Some(self.offset) == self.offset_end {
@@ -208,7 +193,7 @@ impl<'a> Iterator for LogStoreIter<'a> {
         match self.store.read_operation_at_offset(self.offset) {
             Ok((op, next_offset)) => {
                 self.offset = next_offset;
-                Some(&op)
+                Some(op)
             }
             Err(_) => None,
         }
