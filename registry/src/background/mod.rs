@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use std::{env, path::Path, sync::mpsc, thread};
 use tokio::sync::oneshot;
 
@@ -50,8 +51,12 @@ pub fn start(pk: cassis::PublicKey) -> Requester {
                         })
                         .map_or_else(|e| Response::Error(e), |_| Response::OK)
                 }
+                Request::ReadOperation(id) => ls.read_operation(id).map_or_else(
+                    |_| Response::Error(anyhow!("not found")),
+                    |op| Response::Operation(op),
+                ),
                 Request::GetKeyID(pubkey) => state.key_indexes.get(&pubkey).map_or_else(
-                    || Response::Error(anyhow::anyhow!("not found")),
+                    || Response::Error(anyhow!("not found")),
                     |idx| Response::KeyIdx(*idx),
                 ),
                 Request::GetLines => {
@@ -76,12 +81,14 @@ enum Request {
     AppendOperation(cassis::Operation),
     ListOperations(Option<u32>, Option<u32>),
     GetKeyID([u8; 32]),
+    ReadOperation(u32),
     GetLines,
 }
 
 #[derive(Debug)]
 enum Response {
     OK,
+    Operation(cassis::Operation),
     Operations(Vec<cassis::Operation>),
     Lines(Vec<cassis::state::Line>),
     KeyIdx(u32),
@@ -124,6 +131,13 @@ impl Requester {
     pub async fn get_key_id(&self, pubkey: [u8; 32]) -> Option<u32> {
         match self.request(Request::GetKeyID(pubkey)).await {
             Response::KeyIdx(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    pub async fn read_operation(&self, id: u32) -> Option<cassis::Operation> {
+        match self.request(Request::ReadOperation(id)).await {
+            Response::Operation(op) => Some(op),
             _ => None,
         }
     }

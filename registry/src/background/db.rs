@@ -80,10 +80,14 @@ impl LogStore {
                 }
                 Ok(()) => {
                     // truncate files to the points in which they are good
-                    self.offset_mmap
-                        .drop_from_tail(self.offset_mmap.size as usize - offsetlen);
-                    self.log_mmap
-                        .drop_from_tail(self.offset_mmap.size as usize - loglen);
+                    let _ = self
+                        .offset_mmap
+                        .drop_from_tail(self.offset_mmap.size as usize - offsetlen)
+                        .context("drop_from_tail 1 failed")?;
+                    let _ = self
+                        .log_mmap
+                        .drop_from_tail(self.offset_mmap.size as usize - loglen)
+                        .context("drop_from_tail 2 failed")?;
 
                     break;
                 }
@@ -110,7 +114,10 @@ impl LogStore {
 
             let x = sha256::Hash::hash(&w[2..]);
             let hash = x.as_byte_array();
-            self.hash_mmap.append(hash);
+            match self.hash_mmap.append(hash).context("append failed") {
+                Err(x) => panic!("{}", x),
+                Ok(_) => {}
+            }
         })?;
         Ok(())
     }

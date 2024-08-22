@@ -45,6 +45,7 @@ async fn main() {
     let app = axum::Router::new()
         .route("/", get(|| async { "cassis-registry" }))
         .route("/append", post(append_op).layer(axum::Extension(streamer)))
+        .route("/log/:op_id", get(read_op))
         .route("/log", get(get_log).layer(axum::Extension(shared_listener)))
         .route(
             "/idx/:pubkey",
@@ -132,6 +133,16 @@ async fn get_key_id(
 
     match ctx.requester.get_key_id(pk).await {
         Some(idx) => format!("{}", idx).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn read_op(
+    axum::extract::State(ctx): axum::extract::State<Arc<GlobalContext>>,
+    axum::extract::Path(op_id): axum::extract::Path<u32>,
+) -> axum::response::Response {
+    match ctx.requester.read_operation(op_id).await {
+        Some(op) => axum::response::Json(op).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
