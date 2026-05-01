@@ -1,10 +1,21 @@
 use cassis_core::{HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, WatchError};
 use cassis_onchain::validate_timelock_delta;
 use clap::Parser;
+use ritualistic::{EventTemplate, Kind, Network, SecretKey, Tags, Timestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+
+mod seed;
+
+const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
+
+const DEFAULT_NOSTR_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://nostr.mom",
+];
 
 type PendingMap = Arc<Mutex<HashMap<[u8; 32], HopInstruction>>>;
 
@@ -23,6 +34,17 @@ struct Cli {
     /// The same kind may be repeated with different parameters.
     #[arg(long, action = clap::ArgAction::Append, value_name = "SPEC")]
     network: Vec<String>,
+
+    /// Nostr relays to publish route announcements to.
+    /// Defaults to a built-in list when none are provided.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
+    nostr_relay: Vec<String>,
+
+    /// BIP39 mnemonic seed (12 words, space-separated) from which every key the
+    /// daemon uses is derived deterministically: the nostr signing key and one
+    /// key per network adapter.
+    #[arg(long, value_name = "MNEMONIC")]
+    seed: String,
 }
 
 #[tokio::main]
@@ -59,6 +81,39 @@ async fn main() {
     for id in adapters.keys() {
         eprintln!("  - {id}");
     }
+
+    let keys = match seed::derive_keys(&cli.seed, adapters.keys().cloned().collect()) {
+        Ok(keys) => keys,
+        Err(err) => {
+            eprintln!("error: invalid --seed: {err}");
+            std::process::exit(2);
+        }
+    };
+
+    eprintln!(
+        "derived nostr signing key: {} ({})",
+        keys.nostr.to_nsec(),
+        keys.nostr.pubkey().to_hex()
+    );
+    for (network_id, sk) in &keys.networks {
+        eprintln!(
+            "  derived key for {network_id}: pubkey={}",
+            sk.pubkey().to_hex()
+        );
+    }
+    for network_id in adapters.keys() {
+        if !keys.networks.contains_key(network_id) {
+            eprintln!("  warning: no derived key for {network_id}");
+        }
+    }
+
+    let relay_urls = if cli.nostr_relay.is_empty() {
+        DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
+    } else {
+        cli.nostr_relay.clone()
+    };
+
+    publish_route_announcements(&adapters, relay_urls, &keys.nostr).await;
 
     let _daemon = CassisDaemon::new(adapters);
 
@@ -330,4 +385,67 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+async fn publish_route_announcements(
+    adapters: &HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
+    relay_urls: Vec<String>,
+    secret_key: &SecretKey,
+) {
+    if relay_urls.is_empty() {
+        eprintln!("no nostr relays configured, skipping route announcement publication");
+        return;
+    }
+
+    let mut network_ids: Vec<NetworkId> = adapters.keys().cloned().collect();
+    network_ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let pairs: Vec<(NetworkId, NetworkId)> = network_ids
+        .iter()
+        .flat_map(|from| {
+            network_ids
+                .iter()
+                .map(move |to| (from.clone(), to.clone()))
+        })
+        .filter(|(from, to)| from != to)
+        .collect();
+
+    let events: Vec<(String, ritualistic::Event)> = pairs
+        .iter()
+        .map(|(from, to)| {
+            let d_tag = format!("{from}//{to}");
+            let template = EventTemplate {
+                created_at: Timestamp::now(),
+                kind: Kind(NOSTR_KIND_ROUTE_ANNOUNCEMENT),
+                tags: Tags(vec![vec!["d".to_string(), d_tag.clone()]]),
+                content: String::new(),
+            };
+            (d_tag, template.finalize(secret_key))
+        })
+        .collect();
+
+    eprintln!(
+        "publishing {} route announcement event(s) (kind {}) to {} relay(s) for pubkey {}",
+        events.len(),
+        NOSTR_KIND_ROUTE_ANNOUNCEMENT,
+        relay_urls.len(),
+        secret_key.pubkey().to_hex()
+    );
+
+    let mut pool = Network::new();
+    for (d_tag, event) in events {
+        let mut results = pool.publish_many(relay_urls.clone(), event).await;
+        let mut ok = 0usize;
+        let mut failed = Vec::new();
+        while let Some(result) = results.recv().await {
+            match result.error {
+                None => ok += 1,
+                Some(err) => failed.push(format!("{}: {err}", result.relay_url)),
+            }
+        }
+        eprintln!("  route {d_tag}: published to {ok} relay(s)",);
+        for failure in &failed {
+            eprintln!("    rejected by {failure}");
+        }
+    }
 }

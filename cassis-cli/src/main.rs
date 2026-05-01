@@ -12,11 +12,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Pay an invoice from a given network
     Pay {
+        #[arg(long)]
         invoice: String,
         #[arg(long)]
         from: String,
     },
+    /// Create an invoice
     Invoice {
         #[arg(long)]
         amount: u64,
@@ -29,13 +32,16 @@ enum Commands {
         #[arg(long)]
         expires_at: Option<u64>,
     },
+    /// Look up a route to a destination
     Route {
+        #[arg(long = "to")]
         destination_pubkey: String,
         #[arg(long)]
         amount: u64,
         #[arg(long)]
         from: String,
     },
+    /// Inspect the local node
     Node {
         #[command(subcommand)]
         command: NodeCommands,
@@ -44,6 +50,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum NodeCommands {
+    /// Show information about the local node
     Info,
 }
 

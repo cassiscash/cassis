@@ -8,7 +8,13 @@ cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
 cassis-nostr = { path = "../cassis-nostr" }
 cassis-onchain = { path = "../cassis-onchain" }
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "std"] }
+bip39 = { version = "2.2.2" }
 clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
+ritualistic = "0.1.1"
+sha2 = "0.10"
+thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 [dependencies.cassis-cashu]
