@@ -8,7 +8,8 @@ cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
 cassis-nostr = { path = "../cassis-nostr" }
 cassis-onchain = { path = "../cassis-onchain" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 [dependencies.cassis-cashu]
 path = "../networks/cassis-cashu"
