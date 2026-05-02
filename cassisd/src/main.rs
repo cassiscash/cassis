@@ -59,9 +59,39 @@ async fn main() {
         std::process::exit(2);
     }
 
+    let network_ids: Vec<NetworkId> = cli
+        .network
+        .iter()
+        .map(|spec| network_id_for_spec(spec))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|err| {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        });
+
+    let keys = match seed::derive_keys(&cli.seed, network_ids) {
+        Ok(keys) => keys,
+        Err(err) => {
+            eprintln!("error: invalid --seed: {err}");
+            std::process::exit(2);
+        }
+    };
+
+    eprintln!(
+        "derived nostr signing key: {} ({})",
+        keys.nostr.to_nsec(),
+        keys.nostr.pubkey().to_hex()
+    );
+    for (network_id, sk) in &keys.networks {
+        eprintln!(
+            "  derived key for {network_id}: pubkey={}",
+            sk.pubkey().to_hex()
+        );
+    }
+
     let mut adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>> = HashMap::new();
     for spec in &cli.network {
-        match build_adapter(spec) {
+        match build_adapter(spec, &keys) {
             Ok(adapter) => {
                 adapters.insert(adapter.network_id(), adapter);
             }
@@ -82,31 +112,6 @@ async fn main() {
         eprintln!("  - {id}");
     }
 
-    let keys = match seed::derive_keys(&cli.seed, adapters.keys().cloned().collect()) {
-        Ok(keys) => keys,
-        Err(err) => {
-            eprintln!("error: invalid --seed: {err}");
-            std::process::exit(2);
-        }
-    };
-
-    eprintln!(
-        "derived nostr signing key: {} ({})",
-        keys.nostr.to_nsec(),
-        keys.nostr.pubkey().to_hex()
-    );
-    for (network_id, sk) in &keys.networks {
-        eprintln!(
-            "  derived key for {network_id}: pubkey={}",
-            sk.pubkey().to_hex()
-        );
-    }
-    for network_id in adapters.keys() {
-        if !keys.networks.contains_key(network_id) {
-            eprintln!("  warning: no derived key for {network_id}");
-        }
-    }
-
     let relay_urls = if cli.nostr_relay.is_empty() {
         DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
     } else {
@@ -121,8 +126,51 @@ async fn main() {
     eprintln!("shutting down");
 }
 
+/// Compute the [`NetworkId`] for a network spec without building the adapter.
+fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
+    let (kind, param) = match spec.split_once(':') {
+        Some((kind, param)) => (kind, Some(param)),
+        None => (spec, None),
+    };
+    match kind {
+        "cashu" => {
+            let mint_url = param.ok_or_else(|| {
+                "network 'cashu' requires a mint URL, e.g. cashu:https://mint.example.com"
+                    .to_string()
+            })?;
+            Ok(NetworkId(format!("cashu:{mint_url}")))
+        }
+        "fedimint" => {
+            let address = param.ok_or_else(|| {
+                "network 'fedimint' requires an address, e.g. fedimint:fedimint://..."
+                    .to_string()
+            })?;
+            Ok(NetworkId(format!("fedimint:{address}")))
+        }
+        "liquid" => {
+            if param.is_some() {
+                return Err("network 'liquid' does not take a parameter".into());
+            }
+            Ok(NetworkId("liquid".to_string()))
+        }
+        "ark" => {
+            if param.is_some() {
+                return Err("network 'ark' does not take a parameter".into());
+            }
+            Ok(NetworkId("ark".to_string()))
+        }
+        "rootstock" => {
+            if param.is_some() {
+                return Err("network 'rootstock' does not take a parameter".into());
+            }
+            Ok(NetworkId("rootstock".to_string()))
+        }
+        _ => Err(format!("unsupported network kind '{kind}'")),
+    }
+}
+
 #[allow(unused_variables)]
-fn build_adapter(spec: &str) -> Result<Arc<dyn NetworkAdapter>, String> {
+fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<dyn NetworkAdapter>, String> {
     let (kind, param) = match spec.split_once(':') {
         Some((kind, param)) => (kind, Some(param)),
         None => (spec, None),
@@ -135,9 +183,17 @@ fn build_adapter(spec: &str) -> Result<Arc<dyn NetworkAdapter>, String> {
                 "network 'cashu' requires a mint URL, e.g. cashu:https://mint.example.com"
                     .to_string()
             })?;
-            Ok(Arc::new(cassis_cashu::CashuAdapter::new(NetworkId(
-                format!("cashu:{mint_url}"),
-            ))))
+            let network_id = NetworkId(format!("cashu:{mint_url}"));
+            let sk = seed_keys
+                .networks
+                .get(&network_id)
+                .map(|k| *k.as_bytes())
+                .unwrap_or([0u8; 32]);
+            Ok(Arc::new(cassis_cashu::CashuAdapter::new(
+                network_id,
+                mint_url.to_string(),
+                sk,
+            )))
         }
 
         #[cfg(not(feature = "cashu"))]
@@ -413,7 +469,7 @@ async fn publish_route_announcements(
     let events: Vec<(String, ritualistic::Event)> = pairs
         .iter()
         .map(|(from, to)| {
-            let d_tag = format!("{from}//{to}");
+            let d_tag = format!("{from}->{to}");
             let template = EventTemplate {
                 created_at: Timestamp::now(),
                 kind: Kind(NOSTR_KIND_ROUTE_ANNOUNCEMENT),
