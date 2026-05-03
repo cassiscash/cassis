@@ -2,6 +2,12 @@ use cassis_core::{Invoice, NetworkId};
 use cassis_onchain::{generate_preimage, hash_preimage};
 use clap::{Parser, Subcommand};
 
+const DEFAULT_NOSTR_RELAYS: &[&str] = &[
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://nostr.mom",
+];
+
 #[derive(Parser)]
 #[command(name = "cassis-cli")]
 #[command(about = "Cassis command-line interface")]
@@ -40,6 +46,10 @@ enum Commands {
         amount: u64,
         #[arg(long)]
         from: String,
+        /// Nostr relays to query for route announcements.
+        /// Defaults to a built-in list when none are provided.
+        #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
+        nostr_relay: Vec<String>,
     },
     /// Inspect the local node
     Node {
@@ -54,7 +64,8 @@ enum NodeCommands {
     Info,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Pay { invoice, from } => cmd_pay(invoice, from),
@@ -69,7 +80,8 @@ fn main() {
             destination_pubkey,
             amount,
             from,
-        } => cmd_route(destination_pubkey, amount, from),
+            nostr_relay,
+        } => cmd_route(destination_pubkey, amount, from, nostr_relay).await,
         Commands::Node { command } => match command {
             NodeCommands::Info => cmd_node_info(),
         },
@@ -111,10 +123,53 @@ fn cmd_invoice(
     println!("preimage: {}", hex::encode(preimage));
 }
 
-fn cmd_route(destination_pubkey: String, amount: u64, from: String) {
-    let _from = NetworkId(from);
-    println!("route lookup requested for {destination_pubkey} amount {amount} msat");
-    println!("route lookup not wired yet; use cassis-client in your app");
+async fn cmd_route(
+    destination_pubkey: String,
+    amount: u64,
+    from: String,
+    nostr_relays: Vec<String>,
+) {
+    let sender_network = NetworkId(from);
+
+    let relays: Vec<String> = if nostr_relays.is_empty() {
+        DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
+    } else {
+        nostr_relays
+    };
+
+    eprintln!("fetching route announcements from {} relay(s)...", relays.len());
+
+    let route = match cassis_client::find_route(&relays, &destination_pubkey, amount, &sender_network).await {
+        Ok(r) => r,
+        Err(cassis_client::RouteError::Fetch(err)) => {
+            eprintln!("error fetching announcements: {err}");
+            std::process::exit(1);
+        }
+        Err(cassis_client::RouteError::Route(cassis_nostr::RouteError::NoRoute)) => {
+            eprintln!("no route found");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("route error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    if route.is_empty() {
+        eprintln!("empty route");
+        std::process::exit(1);
+    }
+
+    println!("route found ({} hop(s)):", route.len());
+    for (i, hop) in route.iter().enumerate() {
+        println!(
+            "  hop {}: {} | {} -> {}",
+            i + 1,
+            hop.node.node_pubkey,
+            hop.incoming.0,
+            hop.outgoing.0,
+        );
+    }
 }
 
 fn cmd_node_info() {

@@ -3,7 +3,7 @@ use cassis_core::{
     WatchError,
 };
 use cassis_iroh::IrohClient;
-use cassis_nostr::{build_graph, compute_hop_expiries, fetch_announcements, find_route};
+use cassis_nostr::{build_graph, compute_hop_expiries, fetch_announcements, find_route as find_route_in_graph};
 use futures::future::try_join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,12 +20,42 @@ pub enum PayError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum RouteError {
-    #[error("no route found")]
-    NoRoute,
+    #[error("route error: {0}")]
+    Route(cassis_nostr::RouteError),
     #[error("nostr fetch error: {0}")]
     Fetch(String),
     #[error("unimplemented")]
     Unimplemented,
+}
+
+/// Find a route to `destination` from `sender_network`, fetching route
+/// announcements from the given Nostr relays and running Dijkstra.
+///
+/// This is a standalone function so callers that only need route lookup
+/// (e.g. `cassis-cli`) don't have to construct a full `CassisClient` with
+/// network adapters.
+pub async fn find_route(
+    relays: &[String],
+    destination: &str,
+    amount_msat: u64,
+    sender_network: &NetworkId,
+) -> Result<Vec<RouteHop>, RouteError> {
+    let announcements = fetch_announcements(relays)
+        .await
+        .map_err(|err| RouteError::Fetch(err.to_string()))?;
+    let graph = build_graph(announcements);
+    graph.log();
+    let route = find_route_in_graph(&graph, destination, amount_msat, sender_network)
+        .map_err(RouteError::Route)?;
+    let hops = route
+        .into_iter()
+        .map(|(node, incoming, outgoing)| RouteHop {
+            node,
+            incoming,
+            outgoing,
+        })
+        .collect();
+    Ok(hops)
 }
 
 pub struct CassisClient {
@@ -46,12 +76,9 @@ impl CassisClient {
 
     pub async fn pay(
         &self,
-        _invoice: Invoice,
-        _sender_network: NetworkId,
+        invoice: Invoice,
+        sender_network: NetworkId,
     ) -> Result<PaymentResult, PayError> {
-        let invoice = _invoice;
-        let sender_network = _sender_network;
-
         let route = self
             .find_route(
                 invoice.destination_pubkey.clone(),
@@ -107,7 +134,6 @@ impl CassisClient {
         let first_hop = route
             .first()
             .ok_or_else(|| PayError::Route("route missing".to_string()))?;
-        let first_outgoing = NetworkId(first_hop.outgoing.0.clone());
         let adapter = self
             .adapters
             .get(&sender_network)
@@ -147,27 +173,10 @@ impl CassisClient {
 
     pub async fn find_route(
         &self,
-        _destination: String,
-        _amount_msat: u64,
-        _sender_network: NetworkId,
+        destination: String,
+        amount_msat: u64,
+        sender_network: NetworkId,
     ) -> Result<Vec<RouteHop>, RouteError> {
-        let destination = _destination;
-        let amount_msat = _amount_msat;
-        let sender_network = _sender_network;
-        let announcements = fetch_announcements(&self.nostr_relays)
-            .await
-            .map_err(|err| RouteError::Fetch(err.to_string()))?;
-        let graph = build_graph(announcements);
-        let route = find_route(&graph, &destination, amount_msat, &sender_network)
-            .map_err(|_| RouteError::NoRoute)?;
-        let hops = route
-            .into_iter()
-            .map(|(node, incoming, outgoing)| RouteHop {
-                node,
-                incoming,
-                outgoing,
-            })
-            .collect();
-        Ok(hops)
+        find_route(&self.nostr_relays, &destination, amount_msat, &sender_network).await
     }
 }

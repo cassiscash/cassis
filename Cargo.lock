@@ -355,10 +355,12 @@ version = "0.1.0"
 dependencies = [
  "cassis-client",
  "cassis-core",
+ "cassis-nostr",
  "cassis-onchain",
  "clap",
  "hex",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -411,8 +413,10 @@ name = "cassis-nostr"
 version = "0.1.0"
 dependencies = [
  "cassis-core",
+ "ritualistic",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

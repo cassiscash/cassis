@@ -28,10 +28,21 @@ pub struct NodeAnnouncement {
     pub node_pubkey: String,
     pub iroh_pubkey: String,
     pub networks: Vec<NetworkId>,
+    /// Directed routes this node offers, e.g. `(A, B)` means
+    /// "receive on A, send on B". Populated from kind-35515 `d` tags.
+    #[serde(default)]
+    pub routes: Vec<Route>,
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
     pub expires_at: u64,
     pub relays: Vec<String>,
+}
+
+/// A directed route offered by a node: receive on `from`, send on `to`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Route {
+    pub from: NetworkId,
+    pub to: NetworkId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
