@@ -6,3 +6,25 @@ edition.workspace = true
 [dependencies]
 async-trait = "0.1"
 cassis-core = { path = "../../cassis-core" }
+
+# Fedimint client stack (LNv2 line). Pin to the same release; adjust the tag
+# to match the federation you talk to. `fedimint-connectors` (the iroh
+# transport) and the consolidated `gatewayd` land in v0.11; LNv2 itself
+# was stabilized earlier (v0.6). Use a single tag across all fedimint
+# crates — they share a workspace version.
+fedimint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+fedimint-core = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+fedimint-connectors = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+fedimint-derive-secret = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+
+anyhow = "1"
+bitcoin = "0.32"
+futures = "0.3"
+lightning-invoice = { version = "0.33.2", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"

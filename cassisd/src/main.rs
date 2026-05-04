@@ -25,7 +25,7 @@ type PendingMap = Arc<Mutex<HashMap<[u8; 32], HopInstruction>>>;
 struct Cli {
     /// Networks to route between. The format depends on the network kind:
     ///     cashu:<mint_url>     e.g. cashu:https://mint.example.com
-    ///     fedimint:<address>  e.g. fedimint:fedimint://...
+    ///     fedimint:<invite_or_db>   e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t...
     ///     liquid               (no parameter)
     ///     ark                  (no parameter)
     ///     rootstock            (no parameter)
@@ -91,7 +91,7 @@ async fn main() {
 
     let mut adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>> = HashMap::new();
     for spec in &cli.network {
-        match build_adapter(spec, &keys) {
+        match build_adapter(spec, &keys).await {
             Ok(adapter) => {
                 adapters.insert(adapter.network_id(), adapter);
             }
@@ -142,7 +142,7 @@ fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
         }
         "fedimint" => {
             let address = param.ok_or_else(|| {
-                "network 'fedimint' requires an address, e.g. fedimint:fedimint://..."
+                "network 'fedimint' requires an invite code, e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
                     .to_string()
             })?;
             Ok(NetworkId(format!("fedimint:{address}")))
@@ -170,7 +170,7 @@ fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
 }
 
 #[allow(unused_variables)]
-fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<dyn NetworkAdapter>, String> {
+async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<dyn NetworkAdapter>, String> {
     let (kind, param) = match spec.split_once(':') {
         Some((kind, param)) => (kind, Some(param)),
         None => (spec, None),
@@ -205,12 +205,22 @@ fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<dyn Ne
         #[cfg(feature = "fedimint")]
         "fedimint" => {
             let address = param.ok_or_else(|| {
-                "network 'fedimint' requires an address, e.g. fedimint:fedimint://..."
+                "network 'fedimint' requires an invite code or pre-joined DB identifier, \
+                 e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
                     .to_string()
             })?;
-            Ok(Arc::new(cassis_fedimint::FedimintAdapter::new(NetworkId(
-                format!("fedimint:{address}"),
-            ))))
+            let network_id = NetworkId(format!("fedimint:{address}"));
+            let sk = seed_keys
+                .networks
+                .get(&network_id)
+                .map(|k| *k.as_bytes())
+                .unwrap_or([0u8; 32]);
+            Ok(Arc::new(
+                match cassis_fedimint::FedimintAdapter::new(network_id, address.to_string(), sk).await {
+                    Ok(adapter) => adapter,
+                    Err(err) => return Err(err),
+                },
+            ))
         }
 
         #[cfg(not(feature = "fedimint"))]
