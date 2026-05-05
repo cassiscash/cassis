@@ -805,6 +805,7 @@ dependencies = [
  "cassis-onchain",
  "clap",
  "hex",
+ "rustls",
  "serde_json",
  "tokio",
 ]
@@ -915,6 +916,7 @@ dependencies = [
  "clap",
  "hmac",
  "ritualistic",
+ "rustls",
  "sha2",
  "thiserror 1.0.69",
  "tokio",

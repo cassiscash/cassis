@@ -49,6 +49,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install default rustls crypto provider");
+
     let cli = Cli::parse();
 
     if cli.network.len() < 2 {

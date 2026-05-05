@@ -66,6 +66,10 @@ enum NodeCommands {
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install default rustls crypto provider");
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Pay { invoice, from } => cmd_pay(invoice, from),
