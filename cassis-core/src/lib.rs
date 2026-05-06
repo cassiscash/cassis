@@ -17,32 +17,17 @@ impl From<&str> for NetworkId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct L2Tag(pub String);
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PeerTag(pub String);
-
+/// A directed route offered by a node: receive on `from`, send on `to`.
+/// Each announcement has its own fee schedule, parsed from kind-35515 event tags.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NodeAnnouncement {
+pub struct RouteAnnouncement {
     pub node_pubkey: String,
-    pub iroh_pubkey: String,
-    pub networks: Vec<NetworkId>,
-    /// Directed routes this node offers, e.g. `(A, B)` means
-    /// "receive on A, send on B". Populated from kind-35515 `d` tags.
-    #[serde(default)]
-    pub routes: Vec<Route>,
+    pub from: NetworkId,
+    pub to: NetworkId,
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
     pub expires_at: u64,
     pub relays: Vec<String>,
-}
-
-/// A directed route offered by a node: receive on `from`, send on `to`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Route {
-    pub from: NetworkId,
-    pub to: NetworkId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,9 +84,9 @@ pub struct OutgoingHtlc {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteHop {
-    pub node: NodeAnnouncement,
-    pub incoming: L2Tag,
-    pub outgoing: L2Tag,
+    pub node: RouteAnnouncement,
+    pub incoming: NetworkId,
+    pub outgoing: NetworkId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

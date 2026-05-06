@@ -480,6 +480,9 @@ async fn publish_route_announcements(
         .filter(|(from, to)| from != to)
         .collect();
 
+    let fee_base_msat: u64 = 1000;
+    let fee_ppm: u64 = 500;
+
     let events: Vec<(String, ritualistic::Event)> = pairs
         .iter()
         .map(|(from, to)| {
@@ -487,7 +490,11 @@ async fn publish_route_announcements(
             let template = EventTemplate {
                 created_at: Timestamp::now(),
                 kind: Kind(NOSTR_KIND_ROUTE_ANNOUNCEMENT),
-                tags: Tags(vec![vec!["d".to_string(), d_tag.clone()]]),
+                tags: Tags(vec![
+                    vec!["d".to_string(), d_tag.clone()],
+                    vec!["fee_base_msat".to_string(), fee_base_msat.to_string()],
+                    vec!["fee_ppm".to_string(), fee_ppm.to_string()],
+                ]),
                 content: String::new(),
             };
             (d_tag, template.finalize(secret_key))

@@ -99,8 +99,8 @@ impl CassisClient {
             .iter()
             .enumerate()
             .map(|(idx, hop)| {
-                let incoming = NetworkId(hop.incoming.0.clone());
-                let outgoing = NetworkId(hop.outgoing.0.clone());
+                let incoming = hop.incoming.clone();
+                let outgoing = hop.outgoing.clone();
                 let incoming_deadline = expiries.get(idx).copied().unwrap_or(invoice.expires_at);
                 let outgoing_expiry = expiries
                     .get(idx + 1)
@@ -115,7 +115,7 @@ impl CassisClient {
                     outgoing_expiry,
                     recipient: hop.node.node_pubkey.clone(),
                 };
-                let client = IrohClient::new(hop.node.iroh_pubkey.clone());
+                let client = IrohClient::new(hop.node.node_pubkey.clone());
                 (client, instruction)
             })
             .collect();

@@ -1,4 +1,4 @@
-use cassis_core::{L2Tag, NetworkId, NodeAnnouncement, Route};
+use cassis_core::{NetworkId, RouteAnnouncement};
 use ritualistic::{Filter, Kind, Network, SubscriptionOptions};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -6,32 +6,19 @@ use std::collections::{BinaryHeap, HashMap};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeGraph {
-    pub nodes: Vec<NodeAnnouncement>,
+    pub nodes: Vec<RouteAnnouncement>,
     #[serde(skip)]
     incoming_index: HashMap<NetworkId, Vec<usize>>,
 }
 
 impl NodeGraph {
-    pub fn new(nodes: Vec<NodeAnnouncement>) -> Self {
+    pub fn new(nodes: Vec<RouteAnnouncement>) -> Self {
         let mut incoming_index: HashMap<NetworkId, Vec<usize>> = HashMap::new();
         for (idx, node) in nodes.iter().enumerate() {
-            if !node.routes.is_empty() {
-                // Directional: index only by the receiving side of each route.
-                for route in &node.routes {
-                    incoming_index
-                        .entry(route.from.clone())
-                        .or_default()
-                        .push(idx);
-                }
-            } else {
-                // Backward compat: no routes, use flat networks list.
-                for network in &node.networks {
-                    incoming_index
-                        .entry(network.clone())
-                        .or_default()
-                        .push(idx);
-                }
-            }
+            incoming_index
+                .entry(node.from.clone())
+                .or_default()
+                .push(idx);
         }
         for v in incoming_index.values_mut() {
             v.sort_unstable();
@@ -43,7 +30,6 @@ impl NodeGraph {
         }
     }
 
-    /// Nodes that can receive on the given network.
     fn nodes_for_network(&self, network: &NetworkId) -> impl Iterator<Item = usize> + '_ {
         self.incoming_index
             .get(network)
@@ -52,23 +38,17 @@ impl NodeGraph {
             .flatten()
     }
 
-    /// Print the full graph contents to stderr.
     pub fn log(&self) {
-        eprintln!("--- graph ({} node(s)) ---", self.nodes.len());
+        eprintln!("--- graph ({} announcement(s)) ---", self.nodes.len());
         if self.nodes.is_empty() {
             eprintln!("  (empty)");
             return;
         }
         for (i, node) in self.nodes.iter().enumerate() {
-            eprintln!("  node #{i}: {}", node.node_pubkey);
-            eprintln!("    fee: base={} ppm={}", node.fee_base_msat, node.fee_ppm);
-            if node.routes.is_empty() {
-                eprintln!("    networks: {:?}", node.networks);
-            } else {
-                for route in &node.routes {
-                    eprintln!("    route: {} -> {}", route.from, route.to);
-                }
-            }
+            eprintln!(
+                "  route #{i}: {} {} -> {} fee={}/{}",
+                node.node_pubkey, node.from, node.to, node.fee_base_msat, node.fee_ppm
+            );
         }
     }
 }
@@ -105,14 +85,14 @@ impl NostrAnnouncer {
 
     pub async fn publish_once(
         &self,
-        _announcement: &NodeAnnouncement,
+        _announcement: &RouteAnnouncement,
     ) -> Result<(), NostrError> {
         Err(NostrError::Unimplemented)
     }
 
     pub async fn run_republish_loop(
         &self,
-        _announcement: NodeAnnouncement,
+        _announcement: RouteAnnouncement,
         _interval_secs: u64,
     ) -> Result<(), NostrError> {
         Err(NostrError::Unimplemented)
@@ -126,12 +106,12 @@ const KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 const D_TAG_SEPARATOR: &str = "->";
 
 /// Fetch route-announcement events (kind 35515) from the given Nostr relays
-/// and build [`NodeAnnouncement`] structs from the directed route `d` tags.
+/// and build [`RouteAnnouncement`] structs from the directed route `d` tags
+/// and fee/relay tags.
 ///
-/// Each event's `d` tag has the form `<network_from>-><network_to>`. Events
-/// are grouped by pubkey — each unique pubkey is a node. The node's
-/// `networks` field is the union of all networks appearing in its `d` tags.
-pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<NodeAnnouncement>, NostrError> {
+/// Each event's `d` tag has the form `<network_from>-><network_to>`.
+/// Additional tags: `fee_base_msat`, `fee_ppm`, `relay`, `expires_at`.
+pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncement>, NostrError> {
     if relays.is_empty() {
         return Err(NostrError::Network("no relays provided".into()));
     }
@@ -147,50 +127,58 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<NodeAnnounceme
         .query(relays, filter, SubscriptionOptions::default())
         .await;
 
-    let mut announcements: HashMap<String, NodeAnnouncement> = HashMap::new();
+    let mut announcements = Vec::new();
 
     for event in events {
         let pubkey_hex = event.pubkey.to_hex();
+        let mut from: Option<String> = None;
+        let mut to: Option<String> = None;
+        let mut fee_base_msat: u64 = 0;
+        let mut fee_ppm: u64 = 0;
+        let mut expires_at: u64 = 0;
+        let mut relays: Vec<String> = Vec::new();
 
         for tag in event.tags.iter() {
-            if tag.len() >= 2 && tag[0] == "d" {
-                if let Some((from, to)) = parse_d_tag(&tag[1]) {
-                    let entry = announcements.entry(pubkey_hex.clone()).or_insert_with(|| {
-                        NodeAnnouncement {
-                            node_pubkey: pubkey_hex.clone(),
-                            iroh_pubkey: String::new(),
-                            networks: Vec::new(),
-                            routes: Vec::new(),
-                            fee_base_msat: 0,
-                            fee_ppm: 0,
-                            expires_at: 0,
-                            relays: Vec::new(),
-                        }
-                    });
-
-                    let from_net = NetworkId(from.to_string());
-                    let to_net = NetworkId(to.to_string());
-
-                    if !entry.networks.contains(&from_net) {
-                        entry.networks.push(from_net.clone());
-                    }
-                    if !entry.networks.contains(&to_net) {
-                        entry.networks.push(to_net.clone());
-                    }
-
-                    let route = Route {
-                        from: from_net,
-                        to: to_net,
-                    };
-                    if !entry.routes.contains(&route) {
-                        entry.routes.push(route);
+            if tag.len() < 2 {
+                continue;
+            }
+            match tag[0].as_str() {
+                "d" => {
+                    if let Some((f, t)) = parse_d_tag(&tag[1]) {
+                        from = Some(f.to_string());
+                        to = Some(t.to_string());
                     }
                 }
+                "fee_base_msat" => {
+                    fee_base_msat = tag[1].parse().unwrap_or(0);
+                }
+                "fee_ppm" => {
+                    fee_ppm = tag[1].parse().unwrap_or(0);
+                }
+                "expires_at" => {
+                    expires_at = tag[1].parse().unwrap_or(0);
+                }
+                "relay" => {
+                    relays.push(tag[1].clone());
+                }
+                _ => {}
             }
+        }
+
+        if let (Some(from), Some(to)) = (from, to) {
+            announcements.push(RouteAnnouncement {
+                node_pubkey: pubkey_hex,
+                from: NetworkId(from),
+                to: NetworkId(to),
+                fee_base_msat,
+                fee_ppm,
+                expires_at,
+                relays,
+            });
         }
     }
 
-    Ok(announcements.into_values().collect())
+    Ok(announcements)
 }
 
 /// Parse a `d` tag value of the form `<network_from>-><network_to>`.
@@ -199,7 +187,7 @@ fn parse_d_tag(d: &str) -> Option<(&str, &str)> {
         .filter(|(from, to)| !from.is_empty() && !to.is_empty())
 }
 
-pub fn build_graph(announcements: Vec<NodeAnnouncement>) -> NodeGraph {
+pub fn build_graph(announcements: Vec<RouteAnnouncement>) -> NodeGraph {
     NodeGraph::new(announcements)
 }
 
@@ -208,7 +196,7 @@ pub fn find_route(
     destination: &str,
     amount_msat: u64,
     sender_network: &NetworkId,
-) -> Result<Vec<(NodeAnnouncement, L2Tag, L2Tag)>, RouteError> {
+) -> Result<Vec<(RouteAnnouncement, NetworkId, NetworkId)>, RouteError> {
     eprintln!(
         "find_route: destination={destination}, amount_msat={amount_msat}, sender_network={sender_network}"
     );
@@ -217,7 +205,6 @@ pub fn find_route(
     let mut dist: HashMap<StateKey, u64> = HashMap::new();
     let mut prev: HashMap<StateKey, (StateKey, NetworkId)> = HashMap::new();
 
-    // Seed: all nodes that can receive on the sender's network.
     for node_idx in graph.nodes_for_network(sender_network) {
         let node = &graph.nodes[node_idx];
         let fee = node_fee_msat(node, amount_msat);
@@ -226,7 +213,7 @@ pub fn find_route(
             incoming: sender_network.clone(),
         };
         eprintln!(
-            "  seed: node #{node_idx} ({}) reachable via {sender_network} cost={fee} msat",
+            "  seed: route #{node_idx} ({}) <{sender_network} cost={fee} msat",
             node.node_pubkey
         );
         dist.insert(key.clone(), fee);
@@ -243,7 +230,7 @@ pub fn find_route(
         if let Some(best) = dist.get(&key) {
             if cost > *best {
                 eprintln!(
-                    "  step {step}: skip stale entry node #{} ({}) cost={cost} > best={best}",
+                    "  step {step}: skip stale entry route #{} ({}) cost={cost} > best={best}",
                     key.node_idx,
                     node.node_pubkey
                 );
@@ -252,16 +239,15 @@ pub fn find_route(
         }
 
         eprintln!(
-            "  step {step}: visit node #{} ({}) via {} cost={cost} msat",
+            "  step {step}: visit route #{} ({}) via {} cost={cost} msat",
             key.node_idx,
             node.node_pubkey,
             key.incoming
         );
 
-        // Destination reached: this node's pubkey matches.
         if node.node_pubkey == destination {
             eprintln!(
-                "  step {step}: destination reached at node #{} ({})",
+                "  step {step}: destination reached at route #{} ({})",
                 key.node_idx,
                 node.node_pubkey
             );
@@ -269,62 +255,50 @@ pub fn find_route(
             break;
         }
 
-        // Follow only directional routes: entered via `incoming`, exit via
-        // each route whose `from` matches `incoming`.
-        let outgoing_networks: Vec<&NetworkId> = if !node.routes.is_empty() {
-            node.routes
-                .iter()
-                .filter(|r| r.from == key.incoming)
-                .map(|r| &r.to)
-                .collect()
-        } else {
-            // Backward compat: if no directional routes, use flat networks
-            // but exclude the incoming network (can't exit where you entered).
-            node.networks.iter().filter(|n| **n != key.incoming).collect()
-        };
+        let outgoing = &node.to;
 
-        for outgoing in outgoing_networks {
-            eprintln!("    edge: {} -> {} (from {})", key.incoming, outgoing, node.node_pubkey);
-            for next_idx in graph.nodes_for_network(outgoing) {
-                if next_idx == key.node_idx {
-                    continue;
-                }
-                let next_key = StateKey {
-                    node_idx: next_idx,
-                    incoming: outgoing.clone(),
-                };
-                let next_node = &graph.nodes[next_idx];
-                let next_cost = cost.saturating_add(node_fee_msat(next_node, amount_msat));
-                let is_better = match dist.get(&next_key) {
-                    Some(existing) => next_cost < *existing,
-                    None => true,
-                };
-                if is_better {
-                    eprintln!(
-                        "    relax: node #{next_idx} ({}) via {} new_cost={next_cost} msat",
-                        next_node.node_pubkey,
-                        outgoing
-                    );
-                    dist.insert(next_key.clone(), next_cost);
-                    prev.insert(next_key.clone(), (key.clone(), outgoing.clone()));
-                    heap.push(State {
-                        cost: next_cost,
-                        key: next_key,
-                    });
-                } else {
-                    eprintln!(
-                        "    skip: node #{next_idx} ({}) via {} cost={next_cost} not better than {}",
-                        next_node.node_pubkey,
-                        outgoing,
-                        dist.get(&next_key).copied().unwrap_or(0)
-                    );
-                }
+        eprintln!("    edge: {} -> {} (from {})", key.incoming, outgoing, node.node_pubkey);
+        for next_idx in graph.nodes_for_network(outgoing) {
+            if next_idx == key.node_idx {
+                continue;
+            }
+            if graph.nodes[next_idx].node_pubkey == node.node_pubkey {
+                continue;
+            }
+            let next_key = StateKey {
+                node_idx: next_idx,
+                incoming: outgoing.clone(),
+            };
+            let next_node = &graph.nodes[next_idx];
+            let next_cost = cost.saturating_add(node_fee_msat(next_node, amount_msat));
+            let is_better = match dist.get(&next_key) {
+                Some(existing) => next_cost < *existing,
+                None => true,
+            };
+            if is_better {
+                eprintln!(
+                    "    relax: route #{next_idx} ({}) via {} new_cost={next_cost} msat",
+                    next_node.node_pubkey, outgoing
+                );
+                dist.insert(next_key.clone(), next_cost);
+                prev.insert(next_key.clone(), (key.clone(), outgoing.clone()));
+                heap.push(State {
+                    cost: next_cost,
+                    key: next_key,
+                });
+            } else {
+                eprintln!(
+                    "    skip: route #{next_idx} ({}) via {} cost={next_cost} not better than {}",
+                    next_node.node_pubkey,
+                    outgoing,
+                    dist.get(&next_key).copied().unwrap_or(0)
+                );
             }
         }
     }
 
     let goal = goal.ok_or(RouteError::NoRoute)?;
-    let mut hops_rev: Vec<(NodeAnnouncement, L2Tag, L2Tag)> = Vec::new();
+    let mut hops_rev: Vec<(RouteAnnouncement, NetworkId, NetworkId)> = Vec::new();
     let mut current = goal.clone();
     let mut outgoing_for_current: Option<NetworkId> = None;
     let mut hop_idx = 0u64;
@@ -337,15 +311,15 @@ pub fn find_route(
         let incoming = current.incoming.clone();
         let outgoing = outgoing_for_current.clone().unwrap_or_else(|| incoming.clone());
         eprintln!(
-            "  backtrack hop {hop_idx}: node #{} ({}) in={incoming} out={outgoing}",
+            "  backtrack hop {hop_idx}: route #{} ({}) in={incoming} out={outgoing}",
             current.node_idx,
             node.node_pubkey
         );
         hop_idx += 1;
         hops_rev.push((
             node.clone(),
-            L2Tag(incoming.0.clone()),
-            L2Tag(outgoing.0.clone()),
+            incoming.clone(),
+            outgoing.clone(),
         ));
 
         if let Some((prev_state, prev_outgoing)) = prev.get(&current) {
@@ -372,7 +346,7 @@ pub fn compute_hop_expiries(final_expiry: u64, deltas: &[u64]) -> Vec<u64> {
     expiries
 }
 
-fn node_fee_msat(node: &NodeAnnouncement, amount_msat: u64) -> u64 {
+fn node_fee_msat(node: &RouteAnnouncement, amount_msat: u64) -> u64 {
     let fee_ppm = (node.fee_ppm as u128)
         .saturating_mul(amount_msat as u128)
         / 1_000_000u128;
@@ -416,21 +390,11 @@ impl PartialOrd for State {
 mod tests {
     use super::*;
 
-    fn node(pubkey: &str, routes: &[(&str, &str)]) -> NodeAnnouncement {
-        NodeAnnouncement {
+    fn route(pubkey: &str, from: &str, to: &str) -> RouteAnnouncement {
+        RouteAnnouncement {
             node_pubkey: pubkey.to_string(),
-            iroh_pubkey: String::new(),
-            networks: routes
-                .iter()
-                .flat_map(|(f, t)| [NetworkId(f.to_string()), NetworkId(t.to_string())])
-                .collect(),
-            routes: routes
-                .iter()
-                .map(|(f, t)| Route {
-                    from: NetworkId(f.to_string()),
-                    to: NetworkId(t.to_string()),
-                })
-                .collect(),
+            from: NetworkId(from.to_string()),
+            to: NetworkId(to.to_string()),
             fee_base_msat: 0,
             fee_ppm: 0,
             expires_at: 0,
@@ -440,7 +404,7 @@ mod tests {
 
     #[test]
     fn single_event_a_to_b_finds_route() {
-        let graph = build_graph(vec![node("nodeX", &[("A", "B")])]);
+        let graph = build_graph(vec![route("nodeX", "A", "B")]);
         let route = find_route(&graph, "nodeX", 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "should find route A->B through nodeX");
         let hops = route.unwrap();
@@ -453,8 +417,8 @@ mod tests {
     #[test]
     fn two_hop_route_a_to_c_via_b() {
         let graph = build_graph(vec![
-            node("nodeX", &[("A", "B")]),
-            node("nodeY", &[("B", "C")]),
+            route("nodeX", "A", "B"),
+            route("nodeY", "B", "C"),
         ]);
         let route = find_route(&graph, "nodeY", 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "should find route A->B->C");
@@ -470,7 +434,7 @@ mod tests {
 
     #[test]
     fn reverse_route_not_found_when_only_a_to_b_exists() {
-        let graph = build_graph(vec![node("nodeX", &[("A", "B")])]);
+        let graph = build_graph(vec![route("nodeX", "A", "B")]);
         let route = find_route(&graph, "nodeX", 1000, &NetworkId("B".into()));
         assert!(route.is_err(), "B->A should not exist when only A->B announced");
     }
@@ -478,8 +442,10 @@ mod tests {
     #[test]
     fn bidirectional_routes_work() {
         let graph = build_graph(vec![
-            node("nodeX", &[("A", "B"), ("B", "A")]),
-            node("nodeY", &[("B", "C"), ("C", "B")]),
+            route("nodeX", "A", "B"),
+            route("nodeX", "B", "A"),
+            route("nodeY", "B", "C"),
+            route("nodeY", "C", "B"),
         ]);
         let route = find_route(&graph, "nodeY", 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "A->B->C forward route");
