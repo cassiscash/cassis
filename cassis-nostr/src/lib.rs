@@ -221,6 +221,7 @@ pub fn find_route(
     }
 
     let mut goal: Option<StateKey> = None;
+    let mut goal_outgoing: Option<NetworkId> = None;
     let mut step = 0u64;
 
     while let Some(State { cost, key }) = heap.pop() {
@@ -245,12 +246,17 @@ pub fn find_route(
             key.incoming
         );
 
-        if node.node_pubkey == destination {
+        if node.node_pubkey == destination || node.to.0 == destination {
             eprintln!(
-                "  step {step}: destination reached at route #{} ({})",
+                "  step {step}: destination reached at route #{} ({}) via pubkey={} to={}",
                 key.node_idx,
-                node.node_pubkey
+                node.node_pubkey,
+                node.node_pubkey == destination,
+                node.to.0 == destination,
             );
+            if node.to.0 == destination {
+                goal_outgoing = Some(node.to.clone());
+            }
             goal = Some(key.clone());
             break;
         }
@@ -309,7 +315,7 @@ pub fn find_route(
             .get(current.node_idx)
             .ok_or_else(|| RouteError::InvalidGraph("node missing".to_string()))?;
         let incoming = current.incoming.clone();
-        let outgoing = outgoing_for_current.clone().unwrap_or_else(|| incoming.clone());
+        let outgoing = outgoing_for_current.clone().or_else(|| goal_outgoing.clone()).unwrap_or_else(|| incoming.clone());
         eprintln!(
             "  backtrack hop {hop_idx}: route #{} ({}) in={incoming} out={outgoing}",
             current.node_idx,
