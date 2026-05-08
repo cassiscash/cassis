@@ -1,4 +1,4 @@
-use cassis_core::{Invoice, NetworkId};
+use cassis_core::{Invoice, NetworkId, NodePubkey};
 use cassis_onchain::{generate_preimage, hash_preimage};
 use clap::{Parser, Subcommand};
 
@@ -134,6 +134,7 @@ async fn cmd_route(
     nostr_relays: Vec<String>,
 ) {
     let sender_network = NetworkId(from);
+    let destination = NodePubkey(destination_pubkey);
 
     let relays: Vec<String> = if nostr_relays.is_empty() {
         DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
@@ -143,7 +144,7 @@ async fn cmd_route(
 
     eprintln!("fetching route announcements from {} relay(s)...", relays.len());
 
-    let route = match cassis_client::find_route(&relays, &destination_pubkey, amount, &sender_network).await {
+    let route = match cassis_client::find_route(&relays, &destination, amount, &sender_network).await {
         Ok(r) => r,
         Err(cassis_client::RouteError::Fetch(err)) => {
             eprintln!("error fetching announcements: {err}");

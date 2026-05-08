@@ -1,6 +1,6 @@
 use cassis_core::{
-    HopInstruction, Invoice, NetworkAdapter, NetworkId, PaymentResult, PaymentStatus, RouteHop,
-    WatchError,
+    HopInstruction, Invoice, NetworkAdapter, NetworkId, NodePubkey, PaymentResult, PaymentStatus,
+    RouteHop, WatchError,
 };
 use cassis_iroh::IrohClient;
 use cassis_nostr::{build_graph, compute_hop_expiries, fetch_announcements, find_route as find_route_in_graph};
@@ -36,7 +36,7 @@ pub enum RouteError {
 /// network adapters.
 pub async fn find_route(
     relays: &[String],
-    destination: &str,
+    destination: &NodePubkey,
     amount_msat: u64,
     sender_network: &NetworkId,
 ) -> Result<Vec<RouteHop>, RouteError> {
@@ -79,9 +79,10 @@ impl CassisClient {
         invoice: Invoice,
         sender_network: NetworkId,
     ) -> Result<PaymentResult, PayError> {
+        let destination = NodePubkey(invoice.destination_pubkey);
         let route = self
             .find_route(
-                invoice.destination_pubkey.clone(),
+                &destination,
                 invoice.amount_msat,
                 sender_network.clone(),
             )
@@ -113,9 +114,9 @@ impl CassisClient {
                     outgoing_network: outgoing,
                     incoming_deadline,
                     outgoing_expiry,
-                    recipient: hop.node.node_pubkey.clone(),
+                    recipient: hop.node.node_pubkey.to_string(),
                 };
-                let client = IrohClient::new(hop.node.node_pubkey.clone());
+                let client = IrohClient::new(hop.node.node_pubkey.to_string());
                 (client, instruction)
             })
             .collect();
@@ -144,7 +145,7 @@ impl CassisClient {
                 invoice.payment_hash,
                 invoice.amount_msat,
                 expiries.get(1).copied().unwrap_or(invoice.expires_at),
-                &first_hop.node.node_pubkey,
+                &first_hop.node.node_pubkey.0,
             )
             .await
             .map_err(|err| PayError::Io(err.to_string()))?;
@@ -173,10 +174,10 @@ impl CassisClient {
 
     pub async fn find_route(
         &self,
-        destination: String,
+        destination: &NodePubkey,
         amount_msat: u64,
         sender_network: NetworkId,
     ) -> Result<Vec<RouteHop>, RouteError> {
-        find_route(&self.nostr_relays, &destination, amount_msat, &sender_network).await
+        find_route(&self.nostr_relays, destination, amount_msat, &sender_network).await
     }
 }

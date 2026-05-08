@@ -1,4 +1,4 @@
-use cassis_core::{NetworkId, RouteAnnouncement};
+use cassis_core::{NetworkId, NodePubkey, RouteAnnouncement};
 use ritualistic::{Filter, Kind, Network, SubscriptionOptions};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -167,7 +167,7 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
 
         if let (Some(from), Some(to)) = (from, to) {
             announcements.push(RouteAnnouncement {
-                node_pubkey: pubkey_hex,
+                node_pubkey: NodePubkey(pubkey_hex),
                 from: NetworkId(from),
                 to: NetworkId(to),
                 fee_base_msat,
@@ -193,7 +193,7 @@ pub fn build_graph(announcements: Vec<RouteAnnouncement>) -> NodeGraph {
 
 pub fn find_route(
     graph: &NodeGraph,
-    destination: &str,
+    destination: &NodePubkey,
     amount_msat: u64,
     sender_network: &NetworkId,
 ) -> Result<Vec<(RouteAnnouncement, NetworkId, NetworkId)>, RouteError> {
@@ -246,15 +246,15 @@ pub fn find_route(
             key.incoming
         );
 
-        if node.node_pubkey == destination || node.to.0 == destination {
+        if node.node_pubkey == *destination || node.to.0 == destination.0 {
             eprintln!(
                 "  step {step}: destination reached at route #{} ({}) via pubkey={} to={}",
                 key.node_idx,
                 node.node_pubkey,
-                node.node_pubkey == destination,
-                node.to.0 == destination,
+                node.node_pubkey == *destination,
+                node.to.0 == destination.0,
             );
-            if node.to.0 == destination {
+            if node.to.0 == destination.0 {
                 goal_outgoing = Some(node.to.clone());
             }
             goal = Some(key.clone());
@@ -398,7 +398,7 @@ mod tests {
 
     fn route(pubkey: &str, from: &str, to: &str) -> RouteAnnouncement {
         RouteAnnouncement {
-            node_pubkey: pubkey.to_string(),
+            node_pubkey: NodePubkey(pubkey.to_string()),
             from: NetworkId(from.to_string()),
             to: NetworkId(to.to_string()),
             fee_base_msat: 0,
@@ -411,11 +411,11 @@ mod tests {
     #[test]
     fn single_event_a_to_b_finds_route() {
         let graph = build_graph(vec![route("nodeX", "A", "B")]);
-        let route = find_route(&graph, "nodeX", 1000, &NetworkId("A".into()));
+        let route = find_route(&graph, &NodePubkey("nodeX".into()), 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "should find route A->B through nodeX");
         let hops = route.unwrap();
         assert_eq!(hops.len(), 1, "single-hop route");
-        assert_eq!(hops[0].0.node_pubkey, "nodeX");
+        assert_eq!(hops[0].0.node_pubkey.0, "nodeX");
         assert_eq!(hops[0].1.0, "A", "incoming is A");
         assert_eq!(hops[0].2.0, "A", "outgoing for destination node is same as incoming");
     }
@@ -426,14 +426,14 @@ mod tests {
             route("nodeX", "A", "B"),
             route("nodeY", "B", "C"),
         ]);
-        let route = find_route(&graph, "nodeY", 1000, &NetworkId("A".into()));
+        let route = find_route(&graph, &NodePubkey("nodeY".into()), 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "should find route A->B->C");
         let hops = route.unwrap();
         assert_eq!(hops.len(), 2);
-        assert_eq!(hops[0].0.node_pubkey, "nodeX");
+        assert_eq!(hops[0].0.node_pubkey.0, "nodeX");
         assert_eq!(hops[0].1.0, "A");
         assert_eq!(hops[0].2.0, "B");
-        assert_eq!(hops[1].0.node_pubkey, "nodeY");
+        assert_eq!(hops[1].0.node_pubkey.0, "nodeY");
         assert_eq!(hops[1].1.0, "B");
         assert_eq!(hops[1].2.0, "B");
     }
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn reverse_route_not_found_when_only_a_to_b_exists() {
         let graph = build_graph(vec![route("nodeX", "A", "B")]);
-        let route = find_route(&graph, "nodeX", 1000, &NetworkId("B".into()));
+        let route = find_route(&graph, &NodePubkey("nodeX".into()), 1000, &NetworkId("B".into()));
         assert!(route.is_err(), "B->A should not exist when only A->B announced");
     }
 
@@ -453,9 +453,9 @@ mod tests {
             route("nodeY", "B", "C"),
             route("nodeY", "C", "B"),
         ]);
-        let route = find_route(&graph, "nodeY", 1000, &NetworkId("A".into()));
+        let route = find_route(&graph, &NodePubkey("nodeY".into()), 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "A->B->C forward route");
-        let route = find_route(&graph, "nodeX", 1000, &NetworkId("C".into()));
+        let route = find_route(&graph, &NodePubkey("nodeX".into()), 1000, &NetworkId("C".into()));
         assert!(route.is_ok(), "C->B->A reverse route");
     }
 }
