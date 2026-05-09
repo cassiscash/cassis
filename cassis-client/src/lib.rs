@@ -79,7 +79,7 @@ impl CassisClient {
         invoice: Invoice,
         sender_network: NetworkId,
     ) -> Result<PaymentResult, PayError> {
-        let destination = NodePubkey(invoice.destination_pubkey);
+        let destination = NodePubkey(invoice.payee);
         let route = self
             .find_route(
                 &destination,

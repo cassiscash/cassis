@@ -48,11 +48,12 @@ pub struct RouteAnnouncement {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invoice {
+    #[serde(with = "hex")]
     pub payment_hash: [u8; 32],
     pub amount_msat: u64,
-    pub destination_pubkey: String,
+    pub payee: String,
     pub expires_at: u64,
-    pub route_hints: Vec<NetworkId>,
+    pub networks: Vec<NetworkId>,
     pub description: Option<String>,
 }
 

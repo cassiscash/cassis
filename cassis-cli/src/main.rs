@@ -32,7 +32,7 @@ enum Commands {
         #[arg(long)]
         network: String,
         #[arg(long)]
-        destination_pubkey: String,
+        payee: String,
         #[arg(long)]
         description: Option<String>,
         #[arg(long)]
@@ -76,10 +76,10 @@ async fn main() {
         Commands::Invoice {
             amount,
             network,
-            destination_pubkey,
+            payee,
             description,
             expires_at,
-        } => cmd_invoice(amount, network, destination_pubkey, description, expires_at),
+        } => cmd_invoice(amount, network, payee, description, expires_at),
         Commands::Route {
             destination_pubkey,
             amount,
@@ -108,7 +108,7 @@ fn cmd_pay(invoice: String, from: String) {
 fn cmd_invoice(
     amount: u64,
     network: String,
-    destination_pubkey: String,
+    payee: String,
     description: Option<String>,
     expires_at: Option<u64>,
 ) {
@@ -117,9 +117,9 @@ fn cmd_invoice(
     let invoice = Invoice {
         payment_hash,
         amount_msat: amount,
-        destination_pubkey,
+        payee,
         expires_at: expires_at.unwrap_or(0),
-        route_hints: vec![NetworkId(network)],
+        networks: vec![NetworkId(network)],
         description,
     };
     let invoice_json = serde_json::to_string(&invoice).unwrap_or_default();
