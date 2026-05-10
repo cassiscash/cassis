@@ -133,6 +133,7 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
         let pubkey_hex = event.pubkey.to_hex();
         let mut from: Option<String> = None;
         let mut to: Option<String> = None;
+        let mut iroh_peer_id: String = String::new();
         let mut fee_base_msat: u64 = 0;
         let mut fee_ppm: u64 = 0;
         let mut expires_at: u64 = 0;
@@ -148,6 +149,9 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
                         from = Some(f.to_string());
                         to = Some(t.to_string());
                     }
+                }
+                "iroh" => {
+                    iroh_peer_id = tag[1].clone();
                 }
                 "fee_base_msat" => {
                     fee_base_msat = tag[1].parse().unwrap_or(0);
@@ -168,6 +172,7 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
         if let (Some(from), Some(to)) = (from, to) {
             announcements.push(RouteAnnouncement {
                 node_pubkey: NodePubkey(pubkey_hex),
+                iroh_peer_id,
                 from: NetworkId(from),
                 to: NetworkId(to),
                 fee_base_msat,
@@ -399,6 +404,7 @@ mod tests {
     fn route(pubkey: &str, from: &str, to: &str) -> RouteAnnouncement {
         RouteAnnouncement {
             node_pubkey: NodePubkey(pubkey.to_string()),
+            iroh_peer_id: String::new(),
             from: NetworkId(from.to_string()),
             to: NetworkId(to.to_string()),
             fee_base_msat: 0,

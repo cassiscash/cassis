@@ -818,6 +818,7 @@ dependencies = [
  "cassis-iroh",
  "cassis-nostr",
  "futures",
+ "iroh 0.35.0",
  "thiserror 1.0.69",
 ]
 
@@ -859,8 +860,11 @@ name = "cassis-iroh"
 version = "0.1.0"
 dependencies = [
  "cassis-core",
+ "iroh 0.35.0",
+ "postcard",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -916,6 +920,7 @@ dependencies = [
  "cassis-rootstock",
  "clap",
  "hmac",
+ "iroh 0.35.0",
  "ritualistic",
  "rustls",
  "sha2",

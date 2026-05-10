@@ -5,7 +5,9 @@ use cassis_core::{
 use cassis_iroh::IrohClient;
 use cassis_nostr::{build_graph, compute_hop_expiries, fetch_announcements, find_route as find_route_in_graph};
 use futures::future::try_join_all;
+use iroh::Endpoint;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(thiserror::Error, Debug)]
@@ -16,6 +18,12 @@ pub enum PayError {
     Io(String),
     #[error("unimplemented")]
     Unimplemented,
+}
+
+impl From<cassis_iroh::IrohError> for PayError {
+    fn from(e: cassis_iroh::IrohError) -> Self {
+        PayError::Io(e.to_string())
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -61,16 +69,22 @@ pub async fn find_route(
 pub struct CassisClient {
     pub adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
     pub nostr_relays: Vec<String>,
+    iroh_client: IrohClient,
 }
 
 impl CassisClient {
-    pub fn new(
+    pub async fn new(
         adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
         nostr_relays: Vec<String>,
     ) -> Self {
+        let endpoint = Endpoint::builder()
+            .bind()
+            .await
+            .expect("failed to bind iroh endpoint for client");
         Self {
             adapters,
             nostr_relays,
+            iroh_client: IrohClient::new(endpoint),
         }
     }
 
@@ -96,38 +110,30 @@ impl CassisClient {
         let deltas = vec![0u64; route.len()];
         let expiries = compute_hop_expiries(invoice.expires_at, &deltas);
 
-        let instructions: Vec<(IrohClient, HopInstruction)> = route
+        let instructions: Vec<(iroh::PublicKey, HopInstruction)> = route
             .iter()
             .enumerate()
             .map(|(idx, hop)| {
-                let incoming = hop.incoming.clone();
-                let outgoing = hop.outgoing.clone();
-                let incoming_deadline = expiries.get(idx).copied().unwrap_or(invoice.expires_at);
-                let outgoing_expiry = expiries
-                    .get(idx + 1)
-                    .copied()
-                    .unwrap_or(invoice.expires_at);
+                let peer_id = iroh::PublicKey::from_str(&hop.node.iroh_peer_id)
+                    .map_err(|e| PayError::Io(e.to_string()))?;
                 let instruction = HopInstruction {
                     payment_hash: invoice.payment_hash,
                     amount_msat: invoice.amount_msat,
-                    incoming_network: incoming,
-                    outgoing_network: outgoing,
-                    incoming_deadline,
-                    outgoing_expiry,
+                    incoming_network: hop.incoming.clone(),
+                    outgoing_network: hop.outgoing.clone(),
+                    incoming_deadline: expiries.get(idx).copied().unwrap_or(invoice.expires_at),
+                    outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
                     recipient: hop.node.node_pubkey.to_string(),
                 };
-                let client = IrohClient::new(hop.node.node_pubkey.to_string());
-                (client, instruction)
+                Ok((peer_id, instruction))
             })
-            .collect();
+            .collect::<Result<Vec<_>, PayError>>()?;
 
-        let ack_futures = instructions.into_iter().map(|(client, instruction)| async move {
-            client
-                .send_instruction(instruction)
-                .await
-                .map_err(|err| PayError::Io(err.to_string()))
+        let ack_futures = instructions.into_iter().map(|(peer_id, instruction)| {
+            self.iroh_client
+                .send_instruction(peer_id, instruction)
         });
-        let acks = try_join_all(ack_futures).await?;
+        let acks: Vec<cassis_core::HopAck> = try_join_all(ack_futures).await?;
         if acks.iter().any(|ack| !ack.accepted) {
             return Err(PayError::Route("hop rejected".to_string()));
         }

@@ -37,6 +37,8 @@ pub enum SeedError {
 pub struct DerivedKeys {
     /// Nostr signing key used to sign route-announcement events.
     pub nostr: SecretKey,
+    /// Iroh transport key used for peer-to-peer connections.
+    pub iroh: iroh::SecretKey,
     /// One signing key per network the daemon routes between.
     pub networks: HashMap<NetworkId, SecretKey>,
 }
@@ -69,6 +71,7 @@ pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<Derive
     let seed = parse_seed(mnemonic)?;
 
     let nostr = derive_nostr_secret_key(&seed)?;
+    let iroh = derive_iroh_secret_key(&seed);
 
     let mut networks = HashMap::with_capacity(network_ids.len());
     for network_id in network_ids {
@@ -78,7 +81,7 @@ pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<Derive
         networks.insert(network_id, secret);
     }
 
-    Ok(DerivedKeys { nostr, networks })
+    Ok(DerivedKeys { nostr, iroh, networks })
 }
 
 /// Derive the Nostr signing key from the BIP39 seed per NIP-6.
@@ -118,6 +121,17 @@ fn derive_secret_key(seed: &[u8; 64], label: &[u8]) -> Result<SecretKey, String>
         }
     }
     unreachable!()
+}
+
+/// Derive the iroh transport key from the seed.  Uses the fixed label
+/// `cassis/iroh` with HMAC-SHA512; the first 32 bytes are the ed25519 seed.
+fn derive_iroh_secret_key(seed: &[u8; 64]) -> iroh::SecretKey {
+    let mut mac = HmacSha512::new_from_slice(seed).expect("hmac accepts any key length");
+    mac.update(b"cassis/iroh");
+    let out = mac.finalize().into_bytes();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&out[..32]);
+    iroh::SecretKey::from(bytes)
 }
 
 #[cfg(test)]

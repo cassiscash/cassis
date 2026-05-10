@@ -1,7 +1,8 @@
 use cassis_core::{HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, WatchError};
+use cassis_iroh::IrohServer;
 use cassis_onchain::validate_timelock_delta;
 use clap::Parser;
-use ritualistic::{EventTemplate, Kind, Network, SecretKey, Tags, Timestamp};
+use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -122,9 +123,32 @@ async fn main() {
         cli.nostr_relay.clone()
     };
 
-    publish_route_announcements(&adapters, relay_urls, &keys.nostr).await;
+    let daemon = Arc::new(CassisDaemon::new(adapters));
+    let handler_daemon = daemon.clone();
 
-    let _daemon = CassisDaemon::new(adapters);
+    let (iroh_server, iroh_secret) =
+        IrohServer::new(keys.iroh.clone()).await.expect("failed to bind iroh endpoint");
+    let iroh_peer_id = iroh_secret.public();
+    eprintln!("iroh endpoint: {iroh_peer_id}");
+
+    tokio::spawn(async move {
+        let handler = Arc::new(move |inst: HopInstruction| -> Result<HopAck, String> {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(handler_daemon.handle_instruction(inst))
+                .map_err(|e| format!("{e:?}"))
+        });
+        if let Err(e) = iroh_server.run(handler).await {
+            eprintln!("iroh server error: {e}");
+        }
+    });
+
+    publish_route_announcements(
+        &daemon.adapters,
+        relay_urls,
+        &keys.nostr,
+        &iroh_peer_id.to_string(),
+    )
+    .await;
 
     tokio::signal::ctrl_c().await.ok();
     eprintln!("shutting down");
@@ -283,7 +307,7 @@ async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<
 }
 
 pub struct CassisDaemon {
-    adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
+    pub adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
     pending: PendingMap,
 }
 
@@ -460,7 +484,8 @@ fn unix_now() -> u64 {
 async fn publish_route_announcements(
     adapters: &HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
     relay_urls: Vec<String>,
-    secret_key: &SecretKey,
+    secret_key: &ritualistic::SecretKey,
+    iroh_peer_id: &str,
 ) {
     if relay_urls.is_empty() {
         eprintln!("no nostr relays configured, skipping route announcement publication");
@@ -492,6 +517,7 @@ async fn publish_route_announcements(
                 kind: Kind(NOSTR_KIND_ROUTE_ANNOUNCEMENT),
                 tags: Tags(vec![
                     vec!["d".to_string(), d_tag.clone()],
+                    vec!["iroh".to_string(), iroh_peer_id.to_string()],
                     vec!["fee_base_msat".to_string(), fee_base_msat.to_string()],
                     vec!["fee_ppm".to_string(), fee_ppm.to_string()],
                 ]),

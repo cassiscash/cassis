@@ -38,6 +38,7 @@ impl From<&str> for NodePubkey {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteAnnouncement {
     pub node_pubkey: NodePubkey,
+    pub iroh_peer_id: String,
     pub from: NetworkId,
     pub to: NetworkId,
     pub fee_base_msat: u64,

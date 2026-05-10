@@ -12,6 +12,7 @@ bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "s
 bip39 = { version = "2.2.2" }
 clap = { version = "4", features = ["derive"] }
 hmac = "0.12"
+iroh = "0.35"
 ritualistic = "0.1.1"
 rustls = "0.23"
 sha2 = "0.10"
