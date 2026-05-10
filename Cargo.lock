@@ -801,10 +801,13 @@ version = "0.1.0"
 dependencies = [
  "cassis-client",
  "cassis-core",
+ "cassis-iroh",
  "cassis-nostr",
  "cassis-onchain",
  "clap",
+ "futures",
  "hex",
+ "iroh 0.35.0",
  "rustls",
  "serde_json",
  "tokio",

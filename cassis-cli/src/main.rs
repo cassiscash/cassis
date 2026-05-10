@@ -1,6 +1,9 @@
-use cassis_core::{Invoice, NetworkId, NodePubkey};
+use cassis_core::{HopInstruction, Invoice, NetworkId, NodePubkey};
+use cassis_iroh::IrohClient;
 use cassis_onchain::{generate_preimage, hash_preimage};
 use clap::{Parser, Subcommand};
+use futures::future::try_join_all;
+use std::str::FromStr;
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -18,12 +21,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Pay an invoice from a given network
+    /// Pay an invoice
     Pay {
         #[arg(long)]
         invoice: String,
-        #[arg(long)]
-        from: String,
+        /// Nostr relays to query for route announcements.
+        /// Defaults to a built-in list when none are provided.
+        #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
+        nostr_relay: Vec<String>,
     },
     /// Create an invoice
     Invoice {
@@ -46,8 +51,6 @@ enum Commands {
         amount: u64,
         #[arg(long)]
         from: String,
-        /// Nostr relays to query for route announcements.
-        /// Defaults to a built-in list when none are provided.
         #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
         nostr_relay: Vec<String>,
     },
@@ -72,7 +75,7 @@ async fn main() {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Pay { invoice, from } => cmd_pay(invoice, from),
+        Commands::Pay { invoice, nostr_relay } => cmd_pay(invoice, nostr_relay).await,
         Commands::Invoice {
             amount,
             network,
@@ -92,17 +95,111 @@ async fn main() {
     }
 }
 
-fn cmd_pay(invoice: String, from: String) {
-    let _from = NetworkId(from);
-    let invoice: Invoice = match serde_json::from_str(&invoice) {
+async fn cmd_pay(invoice_str: String, nostr_relays: Vec<String>) {
+    let invoice: Invoice = match serde_json::from_str(&invoice_str) {
         Ok(invoice) => invoice,
         Err(err) => {
             eprintln!("invalid invoice: {err}");
             std::process::exit(1);
         }
     };
-    println!("payment requested for {} msat", invoice.amount_msat);
-    println!("payment flow not wired yet; use cassis-client in your app");
+
+    let sender_network = match invoice.networks.first() {
+        Some(n) => n.clone(),
+        None => {
+            eprintln!("invoice has no networks");
+            std::process::exit(1);
+        }
+    };
+
+    let relays: Vec<String> = if nostr_relays.is_empty() {
+        DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
+    } else {
+        nostr_relays
+    };
+
+    let destination = NodePubkey(invoice.payee);
+    let route = match cassis_client::find_route(&relays, &destination, invoice.amount_msat, &sender_network).await {
+        Ok(r) => r,
+        Err(cassis_client::RouteError::Fetch(err)) => {
+            eprintln!("error fetching announcements: {err}");
+            std::process::exit(1);
+        }
+        Err(cassis_client::RouteError::Route(cassis_nostr::RouteError::NoRoute)) => {
+            eprintln!("no route found");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("route error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    if route.is_empty() {
+        eprintln!("empty route");
+        std::process::exit(1);
+    }
+
+    eprintln!(
+        "paying {} msat via {} hop(s) from {}",
+        invoice.amount_msat,
+        route.len(),
+        sender_network,
+    );
+
+    let endpoint = iroh::Endpoint::builder()
+        .bind()
+        .await
+        .expect("failed to bind iroh endpoint");
+    let client = IrohClient::new(endpoint);
+
+    let deltas = vec![0u64; route.len()];
+    let expiries = crate::compute_hop_expiries(invoice.expires_at, &deltas);
+
+    let instructions: Vec<(iroh::PublicKey, HopInstruction)> = route
+        .iter()
+        .enumerate()
+        .map(|(idx, hop)| {
+            let peer_id = iroh::PublicKey::from_str(&hop.node.iroh_peer_id)
+                .unwrap_or_else(|_| {
+                    eprintln!("invalid iroh peer id for hop {idx}: {}", hop.node.iroh_peer_id);
+                    std::process::exit(1);
+                });
+            let instruction = HopInstruction {
+                payment_hash: invoice.payment_hash,
+                amount_msat: invoice.amount_msat,
+                incoming_network: hop.incoming.clone(),
+                outgoing_network: hop.outgoing.clone(),
+                incoming_deadline: expiries.get(idx).copied().unwrap_or(invoice.expires_at),
+                outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
+                recipient: hop.node.node_pubkey.to_string(),
+            };
+            (peer_id, instruction)
+        })
+        .collect();
+
+    let ack_futures = instructions.into_iter().map(|(peer_id, instruction)| {
+        client.send_instruction(peer_id, instruction)
+    });
+
+    let acks = match try_join_all(ack_futures).await {
+        Ok(acks) => acks,
+        Err(err) => {
+            eprintln!("iroh error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    for (i, ack) in acks.iter().enumerate() {
+        if ack.accepted {
+            println!("hop {} accepted", i + 1);
+        } else {
+            eprintln!("hop {} rejected: {:?}", i + 1, ack.signature);
+            std::process::exit(1);
+        }
+    }
+
+    eprintln!("all hops prepared");
 }
 
 fn cmd_invoice(
@@ -175,6 +272,18 @@ async fn cmd_route(
             hop.outgoing.0,
         );
     }
+}
+
+fn compute_hop_expiries(final_expiry: u64, deltas: &[u64]) -> Vec<u64> {
+    let mut expiries = Vec::with_capacity(deltas.len() + 1);
+    let mut current = final_expiry;
+    expiries.push(current);
+    for delta in deltas.iter().rev() {
+        current = current.saturating_add(*delta);
+        expiries.push(current);
+    }
+    expiries.reverse();
+    expiries
 }
 
 fn cmd_node_info() {

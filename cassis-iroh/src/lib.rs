@@ -3,7 +3,6 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 
 pub const ALPN_PROTOCOL: &[u8] = b"cassis-hop/1";
 

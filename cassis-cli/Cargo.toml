@@ -6,10 +6,13 @@ edition.workspace = true
 [dependencies]
 cassis-client = { path = "../cassis-client" }
 cassis-core = { path = "../cassis-core" }
+cassis-iroh = { path = "../cassis-iroh" }
 cassis-nostr = { path = "../cassis-nostr" }
 cassis-onchain = { path = "../cassis-onchain" }
 clap = { version = "4", features = ["derive"] }
+futures = "0.3"
 hex = "0.4"
+iroh = "0.35"
 rustls = "0.23"
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
