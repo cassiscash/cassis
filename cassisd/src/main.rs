@@ -323,6 +323,13 @@ impl CassisDaemon {
         &self,
         instruction: HopInstruction,
     ) -> Result<HopAck, HopReject> {
+        eprintln!(
+            "iroh instruction: {} msat {} -> {} via {}",
+            instruction.amount_msat,
+            instruction.incoming_network,
+            instruction.outgoing_network,
+            instruction.recipient,
+        );
         self.validate_instruction(&instruction)?;
         {
             let mut pending = self.pending.lock().await;
@@ -412,8 +419,12 @@ async fn watch_instruction(
         )
         .await
     {
-        Ok(htlc) => htlc,
+        Ok(htlc) => {
+            eprintln!("  incoming HTLC on {}: amount={}", htlc.network, htlc.amount_msat);
+            htlc
+        }
         Err(_) => {
+            eprintln!("  incoming HTLC failed on {}", instruction.incoming_network);
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
@@ -444,8 +455,12 @@ async fn watch_instruction(
         )
         .await
     {
-        Ok(htlc) => htlc,
+        Ok(htlc) => {
+            eprintln!("  outgoing HTLC on {} for {}", htlc.network, htlc.recipient);
+            htlc
+        }
         Err(_) => {
+            eprintln!("  outgoing HTLC failed on {}", instruction.outgoing_network);
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
@@ -456,12 +471,15 @@ async fn watch_instruction(
         .await
     {
         Ok(preimage) => {
+            eprintln!("  preimage received, claiming incoming");
             let _ = incoming_adapter.claim_incoming(&incoming, preimage).await;
         }
         Err(WatchError::DeadlineExceeded) => {
+            eprintln!("  deadline exceeded, refunding outgoing");
             let _ = outgoing_adapter.refund_outgoing(&outgoing).await;
         }
         Err(_) => {
+            eprintln!("  error watching preimage, refunding outgoing");
             let _ = outgoing_adapter.refund_outgoing(&outgoing).await;
         }
     }
