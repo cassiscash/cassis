@@ -21,10 +21,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Pay an invoice
+    /// Pay an invoice from a given network
     Pay {
         #[arg(long)]
         invoice: String,
+        #[arg(long)]
+        from: String,
         /// Nostr relays to query for route announcements.
         /// Defaults to a built-in list when none are provided.
         #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
@@ -75,7 +77,7 @@ async fn main() {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Pay { invoice, nostr_relay } => cmd_pay(invoice, nostr_relay).await,
+        Commands::Pay { invoice, from, nostr_relay } => cmd_pay(invoice, from, nostr_relay).await,
         Commands::Invoice {
             amount,
             network,
@@ -95,7 +97,7 @@ async fn main() {
     }
 }
 
-async fn cmd_pay(invoice_str: String, nostr_relays: Vec<String>) {
+async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let invoice: Invoice = match serde_json::from_str(&invoice_str) {
         Ok(invoice) => invoice,
         Err(err) => {
@@ -104,13 +106,7 @@ async fn cmd_pay(invoice_str: String, nostr_relays: Vec<String>) {
         }
     };
 
-    let sender_network = match invoice.networks.first() {
-        Some(n) => n.clone(),
-        None => {
-            eprintln!("invoice has no networks");
-            std::process::exit(1);
-        }
-    };
+    let sender_network = NetworkId(from);
 
     let relays: Vec<String> = if nostr_relays.is_empty() {
         DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
