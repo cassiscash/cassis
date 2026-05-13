@@ -108,13 +108,25 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
 
     let sender_network = NetworkId(from);
 
+    let dest_network = match invoice.networks.first() {
+        Some(n) => n.clone(),
+        None => {
+            eprintln!("invoice has no network hints");
+            std::process::exit(1);
+        }
+    };
+    let destination = NodePubkey(dest_network.0.clone());
+    eprintln!(
+        "routing to network {dest_network} (payee {})",
+        invoice.payee,
+    );
+
     let relays: Vec<String> = if nostr_relays.is_empty() {
         DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
     } else {
         nostr_relays
     };
 
-    let destination = NodePubkey(invoice.payee);
     let route = match cassis_client::find_route(&relays, &destination, invoice.amount_msat, &sender_network).await {
         Ok(r) => r,
         Err(cassis_client::RouteError::Fetch(err)) => {

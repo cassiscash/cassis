@@ -203,7 +203,7 @@ pub fn find_route(
     sender_network: &NetworkId,
 ) -> Result<Vec<(RouteAnnouncement, NetworkId, NetworkId)>, RouteError> {
     eprintln!(
-        "find_route: destination={destination}, amount_msat={amount_msat}, sender_network={sender_network}"
+        "--- find_route: destination={destination}, amount_msat={amount_msat}, sender_network={sender_network}"
     );
 
     let mut heap: BinaryHeap<State> = BinaryHeap::new();

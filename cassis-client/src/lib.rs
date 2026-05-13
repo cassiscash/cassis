@@ -93,7 +93,10 @@ impl CassisClient {
         invoice: Invoice,
         sender_network: NetworkId,
     ) -> Result<PaymentResult, PayError> {
-        let destination = NodePubkey(invoice.payee);
+        let dest_network = invoice.networks.first().ok_or_else(|| {
+            PayError::Route("invoice has no network hints".to_string())
+        })?.clone();
+        let destination = NodePubkey(dest_network.0.clone());
         let route = self
             .find_route(
                 &destination,
