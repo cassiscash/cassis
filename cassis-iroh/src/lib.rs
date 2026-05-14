@@ -1,7 +1,8 @@
-use cassis_core::{HopAck, HopInstruction};
+use cassis_core::{HopAck, HopInstruction, RouteAnnouncement};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, SecretKey};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub const ALPN_PROTOCOL: &[u8] = b"cassis-hop/1";
@@ -22,6 +23,21 @@ enum Frame {
     HopAck(HopAck),
 }
 
+/// Build a [`NodeAddr`] from a route announcement's iroh fields.
+pub fn node_addr_from_announcement(ann: &RouteAnnouncement) -> Result<NodeAddr, IrohError> {
+    let peer_id =
+        iroh::PublicKey::from_str(&ann.iroh_peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
+    let mut addr = NodeAddr::new(peer_id);
+    if let Some(relay_url) = &ann.iroh_relay {
+        let relay = iroh::RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
+        addr = addr.with_relay_url(relay);
+    }
+    Ok(addr)
+}
+
+/// Default iroh relay URL when the node has no home relay.
+pub const DEFAULT_IROH_RELAY: &str = "https://euw1-1.relay.iroh.network";
+
 #[derive(Clone, Debug)]
 pub struct IrohClient {
     endpoint: Endpoint,
@@ -34,10 +50,9 @@ impl IrohClient {
 
     pub async fn send_instruction(
         &self,
-        peer_id: iroh::PublicKey,
+        addr: NodeAddr,
         instruction: HopInstruction,
     ) -> Result<HopAck, IrohError> {
-        let addr = NodeAddr::new(peer_id);
         let conn = self
             .endpoint
             .connect(addr, ALPN_PROTOCOL)
@@ -73,6 +88,7 @@ impl IrohClient {
 
 pub struct IrohServer {
     endpoint: Endpoint,
+    home_relay: Option<String>,
 }
 
 impl IrohServer {
@@ -84,11 +100,16 @@ impl IrohServer {
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
         let key = endpoint.secret_key().clone();
-        Ok((Self { endpoint }, key))
+        let home_relay = endpoint.home_relay().get().ok().flatten().map(|u| u.to_string());
+        Ok((Self { endpoint, home_relay }, key))
     }
 
     pub fn peer_id(&self) -> iroh::PublicKey {
         self.endpoint.secret_key().public()
+    }
+
+    pub fn home_relay(&self) -> Option<&str> {
+        self.home_relay.as_deref()
     }
 
     pub async fn run(

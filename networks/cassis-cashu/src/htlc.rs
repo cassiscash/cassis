@@ -17,7 +17,7 @@ impl HtlcProofs {
         payment_hash: [u8; 32],
         locktime: u64,
     ) -> std::result::Result<SpendingConditions, cashu::nuts::nut14::Error> {
-        let hash_hex = hex::encode(payment_hash);
+        let hash_hex = lowercase_hex::encode(payment_hash);
         let conditions = Conditions::new(Some(locktime), None, None, None, None, None)
             .map_err(|e| cashu::nuts::nut14::Error::LocktimeInPast)?;
         SpendingConditions::new_htlc_hash(&hash_hex, Some(conditions))
@@ -25,7 +25,7 @@ impl HtlcProofs {
 
     /// Add a preimage witness to a set of proofs so they can be spent.
     pub fn add_preimage_to_proofs(proofs: &mut [Proof], preimage: [u8; 32]) {
-        let preimage_hex = hex::encode(preimage);
+        let preimage_hex = lowercase_hex::encode(preimage);
         for proof in proofs.iter_mut() {
             proof.add_preimage(preimage_hex.clone());
         }

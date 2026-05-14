@@ -1,9 +1,8 @@
-use cassis_core::{HopInstruction, Invoice, NetworkId, NodePubkey};
-use cassis_iroh::IrohClient;
+use cassis_core::{HopInstruction, Invoice, NetworkId};
+use cassis_iroh::{node_addr_from_announcement, IrohClient};
 use cassis_onchain::{generate_preimage, hash_preimage};
 use clap::{Parser, Subcommand};
 use futures::future::try_join_all;
-use std::str::FromStr;
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -115,7 +114,6 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
             std::process::exit(1);
         }
     };
-    let destination = NodePubkey(dest_network.0.clone());
     eprintln!(
         "routing to network {dest_network} (payee {})",
         invoice.payee,
@@ -127,7 +125,7 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
         nostr_relays
     };
 
-    let route = match cassis_client::find_route(&relays, &destination, invoice.amount_msat, &sender_network).await {
+    let route = match cassis_client::find_route(&relays, &dest_network, invoice.amount_msat, &sender_network).await {
         Ok(r) => r,
         Err(cassis_client::RouteError::Fetch(err)) => {
             eprintln!("error fetching announcements: {err}");
@@ -164,13 +162,13 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let deltas = vec![0u64; route.len()];
     let expiries = crate::compute_hop_expiries(invoice.expires_at, &deltas);
 
-    let instructions: Vec<(iroh::PublicKey, HopInstruction)> = route
+    let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
         .iter()
         .enumerate()
         .map(|(idx, hop)| {
-            let peer_id = iroh::PublicKey::from_str(&hop.node.iroh_peer_id)
-                .unwrap_or_else(|_| {
-                    eprintln!("invalid iroh peer id for hop {idx}: {}", hop.node.iroh_peer_id);
+            let addr = node_addr_from_announcement(&hop.node)
+                .unwrap_or_else(|e| {
+                    eprintln!("invalid iroh addr for hop {idx}: {e}");
                     std::process::exit(1);
                 });
             let instruction = HopInstruction {
@@ -182,12 +180,12 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
                 outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
                 recipient: hop.node.node_pubkey.to_string(),
             };
-            (peer_id, instruction)
+            (addr, instruction)
         })
         .collect();
 
-    let ack_futures = instructions.into_iter().map(|(peer_id, instruction)| {
-        client.send_instruction(peer_id, instruction)
+    let ack_futures = instructions.into_iter().map(|(addr, instruction)| {
+        client.send_instruction(addr, instruction)
     });
 
     let acks = match try_join_all(ack_futures).await {
@@ -229,7 +227,7 @@ fn cmd_invoice(
     };
     let invoice_json = serde_json::to_string(&invoice).unwrap_or_default();
     println!("invoice: {invoice_json}");
-    println!("preimage: {}", hex::encode(preimage));
+    println!("preimage: {}", lowercase_hex::encode(preimage));
 }
 
 async fn cmd_route(
@@ -239,7 +237,7 @@ async fn cmd_route(
     nostr_relays: Vec<String>,
 ) {
     let sender_network = NetworkId(from);
-    let destination = NodePubkey(destination_pubkey);
+    let dest_network = NetworkId(destination_pubkey);
 
     let relays: Vec<String> = if nostr_relays.is_empty() {
         DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
@@ -249,7 +247,7 @@ async fn cmd_route(
 
     eprintln!("fetching route announcements from {} relay(s)...", relays.len());
 
-    let route = match cassis_client::find_route(&relays, &destination, amount, &sender_network).await {
+    let route = match cassis_client::find_route(&relays, &dest_network, amount, &sender_network).await {
         Ok(r) => r,
         Err(cassis_client::RouteError::Fetch(err)) => {
             eprintln!("error fetching announcements: {err}");

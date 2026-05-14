@@ -129,7 +129,11 @@ async fn main() {
     let (iroh_server, iroh_secret) =
         IrohServer::new(keys.iroh.clone()).await.expect("failed to bind iroh endpoint");
     let iroh_peer_id = iroh_secret.public();
-    eprintln!("iroh endpoint: {iroh_peer_id}");
+    let iroh_relay = iroh_server
+        .home_relay()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| cassis_iroh::DEFAULT_IROH_RELAY.to_string());
+    eprintln!("iroh endpoint: {iroh_peer_id} relay: {iroh_relay}");
 
     tokio::spawn(async move {
         let handler = Arc::new(move |inst: HopInstruction| -> Result<HopAck, String> {
@@ -147,6 +151,7 @@ async fn main() {
         relay_urls,
         &keys.nostr,
         &iroh_peer_id.to_string(),
+        &iroh_relay,
     )
     .await;
 
@@ -504,6 +509,7 @@ async fn publish_route_announcements(
     relay_urls: Vec<String>,
     secret_key: &ritualistic::SecretKey,
     iroh_peer_id: &str,
+    iroh_relay: &str,
 ) {
     if relay_urls.is_empty() {
         eprintln!("no nostr relays configured, skipping route announcement publication");
@@ -535,7 +541,7 @@ async fn publish_route_announcements(
                 kind: Kind(NOSTR_KIND_ROUTE_ANNOUNCEMENT),
                 tags: Tags(vec![
                     vec!["d".to_string(), d_tag.clone()],
-                    vec!["iroh".to_string(), iroh_peer_id.to_string()],
+                    vec!["iroh".to_string(), iroh_peer_id.to_string(), iroh_relay.to_string()],
                     vec!["fee_base_msat".to_string(), fee_base_msat.to_string()],
                     vec!["fee_ppm".to_string(), fee_ppm.to_string()],
                 ]),

@@ -788,6 +788,7 @@ dependencies = [
  "async-trait",
  "cashu",
  "cassis-core",
+ "lowercase-hex",
  "reqwest",
  "serde",
  "serde_json",
@@ -806,8 +807,8 @@ dependencies = [
  "cassis-onchain",
  "clap",
  "futures",
- "hex",
  "iroh 0.35.0",
+ "lowercase-hex",
  "rustls",
  "serde_json",
  "tokio",
@@ -830,7 +831,8 @@ name = "cassis-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "hex",
+ "lowercase-hex",
+ "ritualistic",
  "serde",
  "thiserror 1.0.69",
 ]

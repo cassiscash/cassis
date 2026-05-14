@@ -1,4 +1,4 @@
-use cassis_core::{NetworkId, NodePubkey, RouteAnnouncement};
+use cassis_core::{NetworkId, RouteAnnouncement};
 use ritualistic::{Filter, Kind, Network, SubscriptionOptions};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -130,10 +130,10 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
     let mut announcements = Vec::new();
 
     for event in events {
-        let pubkey_hex = event.pubkey.to_hex();
         let mut from: Option<String> = None;
         let mut to: Option<String> = None;
         let mut iroh_peer_id: String = String::new();
+        let mut iroh_relay: Option<String> = None;
         let mut fee_base_msat: u64 = 0;
         let mut fee_ppm: u64 = 0;
         let mut expires_at: u64 = 0;
@@ -152,6 +152,9 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
                 }
                 "iroh" => {
                     iroh_peer_id = tag[1].clone();
+                    if tag.len() >= 3 && !tag[2].is_empty() {
+                        iroh_relay = Some(tag[2].clone());
+                    }
                 }
                 "fee_base_msat" => {
                     fee_base_msat = tag[1].parse().unwrap_or(0);
@@ -171,8 +174,9 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
 
         if let (Some(from), Some(to)) = (from, to) {
             announcements.push(RouteAnnouncement {
-                node_pubkey: NodePubkey(pubkey_hex),
+                node_pubkey: event.pubkey,
                 iroh_peer_id,
+                iroh_relay,
                 from: NetworkId(from),
                 to: NetworkId(to),
                 fee_base_msat,
@@ -198,12 +202,12 @@ pub fn build_graph(announcements: Vec<RouteAnnouncement>) -> NodeGraph {
 
 pub fn find_route(
     graph: &NodeGraph,
-    destination: &NodePubkey,
+    destination_network: &NetworkId,
     amount_msat: u64,
     sender_network: &NetworkId,
 ) -> Result<Vec<(RouteAnnouncement, NetworkId, NetworkId)>, RouteError> {
     eprintln!(
-        "--- find_route: destination={destination}, amount_msat={amount_msat}, sender_network={sender_network}"
+        "--- find_route: destination_network={destination_network}, amount_msat={amount_msat}, sender_network={sender_network}"
     );
 
     let mut heap: BinaryHeap<State> = BinaryHeap::new();
@@ -226,7 +230,6 @@ pub fn find_route(
     }
 
     let mut goal: Option<StateKey> = None;
-    let mut goal_outgoing: Option<NetworkId> = None;
     let mut step = 0u64;
 
     while let Some(State { cost, key }) = heap.pop() {
@@ -245,23 +248,19 @@ pub fn find_route(
         }
 
         eprintln!(
-            "  step {step}: visit route #{} ({}) via {} cost={cost} msat",
+            "  step {step}: visit route #{} ({}) via {} -> {} cost={cost} msat",
             key.node_idx,
             node.node_pubkey,
-            key.incoming
+            key.incoming,
+            node.to
         );
 
-        if node.node_pubkey == *destination || node.to.0 == destination.0 {
+        if &node.to == destination_network {
             eprintln!(
-                "  step {step}: destination reached at route #{} ({}) via pubkey={} to={}",
+                "  step {step}: destination network {destination_network} reached at route #{} ({})",
                 key.node_idx,
                 node.node_pubkey,
-                node.node_pubkey == *destination,
-                node.to.0 == destination.0,
             );
-            if node.to.0 == destination.0 {
-                goal_outgoing = Some(node.to.clone());
-            }
             goal = Some(key.clone());
             break;
         }
@@ -281,7 +280,8 @@ pub fn find_route(
                 incoming: outgoing.clone(),
             };
             let next_node = &graph.nodes[next_idx];
-            let next_cost = cost.saturating_add(node_fee_msat(next_node, amount_msat));
+            let incoming_amount = amount_msat.saturating_sub(cost);
+            let next_cost = cost.saturating_add(node_fee_msat(next_node, incoming_amount));
             let is_better = match dist.get(&next_key) {
                 Some(existing) => next_cost < *existing,
                 None => true,
@@ -311,7 +311,8 @@ pub fn find_route(
     let goal = goal.ok_or(RouteError::NoRoute)?;
     let mut hops_rev: Vec<(RouteAnnouncement, NetworkId, NetworkId)> = Vec::new();
     let mut current = goal.clone();
-    let mut outgoing_for_current: Option<NetworkId> = None;
+    let mut outgoing_for_current: Option<NetworkId> =
+        Some(graph.nodes[goal.node_idx].to.clone());
     let mut hop_idx = 0u64;
 
     loop {
@@ -320,7 +321,7 @@ pub fn find_route(
             .get(current.node_idx)
             .ok_or_else(|| RouteError::InvalidGraph("node missing".to_string()))?;
         let incoming = current.incoming.clone();
-        let outgoing = outgoing_for_current.clone().or_else(|| goal_outgoing.clone()).unwrap_or_else(|| incoming.clone());
+        let outgoing = outgoing_for_current.clone().unwrap_or_else(|| incoming.clone());
         eprintln!(
             "  backtrack hop {hop_idx}: route #{} ({}) in={incoming} out={outgoing}",
             current.node_idx,
@@ -400,11 +401,13 @@ impl PartialOrd for State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cassis_core::NetworkId;
 
-    fn route(pubkey: &str, from: &str, to: &str) -> RouteAnnouncement {
+    fn route(pubkey: [u8; 32], from: &str, to: &str) -> RouteAnnouncement {
         RouteAnnouncement {
-            node_pubkey: NodePubkey(pubkey.to_string()),
+            node_pubkey: ritualistic::PubKey(pubkey),
             iroh_peer_id: String::new(),
+            iroh_relay: None,
             from: NetworkId(from.to_string()),
             to: NetworkId(to.to_string()),
             fee_base_msat: 0,
@@ -414,54 +417,62 @@ mod tests {
         }
     }
 
+    fn key_x() -> [u8; 32] {
+        [1u8; 32]
+    }
+
+    fn key_y() -> [u8; 32] {
+        [2u8; 32]
+    }
+
     #[test]
     fn single_event_a_to_b_finds_route() {
-        let graph = build_graph(vec![route("nodeX", "A", "B")]);
-        let route = find_route(&graph, &NodePubkey("nodeX".into()), 1000, &NetworkId("A".into()));
+        let graph = build_graph(vec![route(key_x(), "A", "B")]);
+        let route = find_route(&graph, &NetworkId("B".into()), 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "should find route A->B through nodeX");
         let hops = route.unwrap();
         assert_eq!(hops.len(), 1, "single-hop route");
-        assert_eq!(hops[0].0.node_pubkey.0, "nodeX");
+        assert_eq!(hops[0].0.node_pubkey.0, key_x());
         assert_eq!(hops[0].1.0, "A", "incoming is A");
-        assert_eq!(hops[0].2.0, "A", "outgoing for destination node is same as incoming");
+        assert_eq!(hops[0].2.0, "B", "outgoing is destination network B");
     }
 
     #[test]
     fn two_hop_route_a_to_c_via_b() {
         let graph = build_graph(vec![
-            route("nodeX", "A", "B"),
-            route("nodeY", "B", "C"),
+            route(key_x(), "A", "B"),
+            route(key_y(), "B", "C"),
         ]);
-        let route = find_route(&graph, &NodePubkey("nodeY".into()), 1000, &NetworkId("A".into()));
+        let route = find_route(&graph, &NetworkId("C".into()), 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "should find route A->B->C");
         let hops = route.unwrap();
         assert_eq!(hops.len(), 2);
-        assert_eq!(hops[0].0.node_pubkey.0, "nodeX");
+        assert_eq!(hops[0].0.node_pubkey.0, key_x());
         assert_eq!(hops[0].1.0, "A");
         assert_eq!(hops[0].2.0, "B");
-        assert_eq!(hops[1].0.node_pubkey.0, "nodeY");
+        assert_eq!(hops[1].0.node_pubkey.0, key_y());
         assert_eq!(hops[1].1.0, "B");
-        assert_eq!(hops[1].2.0, "B");
+        assert_eq!(hops[1].2.0, "C", "last hop's outgoing is the destination network");
     }
 
     #[test]
     fn reverse_route_not_found_when_only_a_to_b_exists() {
-        let graph = build_graph(vec![route("nodeX", "A", "B")]);
-        let route = find_route(&graph, &NodePubkey("nodeX".into()), 1000, &NetworkId("B".into()));
+        let graph = build_graph(vec![route(key_x(), "A", "B")]);
+        let route = find_route(&graph, &NetworkId("A".into()), 1000, &NetworkId("B".into()));
         assert!(route.is_err(), "B->A should not exist when only A->B announced");
     }
 
     #[test]
     fn bidirectional_routes_work() {
         let graph = build_graph(vec![
-            route("nodeX", "A", "B"),
-            route("nodeX", "B", "A"),
-            route("nodeY", "B", "C"),
-            route("nodeY", "C", "B"),
+            route(key_x(), "A", "B"),
+            route(key_x(), "B", "A"),
+            route(key_y(), "B", "C"),
+            route(key_y(), "C", "B"),
         ]);
-        let route = find_route(&graph, &NodePubkey("nodeY".into()), 1000, &NetworkId("A".into()));
+        let route = find_route(&graph, &NetworkId("C".into()), 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "A->B->C forward route");
-        let route = find_route(&graph, &NodePubkey("nodeX".into()), 1000, &NetworkId("C".into()));
+        let route = find_route(&graph, &NetworkId("A".into()), 1000, &NetworkId("C".into()));
         assert!(route.is_ok(), "C->B->A reverse route");
     }
 }

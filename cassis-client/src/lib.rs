@@ -1,13 +1,12 @@
 use cassis_core::{
-    HopInstruction, Invoice, NetworkAdapter, NetworkId, NodePubkey, PaymentResult, PaymentStatus,
+    HopInstruction, Invoice, NetworkAdapter, NetworkId, PaymentResult, PaymentStatus,
     RouteHop, WatchError,
 };
-use cassis_iroh::IrohClient;
+use cassis_iroh::{node_addr_from_announcement, IrohClient};
 use cassis_nostr::{build_graph, compute_hop_expiries, fetch_announcements, find_route as find_route_in_graph};
 use futures::future::try_join_all;
 use iroh::Endpoint;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(thiserror::Error, Debug)]
@@ -44,7 +43,7 @@ pub enum RouteError {
 /// network adapters.
 pub async fn find_route(
     relays: &[String],
-    destination: &NodePubkey,
+    destination_network: &NetworkId,
     amount_msat: u64,
     sender_network: &NetworkId,
 ) -> Result<Vec<RouteHop>, RouteError> {
@@ -53,7 +52,7 @@ pub async fn find_route(
         .map_err(|err| RouteError::Fetch(err.to_string()))?;
     let graph = build_graph(announcements);
     graph.log();
-    let route = find_route_in_graph(&graph, destination, amount_msat, sender_network)
+    let route = find_route_in_graph(&graph, destination_network, amount_msat, sender_network)
         .map_err(RouteError::Route)?;
     let hops = route
         .into_iter()
@@ -94,12 +93,11 @@ impl CassisClient {
         sender_network: NetworkId,
     ) -> Result<PaymentResult, PayError> {
         let dest_network = invoice.networks.first().ok_or_else(|| {
-            PayError::Route("invoice has no network hints".to_string())
+            PayError::Route("invoice has no network".to_string())
         })?.clone();
-        let destination = NodePubkey(dest_network.0.clone());
         let route = self
             .find_route(
-                &destination,
+                &dest_network,
                 invoice.amount_msat,
                 sender_network.clone(),
             )
@@ -113,11 +111,11 @@ impl CassisClient {
         let deltas = vec![0u64; route.len()];
         let expiries = compute_hop_expiries(invoice.expires_at, &deltas);
 
-        let instructions: Vec<(iroh::PublicKey, HopInstruction)> = route
+        let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
             .iter()
             .enumerate()
             .map(|(idx, hop)| {
-                let peer_id = iroh::PublicKey::from_str(&hop.node.iroh_peer_id)
+                let addr = node_addr_from_announcement(&hop.node)
                     .map_err(|e| PayError::Io(e.to_string()))?;
                 let instruction = HopInstruction {
                     payment_hash: invoice.payment_hash,
@@ -128,13 +126,13 @@ impl CassisClient {
                     outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
                     recipient: hop.node.node_pubkey.to_string(),
                 };
-                Ok((peer_id, instruction))
+                Ok((addr, instruction))
             })
             .collect::<Result<Vec<_>, PayError>>()?;
 
-        let ack_futures = instructions.into_iter().map(|(peer_id, instruction)| {
+        let ack_futures = instructions.into_iter().map(|(addr, instruction)| {
             self.iroh_client
-                .send_instruction(peer_id, instruction)
+                .send_instruction(addr, instruction)
         });
         let acks: Vec<cassis_core::HopAck> = try_join_all(ack_futures).await?;
         if acks.iter().any(|ack| !ack.accepted) {
@@ -154,7 +152,7 @@ impl CassisClient {
                 invoice.payment_hash,
                 invoice.amount_msat,
                 expiries.get(1).copied().unwrap_or(invoice.expires_at),
-                &first_hop.node.node_pubkey.0,
+                &first_hop.node.node_pubkey.to_string(),
             )
             .await
             .map_err(|err| PayError::Io(err.to_string()))?;
@@ -183,10 +181,10 @@ impl CassisClient {
 
     pub async fn find_route(
         &self,
-        destination: &NodePubkey,
+        destination_network: &NetworkId,
         amount_msat: u64,
         sender_network: NetworkId,
     ) -> Result<Vec<RouteHop>, RouteError> {
-        find_route(&self.nostr_relays, destination, amount_msat, &sender_network).await
+        find_route(&self.nostr_relays, destination_network, amount_msat, &sender_network).await
     }
 }
