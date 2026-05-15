@@ -865,6 +865,7 @@ name = "cassis-iroh"
 version = "0.1.0"
 dependencies = [
  "cassis-core",
+ "hex",
  "iroh 0.35.0",
  "postcard",
  "serde",

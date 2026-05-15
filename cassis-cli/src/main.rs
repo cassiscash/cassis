@@ -153,11 +153,9 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
         sender_network,
     );
 
-    let endpoint = iroh::Endpoint::builder()
-        .bind()
-        .await
-        .expect("failed to bind iroh endpoint");
-    let client = IrohClient::new(endpoint);
+    eprintln!("binding iroh endpoint...");
+    let client = IrohClient::bind().await.expect("failed to bind iroh endpoint");
+    eprintln!("iroh endpoint bound");
 
     let deltas = vec![0u64; route.len()];
     let expiries = crate::compute_hop_expiries(invoice.expires_at, &deltas);
@@ -180,10 +178,20 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
                 outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
                 recipient: hop.node.node_pubkey.to_string(),
             };
+            eprintln!(
+                "  hop {}: sending instruction to {} (amount={}, incoming={}, outgoing={}, recipient={})",
+                idx + 1,
+                hop.node.node_pubkey,
+                instruction.amount_msat,
+                instruction.incoming_network.0,
+                instruction.outgoing_network.0,
+                instruction.recipient,
+            );
             (addr, instruction)
         })
         .collect();
 
+    eprintln!("sending {} hop instruction(s) in parallel...", instructions.len());
     let ack_futures = instructions.into_iter().map(|(addr, instruction)| {
         client.send_instruction(addr, instruction)
     });
@@ -195,10 +203,11 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
             std::process::exit(1);
         }
     };
+    eprintln!("all {} response(s) received", acks.len());
 
     for (i, ack) in acks.iter().enumerate() {
         if ack.accepted {
-            println!("hop {} accepted", i + 1);
+            eprintln!("hop {} accepted", i + 1);
         } else {
             eprintln!("hop {} rejected: {:?}", i + 1, ack.signature);
             std::process::exit(1);

@@ -136,11 +136,19 @@ async fn main() {
     eprintln!("iroh endpoint: {iroh_peer_id} relay: {iroh_relay}");
 
     tokio::spawn(async move {
-        let handler = Arc::new(move |inst: HopInstruction| -> Result<HopAck, String> {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(handler_daemon.handle_instruction(inst))
-                .map_err(|e| format!("{e:?}"))
-        });
+        let handler = Arc::new(
+            move |inst: HopInstruction| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<HopAck, String>> + Send>,
+            > {
+                let daemon = handler_daemon.clone();
+                Box::pin(async move {
+                    match daemon.handle_instruction(inst).await {
+                        Ok(ack) => Ok(ack),
+                        Err(reject) => Err(format!("{:?}", reject)),
+                    }
+                })
+            },
+        );
         if let Err(e) = iroh_server.run(handler).await {
             eprintln!("iroh server error: {e}");
         }
