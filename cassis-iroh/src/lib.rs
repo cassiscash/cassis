@@ -100,7 +100,7 @@ impl IrohClient {
         let data = postcard::to_allocvec(&frame).map_err(|e| IrohError::Protocol(e.to_string()))?;
         eprintln!(
             "iroh client: sending HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
-            hex::encode(instruction.payment_hash),
+            lowercase_hex::encode(instruction.payment_hash),
             instruction.amount_msat,
             instruction.incoming_network.0,
             instruction.outgoing_network.0,
@@ -128,7 +128,7 @@ impl IrohClient {
             Frame::HopAck(ack) => {
                 eprintln!(
                     "iroh client: received HopAck(payment_hash={}, accepted={}, signature={:?})",
-                    hex::encode(ack.payment_hash),
+                    lowercase_hex::encode(ack.payment_hash),
                     ack.accepted,
                     ack.signature,
                 );
@@ -267,7 +267,7 @@ async fn handle_conn(
         Frame::HopInstruction(inst) => {
             eprintln!(
                 "iroh server: received HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
-                hex::encode(inst.payment_hash),
+                lowercase_hex::encode(inst.payment_hash),
                 inst.amount_msat,
                 inst.incoming_network.0,
                 inst.outgoing_network.0,
@@ -277,7 +277,7 @@ async fn handle_conn(
                 Ok(ack) => {
                     eprintln!(
                         "iroh server: handler returned HopAck(payment_hash={}, accepted=true)",
-                        hex::encode(ack.payment_hash),
+                        lowercase_hex::encode(ack.payment_hash),
                     );
                     Frame::HopAck(ack)
                 }

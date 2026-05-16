@@ -60,6 +60,7 @@ pub struct Invoice {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopInstruction {
+    #[serde(with = "lowercase_hex_serde")]
     pub payment_hash: [u8; 32],
     pub amount_msat: u64,
     pub incoming_network: NetworkId,
@@ -71,6 +72,7 @@ pub struct HopInstruction {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopAck {
+    #[serde(with = "lowercase_hex_serde")]
     pub payment_hash: [u8; 32],
     pub accepted: bool,
     pub signature: Option<String>,
@@ -78,12 +80,14 @@ pub struct HopAck {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopReject {
+    #[serde(with = "lowercase_hex_serde")]
     pub payment_hash: [u8; 32],
     pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IncomingHtlc {
+    #[serde(with = "lowercase_hex_serde")]
     pub payment_hash: [u8; 32],
     pub amount_msat: u64,
     pub expiry: u64,
@@ -93,6 +97,7 @@ pub struct IncomingHtlc {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutgoingHtlc {
+    #[serde(with = "lowercase_hex_serde")]
     pub payment_hash: [u8; 32],
     pub amount_msat: u64,
     pub expiry: u64,
