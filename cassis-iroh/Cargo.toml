@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cassis-core = { path = "../cassis-core" }
+log = "0.4"
 lowercase-hex = "0.1"
 iroh = "0.35"
 postcard = { version = "1.0", features = ["alloc"] }

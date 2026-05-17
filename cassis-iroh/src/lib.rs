@@ -1,6 +1,7 @@
 use cassis_core::{HopAck, HopInstruction, RouteAnnouncement};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, SecretKey};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -56,14 +57,14 @@ impl IrohClient {
     /// the TLS authentication mode matches the server's and QUIC handshakes
     /// over the relay don't time out.
     pub async fn bind() -> Result<Self, IrohError> {
-        eprintln!("iroh client: binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
+        info!(target: "iroh_client", "binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
         let endpoint = Endpoint::builder()
             .alpns(vec![ALPN_PROTOCOL.to_vec()])
             .tls_x509()
             .bind()
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
-        eprintln!("iroh client: bound peer_id={}", endpoint.node_id());
+        info!(target: "iroh_client", "bound peer_id={}", endpoint.node_id());
         Ok(Self::new(endpoint))
     }
 
@@ -72,8 +73,9 @@ impl IrohClient {
         addr: NodeAddr,
         instruction: HopInstruction,
     ) -> Result<HopAck, IrohError> {
-        eprintln!(
-            "iroh client: connecting to {} (relay={:?}, direct_addrs={})...",
+        info!(
+            target: "iroh_client",
+            "connecting to {} (relay={:?}, direct_addrs={})...",
             addr.node_id,
             addr.relay_url(),
             addr.direct_addresses().count()
@@ -81,25 +83,26 @@ impl IrohClient {
         let conn = match self.endpoint.connect(addr, ALPN_PROTOCOL).await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("iroh client: connect error chain:");
+                error!(target: "iroh_client", "connect error:");
                 for cause in e.chain() {
-                    eprintln!("  caused by: {cause}");
+                    error!(target: "iroh_client", "  caused by: {cause}");
                 }
                 return Err(IrohError::Io(format!("{e:#}")));
             }
         };
-        eprintln!("iroh client: connected, opening bi stream...");
+        debug!(target: "iroh_client", "connected, opening bi stream...");
 
         let (mut writer, mut reader) = conn
             .open_bi()
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
-        eprintln!("iroh client: stream opened, writing frame...");
+        debug!(target: "iroh_client", "stream opened, writing frame...");
 
         let frame = Frame::HopInstruction(instruction.clone());
         let data = postcard::to_allocvec(&frame).map_err(|e| IrohError::Protocol(e.to_string()))?;
-        eprintln!(
-            "iroh client: sending HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
+        debug!(
+            target: "iroh_client",
+            "sending HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
             lowercase_hex::encode(instruction.payment_hash),
             instruction.amount_msat,
             instruction.incoming_network.0,
@@ -111,23 +114,24 @@ impl IrohClient {
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
         let _ = writer.finish();
-        eprintln!("iroh client: wrote {} byte(s), awaiting response...", data.len());
+        debug!(target: "iroh_client", "wrote {} byte(s), awaiting response...", data.len());
 
         let buf = match reader.read_to_end(1024 * 1024).await {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("iroh client: read_to_end error: {e:?}");
+                error!(target: "iroh_client", "read_to_end error: {e:?}");
                 return Err(IrohError::Io(format!("read error: {e:?}")));
             }
         };
-        eprintln!("iroh client: got {} byte(s) of response", buf.len());
+        debug!(target: "iroh_client", "got {} byte(s) of response", buf.len());
 
         let frame: Frame =
             postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
         match frame {
             Frame::HopAck(ack) => {
-                eprintln!(
-                    "iroh client: received HopAck(payment_hash={}, accepted={}, signature={:?})",
+                info!(
+                    target: "iroh_client",
+                    "received HopAck(payment_hash={}, accepted={}, signature={:?})",
                     lowercase_hex::encode(ack.payment_hash),
                     ack.accepted,
                     ack.signature,
@@ -146,7 +150,7 @@ pub struct IrohServer {
 
 impl IrohServer {
     pub async fn new(secret_key: SecretKey) -> Result<(Self, SecretKey), IrohError> {
-        eprintln!("iroh server: binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
+        info!(target: "iroh_server", "binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
             .alpns(vec![ALPN_PROTOCOL.to_vec()])
@@ -155,12 +159,11 @@ impl IrohServer {
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
         let key = endpoint.secret_key().clone();
-        eprintln!(
-            "iroh server: bound peer_id={}, waiting for home relay...",
+        info!(
+            target: "iroh_server",
+            "bound peer_id={}, waiting for home relay...",
             endpoint.secret_key().public()
         );
-        // Wait until the endpoint has selected a home relay so that incoming
-        // connections through the relay can actually be delivered.
         let home_relay = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             endpoint.home_relay().initialized(),
@@ -168,16 +171,17 @@ impl IrohServer {
         .await
         {
             Ok(Ok(url)) => {
-                eprintln!("iroh server: home relay established: {url}");
+                info!(target: "iroh_server", "home relay established: {url}");
                 Some(url.to_string())
             }
             Ok(Err(e)) => {
-                eprintln!("iroh server: home_relay watcher error: {e}");
+                warn!(target: "iroh_server", "home_relay watcher error: {e}");
                 None
             }
             Err(_) => {
-                eprintln!(
-                    "iroh server: WARNING timed out waiting 10s for home relay to initialize; \
+                warn!(
+                    target: "iroh_server",
+                    "timed out waiting 10s for home relay to initialize; \
                      incoming relay connections will fail"
                 );
                 None
@@ -202,38 +206,39 @@ impl IrohServer {
                 + Sync,
         >,
     ) -> Result<(), IrohError> {
-        eprintln!("iroh server: entering accept loop");
+        info!(target: "iroh_server", "entering accept loop");
         loop {
-            eprintln!("iroh server: waiting for incoming connection...");
+            debug!(target: "iroh_server", "waiting for incoming connection...");
             let connecting = match self.endpoint.accept().await {
                 Some(c) => c,
                 None => {
-                    eprintln!("iroh server: accept() returned None, endpoint closed");
+                    error!(target: "iroh_server", "accept() returned None, endpoint closed");
                     return Err(IrohError::Closed);
                 }
             };
-            eprintln!("iroh server: got incoming connecting future, awaiting handshake...");
+            debug!(target: "iroh_server", "got incoming connecting future, awaiting handshake...");
             let conn = match connecting.await {
                 Ok(c) => {
-                    eprintln!(
-                        "iroh server: handshake complete from remote={:?}",
+                    info!(
+                        target: "iroh_server",
+                        "handshake complete from remote={:?}",
                         c.remote_node_id().ok()
                     );
                     c
                 }
                 Err(e) => {
-                    eprintln!("iroh server: handshake error: {e}");
+                    warn!(target: "iroh_server", "handshake error: {e}");
                     continue;
                 }
             };
 
             let handler = handler.clone();
             tokio::spawn(async move {
-                eprintln!("iroh server: handling new connection");
+                debug!(target: "iroh_server", "handling new connection");
                 if let Err(e) = handle_conn(conn, handler).await {
-                    eprintln!("iroh handle error: {e}");
+                    error!(target: "iroh_server", "handle error: {e}");
                 } else {
-                    eprintln!("iroh server: connection handled successfully");
+                    info!(target: "iroh_server", "connection handled successfully");
                 }
             });
         }
@@ -248,25 +253,26 @@ async fn handle_conn(
             + Sync,
     >,
 ) -> Result<(), IrohError> {
-    eprintln!("iroh server: accept_bi waiting for stream...");
+    debug!(target: "iroh_server", "accept_bi waiting for stream...");
     let (mut writer, mut reader) = conn
         .accept_bi()
         .await
         .map_err(|e| IrohError::Io(e.to_string()))?;
-    eprintln!("iroh server: stream opened, reading payload...");
+    debug!(target: "iroh_server", "stream opened, reading payload...");
 
     let buf = reader
         .read_to_end(1024 * 1024)
         .await
         .map_err(|e| IrohError::Io(e.to_string()))?;
-    eprintln!("iroh server: read {} byte(s) of payload", buf.len());
+    debug!(target: "iroh_server", "read {} byte(s) of payload", buf.len());
 
     let frame: Frame = postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
-    eprintln!("iroh server: decoded frame, dispatching to handler");
+    debug!(target: "iroh_server", "decoded frame, dispatching to handler");
     let response = match frame {
         Frame::HopInstruction(inst) => {
-            eprintln!(
-                "iroh server: received HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
+            info!(
+                target: "iroh_server",
+                "received HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
                 lowercase_hex::encode(inst.payment_hash),
                 inst.amount_msat,
                 inst.incoming_network.0,
@@ -275,14 +281,15 @@ async fn handle_conn(
             );
             match handler(inst).await {
                 Ok(ack) => {
-                    eprintln!(
-                        "iroh server: handler returned HopAck(payment_hash={}, accepted=true)",
+                    info!(
+                        target: "iroh_server",
+                        "handler returned HopAck(payment_hash={}, accepted=true)",
                         lowercase_hex::encode(ack.payment_hash),
                     );
                     Frame::HopAck(ack)
                 }
                 Err(reason) => {
-                    eprintln!("iroh server: handler rejected: {reason}");
+                    warn!(target: "iroh_server", "handler rejected: {reason}");
                     Frame::HopAck(HopAck {
                         payment_hash: [0u8; 32],
                         accepted: false,
@@ -296,19 +303,19 @@ async fn handle_conn(
 
     let data =
         postcard::to_allocvec(&response).map_err(|e| IrohError::Protocol(e.to_string()))?;
-    eprintln!("iroh server: writing {} byte(s) of response", data.len());
+    debug!(target: "iroh_server", "writing {} byte(s) of response", data.len());
     writer
         .write_all(&data)
         .await
         .map_err(|e| IrohError::Io(e.to_string()))?;
     let _ = writer.finish();
-    eprintln!("iroh server: response written and stream finished, waiting for peer to close...");
+    debug!(target: "iroh_server", "response written and stream finished, waiting for peer to close...");
 
     // Keep the connection open until the peer (client) closes its side.
     // If we drop `conn` now, the client may see `ConnectionLost` instead
     // of a clean stream FIN.
     let close_reason = conn.closed().await;
-    eprintln!("iroh server: connection closed by peer: {close_reason}");
+    debug!(target: "iroh_server", "connection closed by peer: {close_reason}");
 
     Ok(())
 }

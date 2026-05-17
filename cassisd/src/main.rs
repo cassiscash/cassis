@@ -2,6 +2,7 @@ use cassis_core::{HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, 
 use cassis_iroh::IrohServer;
 use cassis_onchain::validate_timelock_delta;
 use clap::Parser;
+use log::{error, info, warn};
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,6 +51,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    cassis_core::logging::init_logging();
+
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install default rustls crypto provider");
@@ -57,8 +60,9 @@ async fn main() {
     let cli = Cli::parse();
 
     if cli.network.len() < 2 {
-        eprintln!(
-            "error: at least two --network flags are required for routing, got {}",
+        error!(
+            target: "cassisd",
+            "at least two --network flags are required for routing, got {}",
             cli.network.len()
         );
         std::process::exit(2);
@@ -70,25 +74,27 @@ async fn main() {
         .map(|spec| network_id_for_spec(spec))
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|err| {
-            eprintln!("error: {err}");
+            error!(target: "cassisd", "{err}");
             std::process::exit(2);
         });
 
     let keys = match seed::derive_keys(&cli.seed, network_ids) {
         Ok(keys) => keys,
         Err(err) => {
-            eprintln!("error: invalid --seed: {err}");
+            error!(target: "cassisd", "invalid --seed: {err}");
             std::process::exit(2);
         }
     };
 
-    eprintln!(
+    info!(
+        target: "cassisd",
         "derived nostr signing key: {} ({})",
         keys.nostr.to_nsec(),
         keys.nostr.pubkey().to_hex()
     );
     for (network_id, sk) in &keys.networks {
-        eprintln!(
+        info!(
+            target: "cassisd",
             "  derived key for {network_id}: pubkey={}",
             sk.pubkey().to_hex()
         );
@@ -101,20 +107,20 @@ async fn main() {
                 adapters.insert(adapter.network_id(), adapter);
             }
             Err(err) => {
-                eprintln!("error: {err}");
+                error!(target: "cassisd", "{err}");
                 std::process::exit(2);
             }
         }
     }
 
     if adapters.len() < 2 {
-        eprintln!("error: at least two distinct networks are required for routing");
+        error!(target: "cassisd", "at least two distinct networks are required for routing");
         std::process::exit(2);
     }
 
-    eprintln!("cassisd routing between {} networks:", adapters.len());
+    info!(target: "cassisd", "routing between {} networks:", adapters.len());
     for id in adapters.keys() {
-        eprintln!("  - {id}");
+        info!(target: "cassisd", "  - {id}");
     }
 
     let relay_urls = if cli.nostr_relay.is_empty() {
@@ -133,7 +139,7 @@ async fn main() {
         .home_relay()
         .map(|s| s.to_string())
         .unwrap_or_else(|| cassis_iroh::DEFAULT_IROH_RELAY.to_string());
-    eprintln!("iroh endpoint: {iroh_peer_id} relay: {iroh_relay}");
+    info!(target: "cassisd", "iroh endpoint: {iroh_peer_id} relay: {iroh_relay}");
 
     tokio::spawn(async move {
         let handler = Arc::new(
@@ -150,7 +156,7 @@ async fn main() {
             },
         );
         if let Err(e) = iroh_server.run(handler).await {
-            eprintln!("iroh server error: {e}");
+            error!(target: "cassisd", "iroh server error: {e}");
         }
     });
 
@@ -164,7 +170,7 @@ async fn main() {
     .await;
 
     tokio::signal::ctrl_c().await.ok();
-    eprintln!("shutting down");
+    info!(target: "cassisd", "shutting down");
 }
 
 /// Compute the [`NetworkId`] for a network spec without building the adapter.
@@ -336,7 +342,8 @@ impl CassisDaemon {
         &self,
         instruction: HopInstruction,
     ) -> Result<HopAck, HopReject> {
-        eprintln!(
+        info!(
+            target: "cassisd",
             "iroh instruction: {} msat {} -> {} via {}",
             instruction.amount_msat,
             instruction.incoming_network,
@@ -433,11 +440,11 @@ async fn watch_instruction(
         .await
     {
         Ok(htlc) => {
-            eprintln!("  incoming HTLC on {}: amount={}", htlc.network, htlc.amount_msat);
+            info!(target: "cassisd", "  incoming HTLC on {}: amount={}", htlc.network, htlc.amount_msat);
             htlc
         }
         Err(_) => {
-            eprintln!("  incoming HTLC failed on {}", instruction.incoming_network);
+            warn!(target: "cassisd", "  incoming HTLC failed on {}", instruction.incoming_network);
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
@@ -469,11 +476,11 @@ async fn watch_instruction(
         .await
     {
         Ok(htlc) => {
-            eprintln!("  outgoing HTLC on {} for {}", htlc.network, htlc.recipient);
+            info!(target: "cassisd", "  outgoing HTLC on {} for {}", htlc.network, htlc.recipient);
             htlc
         }
         Err(_) => {
-            eprintln!("  outgoing HTLC failed on {}", instruction.outgoing_network);
+            warn!(target: "cassisd", "  outgoing HTLC failed on {}", instruction.outgoing_network);
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
@@ -484,15 +491,15 @@ async fn watch_instruction(
         .await
     {
         Ok(preimage) => {
-            eprintln!("  preimage received, claiming incoming");
+            info!(target: "cassisd", "  preimage received, claiming incoming");
             let _ = incoming_adapter.claim_incoming(&incoming, preimage).await;
         }
         Err(WatchError::DeadlineExceeded) => {
-            eprintln!("  deadline exceeded, refunding outgoing");
+            warn!(target: "cassisd", "  deadline exceeded, refunding outgoing");
             let _ = outgoing_adapter.refund_outgoing(&outgoing).await;
         }
         Err(_) => {
-            eprintln!("  error watching preimage, refunding outgoing");
+            error!(target: "cassisd", "  error watching preimage, refunding outgoing");
             let _ = outgoing_adapter.refund_outgoing(&outgoing).await;
         }
     }
@@ -520,7 +527,7 @@ async fn publish_route_announcements(
     iroh_relay: &str,
 ) {
     if relay_urls.is_empty() {
-        eprintln!("no nostr relays configured, skipping route announcement publication");
+        warn!(target: "cassisd", "no nostr relays configured, skipping route announcement publication");
         return;
     }
 
@@ -559,7 +566,8 @@ async fn publish_route_announcements(
         })
         .collect();
 
-    eprintln!(
+    info!(
+        target: "cassisd",
         "publishing {} route announcement event(s) (kind {}) to {} relay(s) for pubkey {}",
         events.len(),
         NOSTR_KIND_ROUTE_ANNOUNCEMENT,
@@ -578,9 +586,9 @@ async fn publish_route_announcements(
                 Some(err) => failed.push(format!("{}: {err}", result.relay_url)),
             }
         }
-        eprintln!("  route {d_tag}: published to {ok} relay(s)",);
+        info!(target: "cassisd", "  route {d_tag}: published to {ok} relay(s)");
         for failure in &failed {
-            eprintln!("    rejected by {failure}");
+            warn!(target: "cassisd", "    rejected by {failure}");
         }
     }
 }

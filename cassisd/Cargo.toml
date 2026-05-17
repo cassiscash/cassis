@@ -8,6 +8,8 @@ cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
 cassis-nostr = { path = "../cassis-nostr" }
 cassis-onchain = { path = "../cassis-onchain" }
+env_logger = "0.11"
+log = "0.4"
 bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "std"] }
 bip39 = { version = "2.2.2" }
 clap = { version = "4", features = ["derive"] }

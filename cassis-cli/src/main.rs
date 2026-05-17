@@ -3,6 +3,7 @@ use cassis_iroh::{node_addr_from_announcement, IrohClient};
 use cassis_onchain::{generate_preimage, hash_preimage};
 use clap::{Parser, Subcommand};
 use futures::future::try_join_all;
+use log::{debug, error, info};
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -70,6 +71,8 @@ enum NodeCommands {
 
 #[tokio::main]
 async fn main() {
+    cassis_core::logging::init_logging();
+
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install default rustls crypto provider");
@@ -100,7 +103,7 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let invoice: Invoice = match serde_json::from_str(&invoice_str) {
         Ok(invoice) => invoice,
         Err(err) => {
-            eprintln!("invalid invoice: {err}");
+            error!(target: "cassis_cli", "invalid invoice: {err}");
             std::process::exit(1);
         }
     };
@@ -110,11 +113,12 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let dest_network = match invoice.networks.first() {
         Some(n) => n.clone(),
         None => {
-            eprintln!("invoice has no network hints");
+            error!(target: "cassis_cli", "invoice has no network hints");
             std::process::exit(1);
         }
     };
-    eprintln!(
+    info!(
+        target: "cassis_cli",
         "routing to network {dest_network} (payee {})",
         invoice.payee,
     );
@@ -128,34 +132,35 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let route = match cassis_client::find_route(&relays, &dest_network, invoice.amount_msat, &sender_network).await {
         Ok(r) => r,
         Err(cassis_client::RouteError::Fetch(err)) => {
-            eprintln!("error fetching announcements: {err}");
+            error!(target: "cassis_cli", "error fetching announcements: {err}");
             std::process::exit(1);
         }
         Err(cassis_client::RouteError::Route(cassis_nostr::RouteError::NoRoute)) => {
-            eprintln!("no route found");
+            error!(target: "cassis_cli", "no route found");
             std::process::exit(1);
         }
         Err(err) => {
-            eprintln!("route error: {err}");
+            error!(target: "cassis_cli", "route error: {err}");
             std::process::exit(1);
         }
     };
 
     if route.is_empty() {
-        eprintln!("empty route");
+        error!(target: "cassis_cli", "empty route");
         std::process::exit(1);
     }
 
-    eprintln!(
+    info!(
+        target: "cassis_cli",
         "paying {} msat via {} hop(s) from {}",
         invoice.amount_msat,
         route.len(),
         sender_network,
     );
 
-    eprintln!("binding iroh endpoint...");
+    info!(target: "cassis_cli", "binding iroh endpoint...");
     let client = IrohClient::bind().await.expect("failed to bind iroh endpoint");
-    eprintln!("iroh endpoint bound");
+    info!(target: "cassis_cli", "iroh endpoint bound");
 
     let deltas = vec![0u64; route.len()];
     let expiries = crate::compute_hop_expiries(invoice.expires_at, &deltas);
@@ -166,7 +171,7 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
         .map(|(idx, hop)| {
             let addr = node_addr_from_announcement(&hop.node)
                 .unwrap_or_else(|e| {
-                    eprintln!("invalid iroh addr for hop {idx}: {e}");
+                    error!(target: "cassis_cli", "invalid iroh addr for hop {idx}: {e}");
                     std::process::exit(1);
                 });
             let instruction = HopInstruction {
@@ -178,7 +183,8 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
                 outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
                 recipient: hop.node.node_pubkey.to_string(),
             };
-            eprintln!(
+            debug!(
+                target: "cassis_cli",
                 "  hop {}: sending instruction to {} (amount={}, incoming={}, outgoing={}, recipient={})",
                 idx + 1,
                 hop.node.node_pubkey,
@@ -191,7 +197,7 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
         })
         .collect();
 
-    eprintln!("sending {} hop instruction(s) in parallel...", instructions.len());
+    info!(target: "cassis_cli", "sending {} hop instruction(s) in parallel...", instructions.len());
     let ack_futures = instructions.into_iter().map(|(addr, instruction)| {
         client.send_instruction(addr, instruction)
     });
@@ -199,22 +205,22 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let acks = match try_join_all(ack_futures).await {
         Ok(acks) => acks,
         Err(err) => {
-            eprintln!("iroh error: {err}");
+            error!(target: "cassis_cli", "iroh error: {err}");
             std::process::exit(1);
         }
     };
-    eprintln!("all {} response(s) received", acks.len());
+    info!(target: "cassis_cli", "all {} response(s) received", acks.len());
 
     for (i, ack) in acks.iter().enumerate() {
         if ack.accepted {
-            eprintln!("hop {} accepted", i + 1);
+            info!(target: "cassis_cli", "hop {} accepted", i + 1);
         } else {
-            eprintln!("hop {} rejected: {:?}", i + 1, ack.signature);
+            error!(target: "cassis_cli", "hop {} rejected: {:?}", i + 1, ack.signature);
             std::process::exit(1);
         }
     }
 
-    eprintln!("all hops prepared");
+    info!(target: "cassis_cli", "all hops prepared");
 }
 
 fn cmd_invoice(
@@ -254,26 +260,26 @@ async fn cmd_route(
         nostr_relays
     };
 
-    eprintln!("fetching route announcements from {} relay(s)...", relays.len());
+    info!(target: "cassis_cli", "fetching route announcements from {} relay(s)...", relays.len());
 
     let route = match cassis_client::find_route(&relays, &dest_network, amount, &sender_network).await {
         Ok(r) => r,
         Err(cassis_client::RouteError::Fetch(err)) => {
-            eprintln!("error fetching announcements: {err}");
+            error!(target: "cassis_cli", "error fetching announcements: {err}");
             std::process::exit(1);
         }
         Err(cassis_client::RouteError::Route(cassis_nostr::RouteError::NoRoute)) => {
-            eprintln!("no route found");
+            error!(target: "cassis_cli", "no route found");
             std::process::exit(1);
         }
         Err(err) => {
-            eprintln!("route error: {err}");
+            error!(target: "cassis_cli", "route error: {err}");
             std::process::exit(1);
         }
     };
 
     if route.is_empty() {
-        eprintln!("empty route");
+        error!(target: "cassis_cli", "empty route");
         std::process::exit(1);
     }
 

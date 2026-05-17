@@ -1,4 +1,5 @@
 use cassis_core::{NetworkId, RouteAnnouncement};
+use log::{debug, info};
 use ritualistic::{Filter, Kind, Network, SubscriptionOptions};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -39,13 +40,14 @@ impl NodeGraph {
     }
 
     pub fn log(&self) {
-        eprintln!("--- graph ({} announcement(s)) ---", self.nodes.len());
+        debug!(target: "nostr", "--- graph ({} announcement(s)) ---", self.nodes.len());
         if self.nodes.is_empty() {
-            eprintln!("  (empty)");
+            debug!(target: "nostr", "  (empty)");
             return;
         }
         for (i, node) in self.nodes.iter().enumerate() {
-            eprintln!(
+            debug!(
+                target: "nostr",
                 "  route #{i}: {} {} -> {} fee={}/{}",
                 node.node_pubkey, node.from, node.to, node.fee_base_msat, node.fee_ppm
             );
@@ -206,7 +208,8 @@ pub fn find_route(
     amount_msat: u64,
     sender_network: &NetworkId,
 ) -> Result<Vec<(RouteAnnouncement, NetworkId, NetworkId)>, RouteError> {
-    eprintln!(
+    info!(
+        target: "nostr",
         "--- find_route: destination_network={destination_network}, amount_msat={amount_msat}, sender_network={sender_network}"
     );
 
@@ -221,7 +224,8 @@ pub fn find_route(
             node_idx,
             incoming: sender_network.clone(),
         };
-        eprintln!(
+        debug!(
+            target: "nostr",
             "  seed: route #{node_idx} ({}) <{sender_network} cost={fee} msat",
             node.node_pubkey
         );
@@ -238,7 +242,8 @@ pub fn find_route(
 
         if let Some(best) = dist.get(&key) {
             if cost > *best {
-                eprintln!(
+                debug!(
+                    target: "nostr",
                     "  step {step}: skip stale entry route #{} ({}) cost={cost} > best={best}",
                     key.node_idx,
                     node.node_pubkey
@@ -247,7 +252,8 @@ pub fn find_route(
             }
         }
 
-        eprintln!(
+        debug!(
+            target: "nostr",
             "  step {step}: visit route #{} ({}) via {} -> {} cost={cost} msat",
             key.node_idx,
             node.node_pubkey,
@@ -256,7 +262,8 @@ pub fn find_route(
         );
 
         if &node.to == destination_network {
-            eprintln!(
+            info!(
+                target: "nostr",
                 "  step {step}: destination network {destination_network} reached at route #{} ({})",
                 key.node_idx,
                 node.node_pubkey,
@@ -267,7 +274,7 @@ pub fn find_route(
 
         let outgoing = &node.to;
 
-        eprintln!("    edge: {} -> {} (from {})", key.incoming, outgoing, node.node_pubkey);
+        debug!(target: "nostr", "    edge: {} -> {} (from {})", key.incoming, outgoing, node.node_pubkey);
         for next_idx in graph.nodes_for_network(outgoing) {
             if next_idx == key.node_idx {
                 continue;
@@ -287,7 +294,8 @@ pub fn find_route(
                 None => true,
             };
             if is_better {
-                eprintln!(
+                debug!(
+                    target: "nostr",
                     "    relax: route #{next_idx} ({}) via {} new_cost={next_cost} msat",
                     next_node.node_pubkey, outgoing
                 );
@@ -298,7 +306,8 @@ pub fn find_route(
                     key: next_key,
                 });
             } else {
-                eprintln!(
+                debug!(
+                    target: "nostr",
                     "    skip: route #{next_idx} ({}) via {} cost={next_cost} not better than {}",
                     next_node.node_pubkey,
                     outgoing,
@@ -322,7 +331,8 @@ pub fn find_route(
             .ok_or_else(|| RouteError::InvalidGraph("node missing".to_string()))?;
         let incoming = current.incoming.clone();
         let outgoing = outgoing_for_current.clone().unwrap_or_else(|| incoming.clone());
-        eprintln!(
+        debug!(
+            target: "nostr",
             "  backtrack hop {hop_idx}: route #{} ({}) in={incoming} out={outgoing}",
             current.node_idx,
             node.node_pubkey
