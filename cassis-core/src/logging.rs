@@ -10,9 +10,18 @@ const CONTEXTS: &[(&str, &str, &str)] = &[
     ("cassis_cli", "\x1b[35m", "cassis-cli"),
 ];
 
+const OUR_TARGETS: &[&str] = &["iroh_server", "iroh_client", "nostr", "cassisd", "cassis_cli"];
+
 pub fn init_logging() {
+    let default_filter = {
+        let mut f = "warn".to_string();
+        for t in OUR_TARGETS {
+            f.push_str(&format!(",{t}=debug"));
+        }
+        f
+    };
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
+        env_logger::Env::default().default_filter_or(&default_filter),
     )
     .format(|buf, record| {
         let target = record.target();
