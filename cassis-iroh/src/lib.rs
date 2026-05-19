@@ -131,10 +131,10 @@ impl IrohClient {
             Frame::HopAck(ack) => {
                 info!(
                     target: "iroh_client",
-                    "received HopAck(payment_hash={}, accepted={}, signature={:?})",
+                    "received HopAck(payment_hash={}, accepted={}, reason={:?})",
                     lowercase_hex::encode(ack.payment_hash),
                     ack.accepted,
-                    ack.signature,
+                    ack.reason,
                 );
                 Ok(ack)
             }
@@ -293,7 +293,7 @@ async fn handle_conn(
                     Frame::HopAck(HopAck {
                         payment_hash: Bytes32([0u8; 32]),
                         accepted: false,
-                        signature: Some(reason),
+                        reason: Some(reason),
                     })
                 }
             }

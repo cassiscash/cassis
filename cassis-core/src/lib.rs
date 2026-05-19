@@ -95,7 +95,7 @@ pub struct HopInstruction {
 pub struct HopAck {
     pub payment_hash: Bytes32,
     pub accepted: bool,
-    pub signature: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

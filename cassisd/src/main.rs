@@ -150,7 +150,7 @@ async fn main() {
                 Box::pin(async move {
                     match daemon.handle_instruction(inst).await {
                         Ok(ack) => Ok(ack),
-                        Err(reject) => Err(format!("{:?}", reject)),
+                        Err(reject) => Err(reject.reason),
                     }
                 })
             },
@@ -366,7 +366,7 @@ impl CassisDaemon {
         Ok(HopAck {
             payment_hash: instruction.payment_hash,
             accepted: true,
-            signature: None,
+            reason: None,
         })
     }
 
