@@ -4,18 +4,39 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-mod lowercase_hex_serde {
-    use serde::{Deserialize, Deserializer, Serializer};
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Bytes32(pub [u8; 32]);
 
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&lowercase_hex::encode(bytes))
+impl fmt::Debug for Bytes32 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", lowercase_hex::encode(self.0))
     }
+}
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
+impl fmt::Display for Bytes32 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", lowercase_hex::encode(self.0))
+    }
+}
+
+impl AsRef<[u8]> for Bytes32 {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl serde::Serialize for Bytes32 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&lowercase_hex::encode(self.0))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Bytes32 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         let mut bytes = [0u8; 32];
         lowercase_hex::decode_to_slice(&s, &mut bytes).map_err(serde::de::Error::custom)?;
-        Ok(bytes)
+        Ok(Bytes32(bytes))
     }
 }
 
@@ -51,8 +72,7 @@ pub struct RouteAnnouncement {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invoice {
-    #[serde(with = "lowercase_hex_serde")]
-    pub payment_hash: [u8; 32],
+    pub payment_hash: Bytes32,
     pub amount_msat: u64,
     pub payee: String,
     pub expires_at: u64,
@@ -62,8 +82,7 @@ pub struct Invoice {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopInstruction {
-    #[serde(with = "lowercase_hex_serde")]
-    pub payment_hash: [u8; 32],
+    pub payment_hash: Bytes32,
     pub amount_msat: u64,
     pub incoming_network: NetworkId,
     pub outgoing_network: NetworkId,
@@ -74,23 +93,20 @@ pub struct HopInstruction {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopAck {
-    #[serde(with = "lowercase_hex_serde")]
-    pub payment_hash: [u8; 32],
+    pub payment_hash: Bytes32,
     pub accepted: bool,
     pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopReject {
-    #[serde(with = "lowercase_hex_serde")]
-    pub payment_hash: [u8; 32],
+    pub payment_hash: Bytes32,
     pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IncomingHtlc {
-    #[serde(with = "lowercase_hex_serde")]
-    pub payment_hash: [u8; 32],
+    pub payment_hash: Bytes32,
     pub amount_msat: u64,
     pub expiry: u64,
     pub sender: String,
@@ -99,8 +115,7 @@ pub struct IncomingHtlc {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutgoingHtlc {
-    #[serde(with = "lowercase_hex_serde")]
-    pub payment_hash: [u8; 32],
+    pub payment_hash: Bytes32,
     pub amount_msat: u64,
     pub expiry: u64,
     pub recipient: String,
@@ -124,7 +139,7 @@ pub enum PaymentStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaymentResult {
     pub status: PaymentStatus,
-    pub preimage: Option<[u8; 32]>,
+    pub preimage: Option<Bytes32>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -153,14 +168,14 @@ pub trait NetworkAdapter: Send + Sync {
 
     async fn watch_incoming_htlc(
         &self,
-        payment_hash: [u8; 32],
+        payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
     ) -> Result<IncomingHtlc, WatchError>;
 
     async fn create_outgoing_htlc(
         &self,
-        payment_hash: [u8; 32],
+        payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
         recipient: &str,
@@ -169,7 +184,7 @@ pub trait NetworkAdapter: Send + Sync {
     async fn claim_incoming(
         &self,
         htlc: &IncomingHtlc,
-        preimage: [u8; 32],
+        preimage: Bytes32,
     ) -> Result<(), HtlcError>;
 
     async fn refund_outgoing(&self, htlc: &OutgoingHtlc) -> Result<(), HtlcError>;
@@ -178,7 +193,7 @@ pub trait NetworkAdapter: Send + Sync {
         &self,
         htlc: &OutgoingHtlc,
         deadline: u64,
-    ) -> Result<[u8; 32], WatchError>;
+    ) -> Result<Bytes32, WatchError>;
 
     fn incoming_delta_secs(&self) -> u64;
 }

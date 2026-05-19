@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use cassis_core::{
-    HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError,
+    Bytes32, HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError,
 };
 
 #[derive(Clone, Debug)]
@@ -22,7 +22,7 @@ impl NetworkAdapter for ArkAdapter {
 
     async fn watch_incoming_htlc(
         &self,
-        _payment_hash: [u8; 32],
+        _payment_hash: Bytes32,
         _min_amount_msat: u64,
         _deadline: u64,
     ) -> Result<IncomingHtlc, WatchError> {
@@ -31,7 +31,7 @@ impl NetworkAdapter for ArkAdapter {
 
     async fn create_outgoing_htlc(
         &self,
-        _payment_hash: [u8; 32],
+        _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
         _recipient: &str,
@@ -42,7 +42,7 @@ impl NetworkAdapter for ArkAdapter {
     async fn claim_incoming(
         &self,
         _htlc: &IncomingHtlc,
-        _preimage: [u8; 32],
+        _preimage: Bytes32,
     ) -> Result<(), HtlcError> {
         Err(HtlcError::Unimplemented)
     }
@@ -55,7 +55,7 @@ impl NetworkAdapter for ArkAdapter {
         &self,
         _htlc: &OutgoingHtlc,
         _deadline: u64,
-    ) -> Result<[u8; 32], WatchError> {
+    ) -> Result<Bytes32, WatchError> {
         Err(WatchError::Unimplemented)
     }
 

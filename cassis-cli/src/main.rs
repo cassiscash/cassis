@@ -1,4 +1,4 @@
-use cassis_core::{HopInstruction, Invoice, NetworkId};
+use cassis_core::{Bytes32, HopInstruction, Invoice, NetworkId};
 use cassis_iroh::{node_addr_from_announcement, IrohClient};
 use cassis_onchain::{generate_preimage, hash_preimage};
 use clap::{Parser, Subcommand};
@@ -233,7 +233,7 @@ fn cmd_invoice(
     let preimage = generate_preimage();
     let payment_hash = hash_preimage(preimage);
     let invoice = Invoice {
-        payment_hash,
+        payment_hash: Bytes32(payment_hash),
         amount_msat: amount,
         payee,
         expires_at: expires_at.unwrap_or(0),

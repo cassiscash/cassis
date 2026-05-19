@@ -13,7 +13,7 @@ use cashu::nuts::{
     CurrencyUnit,
 };
 use cashu::MintUrl;
-use cassis_core::{HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError};
+use cassis_core::{Bytes32, HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -98,7 +98,7 @@ impl NetworkAdapter for CashuAdapter {
 
     async fn create_outgoing_htlc(
         &self,
-        payment_hash: [u8; 32],
+        payment_hash: Bytes32,
         amount_msat: u64,
         _expiry: u64,
         _recipient: &str,
@@ -120,7 +120,7 @@ impl NetworkAdapter for CashuAdapter {
 
     async fn watch_incoming_htlc(
         &self,
-        _payment_hash: [u8; 32],
+        _payment_hash: Bytes32,
         _min_amount_msat: u64,
         _deadline: u64,
     ) -> Result<IncomingHtlc, WatchError> {
@@ -137,7 +137,7 @@ impl NetworkAdapter for CashuAdapter {
     async fn claim_incoming(
         &self,
         _htlc: &IncomingHtlc,
-        _preimage: [u8; 32],
+        _preimage: Bytes32,
     ) -> Result<(), HtlcError> {
         Err(HtlcError::Unimplemented)
     }
@@ -150,7 +150,7 @@ impl NetworkAdapter for CashuAdapter {
         &self,
         _htlc: &OutgoingHtlc,
         _deadline: u64,
-    ) -> Result<[u8; 32], WatchError> {
+    ) -> Result<Bytes32, WatchError> {
         Err(WatchError::Unimplemented)
     }
 

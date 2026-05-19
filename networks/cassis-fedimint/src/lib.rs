@@ -79,7 +79,7 @@ use tracing::{debug, warn};
 
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
 
-use cassis_core::{HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError};
+use cassis_core::{Bytes32, HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError};
 
 /// Default per-operation invoice expiry in seconds (~1 hour) so callers
 /// have enough room to construct the cross-network swap before the
@@ -115,8 +115,8 @@ pub struct FedimintAdapter {
     /// invariant), so we keep both maps. The LNv2 operation
     /// identifier is what we poll to observe the contract's
     /// terminal state.
-    incoming_ops: Mutex<HashMap<[u8; 32], IncomingOp>>,
-    outgoing_ops: Mutex<HashMap<[u8; 32], OutgoingOp>>,
+    incoming_ops: Mutex<HashMap<Bytes32, IncomingOp>>,
+    outgoing_ops: Mutex<HashMap<Bytes32, OutgoingOp>>,
 }
 
 #[derive(Clone)]
@@ -306,7 +306,7 @@ impl NetworkAdapter for FedimintAdapter {
     /// `create_outgoing_htlc` downstream).
     async fn watch_incoming_htlc(
         &self,
-        _payment_hash: [u8; 32],
+        _payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
     ) -> Result<IncomingHtlc, WatchError> {
@@ -330,7 +330,7 @@ impl NetworkAdapter for FedimintAdapter {
         .map_err(|_| WatchError::DeadlineExceeded)?
         .map_err(|e| WatchError::Network(format!("receive failed: {e:?}")))?;
 
-        let payment_hash: [u8; 32] = invoice.payment_hash().to_byte_array();
+        let payment_hash = Bytes32(invoice.payment_hash().to_byte_array());
         let invoice_str = invoice.to_string();
 
         let incoming = IncomingHtlc {
@@ -365,7 +365,7 @@ impl NetworkAdapter for FedimintAdapter {
     /// `amount_msat` is validated against the invoice's amount.
     async fn create_outgoing_htlc(
         &self,
-        _payment_hash: [u8; 32],
+        _payment_hash: Bytes32,
         amount_msat: u64,
         _expiry: u64,
         recipient: &str,
@@ -382,7 +382,7 @@ impl NetworkAdapter for FedimintAdapter {
                 "invoice amount {invoice_amount_msat} msat does not match requested {amount_msat}"
             )));
         }
-        let invoice_payment_hash: [u8; 32] = invoice.payment_hash().to_byte_array();
+        let invoice_payment_hash = Bytes32(invoice.payment_hash().to_byte_array());
 
         let ln = Self::ln_module(&self.client)
             .map_err(|e| HtlcError::Network(format!("LNv2 module not available: {e}")))?;
@@ -427,7 +427,7 @@ impl NetworkAdapter for FedimintAdapter {
     async fn claim_incoming(
         &self,
         htlc: &IncomingHtlc,
-        preimage: [u8; 32],
+        preimage: Bytes32,
     ) -> Result<(), HtlcError> {
         let ln = Self::ln_module(&self.client)
             .map_err(|e| HtlcError::Network(format!("LNv2 module not available: {e}")))?;
@@ -446,7 +446,7 @@ impl NetworkAdapter for FedimintAdapter {
         // Sanity-check the supplied preimage against the payment hash
         // (the public LN module doesn't reveal the raw preimage it
         // generated, so we validate via SHA256 instead).
-        let computed: [u8; 32] = sha256::Hash::hash(&preimage).to_byte_array();
+        let computed = Bytes32(sha256::Hash::hash(&preimage.0).to_byte_array());
         if computed != htlc.payment_hash {
             warn!(
                 expected = ?htlc.payment_hash,
@@ -545,7 +545,7 @@ impl NetworkAdapter for FedimintAdapter {
         &self,
         htlc: &OutgoingHtlc,
         deadline: u64,
-    ) -> Result<[u8; 32], WatchError> {
+    ) -> Result<Bytes32, WatchError> {
         let ln = Self::ln_module(&self.client)
             .map_err(|e| WatchError::Network(format!("LNv2 module not available: {e}")))?;
         let op_id = {
@@ -570,7 +570,7 @@ impl NetworkAdapter for FedimintAdapter {
             let mut s = stream;
             while let Some(state) = s.next().await {
                 match state {
-                    SendOperationState::Success(p) => return Ok(p),
+                    SendOperationState::Success(p) => return Ok(Bytes32(p)),
                     SendOperationState::Refunded => {
                         return Err(WatchError::Network(
                             "outgoing HTLC refunded (counter-party forfeited or expired)".into(),

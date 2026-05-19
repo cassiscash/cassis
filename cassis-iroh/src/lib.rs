@@ -1,4 +1,4 @@
-use cassis_core::{HopAck, HopInstruction, RouteAnnouncement};
+use cassis_core::{Bytes32, HopAck, HopInstruction, RouteAnnouncement};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, SecretKey};
 use log::{debug, error, info, warn};
@@ -291,7 +291,7 @@ async fn handle_conn(
                 Err(reason) => {
                     warn!(target: "iroh_server", "handler rejected: {reason}");
                     Frame::HopAck(HopAck {
-                        payment_hash: [0u8; 32],
+                        payment_hash: Bytes32([0u8; 32]),
                         accepted: false,
                         signature: Some(reason),
                     })

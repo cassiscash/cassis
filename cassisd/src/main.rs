@@ -1,4 +1,4 @@
-use cassis_core::{HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, WatchError};
+use cassis_core::{Bytes32, HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, WatchError};
 use cassis_iroh::IrohServer;
 use cassis_onchain::validate_timelock_delta;
 use clap::Parser;
@@ -19,7 +19,7 @@ const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://nostr.mom",
 ];
 
-type PendingMap = Arc<Mutex<HashMap<[u8; 32], HopInstruction>>>;
+type PendingMap = Arc<Mutex<HashMap<Bytes32, HopInstruction>>>;
 
 #[derive(Parser)]
 #[command(name = "cassisd")]
@@ -371,7 +371,7 @@ impl CassisDaemon {
     }
 
     fn validate_instruction(&self, instruction: &HopInstruction) -> Result<(), HopReject> {
-        if instruction.payment_hash.iter().all(|byte| *byte == 0) {
+        if instruction.payment_hash.0.iter().all(|byte| *byte == 0) {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
                 reason: "zero payment hash".to_string(),
@@ -507,7 +507,7 @@ async fn watch_instruction(
     remove_pending(&pending, instruction.payment_hash).await;
 }
 
-async fn remove_pending(pending: &PendingMap, payment_hash: [u8; 32]) {
+async fn remove_pending(pending: &PendingMap, payment_hash: Bytes32) {
     let mut pending = pending.lock().await;
     pending.remove(&payment_hash);
 }
