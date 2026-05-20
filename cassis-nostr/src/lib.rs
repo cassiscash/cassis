@@ -4,6 +4,15 @@ use ritualistic::{Filter, Kind, Network, SubscriptionOptions};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::time::Duration;
+
+mod delta_table;
+
+pub use delta_table::fallback_incoming_delta;
+
+/// Maximum time we wait for Nostr relays to respond in
+/// [`fetch_announcements`] before giving up.
+const FETCH_ANNOUNCEMENTS_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeGraph {
@@ -61,6 +70,8 @@ pub enum NostrError {
     Network(String),
     #[error("invalid event: {0}")]
     InvalidEvent(String),
+    #[error("relay query timed out")]
+    Timeout,
     #[error("unimplemented")]
     Unimplemented,
 }
@@ -109,11 +120,23 @@ const D_TAG_SEPARATOR: &str = "->";
 
 /// Fetch route-announcement events (kind 35515) from the given Nostr relays
 /// and build [`RouteAnnouncement`] structs from the directed route `d` tags
-/// and fee/relay tags.
+/// and fee/relay tags. Bounded by [`FETCH_ANNOUNCEMENTS_TIMEOUT`].
 ///
 /// Each event's `d` tag has the form `<network_from>-><network_to>`.
-/// Additional tags: `fee_base_msat`, `fee_ppm`, `relay`, `expires_at`.
+/// Additional tags: `fee_base_msat`, `fee_ppm`, `relay`,
+/// `incoming_delta_secs` (per-hop CLTV budget in seconds; 0/absent
+/// means callers should fall back to a per-network default).
 pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncement>, NostrError> {
+    fetch_announcements_with_timeout(relays, FETCH_ANNOUNCEMENTS_TIMEOUT).await
+}
+
+/// Fetch route-announcement events with an explicit timeout. Exposed
+/// so callers (and tests) can bound the relay query without depending
+/// on the global constant.
+pub async fn fetch_announcements_with_timeout(
+    relays: &[String],
+    timeout: Duration,
+) -> Result<Vec<RouteAnnouncement>, NostrError> {
     if relays.is_empty() {
         return Err(NostrError::Network("no relays provided".into()));
     }
@@ -125,9 +148,15 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
     };
 
     let pool = Network::new();
-    let events = pool
-        .query(relays, filter, SubscriptionOptions::default())
-        .await;
+    let events = match tokio::time::timeout(
+        timeout,
+        pool.query(relays, filter, SubscriptionOptions::default()),
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(_) => return Err(NostrError::Timeout),
+    };
 
     let mut announcements = Vec::new();
 
@@ -138,7 +167,7 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
         let mut iroh_relay: Option<String> = None;
         let mut fee_base_msat: u64 = 0;
         let mut fee_ppm: u64 = 0;
-        let mut expires_at: u64 = 0;
+        let mut incoming_delta_secs: u64 = 0;
         let mut relays: Vec<String> = Vec::new();
 
         for tag in event.tags.iter() {
@@ -164,8 +193,8 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
                 "fee_ppm" => {
                     fee_ppm = tag[1].parse().unwrap_or(0);
                 }
-                "expires_at" => {
-                    expires_at = tag[1].parse().unwrap_or(0);
+                "incoming_delta_secs" => {
+                    incoming_delta_secs = tag[1].parse().unwrap_or(0);
                 }
                 "relay" => {
                     relays.push(tag[1].clone());
@@ -183,7 +212,7 @@ pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncem
                 to: NetworkId(to),
                 fee_base_msat,
                 fee_ppm,
-                expires_at,
+                incoming_delta_secs,
                 relays,
             });
         }
@@ -356,17 +385,11 @@ pub fn find_route(
     Ok(hops_rev)
 }
 
-pub fn compute_hop_expiries(final_expiry: u64, deltas: &[u64]) -> Vec<u64> {
-    let mut expiries = Vec::with_capacity(deltas.len() + 1);
-    let mut current = final_expiry;
-    expiries.push(current);
-    for delta in deltas.iter().rev() {
-        current = current.saturating_add(*delta);
-        expiries.push(current);
-    }
-    expiries.reverse();
-    expiries
-}
+/// Re-exported from `cassis-onchain` so existing callers that import
+/// `cassis_nostr::compute_hop_expiries` keep working. The cascade grows
+/// toward the sender: `expiries[0]` is the first hop's outgoing expiry
+/// (most generous), `expiries[N]` is the recipient's CLTV (`final_expiry`).
+pub use cassis_onchain::compute_timelock_cascade as compute_hop_expiries;
 
 fn node_fee_msat(node: &RouteAnnouncement, amount_msat: u64) -> u64 {
     let fee_ppm = (node.fee_ppm as u128)
@@ -422,7 +445,7 @@ mod tests {
             to: NetworkId(to.to_string()),
             fee_base_msat: 0,
             fee_ppm: 0,
-            expires_at: 0,
+            incoming_delta_secs: 0,
             relays: Vec::new(),
         }
     }
@@ -484,5 +507,107 @@ mod tests {
         assert!(route.is_ok(), "A->B->C forward route");
         let route = find_route(&graph, &NetworkId("A".into()), 1000, &NetworkId("C".into()));
         assert!(route.is_ok(), "C->B->A reverse route");
+    }
+
+    // ---- compute_hop_expiries (cascading timelock) tests ----
+
+    #[test]
+    fn compute_hop_expiries_empty_deltas() {
+        // No hops means just the recipient's CLTV; the result has length 1.
+        let expiries = compute_hop_expiries(1000, &[]);
+        assert_eq!(expiries, vec![1000]);
+    }
+
+    #[test]
+    fn compute_hop_expiries_zero_deltas() {
+        // With all deltas zero, every entry equals `final_expiry`. The
+        // function returns N+1 entries for N hops so callers can index
+        // `idx` (incoming_deadline) and `idx+1` (outgoing_expiry).
+        let expiries = compute_hop_expiries(1000, &[0, 0, 0]);
+        assert_eq!(expiries, vec![1000, 1000, 1000, 1000]);
+    }
+
+    #[test]
+    fn compute_hop_expiries_cascade() {
+        // deltas[i] is hop i's required buffer between receiving and
+        // forwarding. The cascade grows toward the sender, so the first
+        // hop's outgoing expiry is the most generous, and the last
+        // entry is exactly `final_expiry`.
+        let expiries = compute_hop_expiries(1000, &[10, 20, 30]);
+        // expiries[3] = 1000 (recipient)
+        // expiries[2] = 1000 + 30 = 1030
+        // expiries[1] = 1030 + 20 = 1050
+        // expiries[0] = 1050 + 10 = 1060
+        assert_eq!(expiries, vec![1060, 1050, 1030, 1000]);
+    }
+
+    #[test]
+    fn compute_hop_expiries_saturates_on_overflow() {
+        // Adding u64::MAX should saturate rather than panic.
+        let expiries = compute_hop_expiries(1000, &[u64::MAX, u64::MAX, u64::MAX]);
+        assert_eq!(expiries.len(), 4);
+        // Monotonically non-increasing from sender to recipient.
+        assert!(expiries[0] >= expiries[1]);
+        assert!(expiries[1] >= expiries[2]);
+        assert!(expiries[2] >= expiries[3]);
+        assert_eq!(expiries[3], 1000);
+    }
+
+    // ---- fallback table tests ----
+
+    #[test]
+    fn fallback_known_networks() {
+        assert_eq!(fallback_incoming_delta(&NetworkId("ark".into())), 10);
+        assert_eq!(fallback_incoming_delta(&NetworkId("fedimint".into())), 30);
+        assert_eq!(fallback_incoming_delta(&NetworkId("cashu".into())), 30);
+        assert_eq!(fallback_incoming_delta(&NetworkId("liquid".into())), 300);
+        assert_eq!(fallback_incoming_delta(&NetworkId("rootstock".into())), 600);
+    }
+
+    #[test]
+    fn fallback_unknown_network_returns_default() {
+        assert_eq!(fallback_incoming_delta(&NetworkId("mystery".into())), 30);
+        assert_eq!(fallback_incoming_delta(&NetworkId("".into())), 30);
+    }
+
+    // ---- announcement schema tests ----
+
+    #[test]
+    fn route_announcement_carries_incoming_delta_secs() {
+        // Constructing a RouteAnnouncement with the new field set and
+        // round-tripping it through `build_graph` must preserve the
+        // value (no serializer surprises, no NodeGraph::new clobber).
+        let mut r = route(key_x(), "A", "B");
+        r.incoming_delta_secs = 42;
+        let graph = build_graph(vec![r.clone()]);
+        assert_eq!(graph.nodes[0].incoming_delta_secs, 42);
+    }
+
+    // ---- relay-fetch timeout test ----
+
+    #[tokio::test]
+    #[ignore = "network-dependent; run with `cargo test -- --ignored`"]
+    async fn fetch_announcements_is_bounded_by_timeout() {
+        // Use an unroutable RFC 1918 address (10.255.255.1) so the
+        // underlying connect would otherwise hang until the OS gives
+        // up (tens of seconds). The wrap should bound the call to
+        // roughly the requested timeout. We accept either Timeout or
+        // an Ok(empty) because some relay pools treat immediate
+        // connect-failure as "no events" and return within the
+        // timer; what we *don't* accept is hanging for the OS TCP
+        // timeout.
+        let relays = vec!["wss://10.255.255.1:443".to_string()];
+        let timeout = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let result = fetch_announcements_with_timeout(&relays, timeout).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "fetch should be bounded by the wrap, took {elapsed:?}"
+        );
+        assert!(
+            matches!(result, Ok(_) | Err(NostrError::Timeout) | Err(NostrError::Network(_))),
+            "unexpected variant: {result:?}"
+        );
     }
 }

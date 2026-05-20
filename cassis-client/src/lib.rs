@@ -3,7 +3,10 @@ use cassis_core::{
     RouteHop, WatchError,
 };
 use cassis_iroh::{node_addr_from_announcement, IrohClient};
-use cassis_nostr::{build_graph, compute_hop_expiries, fetch_announcements, find_route as find_route_in_graph};
+use cassis_nostr::{
+    build_graph, compute_hop_expiries, fallback_incoming_delta, fetch_announcements,
+    find_route as find_route_in_graph,
+};
 use futures::future::try_join_all;
 use iroh::Endpoint;
 use std::collections::HashMap;
@@ -108,7 +111,21 @@ impl CassisClient {
             return Err(PayError::Route("empty route".to_string()));
         }
 
-        let deltas = vec![0u64; route.len()];
+        // Per-hop CLTV delta: prefer the value the operator published on
+        // the announcement; fall back to a per-network default. This
+        // makes `compute_hop_expiries` produce a real cascade (the
+        // sender's `incoming_deadline` is the most generous) instead of
+        // a degenerate all-zero one.
+        let deltas: Vec<u64> = route
+            .iter()
+            .map(|hop| {
+                if hop.node.incoming_delta_secs > 0 {
+                    hop.node.incoming_delta_secs
+                } else {
+                    fallback_incoming_delta(&hop.incoming)
+                }
+            })
+            .collect();
         let expiries = compute_hop_expiries(invoice.expires_at, &deltas);
 
         let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route

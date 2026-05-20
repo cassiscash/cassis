@@ -66,7 +66,12 @@ pub struct RouteAnnouncement {
     pub to: NetworkId,
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
-    pub expires_at: u64,
+    /// Per-hop timelock budget (seconds): the time this hop needs
+    /// between receiving the incoming HTLC and forwarding the outgoing
+    /// one. Mirrors the `incoming_delta_secs` kind-35515 tag.
+    /// `0` means the operator did not publish a value; callers fall
+    /// back to a per-network default.
+    pub incoming_delta_secs: u64,
     pub relays: Vec<String>,
 }
 

@@ -162,8 +162,17 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let client = IrohClient::bind().await.expect("failed to bind iroh endpoint");
     info!(target: "cassis_cli", "iroh endpoint bound");
 
-    let deltas = vec![0u64; route.len()];
-    let expiries = crate::compute_hop_expiries(invoice.expires_at, &deltas);
+    let deltas: Vec<u64> = route
+        .iter()
+        .map(|hop| {
+            if hop.node.incoming_delta_secs > 0 {
+                hop.node.incoming_delta_secs
+            } else {
+                cassis_nostr::fallback_incoming_delta(&hop.incoming)
+            }
+        })
+        .collect();
+    let expiries = cassis_nostr::compute_hop_expiries(invoice.expires_at, &deltas);
 
     let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
         .iter()
@@ -215,7 +224,7 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
         if ack.accepted {
             info!(target: "cassis_cli", "hop {} accepted", i + 1);
         } else {
-            error!(target: "cassis_cli", "hop {} rejected: {:?}", i + 1, ack.signature);
+            error!(target: "cassis_cli", "hop {} rejected: {:?}", i + 1, ack.reason);
             std::process::exit(1);
         }
     }
@@ -293,18 +302,6 @@ async fn cmd_route(
             hop.outgoing.0,
         );
     }
-}
-
-fn compute_hop_expiries(final_expiry: u64, deltas: &[u64]) -> Vec<u64> {
-    let mut expiries = Vec::with_capacity(deltas.len() + 1);
-    let mut current = final_expiry;
-    expiries.push(current);
-    for delta in deltas.iter().rev() {
-        current = current.saturating_add(*delta);
-        expiries.push(current);
-    }
-    expiries.reverse();
-    expiries
 }
 
 fn cmd_node_info() {

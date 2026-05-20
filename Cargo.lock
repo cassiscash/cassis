@@ -891,6 +891,7 @@ name = "cassis-nostr"
 version = "0.1.0"
 dependencies = [
  "cassis-core",
+ "cassis-onchain",
  "log",
  "ritualistic",
  "serde",
