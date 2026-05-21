@@ -374,14 +374,19 @@ impl CassisDaemon {
         if instruction.payment_hash.0.iter().all(|byte| *byte == 0) {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
-                reason: "zero payment hash".to_string(),
+                reason: format!(
+                    "zero payment hash, accepted: non-zero hash",
+                ),
             });
         }
 
         if instruction.amount_msat == 0 {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
-                reason: "amount must be positive".to_string(),
+                reason: format!(
+                    "amount must be positive, accepted: > 0, actual: {}",
+                    instruction.amount_msat
+                ),
             });
         }
 
@@ -390,20 +395,32 @@ impl CassisDaemon {
             .get(&instruction.incoming_network)
             .ok_or_else(|| HopReject {
                 payment_hash: instruction.payment_hash,
-                reason: "incoming network unsupported".to_string(),
+                reason: format!(
+                    "incoming network unsupported, accepted: {:?}, actual: {}",
+                    self.adapters.keys().collect::<Vec<_>>(),
+                    instruction.incoming_network
+                ),
             })?;
         if !self.adapters.contains_key(&instruction.outgoing_network) {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
-                reason: "outgoing network unsupported".to_string(),
+                reason: format!(
+                    "outgoing network unsupported, accepted: {:?}, actual: {}",
+                    self.adapters.keys().collect::<Vec<_>>(),
+                    instruction.outgoing_network
+                ),
             });
         }
 
         let now = unix_now();
-        if instruction.incoming_deadline < now.saturating_add(incoming.incoming_delta_secs()) {
+        let min_deadline = now.saturating_add(incoming.incoming_delta_secs());
+        if instruction.incoming_deadline < min_deadline {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
-                reason: "incoming deadline too soon".to_string(),
+                reason: format!(
+                    "incoming deadline too soon, accepted: >= {}, actual: {}",
+                    min_deadline, instruction.incoming_deadline
+                ),
             });
         }
 
