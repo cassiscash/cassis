@@ -1,11 +1,10 @@
 [package]
-name = "cassis-nostr"
+name = "cassis-routing"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 cassis-core = { path = "../cassis-core" }
-cassis-onchain = { path = "../cassis-onchain" }
 log = "0.4"
 ritualistic = "0.1.1"
 serde = { version = "1.0", features = ["derive"] }

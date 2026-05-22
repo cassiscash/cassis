@@ -1,6 +1,5 @@
 use cassis_core::{Bytes32, HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, WatchError};
 use cassis_iroh::IrohServer;
-use cassis_onchain::validate_timelock_delta;
 use clap::Parser;
 use log::{error, info, warn};
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
@@ -144,13 +143,13 @@ async fn main() {
     tokio::spawn(async move {
         let handler = Arc::new(
             move |inst: HopInstruction| -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<HopAck, String>> + Send>,
+                Box<dyn std::future::Future<Output = Result<HopAck, HopReject>> + Send>,
             > {
                 let daemon = handler_daemon.clone();
                 Box::pin(async move {
                     match daemon.handle_instruction(inst).await {
                         Ok(ack) => Ok(ack),
-                        Err(reject) => Err(reject.reason),
+                        Err(reject) => Err(reject),
                     }
                 })
             },
@@ -527,6 +526,24 @@ async fn watch_instruction(
 async fn remove_pending(pending: &PendingMap, payment_hash: Bytes32) {
     let mut pending = pending.lock().await;
     pending.remove(&payment_hash);
+}
+
+#[derive(thiserror::Error, Debug)]
+enum TimelockError {
+    #[error("insufficient delta")]
+    InsufficientDelta,
+}
+
+fn validate_timelock_delta(
+    incoming_expiry: u64,
+    outgoing_expiry: u64,
+    delta_secs: u64,
+) -> Result<(), TimelockError> {
+    if incoming_expiry >= outgoing_expiry.saturating_add(delta_secs) {
+        Ok(())
+    } else {
+        Err(TimelockError::InsufficientDelta)
+    }
 }
 
 fn unix_now() -> u64 {

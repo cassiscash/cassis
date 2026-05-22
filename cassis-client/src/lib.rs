@@ -3,7 +3,7 @@ use cassis_core::{
     RouteHop, WatchError,
 };
 use cassis_iroh::{node_addr_from_announcement, IrohClient};
-use cassis_nostr::{
+use cassis_routing::{
     build_graph, compute_hop_expiries, fallback_incoming_delta, fetch_announcements,
     find_route as find_route_in_graph,
 };
@@ -31,7 +31,7 @@ impl From<cassis_iroh::IrohError> for PayError {
 #[derive(thiserror::Error, Debug)]
 pub enum RouteError {
     #[error("route error: {0}")]
-    Route(cassis_nostr::RouteError),
+    Route(cassis_routing::RouteError),
     #[error("nostr fetch error: {0}")]
     Fetch(String),
     #[error("unimplemented")]
@@ -112,10 +112,14 @@ impl CassisClient {
         }
 
         // Per-hop CLTV delta: prefer the value the operator published on
-        // the announcement; fall back to a per-network default. This
-        // makes `compute_hop_expiries` produce a real cascade (the
-        // sender's `incoming_deadline` is the most generous) instead of
-        // a degenerate all-zero one.
+        // the announcement; fall back to a per-network default. The
+        // cascade grows off `now` per hop, independent of the invoice's
+        // `expires_at`, so the sender's incoming_deadline is `now` plus
+        // the sum of all deltas.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let deltas: Vec<u64> = route
             .iter()
             .map(|hop| {
@@ -126,7 +130,7 @@ impl CassisClient {
                 }
             })
             .collect();
-        let expiries = compute_hop_expiries(invoice.expires_at, &deltas);
+        let expiries = compute_hop_expiries(now, &deltas);
 
         let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
             .iter()
@@ -139,8 +143,8 @@ impl CassisClient {
                     amount_msat: invoice.amount_msat,
                     incoming_network: hop.incoming.clone(),
                     outgoing_network: hop.outgoing.clone(),
-                    incoming_deadline: expiries.get(idx).copied().unwrap_or(invoice.expires_at),
-                    outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
+                    incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
+                    outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
                     recipient: hop.node.node_pubkey.to_string(),
                 };
                 Ok((addr, instruction))
@@ -168,7 +172,7 @@ impl CassisClient {
             .create_outgoing_htlc(
                 invoice.payment_hash,
                 invoice.amount_msat,
-                expiries.get(1).copied().unwrap_or(invoice.expires_at),
+                expiries.get(1).copied().unwrap_or(now),
                 &first_hop.node.node_pubkey.to_string(),
             )
             .await

@@ -1,9 +1,10 @@
 use cassis_core::{Bytes32, HopInstruction, Invoice, NetworkId};
 use cassis_iroh::{node_addr_from_announcement, IrohClient};
-use cassis_onchain::{generate_preimage, hash_preimage};
 use clap::{Parser, Subcommand};
 use futures::future::try_join_all;
 use log::{debug, error, info};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -135,7 +136,7 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
             error!(target: "cassis_cli", "error fetching announcements: {err}");
             std::process::exit(1);
         }
-        Err(cassis_client::RouteError::Route(cassis_nostr::RouteError::NoRoute)) => {
+        Err(cassis_client::RouteError::Route(cassis_routing::RouteError::NoRoute)) => {
             error!(target: "cassis_cli", "no route found");
             std::process::exit(1);
         }
@@ -168,11 +169,15 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
             if hop.node.incoming_delta_secs > 0 {
                 hop.node.incoming_delta_secs
             } else {
-                cassis_nostr::fallback_incoming_delta(&hop.incoming)
+                cassis_routing::fallback_incoming_delta(&hop.incoming)
             }
         })
         .collect();
-    let expiries = cassis_nostr::compute_hop_expiries(invoice.expires_at, &deltas);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expiries = cassis_routing::compute_hop_expiries(now, &deltas);
 
     let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
         .iter()
@@ -188,8 +193,8 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
                 amount_msat: invoice.amount_msat,
                 incoming_network: hop.incoming.clone(),
                 outgoing_network: hop.outgoing.clone(),
-                incoming_deadline: expiries.get(idx).copied().unwrap_or(invoice.expires_at),
-                outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(invoice.expires_at),
+                incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
+                outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
                 recipient: hop.node.node_pubkey.to_string(),
             };
             debug!(
@@ -232,6 +237,21 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     info!(target: "cassis_cli", "all hops prepared");
 }
 
+fn hash_preimage(preimage: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(preimage);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+fn generate_preimage() -> [u8; 32] {
+    let mut preimage = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut preimage);
+    preimage
+}
+
 fn cmd_invoice(
     amount: u64,
     network: String,
@@ -241,11 +261,16 @@ fn cmd_invoice(
 ) {
     let preimage = generate_preimage();
     let payment_hash = hash_preimage(preimage);
+    const DEFAULT_INVOICE_TTL_SECS: u64 = 600;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let invoice = Invoice {
         payment_hash: Bytes32(payment_hash),
         amount_msat: amount,
         payee,
-        expires_at: expires_at.unwrap_or(0),
+        expires_at: expires_at.unwrap_or(now + DEFAULT_INVOICE_TTL_SECS),
         networks: vec![NetworkId(network)],
         description,
     };
@@ -277,7 +302,7 @@ async fn cmd_route(
             error!(target: "cassis_cli", "error fetching announcements: {err}");
             std::process::exit(1);
         }
-        Err(cassis_client::RouteError::Route(cassis_nostr::RouteError::NoRoute)) => {
+        Err(cassis_client::RouteError::Route(cassis_routing::RouteError::NoRoute)) => {
             error!(target: "cassis_cli", "no route found");
             std::process::exit(1);
         }

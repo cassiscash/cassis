@@ -6,8 +6,7 @@ edition.workspace = true
 [dependencies]
 cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
-cassis-nostr = { path = "../cassis-nostr" }
-cassis-onchain = { path = "../cassis-onchain" }
+cassis-routing = { path = "../cassis-routing" }
 env_logger = "0.11"
 log = "0.4"
 bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "std"] }

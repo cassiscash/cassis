@@ -1,9 +1,0 @@
-[package]
-name = "cassis-onchain"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-rand = "0.8"
-sha2 = "0.10"
-thiserror = "1.0"

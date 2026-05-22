@@ -803,16 +803,17 @@ dependencies = [
  "cassis-client",
  "cassis-core",
  "cassis-iroh",
- "cassis-nostr",
- "cassis-onchain",
+ "cassis-routing",
  "clap",
  "env_logger",
  "futures",
  "iroh 0.35.0",
  "log",
  "lowercase-hex",
+ "rand 0.8.5",
  "rustls",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -822,7 +823,7 @@ version = "0.1.0"
 dependencies = [
  "cassis-core",
  "cassis-iroh",
- "cassis-nostr",
+ "cassis-routing",
  "futures",
  "iroh 0.35.0",
  "thiserror 1.0.69",
@@ -887,33 +888,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "cassis-nostr"
-version = "0.1.0"
-dependencies = [
- "cassis-core",
- "cassis-onchain",
- "log",
- "ritualistic",
- "serde",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "cassis-onchain"
-version = "0.1.0"
-dependencies = [
- "rand 0.8.5",
- "sha2",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "cassis-rootstock"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "cassis-core",
+]
+
+[[package]]
+name = "cassis-routing"
+version = "0.1.0"
+dependencies = [
+ "cassis-core",
+ "log",
+ "ritualistic",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -928,9 +919,8 @@ dependencies = [
  "cassis-fedimint",
  "cassis-iroh",
  "cassis-liquid",
- "cassis-nostr",
- "cassis-onchain",
  "cassis-rootstock",
+ "cassis-routing",
  "clap",
  "env_logger",
  "hmac",

@@ -7,9 +7,10 @@ edition.workspace = true
 cassis-client = { path = "../cassis-client" }
 cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
-cassis-nostr = { path = "../cassis-nostr" }
-cassis-onchain = { path = "../cassis-onchain" }
+cassis-routing = { path = "../cassis-routing" }
 clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+sha2 = "0.10"
 env_logger = "0.11"
 futures = "0.3"
 iroh = "0.35"

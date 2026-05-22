@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cassis-core = { path = "../cassis-core" }
-cassis-nostr = { path = "../cassis-nostr" }
+cassis-routing = { path = "../cassis-routing" }
 cassis-iroh = { path = "../cassis-iroh" }
 futures = "0.3"
 iroh = "0.35"

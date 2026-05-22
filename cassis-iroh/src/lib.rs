@@ -1,4 +1,4 @@
-use cassis_core::{Bytes32, HopAck, HopInstruction, RouteAnnouncement};
+use cassis_core::{HopAck, HopInstruction, HopReject, RouteAnnouncement};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, SecretKey};
 use log::{debug, error, info, warn};
@@ -201,7 +201,7 @@ impl IrohServer {
     pub async fn run(
         self,
         handler: Arc<
-            dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, String>> + Send>>
+            dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -248,7 +248,7 @@ impl IrohServer {
 async fn handle_conn(
     conn: Connection,
     handler: Arc<
-        dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, String>> + Send>>
+        dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
             + Send
             + Sync,
     >,
@@ -288,12 +288,17 @@ async fn handle_conn(
                     );
                     Frame::HopAck(ack)
                 }
-                Err(reason) => {
-                    warn!(target: "iroh_server", "handler rejected: {reason}");
+                Err(reject) => {
+                    warn!(
+                        target: "iroh_server",
+                        "handler rejected payment_hash={}: {}",
+                        lowercase_hex::encode(reject.payment_hash),
+                        reject.reason
+                    );
                     Frame::HopAck(HopAck {
-                        payment_hash: Bytes32([0u8; 32]),
+                        payment_hash: reject.payment_hash,
                         accepted: false,
-                        reason: Some(reason),
+                        reason: Some(reject.reason),
                     })
                 }
             }

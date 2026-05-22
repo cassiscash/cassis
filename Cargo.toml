@@ -1,9 +1,8 @@
 [workspace]
 members = [
   "cassis-core",
-  "cassis-nostr",
+  "cassis-routing",
   "cassis-iroh",
-  "cassis-onchain",
   "networks/cassis-cashu",
   "networks/cassis-fedimint",
   "networks/cassis-ark",
