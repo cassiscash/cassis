@@ -124,7 +124,7 @@ const D_TAG_SEPARATOR: &str = "->";
 ///
 /// Each event's `d` tag has the form `<network_from>-><network_to>`.
 /// Additional tags: `fee_base_msat`, `fee_ppm`, `relay`,
-/// `incoming_delta_secs` (per-hop CLTV budget in seconds; 0/absent
+/// `incoming_delta_secs` (per-hop timelock budget in seconds; 0/absent
 /// means callers should fall back to a per-network default).
 pub async fn fetch_announcements(relays: &[String]) -> Result<Vec<RouteAnnouncement>, NostrError> {
     fetch_announcements_with_timeout(relays, FETCH_ANNOUNCEMENTS_TIMEOUT).await
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn compute_hop_expiries_empty_deltas() {
-        // No hops means just the recipient's CLTV (equivalent to `now`),
+        // No hops means just the recipient's expiry (equivalent to `now`),
         // since no delta buffer accumulates.
         let expiries = compute_hop_expiries(1000, &[]);
         assert_eq!(expiries, vec![1000]);

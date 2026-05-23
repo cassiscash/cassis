@@ -1,6 +1,6 @@
 use cassis_core::NetworkId;
 
-/// Fallback per-hop CLTV delta (seconds) for a given network, used when
+/// Fallback per-hop incoming delta (seconds) for a given network, used when
 /// a route announcement did not publish an `incoming_delta_secs` tag.
 ///
 /// Values mirror the `incoming_delta_secs()` declared on each network

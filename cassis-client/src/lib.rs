@@ -111,7 +111,7 @@ impl CassisClient {
             return Err(PayError::Route("empty route".to_string()));
         }
 
-        // Per-hop CLTV delta: prefer the value the operator published on
+        // Per-hop incoming delta: prefer the value the operator published on
         // the announcement; fall back to a per-network default. The
         // cascade grows off `now` per hop, independent of the invoice's
         // `expires_at`, so the sender's incoming_deadline is `now` plus
