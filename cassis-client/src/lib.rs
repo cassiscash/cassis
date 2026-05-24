@@ -4,9 +4,10 @@ use cassis_core::{
 };
 use cassis_iroh::{node_addr_from_announcement, IrohClient};
 use cassis_routing::{
-    build_graph, compute_hop_expiries, fallback_incoming_delta, fetch_announcements,
-    find_route as find_route_in_graph,
+    build_graph, compute_hop_expiries, fallback_incoming_delta, fallback_transit_slack,
+    fetch_announcements, find_route as find_route_in_graph,
 };
+use log::{debug, info};
 use futures::future::try_join_all;
 use iroh::Endpoint;
 use std::collections::HashMap;
@@ -112,25 +113,45 @@ impl CassisClient {
         }
 
         // Per-hop incoming delta: prefer the value the operator published on
-        // the announcement; fall back to a per-network default. The
-        // cascade grows off `now` per hop, independent of the invoice's
+        // the announcement; fall back to a per-network default. Each hop
+        // also receives a transit slack (published or fallback) to absorb
+        // in-flight latency and clock skew between sender and that hop.
+        // The effective buffer per hop is `delta + slack`. The cascade
+        // grows off `now` per hop, independent of the invoice's
         // `expires_at`, so the sender's incoming_deadline is `now` plus
-        // the sum of all deltas.
+        // the sum of all effective buffers.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let deltas: Vec<u64> = route
+        let buffers: Vec<u64> = route
             .iter()
             .map(|hop| {
-                if hop.node.incoming_delta_secs > 0 {
+                let delta = if hop.node.incoming_delta_secs > 0 {
                     hop.node.incoming_delta_secs
                 } else {
                     fallback_incoming_delta(&hop.incoming)
-                }
+                };
+                let slack = if hop.node.transit_slack_secs > 0 {
+                    hop.node.transit_slack_secs
+                } else {
+                    fallback_transit_slack(&hop.incoming)
+                };
+                delta.saturating_add(slack)
             })
             .collect();
-        let expiries = compute_hop_expiries(now, &deltas);
+        info!(
+            target: "cassis_client",
+            "computing hop deadlines: now={now}, route_len={}, buffers={:?}",
+            route.len(),
+            buffers
+        );
+        let expiries = compute_hop_expiries(now, &buffers);
+        info!(
+            target: "cassis_client",
+            "computed hop expiries (oldest first): {:?}",
+            expiries
+        );
 
         let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
             .iter()
@@ -138,13 +159,22 @@ impl CassisClient {
             .map(|(idx, hop)| {
                 let addr = node_addr_from_announcement(&hop.node)
                     .map_err(|e| PayError::Io(e.to_string()))?;
+                let incoming_deadline = expiries.get(idx).copied().unwrap_or(now);
+                let outgoing_expiry = expiries.get(idx + 1).copied().unwrap_or(now);
+                debug!(
+                    target: "cassis_client",
+                    "  hop {idx}: incoming_network={}, outgoing_network={}, \
+                     incoming_deadline={incoming_deadline}, outgoing_expiry={outgoing_expiry}, \
+                     recipient={}",
+                    hop.incoming, hop.outgoing, hop.node.node_pubkey
+                );
                 let instruction = HopInstruction {
                     payment_hash: invoice.payment_hash,
                     amount_msat: invoice.amount_msat,
                     incoming_network: hop.incoming.clone(),
                     outgoing_network: hop.outgoing.clone(),
-                    incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
-                    outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
+                    incoming_deadline,
+                    outgoing_expiry,
                     recipient: hop.node.node_pubkey.to_string(),
                 };
                 Ok((addr, instruction))

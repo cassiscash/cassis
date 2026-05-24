@@ -9,4 +9,5 @@ cassis-routing = { path = "../cassis-routing" }
 cassis-iroh = { path = "../cassis-iroh" }
 futures = "0.3"
 iroh = "0.35"
+log = "0.4"
 thiserror = "1.0"

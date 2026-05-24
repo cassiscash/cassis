@@ -8,7 +8,7 @@ use std::time::Duration;
 
 mod delta_table;
 
-pub use delta_table::fallback_incoming_delta;
+pub use delta_table::{fallback_incoming_delta, fallback_transit_slack};
 
 /// Maximum time we wait for Nostr relays to respond in
 /// [`fetch_announcements`] before giving up.
@@ -168,6 +168,7 @@ pub async fn fetch_announcements_with_timeout(
         let mut fee_base_msat: u64 = 0;
         let mut fee_ppm: u64 = 0;
         let mut incoming_delta_secs: u64 = 0;
+        let mut transit_slack_secs: u64 = 0;
         let mut relays: Vec<String> = Vec::new();
 
         for tag in event.tags.iter() {
@@ -196,6 +197,9 @@ pub async fn fetch_announcements_with_timeout(
                 "incoming_delta_secs" => {
                     incoming_delta_secs = tag[1].parse().unwrap_or(0);
                 }
+                "transit_slack_secs" => {
+                    transit_slack_secs = tag[1].parse().unwrap_or(0);
+                }
                 "relay" => {
                     relays.push(tag[1].clone());
                 }
@@ -213,6 +217,7 @@ pub async fn fetch_announcements_with_timeout(
                 fee_base_msat,
                 fee_ppm,
                 incoming_delta_secs,
+                transit_slack_secs,
                 relays,
             });
         }
@@ -452,6 +457,7 @@ mod tests {
             fee_base_msat: 0,
             fee_ppm: 0,
             incoming_delta_secs: 0,
+            transit_slack_secs: 0,
             relays: Vec::new(),
         }
     }
@@ -592,6 +598,15 @@ mod tests {
         r.incoming_delta_secs = 42;
         let graph = build_graph(vec![r.clone()]);
         assert_eq!(graph.nodes[0].incoming_delta_secs, 42);
+    }
+
+    #[test]
+    fn route_announcement_carries_transit_slack_secs() {
+        // Same round-trip property for the transit-slack field.
+        let mut r = route(key_x(), "A", "B");
+        r.transit_slack_secs = 60;
+        let graph = build_graph(vec![r.clone()]);
+        assert_eq!(graph.nodes[0].transit_slack_secs, 60);
     }
 
     // ---- relay-fetch timeout test ----

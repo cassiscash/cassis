@@ -1,7 +1,7 @@
 use cassis_core::{Bytes32, HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, WatchError};
 use cassis_iroh::IrohServer;
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -370,6 +370,17 @@ impl CassisDaemon {
     }
 
     fn validate_instruction(&self, instruction: &HopInstruction) -> Result<(), HopReject> {
+        debug!(
+            target: "cassisd",
+            "validate_instruction: payment_hash={}, amount_msat={}, incoming={}, outgoing={}, \
+             incoming_deadline={}, outgoing_expiry={}",
+            lowercase_hex::encode(instruction.payment_hash),
+            instruction.amount_msat,
+            instruction.incoming_network,
+            instruction.outgoing_network,
+            instruction.incoming_deadline,
+            instruction.outgoing_expiry,
+        );
         if instruction.payment_hash.0.iter().all(|byte| *byte == 0) {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
@@ -412,7 +423,14 @@ impl CassisDaemon {
         }
 
         let now = unix_now();
-        let min_deadline = now.saturating_add(incoming.incoming_delta_secs());
+        let required_delta = incoming.incoming_delta_secs();
+        let min_deadline = now.saturating_add(required_delta);
+        debug!(
+            target: "cassisd",
+            "validate_instruction: incoming_network={}, incoming_delta={required_delta}, \
+             now={now}, min_deadline={min_deadline}, actual={}",
+            instruction.incoming_network, instruction.incoming_deadline
+        );
         if instruction.incoming_deadline < min_deadline {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
@@ -459,8 +477,8 @@ async fn watch_instruction(
             info!(target: "cassisd", "  incoming HTLC on {}: amount={}", htlc.network, htlc.amount_msat);
             htlc
         }
-        Err(_) => {
-            warn!(target: "cassisd", "  incoming HTLC failed on {}", instruction.incoming_network);
+        Err(err) => {
+            warn!(target: "cassisd", "  incoming HTLC failed on {}: {:?}", instruction.incoming_network, err);
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
@@ -580,6 +598,7 @@ async fn publish_route_announcements(
 
     let fee_base_msat: u64 = 1000;
     let fee_ppm: u64 = 500;
+    let transit_slack_secs: u64 = 60;
 
     let events: Vec<(String, ritualistic::Event)> = pairs
         .iter()
@@ -593,6 +612,7 @@ async fn publish_route_announcements(
                     vec!["iroh".to_string(), iroh_peer_id.to_string(), iroh_relay.to_string()],
                     vec!["fee_base_msat".to_string(), fee_base_msat.to_string()],
                     vec!["fee_ppm".to_string(), fee_ppm.to_string()],
+                    vec!["transit_slack_secs".to_string(), transit_slack_secs.to_string()],
                 ]),
                 content: String::new(),
             };
@@ -602,9 +622,10 @@ async fn publish_route_announcements(
 
     info!(
         target: "cassisd",
-        "publishing {} route announcement event(s) (kind {}) to {} relay(s) for pubkey {}",
+        "publishing {} route announcement event(s) (kind {}, transit_slack_secs={}) to {} relay(s) for pubkey {}",
         events.len(),
         NOSTR_KIND_ROUTE_ANNOUNCEMENT,
+        transit_slack_secs,
         relay_urls.len(),
         secret_key.pubkey().to_hex()
     );

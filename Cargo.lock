@@ -826,6 +826,7 @@ dependencies = [
  "cassis-routing",
  "futures",
  "iroh 0.35.0",
+ "log",
  "thiserror 1.0.69",
 ]
 
@@ -926,6 +927,7 @@ dependencies = [
  "hmac",
  "iroh 0.35.0",
  "log",
+ "lowercase-hex",
  "ritualistic",
  "rustls",
  "sha2",

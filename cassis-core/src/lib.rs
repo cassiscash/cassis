@@ -72,6 +72,13 @@ pub struct RouteAnnouncement {
     /// `0` means the operator did not publish a value; callers fall
     /// back to a per-network default.
     pub incoming_delta_secs: u64,
+    /// Per-hop transit slack (seconds): extra buffer the sender adds to
+    /// deadlines to absorb in-flight latency and clock skew between
+    /// sender and this hop. Independent of `incoming_delta_secs` (which
+    /// is the hop's processing budget). Mirrors the `transit_slack_secs`
+    /// kind-35515 tag. `0` means the operator did not publish a value;
+    /// callers fall back to a global default.
+    pub transit_slack_secs: u64,
     pub relays: Vec<String>,
 }
 

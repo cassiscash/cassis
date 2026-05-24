@@ -163,21 +163,38 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
     let client = IrohClient::bind().await.expect("failed to bind iroh endpoint");
     info!(target: "cassis_cli", "iroh endpoint bound");
 
-    let deltas: Vec<u64> = route
-        .iter()
-        .map(|hop| {
-            if hop.node.incoming_delta_secs > 0 {
-                hop.node.incoming_delta_secs
-            } else {
-                cassis_routing::fallback_incoming_delta(&hop.incoming)
-            }
-        })
-        .collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let expiries = cassis_routing::compute_hop_expiries(now, &deltas);
+    let buffers: Vec<u64> = route
+        .iter()
+        .map(|hop| {
+            let delta = if hop.node.incoming_delta_secs > 0 {
+                hop.node.incoming_delta_secs
+            } else {
+                cassis_routing::fallback_incoming_delta(&hop.incoming)
+            };
+            let slack = if hop.node.transit_slack_secs > 0 {
+                hop.node.transit_slack_secs
+            } else {
+                cassis_routing::fallback_transit_slack(&hop.incoming)
+            };
+            delta.saturating_add(slack)
+        })
+        .collect();
+    info!(
+        target: "cassis_cli",
+        "computing hop deadlines: now={now}, route_len={}, buffers={:?}",
+        route.len(),
+        buffers
+    );
+    let expiries = cassis_routing::compute_hop_expiries(now, &buffers);
+    info!(
+        target: "cassis_cli",
+        "computed hop expiries (oldest first): {:?}",
+        expiries
+    );
 
     let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
         .iter()
@@ -188,18 +205,21 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) {
                     error!(target: "cassis_cli", "invalid iroh addr for hop {idx}: {e}");
                     std::process::exit(1);
                 });
+            let incoming_deadline = expiries.get(idx).copied().unwrap_or(now);
+            let outgoing_expiry = expiries.get(idx + 1).copied().unwrap_or(now);
             let instruction = HopInstruction {
                 payment_hash: invoice.payment_hash,
                 amount_msat: invoice.amount_msat,
                 incoming_network: hop.incoming.clone(),
                 outgoing_network: hop.outgoing.clone(),
-                incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
-                outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
+                incoming_deadline,
+                outgoing_expiry,
                 recipient: hop.node.node_pubkey.to_string(),
             };
             debug!(
                 target: "cassis_cli",
-                "  hop {}: sending instruction to {} (amount={}, incoming={}, outgoing={}, recipient={})",
+                "  hop {}: sending instruction to {} (amount={}, incoming={}, outgoing={}, \
+                 incoming_deadline={incoming_deadline}, outgoing_expiry={outgoing_expiry}, recipient={})",
                 idx + 1,
                 hop.node.node_pubkey,
                 instruction.amount_msat,
