@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError,
+    Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
 };
 
 #[derive(Clone, Debug)]
@@ -15,7 +15,7 @@ impl ArkAdapter {
 }
 
 #[async_trait]
-impl NetworkAdapter for ArkAdapter {
+impl NetworkRouterAdapter for ArkAdapter {
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }

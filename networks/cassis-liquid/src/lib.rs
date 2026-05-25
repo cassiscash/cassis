@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError,
+    Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
 };
 
 #[derive(Clone, Debug)]
@@ -15,7 +15,7 @@ impl LiquidAdapter {
 }
 
 #[async_trait]
-impl NetworkAdapter for LiquidAdapter {
+impl NetworkRouterAdapter for LiquidAdapter {
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }

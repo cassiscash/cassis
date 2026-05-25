@@ -1,6 +1,6 @@
 use cassis_core::{
-    HopInstruction, Invoice, NetworkAdapter, NetworkId, PaymentResult, PaymentStatus,
-    RouteHop, WatchError,
+    HopInstruction, Invoice, NetworkId, NetworkSenderAdapter, PaymentResult, PaymentStatus,
+    RouteHop, SendError,
 };
 use cassis_iroh::{node_addr_from_announcement, IrohClient};
 use cassis_routing::{
@@ -69,15 +69,20 @@ pub async fn find_route(
     Ok(hops)
 }
 
+/// Pure-sender client: holds a map from `NetworkId` to a
+/// `NetworkSenderAdapter` (the user-facing "pay invoice" trait). Any
+/// `NetworkRouterAdapter` is automatically a sender via the blanket
+/// impl in `cassis-core`, so router-style networks can be passed in
+/// the same way.
 pub struct CassisClient {
-    pub adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
+    pub senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
     pub nostr_relays: Vec<String>,
     iroh_client: IrohClient,
 }
 
 impl CassisClient {
     pub async fn new(
-        adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
+        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
         nostr_relays: Vec<String>,
     ) -> Self {
         let endpoint = Endpoint::builder()
@@ -85,7 +90,7 @@ impl CassisClient {
             .await
             .expect("failed to bind iroh endpoint for client");
         Self {
-            adapters,
+            senders,
             nostr_relays,
             iroh_client: IrohClient::new(endpoint),
         }
@@ -193,38 +198,39 @@ impl CassisClient {
         let first_hop = route
             .first()
             .ok_or_else(|| PayError::Route("route missing".to_string()))?;
-        let adapter = self
-            .adapters
+        let sender = self
+            .senders
             .get(&sender_network)
             .ok_or_else(|| PayError::Route("sender network adapter missing".to_string()))?;
 
-        let outgoing_htlc = adapter
-            .create_outgoing_htlc(
+        let payment = sender
+            .pay_invoice(
                 invoice.payment_hash,
                 invoice.amount_msat,
-                expiries.get(1).copied().unwrap_or(now),
                 &first_hop.node.node_pubkey.to_string(),
+                &first_hop.outgoing,
+                expiries.get(1).copied().unwrap_or(now),
             )
             .await
             .map_err(|err| PayError::Io(err.to_string()))?;
 
-        match adapter
-            .watch_preimage(&outgoing_htlc, outgoing_htlc.expiry)
+        match sender
+            .watch_payment(payment.clone(), payment.expiry)
             .await
         {
             Ok(preimage) => Ok(PaymentResult {
                 status: PaymentStatus::Completed,
                 preimage: Some(preimage),
             }),
-            Err(WatchError::DeadlineExceeded) => {
-                let _ = adapter.refund_outgoing(&outgoing_htlc).await;
+            Err(SendError::DeadlineExceeded) => {
+                let _ = sender.refund_payment(payment).await;
                 Ok(PaymentResult {
                     status: PaymentStatus::Refunded,
                     preimage: None,
                 })
             }
             Err(err) => {
-                let _ = adapter.refund_outgoing(&outgoing_htlc).await;
+                let _ = sender.refund_payment(payment).await;
                 Err(PayError::Io(err.to_string()))
             }
         }

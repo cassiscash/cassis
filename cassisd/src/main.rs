@@ -1,4 +1,7 @@
-use cassis_core::{Bytes32, HopAck, HopInstruction, HopReject, NetworkAdapter, NetworkId, WatchError};
+use cassis_core::{
+    Bytes32, HopAck, HopInstruction, HopReject, NetworkId, NetworkReceiverAdapter,
+    NetworkSenderAdapter, SendError,
+};
 use cassis_iroh::IrohServer;
 use clap::Parser;
 use log::{debug, error, info, warn};
@@ -99,11 +102,11 @@ async fn main() {
         );
     }
 
-    let mut adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>> = HashMap::new();
+    let mut adapters: HashMap<NetworkId, NetworkEntry> = HashMap::new();
     for spec in &cli.network {
         match build_adapter(spec, &keys).await {
-            Ok(adapter) => {
-                adapters.insert(adapter.network_id(), adapter);
+            Ok(entry) => {
+                adapters.insert(entry.receiver.network_id(), entry);
             }
             Err(err) => {
                 error!(target: "cassisd", "{err}");
@@ -215,8 +218,23 @@ fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
     }
 }
 
+/// Per-network entry the daemon tracks. Splits the
+/// "receive incoming" and "send outgoing" roles onto the
+/// user-facing traits, so a single network can be both source and
+/// destination of a hop. The underlying adapter object is shared
+/// (`Arc`) when it implements both traits on the same concrete
+/// type (cashu via the blanket impl, fedimint via direct impls).
+#[derive(Clone)]
+pub struct NetworkEntry {
+    pub receiver: Arc<dyn NetworkReceiverAdapter>,
+    pub sender: Arc<dyn NetworkSenderAdapter>,
+}
+
 #[allow(unused_variables)]
-async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<dyn NetworkAdapter>, String> {
+async fn build_adapter(
+    spec: &str,
+    seed_keys: &seed::DerivedKeys,
+) -> Result<NetworkEntry, String> {
     let (kind, param) = match spec.split_once(':') {
         Some((kind, param)) => (kind, Some(param)),
         None => (spec, None),
@@ -235,11 +253,14 @@ async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
-            Ok(Arc::new(cassis_cashu::CashuAdapter::new(
+            let adapter = Arc::new(cassis_cashu::CashuAdapter::new(
                 network_id,
                 mint_url.to_string(),
                 sk,
-            )))
+            ));
+            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            Ok(NetworkEntry { receiver, sender })
         }
 
         #[cfg(not(feature = "cashu"))]
@@ -261,12 +282,19 @@ async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
-            Ok(Arc::new(
-                match cassis_fedimint::FedimintAdapter::new(network_id, address.to_string(), sk).await {
-                    Ok(adapter) => adapter,
-                    Err(err) => return Err(err),
-                },
-            ))
+            let adapter = match cassis_fedimint::FedimintAdapter::new(
+                network_id,
+                address.to_string(),
+                sk,
+            )
+            .await
+            {
+                Ok(adapter) => Arc::new(adapter),
+                Err(err) => return Err(err),
+            };
+            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            Ok(NetworkEntry { receiver, sender })
         }
 
         #[cfg(not(feature = "fedimint"))]
@@ -280,9 +308,12 @@ async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<
             if param.is_some() {
                 return Err("network 'liquid' does not take a parameter".into());
             }
-            Ok(Arc::new(cassis_liquid::LiquidAdapter::new(NetworkId(
+            let adapter = Arc::new(cassis_liquid::LiquidAdapter::new(NetworkId(
                 "liquid".to_string(),
-            ))))
+            )));
+            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            Ok(NetworkEntry { receiver, sender })
         }
 
         #[cfg(not(feature = "liquid"))]
@@ -296,7 +327,10 @@ async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<
             if param.is_some() {
                 return Err("network 'ark' does not take a parameter".into());
             }
-            Ok(Arc::new(cassis_ark::ArkAdapter::new(NetworkId("ark".to_string()))))
+            let adapter = Arc::new(cassis_ark::ArkAdapter::new(NetworkId("ark".to_string())));
+            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            Ok(NetworkEntry { receiver, sender })
         }
 
         #[cfg(not(feature = "ark"))]
@@ -309,9 +343,12 @@ async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<
             if param.is_some() {
                 return Err("network 'rootstock' does not take a parameter".into());
             }
-            Ok(Arc::new(cassis_rootstock::RootstockAdapter::new(NetworkId(
+            let adapter = Arc::new(cassis_rootstock::RootstockAdapter::new(NetworkId(
                 "rootstock".to_string(),
-            ))))
+            )));
+            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            Ok(NetworkEntry { receiver, sender })
         }
 
         #[cfg(not(feature = "rootstock"))]
@@ -325,12 +362,12 @@ async fn build_adapter(spec: &str, seed_keys: &seed::DerivedKeys) -> Result<Arc<
 }
 
 pub struct CassisDaemon {
-    pub adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
+    pub adapters: HashMap<NetworkId, NetworkEntry>,
     pending: PendingMap,
 }
 
 impl CassisDaemon {
-    pub fn new(adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>) -> Self {
+    pub fn new(adapters: HashMap<NetworkId, NetworkEntry>) -> Self {
         Self {
             adapters,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -423,7 +460,7 @@ impl CassisDaemon {
         }
 
         let now = unix_now();
-        let required_delta = incoming.incoming_delta_secs();
+        let required_delta = incoming.receiver.incoming_delta_secs();
         let min_deadline = now.saturating_add(required_delta);
         debug!(
             target: "cassisd",
@@ -447,94 +484,140 @@ impl CassisDaemon {
 
 async fn watch_instruction(
     instruction: HopInstruction,
-    adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
+    adapters: HashMap<NetworkId, NetworkEntry>,
     pending: PendingMap,
 ) {
-    let incoming_adapter = match adapters.get(&instruction.incoming_network) {
-        Some(adapter) => adapter,
+    let incoming_entry = match adapters.get(&instruction.incoming_network) {
+        Some(entry) => entry,
         None => {
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
     };
-    let outgoing_adapter = match adapters.get(&instruction.outgoing_network) {
-        Some(adapter) => adapter,
+    let outgoing_entry = match adapters.get(&instruction.outgoing_network) {
+        Some(entry) => entry,
         None => {
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
     };
 
-    let incoming = match incoming_adapter
-        .watch_incoming_htlc(
-            instruction.payment_hash,
-            instruction.amount_msat,
-            instruction.incoming_deadline,
-        )
+    // 1. Register the incoming invoice on the receiver. For
+    //    "sells its own preimage" networks (fedimint) this returns
+    //    the network's payment hash; for router-style networks the
+    //    auto-impl delegates to `watch_incoming_htlc` and may block
+    //    until the upstream funds the contract.
+    let invoice = match incoming_entry
+        .receiver
+        .create_invoice(instruction.amount_msat, instruction.incoming_deadline, None)
         .await
     {
-        Ok(htlc) => {
-            info!(target: "cassisd", "  incoming HTLC on {}: amount={}", htlc.network, htlc.amount_msat);
-            htlc
+        Ok(invoice) => {
+            info!(
+                target: "cassisd",
+                "  incoming invoice on {}: amount={} hash={:?}",
+                instruction.incoming_network, invoice.amount_msat, invoice.payment_hash
+            );
+            invoice
         }
         Err(err) => {
-            warn!(target: "cassisd", "  incoming HTLC failed on {}: {:?}", instruction.incoming_network, err);
+            warn!(
+                target: "cassisd",
+                "  create_invoice failed on {}: {:?}",
+                instruction.incoming_network, err
+            );
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
     };
 
-    if incoming.amount_msat < instruction.amount_msat {
-        remove_pending(&pending, instruction.payment_hash).await;
-        return;
-    }
-
-    if validate_timelock_delta(
-        incoming.expiry,
-        instruction.outgoing_expiry,
-        incoming_adapter.incoming_delta_secs(),
-    )
-    .is_err()
+    // Sanity-check the timelock cascade: the incoming invoice must
+    // outlive the outgoing by at least the receiver's per-hop delta,
+    // so we never have to claim an expired contract.
+    let required_delta = incoming_entry.receiver.incoming_delta_secs();
+    if invoice.expires_at
+        < instruction
+            .outgoing_expiry
+            .saturating_add(required_delta)
     {
+        warn!(
+            target: "cassisd",
+            "  incoming invoice expires too soon: invoice.expires_at={}, \
+             outgoing_expiry={}, required_delta={}",
+            invoice.expires_at, instruction.outgoing_expiry, required_delta
+        );
         remove_pending(&pending, instruction.payment_hash).await;
         return;
     }
 
-    let outgoing = match outgoing_adapter
-        .create_outgoing_htlc(
-            instruction.payment_hash,
+    // 2. Initiate the outgoing payment. The payment hash from the
+    //    `Invoice` is what the upstream is paying; the sender routes
+    //    the funds to the next hop on the outgoing network.
+    let payment = match outgoing_entry
+        .sender
+        .pay_invoice(
+            invoice.payment_hash,
             instruction.amount_msat,
-            instruction.outgoing_expiry,
             &instruction.recipient,
+            &instruction.outgoing_network,
+            instruction.outgoing_expiry,
         )
         .await
     {
-        Ok(htlc) => {
-            info!(target: "cassisd", "  outgoing HTLC on {} for {}", htlc.network, htlc.recipient);
-            htlc
+        Ok(payment) => {
+            info!(
+                target: "cassisd",
+                "  outgoing payment on {} for {}",
+                payment.destination_network, payment.destination_pubkey
+            );
+            payment
         }
-        Err(_) => {
-            warn!(target: "cassisd", "  outgoing HTLC failed on {}", instruction.outgoing_network);
+        Err(err) => {
+            warn!(
+                target: "cassisd",
+                "  pay_invoice failed on {}: {:?}",
+                instruction.outgoing_network, err
+            );
             remove_pending(&pending, instruction.payment_hash).await;
             return;
         }
     };
 
-    match outgoing_adapter
-        .watch_preimage(&outgoing, instruction.outgoing_expiry)
+    // 3. Wait for the preimage to be revealed on the outgoing
+    //    payment.
+    match outgoing_entry
+        .sender
+        .watch_payment(payment.clone(), instruction.outgoing_expiry)
         .await
     {
         Ok(preimage) => {
-            info!(target: "cassisd", "  preimage received, claiming incoming");
-            let _ = incoming_adapter.claim_incoming(&incoming, preimage).await;
+            info!(target: "cassisd", "  preimage received, settling incoming");
+            // 4. Settle the incoming side. For "sells its own
+            //    preimage" networks the preimage is informational;
+            //    the network settles via its own state machine.
+            if let Err(err) = incoming_entry
+                .receiver
+                .claim_incoming(invoice.payment_hash, preimage)
+                .await
+            {
+                warn!(
+                    target: "cassisd",
+                    "  claim_incoming failed on {}: {:?}",
+                    instruction.incoming_network, err
+                );
+            }
         }
-        Err(WatchError::DeadlineExceeded) => {
+        Err(SendError::DeadlineExceeded) => {
             warn!(target: "cassisd", "  deadline exceeded, refunding outgoing");
-            let _ = outgoing_adapter.refund_outgoing(&outgoing).await;
+            let _ = outgoing_entry.sender.refund_payment(payment).await;
         }
-        Err(_) => {
-            error!(target: "cassisd", "  error watching preimage, refunding outgoing");
-            let _ = outgoing_adapter.refund_outgoing(&outgoing).await;
+        Err(err) => {
+            error!(
+                target: "cassisd",
+                "  error watching payment on {}: {:?}",
+                instruction.outgoing_network, err
+            );
+            let _ = outgoing_entry.sender.refund_payment(payment).await;
         }
     }
 
@@ -546,24 +629,6 @@ async fn remove_pending(pending: &PendingMap, payment_hash: Bytes32) {
     pending.remove(&payment_hash);
 }
 
-#[derive(thiserror::Error, Debug)]
-enum TimelockError {
-    #[error("insufficient delta")]
-    InsufficientDelta,
-}
-
-fn validate_timelock_delta(
-    incoming_expiry: u64,
-    outgoing_expiry: u64,
-    delta_secs: u64,
-) -> Result<(), TimelockError> {
-    if incoming_expiry >= outgoing_expiry.saturating_add(delta_secs) {
-        Ok(())
-    } else {
-        Err(TimelockError::InsufficientDelta)
-    }
-}
-
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -572,7 +637,7 @@ fn unix_now() -> u64 {
 }
 
 async fn publish_route_announcements(
-    adapters: &HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
+    adapters: &HashMap<NetworkId, NetworkEntry>,
     relay_urls: Vec<String>,
     secret_key: &ritualistic::SecretKey,
     iroh_peer_id: &str,

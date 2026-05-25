@@ -13,7 +13,7 @@ use cashu::nuts::{
     CurrencyUnit,
 };
 use cashu::MintUrl;
-use cassis_core::{Bytes32, HtlcError, IncomingHtlc, NetworkAdapter, NetworkId, OutgoingHtlc, WatchError};
+use cassis_core::{Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -91,7 +91,7 @@ impl CashuAdapter {
 }
 
 #[async_trait]
-impl NetworkAdapter for CashuAdapter {
+impl NetworkRouterAdapter for CashuAdapter {
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }
