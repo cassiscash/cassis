@@ -29,8 +29,8 @@ optional = true
 path = "../networks/cassis-fedimint"
 optional = true
 
-[dependencies.cassis-ark]
-path = "../networks/cassis-ark"
+[dependencies.cassis-arkade]
+path = "../networks/cassis-arkade"
 optional = true
 
 [dependencies.cassis-rootstock]
@@ -42,7 +42,7 @@ path = "../networks/cassis-liquid"
 optional = true
 
 [features]
-ark = ["cassis-ark"]
+ark = ["cassis-arkade"]
 cashu = ["cassis-cashu"]
 liquid = ["cassis-liquid"]
 fedimint = ["cassis-fedimint"]

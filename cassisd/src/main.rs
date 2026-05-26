@@ -327,7 +327,7 @@ async fn build_adapter(
             if param.is_some() {
                 return Err("network 'ark' does not take a parameter".into());
             }
-            let adapter = Arc::new(cassis_ark::ArkAdapter::new(NetworkId("ark".to_string())));
+            let adapter = Arc::new(cassis_arkade::ArkAdapter::new(NetworkId("ark".to_string())));
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
             Ok(NetworkEntry { receiver, sender })

@@ -774,7 +774,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cassis-ark"
+name = "cassis-arkade"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -917,7 +917,7 @@ version = "0.1.0"
 dependencies = [
  "bip32",
  "bip39",
- "cassis-ark",
+ "cassis-arkade",
  "cassis-cashu",
  "cassis-core",
  "cassis-fedimint",

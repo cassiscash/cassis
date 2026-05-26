@@ -1,5 +1,5 @@
 [package]
-name = "cassis-ark"
+name = "cassis-arkade"
 version.workspace = true
 edition.workspace = true
 

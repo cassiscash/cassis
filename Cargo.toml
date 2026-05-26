@@ -5,7 +5,7 @@ members = [
   "cassis-iroh",
   "networks/cassis-cashu",
   "networks/cassis-fedimint",
-  "networks/cassis-ark",
+  "networks/cassis-arkade",
   "networks/cassis-rootstock",
   "networks/cassis-liquid",
   "cassisd",
