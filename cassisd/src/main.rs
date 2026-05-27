@@ -253,11 +253,10 @@ async fn build_adapter(
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
-            let adapter = Arc::new(cassis_cashu::CashuAdapter::new(
-                network_id,
-                mint_url.to_string(),
-                sk,
-            ));
+            let adapter = Arc::new(
+                cassis_cashu::CashuAdapter::new(network_id, mint_url.to_string(), sk)
+                    .map_err(|e| format!("cashu adapter init failed: {e}"))?,
+            );
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
             Ok(NetworkEntry { receiver, sender })
