@@ -28,11 +28,18 @@ type PendingMap = Arc<Mutex<HashMap<Bytes32, HopInstruction>>>;
 #[command(about = "Cassis multi-network routing daemon")]
 struct Cli {
     /// Networks to route between. The format depends on the network kind:
-    ///     cashu:<mint_url>     e.g. cashu:https://mint.example.com
+    ///     cashu:<host_or_url>  e.g. cashu:mint.example.com (https) or
+    ///                          cashu:http://localhost:3338 or
+    ///                          cashu:127.0.0.1:3338 (http, since localhost)
     ///     fedimint:<invite_or_db>   e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t...
     ///     liquid               (no parameter)
     ///     ark                  (no parameter)
     ///     rootstock            (no parameter)
+    ///
+    /// For `cashu:` the scheme is optional. If the value already has
+    /// a `://` it's used verbatim; otherwise the daemon prepends
+    /// `https://` (or `http://` for `localhost`, `127.0.0.1`,
+    /// `::1`, and `[::1]`).
     ///
     /// At least two are required so the daemon can route between them.
     /// The same kind may be repeated with different parameters.
@@ -177,17 +184,16 @@ async fn main() {
 
 /// Compute the [`NetworkId`] for a network spec without building the adapter.
 fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
-    let (kind, param) = match spec.split_once(':') {
-        Some((kind, param)) => (kind, Some(param)),
-        None => (spec, None),
-    };
+    let (kind, param) = split_spec(spec);
     match kind {
         "cashu" => {
             let mint_url = param.ok_or_else(|| {
-                "network 'cashu' requires a mint URL, e.g. cashu:https://mint.example.com"
+                "network 'cashu' requires a host or URL, \
+                 e.g. cashu:mint.example.com (https) or cashu:http://localhost:3338"
                     .to_string()
             })?;
-            Ok(NetworkId(format!("cashu:{mint_url}")))
+            let normalized = normalize_mint_url(mint_url);
+            Ok(NetworkId(format!("cashu:{normalized}")))
         }
         "fedimint" => {
             let address = param.ok_or_else(|| {
@@ -218,6 +224,44 @@ fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
     }
 }
 
+/// Split a `kind:param` spec into `(kind, Option<param>)`. A bare
+/// `kind` with no colon yields `(kind, None)`. The split is on the
+/// *first* colon only, so `cashu:https://...` and `fedimint:fed1q...`
+/// stay intact.
+fn split_spec(spec: &str) -> (&str, Option<&str>) {
+    match spec.split_once(':') {
+        Some((kind, param)) => (kind, Some(param)),
+        None => (spec, None),
+    }
+}
+
+/// Normalize a cashu mint URL: prepend `https://` if no scheme is
+/// present, or `http://` for loopback hosts (`localhost`,
+/// `127.0.0.1`, `::1`, `[::1]`, with or without a port). Values that
+/// already have a `scheme://` are returned unchanged.
+fn normalize_mint_url(host_or_url: &str) -> String {
+    if host_or_url.contains("://") {
+        return host_or_url.to_string();
+    }
+    // Extract the host portion so we can decide the scheme.
+    // Bracketed IPv6 like `[::1]:3338` → host is between `[` and `]`.
+    // Bare IPv6 loopback `::1` or `::1:3338` starts with `::1`.
+    // Everything else: host is everything before the first `:`.
+    let host: &str = if let Some(rest) = host_or_url.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => host_or_url,
+        }
+    } else if host_or_url == "::1" || host_or_url.starts_with("::1:") {
+        "::1"
+    } else {
+        host_or_url.split(':').next().unwrap_or(host_or_url)
+    };
+    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    let scheme = if is_loopback { "http" } else { "https" };
+    format!("{scheme}://{host_or_url}")
+}
+
 /// Per-network entry the daemon tracks. Splits the
 /// "receive incoming" and "send outgoing" roles onto the
 /// user-facing traits, so a single network can be both source and
@@ -235,18 +279,17 @@ async fn build_adapter(
     spec: &str,
     seed_keys: &seed::DerivedKeys,
 ) -> Result<NetworkEntry, String> {
-    let (kind, param) = match spec.split_once(':') {
-        Some((kind, param)) => (kind, Some(param)),
-        None => (spec, None),
-    };
+    let (kind, param) = split_spec(spec);
 
     match kind {
         #[cfg(feature = "cashu")]
         "cashu" => {
-            let mint_url = param.ok_or_else(|| {
-                "network 'cashu' requires a mint URL, e.g. cashu:https://mint.example.com"
+            let raw = param.ok_or_else(|| {
+                "network 'cashu' requires a host or URL, \
+                 e.g. cashu:mint.example.com (https) or cashu:http://localhost:3338"
                     .to_string()
             })?;
+            let mint_url = normalize_mint_url(raw);
             let network_id = NetworkId(format!("cashu:{mint_url}"));
             let sk = seed_keys
                 .networks
@@ -254,7 +297,7 @@ async fn build_adapter(
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
             let adapter = Arc::new(
-                cassis_cashu::CashuAdapter::new(network_id, mint_url.to_string(), sk)
+                cassis_cashu::CashuAdapter::new(network_id, mint_url.clone(), sk)
                     .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
@@ -709,5 +752,89 @@ async fn publish_route_announcements(
         for failure in &failed {
             warn!(target: "cassisd", "    rejected by {failure}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_prepends_https_for_remote_hostname() {
+        assert_eq!(
+            normalize_mint_url("mint.example.com"),
+            "https://mint.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_prepends_https_for_hostname_with_port() {
+        assert_eq!(
+            normalize_mint_url("mint.example.com:3338"),
+            "https://mint.example.com:3338"
+        );
+    }
+
+    #[test]
+    fn normalize_prepends_http_for_localhost() {
+        assert_eq!(
+            normalize_mint_url("localhost"),
+            "http://localhost"
+        );
+        assert_eq!(
+            normalize_mint_url("localhost:3338"),
+            "http://localhost:3338"
+        );
+    }
+
+    #[test]
+    fn normalize_prepends_http_for_loopback_ips() {
+        assert_eq!(normalize_mint_url("127.0.0.1"), "http://127.0.0.1");
+        assert_eq!(normalize_mint_url("127.0.0.1:3338"), "http://127.0.0.1:3338");
+        assert_eq!(normalize_mint_url("::1"), "http://::1");
+        assert_eq!(normalize_mint_url("[::1]:3338"), "http://[::1]:3338");
+    }
+
+    #[test]
+    fn normalize_preserves_explicit_scheme() {
+        assert_eq!(
+            normalize_mint_url("https://mint.example.com"),
+            "https://mint.example.com"
+        );
+        assert_eq!(
+            normalize_mint_url("http://localhost:3338"),
+            "http://localhost:3338"
+        );
+        // Non-default ports on remote hosts keep https.
+        assert_eq!(
+            normalize_mint_url("https://mint.example.com:8443"),
+            "https://mint.example.com:8443"
+        );
+    }
+
+    #[test]
+    fn network_id_for_cashu_spec_uses_normalized_url() {
+        // The NetworkId and the adapter mint URL must agree, so key
+        // derivation and adapter init hit the same mint.
+        let id = network_id_for_spec("cashu:mint.example.com").unwrap();
+        assert_eq!(id.0, "cashu:https://mint.example.com");
+    }
+
+    #[test]
+    fn network_id_for_cashu_spec_loopback_uses_http() {
+        let id = network_id_for_spec("cashu:localhost:3338").unwrap();
+        assert_eq!(id.0, "cashu:http://localhost:3338");
+    }
+
+    #[test]
+    fn network_id_for_cashu_spec_preserves_explicit_scheme() {
+        let id = network_id_for_spec("cashu:https://mint.example.com:8443").unwrap();
+        assert_eq!(id.0, "cashu:https://mint.example.com:8443");
+    }
+
+    #[test]
+    fn network_id_for_fedimint_spec_is_unchanged() {
+        let id = network_id_for_spec("fedimint:fed1qabc").unwrap();
+        assert_eq!(id.0, "fedimint:fed1qabc");
     }
 }
