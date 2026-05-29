@@ -3,6 +3,9 @@ name = "cassis-rootstock"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+
 [dependencies]
 async-trait = "0.1"
 cassis-core = { path = "../../cassis-core" }

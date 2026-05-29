@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "cassis-core",
+  "cassis-keys",
   "cassis-routing",
   "cassis-iroh",
   "networks/cassis-cashu",
@@ -8,7 +9,7 @@ members = [
   "networks/cassis-arkade",
   "networks/cassis-rootstock",
   "networks/cassis-liquid",
-  "cassisd",
+  "cassis-router",
   "cassis-client",
   "cassis-cli",
 ]

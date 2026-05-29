@@ -1,8 +1,16 @@
 use cassis_core::{
-    Bytes32, HopAck, HopInstruction, HopReject, NetworkId, NetworkReceiverAdapter,
-    NetworkSenderAdapter, SendError,
+    Bytes32, HopAck, HopInstruction, HopReject, NetworkId, NetworkSenderAdapter, SendError,
 };
+#[cfg(any(
+    feature = "cashu",
+    feature = "fedimint",
+    feature = "ark",
+    feature = "liquid",
+    feature = "rootstock",
+))]
+use cassis_core::NetworkReceiverAdapter;
 use cassis_iroh::IrohServer;
+use cassis_keys as keys;
 use clap::Parser;
 use log::{debug, error, info, warn};
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
@@ -10,8 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-
-mod seed;
 
 const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 
@@ -24,8 +30,8 @@ const DEFAULT_NOSTR_RELAYS: &[&str] = &[
 type PendingMap = Arc<Mutex<HashMap<Bytes32, HopInstruction>>>;
 
 #[derive(Parser)]
-#[command(name = "cassisd")]
-#[command(about = "Cassis multi-network routing daemon")]
+#[command(name = "cassis-router")]
+#[command(about = "Cassis multi-network routing daemon (router only; receivers live in cassis-cli)")]
 struct Cli {
     /// Networks to route between. The format depends on the network kind:
     ///     cashu:<host_or_url>  e.g. cashu:mint.example.com (https) or
@@ -70,7 +76,7 @@ async fn main() {
 
     if cli.network.len() < 2 {
         error!(
-            target: "cassisd",
+            target: "cassis_router",
             "at least two --network flags are required for routing, got {}",
             cli.network.len()
         );
@@ -83,27 +89,27 @@ async fn main() {
         .map(|spec| network_id_for_spec(spec))
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|err| {
-            error!(target: "cassisd", "{err}");
+            error!(target: "cassis_router", "{err}");
             std::process::exit(2);
         });
 
-    let keys = match seed::derive_keys(&cli.seed, network_ids) {
+    let derived = match keys::derive_keys(&cli.seed, network_ids.clone()) {
         Ok(keys) => keys,
         Err(err) => {
-            error!(target: "cassisd", "invalid --seed: {err}");
+            error!(target: "cassis_router", "invalid --seed: {err}");
             std::process::exit(2);
         }
     };
 
     info!(
-        target: "cassisd",
+        target: "cassis_router",
         "derived nostr signing key: {} ({})",
-        keys.nostr.to_nsec(),
-        keys.nostr.pubkey().to_hex()
+        derived.nostr.to_nsec(),
+        derived.nostr.pubkey().to_hex()
     );
-    for (network_id, sk) in &keys.networks {
+    for (network_id, sk) in &derived.networks {
         info!(
-            target: "cassisd",
+            target: "cassis_router",
             "  derived key for {network_id}: pubkey={}",
             sk.pubkey().to_hex()
         );
@@ -111,25 +117,25 @@ async fn main() {
 
     let mut adapters: HashMap<NetworkId, NetworkEntry> = HashMap::new();
     for spec in &cli.network {
-        match build_adapter(spec, &keys).await {
+        match build_adapter(spec, &derived).await {
             Ok(entry) => {
-                adapters.insert(entry.receiver.network_id(), entry);
+                adapters.insert(entry.network_id.clone(), entry);
             }
             Err(err) => {
-                error!(target: "cassisd", "{err}");
+                error!(target: "cassis_router", "{err}");
                 std::process::exit(2);
             }
         }
     }
 
     if adapters.len() < 2 {
-        error!(target: "cassisd", "at least two distinct networks are required for routing");
+        error!(target: "cassis_router", "at least two distinct networks are required for routing");
         std::process::exit(2);
     }
 
-    info!(target: "cassisd", "routing between {} networks:", adapters.len());
+    info!(target: "cassis_router", "routing between {} networks:", adapters.len());
     for id in adapters.keys() {
-        info!(target: "cassisd", "  - {id}");
+        info!(target: "cassis_router", "  - {id}");
     }
 
     let relay_urls = if cli.nostr_relay.is_empty() {
@@ -138,26 +144,26 @@ async fn main() {
         cli.nostr_relay.clone()
     };
 
-    let daemon = Arc::new(CassisDaemon::new(adapters));
-    let handler_daemon = daemon.clone();
+    let router = Arc::new(CassisRouter::new(adapters));
+    let handler_router = router.clone();
 
     let (iroh_server, iroh_secret) =
-        IrohServer::new(keys.iroh.clone()).await.expect("failed to bind iroh endpoint");
+        IrohServer::new(derived.iroh.clone()).await.expect("failed to bind iroh endpoint");
     let iroh_peer_id = iroh_secret.public();
     let iroh_relay = iroh_server
         .home_relay()
         .map(|s| s.to_string())
         .unwrap_or_else(|| cassis_iroh::DEFAULT_IROH_RELAY.to_string());
-    info!(target: "cassisd", "iroh endpoint: {iroh_peer_id} relay: {iroh_relay}");
+    info!(target: "cassis_router", "iroh endpoint: {iroh_peer_id} relay: {iroh_relay}");
 
     tokio::spawn(async move {
         let handler = Arc::new(
             move |inst: HopInstruction| -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<HopAck, HopReject>> + Send>,
             > {
-                let daemon = handler_daemon.clone();
+                let router = handler_router.clone();
                 Box::pin(async move {
-                    match daemon.handle_instruction(inst).await {
+                    match router.handle_instruction(inst).await {
                         Ok(ack) => Ok(ack),
                         Err(reject) => Err(reject),
                     }
@@ -165,21 +171,21 @@ async fn main() {
             },
         );
         if let Err(e) = iroh_server.run(handler).await {
-            error!(target: "cassisd", "iroh server error: {e}");
+            error!(target: "cassis_router", "iroh server error: {e}");
         }
     });
 
     publish_route_announcements(
-        &daemon.adapters,
+        &router.adapters,
         relay_urls,
-        &keys.nostr,
+        &derived.nostr,
         &iroh_peer_id.to_string(),
         &iroh_relay,
     )
     .await;
 
     tokio::signal::ctrl_c().await.ok();
-    info!(target: "cassisd", "shutting down");
+    info!(target: "cassis_router", "shutting down");
 }
 
 /// Compute the [`NetworkId`] for a network spec without building the adapter.
@@ -224,10 +230,6 @@ fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
     }
 }
 
-/// Split a `kind:param` spec into `(kind, Option<param>)`. A bare
-/// `kind` with no colon yields `(kind, None)`. The split is on the
-/// *first* colon only, so `cashu:https://...` and `fedimint:fed1q...`
-/// stay intact.
 fn split_spec(spec: &str) -> (&str, Option<&str>) {
     match spec.split_once(':') {
         Some((kind, param)) => (kind, Some(param)),
@@ -235,18 +237,10 @@ fn split_spec(spec: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Normalize a cashu mint URL: prepend `https://` if no scheme is
-/// present, or `http://` for loopback hosts (`localhost`,
-/// `127.0.0.1`, `::1`, `[::1]`, with or without a port). Values that
-/// already have a `scheme://` are returned unchanged.
 fn normalize_mint_url(host_or_url: &str) -> String {
     if host_or_url.contains("://") {
         return host_or_url.to_string();
     }
-    // Extract the host portion so we can decide the scheme.
-    // Bracketed IPv6 like `[::1]:3338` → host is between `[` and `]`.
-    // Bare IPv6 loopback `::1` or `::1:3338` starts with `::1`.
-    // Everything else: host is everything before the first `:`.
     let host: &str = if let Some(rest) = host_or_url.strip_prefix('[') {
         match rest.find(']') {
             Some(end) => &rest[..end],
@@ -262,13 +256,6 @@ fn normalize_mint_url(host_or_url: &str) -> String {
     format!("{scheme}://{host_or_url}")
 }
 
-/// Canonicalize a [`NetworkId`] received from an external peer (an
-/// incoming iroh `HopInstruction`, a route announcement tag, etc.)
-/// into the form the daemon uses internally. Currently this only
-/// fixes the `cashu:` kind: a peer that sends `cashu:localhost:8093`
-/// must match the daemon's own `cashu:http://localhost:8093`
-/// adapter key, so we run the same scheme-prepending pass
-/// [`normalize_mint_url`] does for the local spec.
 fn normalize_network_id(network_id: &NetworkId) -> NetworkId {
     if let Some(rest) = network_id.0.strip_prefix("cashu:") {
         NetworkId(format!("cashu:{}", normalize_mint_url(rest)))
@@ -277,22 +264,23 @@ fn normalize_network_id(network_id: &NetworkId) -> NetworkId {
     }
 }
 
-/// Per-network entry the daemon tracks. Splits the
-/// "receive incoming" and "send outgoing" roles onto the
-/// user-facing traits, so a single network can be both source and
-/// destination of a hop. The underlying adapter object is shared
-/// (`Arc`) when it implements both traits on the same concrete
-/// type (cashu via the blanket impl, fedimint via direct impls).
+/// Per-network entry the router tracks. Only the outgoing side
+/// (sender) is used; `incoming_delta_secs` is read off the
+/// `NetworkReceiverAdapter` *at construction* and cached, so the
+/// router can validate timelocks without ever calling into the
+/// receiver runtime. The router no longer plays the receiver role;
+/// the `cassis-cli` does that.
 #[derive(Clone)]
 pub struct NetworkEntry {
-    pub receiver: Arc<dyn NetworkReceiverAdapter>,
+    pub network_id: NetworkId,
     pub sender: Arc<dyn NetworkSenderAdapter>,
+    pub incoming_delta_secs: u64,
 }
 
 #[allow(unused_variables)]
 async fn build_adapter(
     spec: &str,
-    seed_keys: &seed::DerivedKeys,
+    derived: &keys::DerivedKeys,
 ) -> Result<NetworkEntry, String> {
     let (kind, param) = split_spec(spec);
 
@@ -306,23 +294,32 @@ async fn build_adapter(
             })?;
             let mint_url = normalize_mint_url(raw);
             let network_id = NetworkId(format!("cashu:{mint_url}"));
-            let sk = seed_keys
+            let sk = derived
                 .networks
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
             let adapter = Arc::new(
-                cassis_cashu::CashuAdapter::new(network_id, mint_url.clone(), sk)
+                cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url, sk)
                     .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
-            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            // Borrow the per-network receiver for its `incoming_delta_secs`
+            // (cashu gets this from the blanket impl) and then drop.
+            let incoming_delta_secs = {
+                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+                receiver.incoming_delta_secs()
+            };
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(NetworkEntry { receiver, sender })
+            Ok(NetworkEntry {
+                network_id,
+                sender,
+                incoming_delta_secs,
+            })
         }
 
         #[cfg(not(feature = "cashu"))]
         "cashu" => Err(
-            "network 'cashu' requested but cassisd was not compiled with the 'cashu' feature"
+            "network 'cashu' requested but cassis-router was not compiled with the 'cashu' feature"
                 .into(),
         ),
 
@@ -334,13 +331,13 @@ async fn build_adapter(
                     .to_string()
             })?;
             let network_id = NetworkId(format!("fedimint:{address}"));
-            let sk = seed_keys
+            let sk = derived
                 .networks
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
             let adapter = match cassis_fedimint::FedimintAdapter::new(
-                network_id,
+                network_id.clone(),
                 address.to_string(),
                 sk,
             )
@@ -349,14 +346,21 @@ async fn build_adapter(
                 Ok(adapter) => Arc::new(adapter),
                 Err(err) => return Err(err),
             };
-            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let incoming_delta_secs = {
+                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+                receiver.incoming_delta_secs()
+            };
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(NetworkEntry { receiver, sender })
+            Ok(NetworkEntry {
+                network_id,
+                sender,
+                incoming_delta_secs,
+            })
         }
 
         #[cfg(not(feature = "fedimint"))]
         "fedimint" => Err(
-            "network 'fedimint' requested but cassisd was not compiled with the 'fedimint' feature"
+            "network 'fedimint' requested but cassis-router was not compiled with the 'fedimint' feature"
                 .into(),
         ),
 
@@ -365,17 +369,23 @@ async fn build_adapter(
             if param.is_some() {
                 return Err("network 'liquid' does not take a parameter".into());
             }
-            let adapter = Arc::new(cassis_liquid::LiquidAdapter::new(NetworkId(
-                "liquid".to_string(),
-            )));
-            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let network_id = NetworkId("liquid".to_string());
+            let adapter = Arc::new(cassis_liquid::LiquidAdapter::new(network_id.clone()));
+            let incoming_delta_secs = {
+                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+                receiver.incoming_delta_secs()
+            };
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(NetworkEntry { receiver, sender })
+            Ok(NetworkEntry {
+                network_id,
+                sender,
+                incoming_delta_secs,
+            })
         }
 
         #[cfg(not(feature = "liquid"))]
         "liquid" => Err(
-            "network 'liquid' requested but cassisd was not compiled with the 'liquid' feature"
+            "network 'liquid' requested but cassis-router was not compiled with the 'liquid' feature"
                 .into(),
         ),
 
@@ -384,15 +394,23 @@ async fn build_adapter(
             if param.is_some() {
                 return Err("network 'ark' does not take a parameter".into());
             }
-            let adapter = Arc::new(cassis_arkade::ArkAdapter::new(NetworkId("ark".to_string())));
-            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let network_id = NetworkId("ark".to_string());
+            let adapter = Arc::new(cassis_arkade::ArkAdapter::new(network_id.clone()));
+            let incoming_delta_secs = {
+                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+                receiver.incoming_delta_secs()
+            };
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(NetworkEntry { receiver, sender })
+            Ok(NetworkEntry {
+                network_id,
+                sender,
+                incoming_delta_secs,
+            })
         }
 
         #[cfg(not(feature = "ark"))]
         "ark" => Err(
-            "network 'ark' requested but cassisd was not compiled with the 'ark' feature".into(),
+            "network 'ark' requested but cassis-router was not compiled with the 'ark' feature".into(),
         ),
 
         #[cfg(feature = "rootstock")]
@@ -400,17 +418,23 @@ async fn build_adapter(
             if param.is_some() {
                 return Err("network 'rootstock' does not take a parameter".into());
             }
-            let adapter = Arc::new(cassis_rootstock::RootstockAdapter::new(NetworkId(
-                "rootstock".to_string(),
-            )));
-            let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+            let network_id = NetworkId("rootstock".to_string());
+            let adapter = Arc::new(cassis_rootstock::RootstockAdapter::new(network_id.clone()));
+            let incoming_delta_secs = {
+                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
+                receiver.incoming_delta_secs()
+            };
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(NetworkEntry { receiver, sender })
+            Ok(NetworkEntry {
+                network_id,
+                sender,
+                incoming_delta_secs,
+            })
         }
 
         #[cfg(not(feature = "rootstock"))]
         "rootstock" => Err(
-            "network 'rootstock' requested but cassisd was not compiled with the 'rootstock' feature"
+            "network 'rootstock' requested but cassis-router was not compiled with the 'rootstock' feature"
                 .into(),
         ),
 
@@ -418,12 +442,12 @@ async fn build_adapter(
     }
 }
 
-pub struct CassisDaemon {
+pub struct CassisRouter {
     pub adapters: HashMap<NetworkId, NetworkEntry>,
     pending: PendingMap,
 }
 
-impl CassisDaemon {
+impl CassisRouter {
     pub fn new(adapters: HashMap<NetworkId, NetworkEntry>) -> Self {
         Self {
             adapters,
@@ -435,13 +459,6 @@ impl CassisDaemon {
         &self,
         mut instruction: HopInstruction,
     ) -> Result<HopAck, HopReject> {
-        // Canonicalize the network ids on the inbound side too. The
-        // daemon's own adapter map uses the scheme-prepended form
-        // (e.g. `cashu:http://localhost:8093`) but an upstream peer
-        // may have built the instruction with the raw form
-        // (`cashu:localhost:8093`); without this the adapter lookup
-        // misses and the instruction is rejected as an unknown
-        // network.
         let incoming_raw = instruction.incoming_network.clone();
         let outgoing_raw = instruction.outgoing_network.clone();
         instruction.incoming_network = normalize_network_id(&instruction.incoming_network);
@@ -450,14 +467,14 @@ impl CassisDaemon {
             || instruction.outgoing_network != outgoing_raw
         {
             debug!(
-                target: "cassisd",
+                target: "cassis_router",
                 "canonicalized network ids: incoming {} -> {}, outgoing {} -> {}",
                 incoming_raw, instruction.incoming_network,
                 outgoing_raw, instruction.outgoing_network,
             );
         }
         info!(
-            target: "cassisd",
+            target: "cassis_router",
             "iroh instruction: {} msat {} -> {} via {}",
             instruction.amount_msat,
             instruction.incoming_network,
@@ -486,7 +503,7 @@ impl CassisDaemon {
 
     fn validate_instruction(&self, instruction: &HopInstruction) -> Result<(), HopReject> {
         debug!(
-            target: "cassisd",
+            target: "cassis_router",
             "validate_instruction: payment_hash={}, amount_msat={}, incoming={}, outgoing={}, \
              incoming_deadline={}, outgoing_expiry={}",
             lowercase_hex::encode(instruction.payment_hash),
@@ -499,9 +516,7 @@ impl CassisDaemon {
         if instruction.payment_hash.0.iter().all(|byte| *byte == 0) {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
-                reason: format!(
-                    "zero payment hash, accepted: non-zero hash",
-                ),
+                reason: format!("zero payment hash, accepted: non-zero hash"),
             });
         }
 
@@ -538,10 +553,10 @@ impl CassisDaemon {
         }
 
         let now = unix_now();
-        let required_delta = incoming.receiver.incoming_delta_secs();
+        let required_delta = incoming.incoming_delta_secs;
         let min_deadline = now.saturating_add(required_delta);
         debug!(
-            target: "cassisd",
+            target: "cassis_router",
             "validate_instruction: incoming_network={}, incoming_delta={required_delta}, \
              now={now}, min_deadline={min_deadline}, actual={}",
             instruction.incoming_network, instruction.incoming_deadline
@@ -565,13 +580,6 @@ async fn watch_instruction(
     adapters: HashMap<NetworkId, NetworkEntry>,
     pending: PendingMap,
 ) {
-    let incoming_entry = match adapters.get(&instruction.incoming_network) {
-        Some(entry) => entry,
-        None => {
-            remove_pending(&pending, instruction.payment_hash).await;
-            return;
-        }
-    };
     let outgoing_entry = match adapters.get(&instruction.outgoing_network) {
         Some(entry) => entry,
         None => {
@@ -580,61 +588,10 @@ async fn watch_instruction(
         }
     };
 
-    // 1. Register the incoming invoice on the receiver. For
-    //    "sells its own preimage" networks (fedimint) this returns
-    //    the network's payment hash; for router-style networks the
-    //    auto-impl delegates to `watch_incoming_htlc` and may block
-    //    until the upstream funds the contract.
-    let invoice = match incoming_entry
-        .receiver
-        .create_invoice(instruction.amount_msat, instruction.incoming_deadline, None)
-        .await
-    {
-        Ok(invoice) => {
-            info!(
-                target: "cassisd",
-                "  incoming invoice on {}: amount={} hash={:?}",
-                instruction.incoming_network, invoice.amount_msat, invoice.payment_hash
-            );
-            invoice
-        }
-        Err(err) => {
-            warn!(
-                target: "cassisd",
-                "  create_invoice failed on {}: {:?}",
-                instruction.incoming_network, err
-            );
-            remove_pending(&pending, instruction.payment_hash).await;
-            return;
-        }
-    };
-
-    // Sanity-check the timelock cascade: the incoming invoice must
-    // outlive the outgoing by at least the receiver's per-hop delta,
-    // so we never have to claim an expired contract.
-    let required_delta = incoming_entry.receiver.incoming_delta_secs();
-    if invoice.expires_at
-        < instruction
-            .outgoing_expiry
-            .saturating_add(required_delta)
-    {
-        warn!(
-            target: "cassisd",
-            "  incoming invoice expires too soon: invoice.expires_at={}, \
-             outgoing_expiry={}, required_delta={}",
-            invoice.expires_at, instruction.outgoing_expiry, required_delta
-        );
-        remove_pending(&pending, instruction.payment_hash).await;
-        return;
-    }
-
-    // 2. Initiate the outgoing payment. The payment hash from the
-    //    `Invoice` is what the upstream is paying; the sender routes
-    //    the funds to the next hop on the outgoing network.
     let payment = match outgoing_entry
         .sender
         .pay_invoice(
-            invoice.payment_hash,
+            instruction.payment_hash,
             instruction.amount_msat,
             &instruction.recipient,
             &instruction.outgoing_network,
@@ -644,7 +601,7 @@ async fn watch_instruction(
     {
         Ok(payment) => {
             info!(
-                target: "cassisd",
+                target: "cassis_router",
                 "  outgoing payment on {} for {}",
                 payment.destination_network, payment.destination_pubkey
             );
@@ -652,7 +609,7 @@ async fn watch_instruction(
         }
         Err(err) => {
             warn!(
-                target: "cassisd",
+                target: "cassis_router",
                 "  pay_invoice failed on {}: {:?}",
                 instruction.outgoing_network, err
             );
@@ -661,37 +618,25 @@ async fn watch_instruction(
         }
     };
 
-    // 3. Wait for the preimage to be revealed on the outgoing
-    //    payment.
     match outgoing_entry
         .sender
         .watch_payment(payment.clone(), instruction.outgoing_expiry)
         .await
     {
-        Ok(preimage) => {
-            info!(target: "cassisd", "  preimage received, settling incoming");
-            // 4. Settle the incoming side. For "sells its own
-            //    preimage" networks the preimage is informational;
-            //    the network settles via its own state machine.
-            if let Err(err) = incoming_entry
-                .receiver
-                .claim_incoming(invoice.payment_hash, preimage)
-                .await
-            {
-                warn!(
-                    target: "cassisd",
-                    "  claim_incoming failed on {}: {:?}",
-                    instruction.incoming_network, err
-                );
-            }
+        Ok(_preimage) => {
+            info!(
+                target: "cassis_router",
+                "  outgoing settled on {} (preimage revealed upstream)",
+                instruction.outgoing_network
+            );
         }
         Err(SendError::DeadlineExceeded) => {
-            warn!(target: "cassisd", "  deadline exceeded, refunding outgoing");
+            warn!(target: "cassis_router", "  deadline exceeded, refunding outgoing");
             let _ = outgoing_entry.sender.refund_payment(payment).await;
         }
         Err(err) => {
             error!(
-                target: "cassisd",
+                target: "cassis_router",
                 "  error watching payment on {}: {:?}",
                 instruction.outgoing_network, err
             );
@@ -722,7 +667,7 @@ async fn publish_route_announcements(
     iroh_relay: &str,
 ) {
     if relay_urls.is_empty() {
-        warn!(target: "cassisd", "no nostr relays configured, skipping route announcement publication");
+        warn!(target: "cassis_router", "no nostr relays configured, skipping route announcement publication");
         return;
     }
 
@@ -764,7 +709,7 @@ async fn publish_route_announcements(
         .collect();
 
     info!(
-        target: "cassisd",
+        target: "cassis_router",
         "publishing {} route announcement event(s) (kind {}, transit_slack_secs={}) to {} relay(s) for pubkey {}",
         events.len(),
         NOSTR_KIND_ROUTE_ANNOUNCEMENT,
@@ -784,9 +729,9 @@ async fn publish_route_announcements(
                 Some(err) => failed.push(format!("{}: {err}", result.relay_url)),
             }
         }
-        info!(target: "cassisd", "  route {d_tag}: published to {ok} relay(s)");
+        info!(target: "cassis_router", "  route {d_tag}: published to {ok} relay(s)");
         for failure in &failed {
-            warn!(target: "cassisd", "    rejected by {failure}");
+            warn!(target: "cassis_router", "    rejected by {failure}");
         }
     }
 }
@@ -841,7 +786,6 @@ mod tests {
             normalize_mint_url("http://localhost:3338"),
             "http://localhost:3338"
         );
-        // Non-default ports on remote hosts keep https.
         assert_eq!(
             normalize_mint_url("https://mint.example.com:8443"),
             "https://mint.example.com:8443"
@@ -850,8 +794,6 @@ mod tests {
 
     #[test]
     fn network_id_for_cashu_spec_uses_normalized_url() {
-        // The NetworkId and the adapter mint URL must agree, so key
-        // derivation and adapter init hit the same mint.
         let id = network_id_for_spec("cashu:mint.example.com").unwrap();
         assert_eq!(id.0, "cashu:https://mint.example.com");
     }
@@ -876,9 +818,6 @@ mod tests {
 
     #[test]
     fn normalize_network_id_adds_scheme_to_cashu() {
-        // The whole point of this helper: a peer's `cashu:localhost:8093`
-        // must round-trip into the same form the daemon stores its
-        // own adapters under, so the inbound lookup hits.
         assert_eq!(
             normalize_network_id(&NetworkId("cashu:localhost:8093".to_string())).0,
             "cashu:http://localhost:8093"

@@ -800,9 +800,15 @@ dependencies = [
 name = "cassis-cli"
 version = "0.1.0"
 dependencies = [
+ "cassis-arkade",
+ "cassis-cashu",
  "cassis-client",
  "cassis-core",
+ "cassis-fedimint",
  "cassis-iroh",
+ "cassis-keys",
+ "cassis-liquid",
+ "cassis-rootstock",
  "cassis-routing",
  "clap",
  "env_logger",
@@ -810,10 +816,12 @@ dependencies = [
  "iroh 0.35.0",
  "log",
  "lowercase-hex",
+ "minisqlite",
  "rand 0.8.5",
  "rustls",
  "serde_json",
  "sha2",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -884,6 +892,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cassis-keys"
+version = "0.1.0"
+dependencies = [
+ "bip32",
+ "bip39",
+ "cassis-core",
+ "hmac",
+ "iroh 0.35.0",
+ "rand 0.8.5",
+ "ritualistic",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cassis-liquid"
 version = "0.1.0"
 dependencies = [
@@ -900,6 +923,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cassis-router"
+version = "0.1.0"
+dependencies = [
+ "cassis-arkade",
+ "cassis-cashu",
+ "cassis-core",
+ "cassis-fedimint",
+ "cassis-iroh",
+ "cassis-keys",
+ "cassis-liquid",
+ "cassis-rootstock",
+ "cassis-routing",
+ "clap",
+ "env_logger",
+ "iroh 0.35.0",
+ "log",
+ "lowercase-hex",
+ "ritualistic",
+ "rustls",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "cassis-routing"
 version = "0.1.0"
 dependencies = [
@@ -907,33 +954,6 @@ dependencies = [
  "log",
  "ritualistic",
  "serde",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "cassisd"
-version = "0.1.0"
-dependencies = [
- "bip32",
- "bip39",
- "cassis-arkade",
- "cassis-cashu",
- "cassis-core",
- "cassis-fedimint",
- "cassis-iroh",
- "cassis-liquid",
- "cassis-rootstock",
- "cassis-routing",
- "clap",
- "env_logger",
- "hmac",
- "iroh 0.35.0",
- "log",
- "lowercase-hex",
- "ritualistic",
- "rustls",
- "sha2",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -1664,6 +1684,15 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "elsa"
+version = "1.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9abf33c656a7256451ebb7d0082c5a471820c31269e49d807c538c252352186e"
+dependencies = [
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -4215,6 +4244,147 @@ dependencies = [
  "bech32",
  "bitcoin",
  "serde",
+]
+
+[[package]]
+name = "minisqlite"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-engine",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-btree"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-fileformat",
+ "minisqlite-pager",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-catalog"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-btree",
+ "minisqlite-fileformat",
+ "minisqlite-pager",
+ "minisqlite-sql",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-engine"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-btree",
+ "minisqlite-catalog",
+ "minisqlite-exec",
+ "minisqlite-fileformat",
+ "minisqlite-pager",
+ "minisqlite-plan",
+ "minisqlite-sql",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-exec"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-btree",
+ "minisqlite-catalog",
+ "minisqlite-expr",
+ "minisqlite-fileformat",
+ "minisqlite-functions",
+ "minisqlite-pager",
+ "minisqlite-plan",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-expr"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-fileformat"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-functions"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-expr",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-journal"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-fileformat",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-pager"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "elsa",
+ "minisqlite-fileformat",
+ "minisqlite-journal",
+ "minisqlite-types",
+ "minisqlite-wal",
+]
+
+[[package]]
+name = "minisqlite-plan"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-catalog",
+ "minisqlite-expr",
+ "minisqlite-functions",
+ "minisqlite-sql",
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-sql"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-types",
+]
+
+[[package]]
+name = "minisqlite-types"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+
+[[package]]
+name = "minisqlite-wal"
+version = "0.0.0"
+source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
+dependencies = [
+ "minisqlite-fileformat",
+ "minisqlite-types",
 ]
 
 [[package]]

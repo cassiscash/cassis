@@ -1,0 +1,15 @@
+[package]
+name = "cassis-keys"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cassis-core = { path = "../cassis-core" }
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "std"] }
+bip39 = { version = "2.2.2" }
+hmac = "0.12"
+iroh = "0.35"
+rand = "0.8"
+ritualistic = "0.1.1"
+sha2 = "0.10"
+thiserror = "1.0"

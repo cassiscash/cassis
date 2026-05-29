@@ -5,7 +5,7 @@ use sha2::Sha512;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-/// BIP39 mnemonic words expected for the `--seed` flag.
+/// BIP39 mnemonic words expected.
 pub const SEED_WORD_COUNT: usize = 12;
 
 /// NIP-6 derivation path for the Nostr signing key (account 0).
@@ -32,14 +32,17 @@ pub enum SeedError {
     DerivationExhausted { label: String },
 }
 
-/// All keys the daemon uses, deterministically derived from a BIP39 seed.
+/// All keys derived from a BIP39 seed. Shared by `cassis-router` and
+/// `cassis-cli`: the router uses it for route-announcement signing and
+/// adapter construction; the CLI uses it for the same plus stable
+/// inbound identity on the receiver side.
 #[derive(Debug, Clone)]
 pub struct DerivedKeys {
     /// Nostr signing key used to sign route-announcement events.
     pub nostr: SecretKey,
     /// Iroh transport key used for peer-to-peer connections.
     pub iroh: iroh::SecretKey,
-    /// One signing key per network the daemon routes between.
+    /// One signing key per network the node participates in.
     pub networks: HashMap<NetworkId, SecretKey>,
 }
 
@@ -58,7 +61,7 @@ pub fn parse_seed(mnemonic: &str) -> Result<[u8; 64], SeedError> {
     Ok(mnemonic.to_seed(""))
 }
 
-/// Derive every key the daemon needs from a BIP39 mnemonic.
+/// Derive every key the node needs from a BIP39 mnemonic.
 ///
 /// The Nostr signing key is derived per NIP-6 at the BIP32 path
 /// `m/44'/1237'/0'/0/0` (account 0). Per-network signing keys use a
@@ -84,11 +87,18 @@ pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<Derive
     Ok(DerivedKeys { nostr, iroh, networks })
 }
 
+/// Generate a fresh 12-word BIP39 mnemonic using the OS CSPRNG.
+pub fn generate_mnemonic() -> Result<String, SeedError> {
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    // 128 bits of entropy = 12 words.
+    let mut entropy = [0u8; 16];
+    OsRng.fill_bytes(&mut entropy);
+    let mnemonic = bip39::Mnemonic::from_entropy(&entropy)?;
+    Ok(mnemonic.to_string())
+}
+
 /// Derive the Nostr signing key from the BIP39 seed per NIP-6.
-///
-/// NIP-6 specifies the BIP32 derivation path `m/44'/1237'/<account>'/0/0`;
-/// this uses account 0, which is what a basic client that needs a single key
-/// is expected to use.
 fn derive_nostr_secret_key(seed: &[u8; 64]) -> Result<SecretKey, SeedError> {
     let path = bip32::DerivationPath::from_str(NOSTR_DERIVATION_PATH)
         .map_err(|err| SeedError::InvalidPath(err.to_string()))?;
@@ -98,8 +108,6 @@ fn derive_nostr_secret_key(seed: &[u8; 64]) -> Result<SecretKey, SeedError> {
     SecretKey::from_bytes(bytes).map_err(|_| SeedError::InvalidScalar)
 }
 
-/// Derive a single secp256k1-valid secret key from the seed for the given
-/// purpose label.
 fn derive_secret_key(seed: &[u8; 64], label: &[u8]) -> Result<SecretKey, String> {
     for counter in 0u32.. {
         let mut mac = HmacSha512::new_from_slice(seed).expect("hmac accepts any key length");
@@ -123,8 +131,6 @@ fn derive_secret_key(seed: &[u8; 64], label: &[u8]) -> Result<SecretKey, String>
     unreachable!()
 }
 
-/// Derive the iroh transport key from the seed.  Uses the fixed label
-/// `cassis/iroh` with HMAC-SHA512; the first 32 bytes are the ed25519 seed.
 fn derive_iroh_secret_key(seed: &[u8; 64]) -> iroh::SecretKey {
     let mut mac = HmacSha512::new_from_slice(seed).expect("hmac accepts any key length");
     mac.update(b"cassis/iroh");
@@ -189,5 +195,11 @@ mod tests {
             keys.networks.get(&ids[0]).unwrap().as_bytes(),
             keys.networks.get(&ids[1]).unwrap().as_bytes()
         );
+    }
+
+    #[test]
+    fn generate_mnemonic_produces_twelve_words() {
+        let m = generate_mnemonic().unwrap();
+        assert_eq!(m.split_whitespace().count(), SEED_WORD_COUNT);
     }
 }

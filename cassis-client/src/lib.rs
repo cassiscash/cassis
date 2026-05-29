@@ -1,6 +1,6 @@
 use cassis_core::{
-    HopInstruction, Invoice, NetworkId, NetworkSenderAdapter, PaymentResult, PaymentStatus,
-    RouteHop, SendError,
+    Bytes32, HopInstruction, Invoice, NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter,
+    PaymentResult, PaymentStatus, ReceiveError, RouteHop, SendError,
 };
 use cassis_iroh::{node_addr_from_announcement, IrohClient};
 use cassis_routing::{
@@ -27,6 +27,22 @@ impl From<cassis_iroh::IrohError> for PayError {
     fn from(e: cassis_iroh::IrohError) -> Self {
         PayError::Io(e.to_string())
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ReceiveFlowError {
+    #[error("network not registered: {0}")]
+    UnknownNetwork(String),
+    #[error("receive error: {0}")]
+    Receive(#[from] ReceiveError),
+}
+
+/// Outcome of a one-shot `receive` call. Either the upstream funded
+/// the invoice (and the receiver claimed it) or the call gave up.
+#[derive(Clone, Debug)]
+pub struct ReceiveResult {
+    pub payment_hash: Bytes32,
+    pub preimage: Option<Bytes32>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -76,11 +92,13 @@ pub async fn find_route(
 /// the same way.
 pub struct CassisClient {
     pub senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
+    pub receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
     pub nostr_relays: Vec<String>,
     iroh_client: IrohClient,
 }
 
 impl CassisClient {
+    /// Build a sender-only client. Use this for pay-only flows.
     pub async fn new(
         senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
         nostr_relays: Vec<String>,
@@ -91,6 +109,26 @@ impl CassisClient {
             .expect("failed to bind iroh endpoint for client");
         Self {
             senders,
+            receivers: HashMap::new(),
+            nostr_relays,
+            iroh_client: IrohClient::new(endpoint),
+        }
+    }
+
+    /// Build a client with both sender and receiver adapters. Use
+    /// this for CLI-style flows that pay and receive.
+    pub async fn with_receivers(
+        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
+        receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
+        nostr_relays: Vec<String>,
+    ) -> Self {
+        let endpoint = Endpoint::builder()
+            .bind()
+            .await
+            .expect("failed to bind iroh endpoint for client");
+        Self {
+            senders,
+            receivers,
             nostr_relays,
             iroh_client: IrohClient::new(endpoint),
         }
@@ -243,5 +281,82 @@ impl CassisClient {
         sender_network: NetworkId,
     ) -> Result<Vec<RouteHop>, RouteError> {
         find_route(&self.nostr_relays, destination_network, amount_msat, &sender_network).await
+    }
+
+    /// Look up the receiver adapter for `network`.
+    fn receiver_for(&self, network: &NetworkId) -> Result<Arc<dyn NetworkReceiverAdapter>, ReceiveFlowError> {
+        self.receivers
+            .get(network)
+            .cloned()
+            .ok_or_else(|| ReceiveFlowError::UnknownNetwork(network.0.clone()))
+    }
+
+    /// Register an incoming invoice on `network` and return the
+    /// network's `Invoice` (whose `payment_hash` is what the upstream
+    /// will fund). The CLI is expected to persist a row tied to
+    /// `payment_hash` before returning to the user; this method does
+    /// not store anything.
+    pub async fn create_invoice(
+        &self,
+        network: &NetworkId,
+        amount_msat: u64,
+        expiry: u64,
+        description: Option<String>,
+    ) -> Result<Invoice, ReceiveFlowError> {
+        let receiver = self.receiver_for(network)?;
+        let invoice = receiver
+            .create_invoice(amount_msat, expiry, description)
+            .await?;
+        Ok(invoice)
+    }
+
+    /// Block until the upstream hop funds the invoice (or the
+    /// `deadline` expires) and return the preimage the network
+    /// revealed. For "sells its own preimage" networks (fedimint)
+    /// the preimage is owned by the network; the returned bytes are
+    /// informational.
+    pub async fn wait_for_incoming(
+        &self,
+        network: &NetworkId,
+        payment_hash: Bytes32,
+        deadline: u64,
+    ) -> Result<Bytes32, ReceiveFlowError> {
+        let receiver = self.receiver_for(network)?;
+        let preimage = receiver.watch_incoming(payment_hash, deadline).await?;
+        Ok(preimage)
+    }
+
+    /// Settle the invoice: release the preimage to the network and
+    /// mark the incoming side paid.
+    pub async fn claim_invoice(
+        &self,
+        network: &NetworkId,
+        payment_hash: Bytes32,
+        preimage: Bytes32,
+    ) -> Result<(), ReceiveFlowError> {
+        let receiver = self.receiver_for(network)?;
+        receiver.claim_incoming(payment_hash, preimage).await?;
+        Ok(())
+    }
+
+    /// Convenience: `create_invoice` followed by `wait_for_incoming`
+    /// (bounded by `deadline`) and `claim_invoice`. The caller is
+    /// expected to have persisted the preimage before calling this
+    /// — the client does not own the secret.
+    pub async fn receive(
+        &self,
+        network: &NetworkId,
+        amount_msat: u64,
+        deadline: u64,
+        description: Option<String>,
+    ) -> Result<ReceiveResult, ReceiveFlowError> {
+        let invoice = self.create_invoice(network, amount_msat, deadline, description).await?;
+        let payment_hash = invoice.payment_hash;
+        let preimage = self.wait_for_incoming(network, payment_hash, deadline).await?;
+        self.claim_invoice(network, payment_hash, preimage).await?;
+        Ok(ReceiveResult {
+            payment_hash,
+            preimage: Some(preimage),
+        })
     }
 }

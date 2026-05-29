@@ -3,10 +3,19 @@ name = "cassis-cli"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+cashu = ["dep:cassis-cashu"]
+fedimint = ["dep:cassis-fedimint"]
+ark = ["dep:cassis-arkade"]
+liquid = ["dep:cassis-liquid"]
+rootstock = ["dep:cassis-rootstock"]
+
 [dependencies]
 cassis-client = { path = "../cassis-client" }
 cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
+cassis-keys = { path = "../cassis-keys" }
 cassis-routing = { path = "../cassis-routing" }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
@@ -16,6 +25,28 @@ futures = "0.3"
 iroh = "0.35"
 log = "0.4"
 lowercase-hex = "0.1"
+minisqlite = { git = "https://github.com/cursor/minisqlite" }
 rustls = "0.23"
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+thiserror = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+
+[dependencies.cassis-cashu]
+path = "../networks/cassis-cashu"
+optional = true
+
+[dependencies.cassis-fedimint]
+path = "../networks/cassis-fedimint"
+optional = true
+
+[dependencies.cassis-arkade]
+path = "../networks/cassis-arkade"
+optional = true
+
+[dependencies.cassis-liquid]
+path = "../networks/cassis-liquid"
+optional = true
+
+[dependencies.cassis-rootstock]
+path = "../networks/cassis-rootstock"
+optional = true
