@@ -262,6 +262,21 @@ fn normalize_mint_url(host_or_url: &str) -> String {
     format!("{scheme}://{host_or_url}")
 }
 
+/// Canonicalize a [`NetworkId`] received from an external peer (an
+/// incoming iroh `HopInstruction`, a route announcement tag, etc.)
+/// into the form the daemon uses internally. Currently this only
+/// fixes the `cashu:` kind: a peer that sends `cashu:localhost:8093`
+/// must match the daemon's own `cashu:http://localhost:8093`
+/// adapter key, so we run the same scheme-prepending pass
+/// [`normalize_mint_url`] does for the local spec.
+fn normalize_network_id(network_id: &NetworkId) -> NetworkId {
+    if let Some(rest) = network_id.0.strip_prefix("cashu:") {
+        NetworkId(format!("cashu:{}", normalize_mint_url(rest)))
+    } else {
+        network_id.clone()
+    }
+}
+
 /// Per-network entry the daemon tracks. Splits the
 /// "receive incoming" and "send outgoing" roles onto the
 /// user-facing traits, so a single network can be both source and
@@ -418,8 +433,29 @@ impl CassisDaemon {
 
     pub async fn handle_instruction(
         &self,
-        instruction: HopInstruction,
+        mut instruction: HopInstruction,
     ) -> Result<HopAck, HopReject> {
+        // Canonicalize the network ids on the inbound side too. The
+        // daemon's own adapter map uses the scheme-prepended form
+        // (e.g. `cashu:http://localhost:8093`) but an upstream peer
+        // may have built the instruction with the raw form
+        // (`cashu:localhost:8093`); without this the adapter lookup
+        // misses and the instruction is rejected as an unknown
+        // network.
+        let incoming_raw = instruction.incoming_network.clone();
+        let outgoing_raw = instruction.outgoing_network.clone();
+        instruction.incoming_network = normalize_network_id(&instruction.incoming_network);
+        instruction.outgoing_network = normalize_network_id(&instruction.outgoing_network);
+        if instruction.incoming_network != incoming_raw
+            || instruction.outgoing_network != outgoing_raw
+        {
+            debug!(
+                target: "cassisd",
+                "canonicalized network ids: incoming {} -> {}, outgoing {} -> {}",
+                incoming_raw, instruction.incoming_network,
+                outgoing_raw, instruction.outgoing_network,
+            );
+        }
         info!(
             target: "cassisd",
             "iroh instruction: {} msat {} -> {} via {}",
@@ -836,5 +872,44 @@ mod tests {
     fn network_id_for_fedimint_spec_is_unchanged() {
         let id = network_id_for_spec("fedimint:fed1qabc").unwrap();
         assert_eq!(id.0, "fedimint:fed1qabc");
+    }
+
+    #[test]
+    fn normalize_network_id_adds_scheme_to_cashu() {
+        // The whole point of this helper: a peer's `cashu:localhost:8093`
+        // must round-trip into the same form the daemon stores its
+        // own adapters under, so the inbound lookup hits.
+        assert_eq!(
+            normalize_network_id(&NetworkId("cashu:localhost:8093".to_string())).0,
+            "cashu:http://localhost:8093"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("cashu:mint.example.com".to_string())).0,
+            "cashu:https://mint.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_network_id_passes_explicit_scheme_through() {
+        assert_eq!(
+            normalize_network_id(&NetworkId("cashu:https://mint.example.com".to_string())).0,
+            "cashu:https://mint.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_network_id_leaves_other_kinds_alone() {
+        assert_eq!(
+            normalize_network_id(&NetworkId("fedimint:fed1qabc".to_string())).0,
+            "fedimint:fed1qabc"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("liquid".to_string())).0,
+            "liquid"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("ark".to_string())).0,
+            "ark"
+        );
     }
 }
