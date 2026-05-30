@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn new_accepts_a_valid_mint_url() {
         let adapter = CashuAdapter::new(
-            NetworkId("cashu:https://mint.example.com".to_string()),
+            NetworkId("cashu::mint.example.com".to_string()),
             "https://mint.example.com".to_string(),
             [0u8; 32],
         );
@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn new_rejects_garbage_mint_url() {
         let adapter = CashuAdapter::new(
-            NetworkId("cashu:not a url".to_string()),
+            NetworkId("cashu::not a url".to_string()),
             "not a url".to_string(),
             [0u8; 32],
         );
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn new_rejects_empty_mint_url() {
         let adapter = CashuAdapter::new(
-            NetworkId("cashu:".to_string()),
+            NetworkId("cashu::".to_string()),
             "".to_string(),
             [0u8; 32],
         );

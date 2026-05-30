@@ -1,4 +1,4 @@
-use cassis_core::NetworkId;
+use cassis_core::{cashu_mint_url, cashu_network_id, fedimint_network_id, NetworkId};
 use clap::{Parser, Subcommand};
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &[
@@ -86,7 +86,7 @@ pub enum Commands {
         command: SeedCommands,
     },
     /// Register a network to participate in. The argument format
-    /// mirrors `cassis-router`: `cashu:host`, `fedimint:invite`,
+    /// mirrors `cassis-router`: `cashu::host`, `fedimint::invite`,
     /// `liquid`, `ark`, `rootstock`. Used to seed the local store
     /// and (for `receive`) the list of adapters to keep open.
     Register {
@@ -134,7 +134,7 @@ pub enum SeedCommands {
 #[derive(Clone, Debug)]
 pub enum NetSpec {
     #[cfg(feature = "cashu")]
-    Cashu { mint_url: String },
+    Cashu { mint_url: String, host: String },
     #[cfg(feature = "fedimint")]
     Fedimint { address: String },
     #[cfg(feature = "liquid")]
@@ -147,29 +147,47 @@ pub enum NetSpec {
 
 impl NetSpec {
     pub fn parse(spec: &str) -> Result<Self, String> {
-        let (kind, param) = match spec.split_once(':') {
-            Some((k, p)) => (k, Some(p)),
-            None => (spec, None),
-        };
-        let _ = param;
+        let (kind, param) = split_canonical_spec(spec);
         match kind {
             #[cfg(feature = "cashu")]
             "cashu" => {
-                let raw = param.ok_or_else(|| {
-                    "network 'cashu' requires a host or URL, \
-                     e.g. cashu:mint.example.com"
+                let host = param.ok_or_else(|| {
+                    "network 'cashu' requires a host, e.g. cashu::mint.example.com"
                         .to_string()
                 })?;
-                let mint_url = normalize_cashu_mint_url(raw);
-                Ok(NetSpec::Cashu { mint_url })
+                if host.is_empty() {
+                    return Err(
+                        "network 'cashu' requires a non-empty host, e.g. cashu::mint.example.com"
+                            .to_string(),
+                    );
+                }
+                if host.contains("://") {
+                    return Err(
+                        "network 'cashu' must not include a scheme; \
+                         drop the http:// or https:// prefix and use cashu::<host> instead"
+                            .to_string(),
+                    );
+                }
+                let network_id = cashu_network_id(host);
+                let mint_url = cashu_mint_url(&network_id)
+                    .map_err(|e| format!("cashu mint url: {e}"))?;
+                Ok(NetSpec::Cashu {
+                    mint_url,
+                    host: host.to_string(),
+                })
             }
             #[cfg(feature = "fedimint")]
             "fedimint" => {
                 let address = param.ok_or_else(|| {
                     "network 'fedimint' requires an invite code, \
-                     e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
+                     e.g. fedimint::fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
                         .to_string()
                 })?;
+                if address.is_empty() {
+                    return Err(
+                        "network 'fedimint' requires a non-empty invite code".to_string(),
+                    );
+                }
                 Ok(NetSpec::Fedimint {
                     address: address.to_string(),
                 })
@@ -221,9 +239,9 @@ impl NetSpec {
     pub fn network_id(&self) -> NetworkId {
         match self {
             #[cfg(feature = "cashu")]
-            NetSpec::Cashu { mint_url } => NetworkId(format!("cashu:{mint_url}")),
+            NetSpec::Cashu { host, .. } => cashu_network_id(host),
             #[cfg(feature = "fedimint")]
-            NetSpec::Fedimint { address } => NetworkId(format!("fedimint:{address}")),
+            NetSpec::Fedimint { address } => fedimint_network_id(address),
             #[cfg(feature = "liquid")]
             NetSpec::Liquid => NetworkId("liquid".to_string()),
             #[cfg(feature = "ark")]
@@ -236,25 +254,93 @@ impl NetSpec {
     }
 }
 
-#[cfg_attr(
-    not(feature = "cashu"),
-    allow(dead_code, unused_variables, unused_imports)
-)]
-fn normalize_cashu_mint_url(host_or_url: &str) -> String {
-    if host_or_url.contains("://") {
-        return host_or_url.to_string();
+/// Split a `--network` spec into `(kind, param)`. Requires the canonical
+/// `::` separator; any other form is rejected.
+fn split_canonical_spec(spec: &str) -> (&str, Option<&str>) {
+    match spec.split_once("::") {
+        Some((kind, param)) => (kind, Some(param)),
+        None => (spec, None),
     }
-    let host: &str = if let Some(rest) = host_or_url.strip_prefix('[') {
-        match rest.find(']') {
-            Some(end) => &rest[..end],
-            None => host_or_url,
-        }
-    } else if host_or_url == "::1" || host_or_url.starts_with("::1:") {
-        "::1"
-    } else {
-        host_or_url.split(':').next().unwrap_or(host_or_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cassis_core::{
+        canonicalize_network_id, CASHU_NETWORK_ID_PREFIX, FEDIMINT_NETWORK_ID_PREFIX,
     };
-    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
-    let scheme = if is_loopback { "http" } else { "https" };
-    format!("{scheme}://{host_or_url}")
+
+    #[test]
+    fn parse_canonical_cashu_spec_uses_canonical_form() {
+        let spec = NetSpec::parse("cashu::mint.example.com").unwrap();
+        assert_eq!(spec.network_id().0, "cashu::mint.example.com");
+        let NetSpec::Cashu { mint_url, host } = spec else {
+            panic!("expected Cashu variant");
+        };
+        assert_eq!(host, "mint.example.com");
+        assert_eq!(mint_url, "https://mint.example.com");
+    }
+
+    #[test]
+    fn parse_canonical_cashu_loopback_uses_canonical_form() {
+        let spec = NetSpec::parse("cashu::localhost:3338").unwrap();
+        assert_eq!(spec.network_id().0, "cashu::localhost:3338");
+        let NetSpec::Cashu { mint_url, host } = spec else {
+            panic!("expected Cashu variant");
+        };
+        assert_eq!(host, "localhost:3338");
+        assert_eq!(mint_url, "http://localhost:3338");
+    }
+
+    #[test]
+    fn parse_canonical_fedimint_spec_uses_canonical_form() {
+        let spec = NetSpec::parse("fedimint::fed1qabc").unwrap();
+        assert_eq!(spec.network_id().0, "fedimint::fed1qabc");
+    }
+
+    #[test]
+    fn parse_rejects_legacy_single_colon() {
+        assert!(NetSpec::parse("cashu:localhost:3338").is_err());
+        assert!(NetSpec::parse("fedimint:fed1qabc").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_explicit_scheme() {
+        assert!(NetSpec::parse("cashu:https://mint.example.com").is_err());
+        assert!(NetSpec::parse("cashu:http://localhost:3338").is_err());
+        assert!(NetSpec::parse("cashu::https://mint.example.com").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_cashu() {
+        assert!(NetSpec::parse("cashu::").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_fedimint() {
+        assert!(NetSpec::parse("fedimint::").is_err());
+    }
+
+    #[test]
+    fn prefixes_match_core_constants() {
+        assert_eq!(NetSpec::parse("cashu::x").unwrap().kind_name(), "cashu");
+        assert_eq!(NetSpec::parse("fedimint::x").unwrap().kind_name(), "fedimint");
+        assert_eq!(CASHU_NETWORK_ID_PREFIX, "cashu::");
+        assert_eq!(FEDIMINT_NETWORK_ID_PREFIX, "fedimint::");
+    }
+
+    #[test]
+    fn canonicalize_passes_through_canonical() {
+        let cases = [
+            "cashu::localhost:3338",
+            "cashu::mint.example.com",
+            "fedimint::fed1qabc",
+            "liquid",
+            "ark",
+        ];
+        for raw in cases {
+            let id = NetworkId(raw.to_string());
+            assert_eq!(canonicalize_network_id(&id).0, raw);
+        }
+    }
 }

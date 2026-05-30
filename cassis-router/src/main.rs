@@ -1,5 +1,6 @@
 use cassis_core::{
-    Bytes32, HopAck, HopInstruction, HopReject, NetworkId, NetworkSenderAdapter, SendError,
+    canonicalize_network_id, cashu_mint_url, cashu_network_id, fedimint_network_id, Bytes32,
+    HopAck, HopInstruction, HopReject, NetworkId, NetworkSenderAdapter, SendError,
 };
 #[cfg(any(
     feature = "cashu",
@@ -34,18 +35,17 @@ type PendingMap = Arc<Mutex<HashMap<Bytes32, HopInstruction>>>;
 #[command(about = "Cassis multi-network routing daemon (router only; receivers live in cassis-cli)")]
 struct Cli {
     /// Networks to route between. The format depends on the network kind:
-    ///     cashu:<host_or_url>  e.g. cashu:mint.example.com (https) or
-    ///                          cashu:http://localhost:3338 or
-    ///                          cashu:127.0.0.1:3338 (http, since localhost)
-    ///     fedimint:<invite_or_db>   e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t...
+    ///     cashu::<host[:port]>     e.g. cashu::mint.example.com (https) or
+    ///                              cashu::localhost:3338 (http, since loopback)
+    ///     fedimint::<invite_code>  e.g. fedimint::fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t...
     ///     liquid               (no parameter)
     ///     ark                  (no parameter)
     ///     rootstock            (no parameter)
     ///
-    /// For `cashu:` the scheme is optional. If the value already has
-    /// a `://` it's used verbatim; otherwise the daemon prepends
-    /// `https://` (or `http://` for `localhost`, `127.0.0.1`,
-    /// `::1`, and `[::1]`).
+    /// The `cashu::` and `fedimint::` forms are the canonical on-the-wire
+    /// syntax used in Nostr route announcements and iroh `HopInstruction`s.
+    /// For `cashu` the scheme is never part of the id: `localhost`/
+    /// `127.0.0.1`/`::1` are always `http`, everything else is `https`.
     ///
     /// At least two are required so the daemon can route between them.
     /// The same kind may be repeated with different parameters.
@@ -193,20 +193,37 @@ fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
     let (kind, param) = split_spec(spec);
     match kind {
         "cashu" => {
-            let mint_url = param.ok_or_else(|| {
-                "network 'cashu' requires a host or URL, \
-                 e.g. cashu:mint.example.com (https) or cashu:http://localhost:3338"
+            let host = param.ok_or_else(|| {
+                "network 'cashu' requires a host, e.g. cashu::mint.example.com or \
+                 cashu::localhost:3338"
                     .to_string()
             })?;
-            let normalized = normalize_mint_url(mint_url);
-            Ok(NetworkId(format!("cashu:{normalized}")))
+            if host.is_empty() {
+                return Err(
+                    "network 'cashu' requires a non-empty host, e.g. cashu::mint.example.com"
+                        .to_string(),
+                );
+            }
+            if host.contains("://") {
+                return Err(
+                    "network 'cashu' must not include a scheme; \
+                     drop the http:// or https:// prefix and use cashu::<host> instead"
+                        .to_string(),
+                );
+            }
+            Ok(cashu_network_id(host))
         }
         "fedimint" => {
             let address = param.ok_or_else(|| {
-                "network 'fedimint' requires an invite code, e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
+                "network 'fedimint' requires an invite code, e.g. fedimint::fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
                     .to_string()
             })?;
-            Ok(NetworkId(format!("fedimint:{address}")))
+            if address.is_empty() {
+                return Err(
+                    "network 'fedimint' requires a non-empty invite code".to_string(),
+                );
+            }
+            Ok(fedimint_network_id(address))
         }
         "liquid" => {
             if param.is_some() {
@@ -231,37 +248,14 @@ fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
 }
 
 fn split_spec(spec: &str) -> (&str, Option<&str>) {
-    match spec.split_once(':') {
-        Some((kind, param)) => (kind, Some(param)),
-        None => (spec, None),
+    if let Some((kind, param)) = spec.split_once("::") {
+        return (kind, Some(param));
     }
-}
-
-fn normalize_mint_url(host_or_url: &str) -> String {
-    if host_or_url.contains("://") {
-        return host_or_url.to_string();
-    }
-    let host: &str = if let Some(rest) = host_or_url.strip_prefix('[') {
-        match rest.find(']') {
-            Some(end) => &rest[..end],
-            None => host_or_url,
-        }
-    } else if host_or_url == "::1" || host_or_url.starts_with("::1:") {
-        "::1"
-    } else {
-        host_or_url.split(':').next().unwrap_or(host_or_url)
-    };
-    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
-    let scheme = if is_loopback { "http" } else { "https" };
-    format!("{scheme}://{host_or_url}")
+    (spec, None)
 }
 
 fn normalize_network_id(network_id: &NetworkId) -> NetworkId {
-    if let Some(rest) = network_id.0.strip_prefix("cashu:") {
-        NetworkId(format!("cashu:{}", normalize_mint_url(rest)))
-    } else {
-        network_id.clone()
-    }
+    canonicalize_network_id(network_id)
 }
 
 /// Per-network entry the router tracks. Only the outgoing side
@@ -287,13 +281,14 @@ async fn build_adapter(
     match kind {
         #[cfg(feature = "cashu")]
         "cashu" => {
-            let raw = param.ok_or_else(|| {
-                "network 'cashu' requires a host or URL, \
-                 e.g. cashu:mint.example.com (https) or cashu:http://localhost:3338"
+            let host = param.ok_or_else(|| {
+                "network 'cashu' requires a host, \
+                 e.g. cashu::mint.example.com (https) or cashu::localhost:3338 (http)"
                     .to_string()
             })?;
-            let mint_url = normalize_mint_url(raw);
-            let network_id = NetworkId(format!("cashu:{mint_url}"));
+            let network_id = cashu_network_id(host);
+            let mint_url = cashu_mint_url(&network_id)
+                .map_err(|e| format!("cashu mint url: {e}"))?;
             let sk = derived
                 .networks
                 .get(&network_id)
@@ -327,10 +322,10 @@ async fn build_adapter(
         "fedimint" => {
             let address = param.ok_or_else(|| {
                 "network 'fedimint' requires an invite code or pre-joined DB identifier, \
-                 e.g. fedimint:fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
+                 e.g. fedimint::fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
                     .to_string()
             })?;
-            let network_id = NetworkId(format!("fedimint:{address}"));
+            let network_id = fedimint_network_id(address);
             let sk = derived
                 .networks
                 .get(&network_id)
@@ -739,108 +734,177 @@ async fn publish_route_announcements(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cassis_core::CASHU_NETWORK_ID_PREFIX;
 
     #[test]
-    fn normalize_prepends_https_for_remote_hostname() {
+    fn cashu_mint_url_uses_https_for_remote_hostname() {
         assert_eq!(
-            normalize_mint_url("mint.example.com"),
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}mint.example.com")))
+                .unwrap(),
             "https://mint.example.com"
         );
     }
 
     #[test]
-    fn normalize_prepends_https_for_hostname_with_port() {
+    fn cashu_mint_url_uses_https_for_hostname_with_port() {
         assert_eq!(
-            normalize_mint_url("mint.example.com:3338"),
+            cashu_mint_url(&NetworkId(format!(
+                "{CASHU_NETWORK_ID_PREFIX}mint.example.com:3338"
+            )))
+            .unwrap(),
             "https://mint.example.com:3338"
         );
     }
 
     #[test]
-    fn normalize_prepends_http_for_localhost() {
+    fn cashu_mint_url_uses_http_for_localhost() {
         assert_eq!(
-            normalize_mint_url("localhost"),
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost")))
+                .unwrap(),
             "http://localhost"
         );
         assert_eq!(
-            normalize_mint_url("localhost:3338"),
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost:3338")))
+                .unwrap(),
             "http://localhost:3338"
         );
     }
 
     #[test]
-    fn normalize_prepends_http_for_loopback_ips() {
-        assert_eq!(normalize_mint_url("127.0.0.1"), "http://127.0.0.1");
-        assert_eq!(normalize_mint_url("127.0.0.1:3338"), "http://127.0.0.1:3338");
-        assert_eq!(normalize_mint_url("::1"), "http://::1");
-        assert_eq!(normalize_mint_url("[::1]:3338"), "http://[::1]:3338");
-    }
-
-    #[test]
-    fn normalize_preserves_explicit_scheme() {
+    fn cashu_mint_url_uses_http_for_loopback_ips() {
         assert_eq!(
-            normalize_mint_url("https://mint.example.com"),
-            "https://mint.example.com"
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1")))
+                .unwrap(),
+            "http://127.0.0.1"
         );
         assert_eq!(
-            normalize_mint_url("http://localhost:3338"),
-            "http://localhost:3338"
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1:3338")))
+                .unwrap(),
+            "http://127.0.0.1:3338"
         );
         assert_eq!(
-            normalize_mint_url("https://mint.example.com:8443"),
-            "https://mint.example.com:8443"
-        );
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_uses_normalized_url() {
-        let id = network_id_for_spec("cashu:mint.example.com").unwrap();
-        assert_eq!(id.0, "cashu:https://mint.example.com");
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_loopback_uses_http() {
-        let id = network_id_for_spec("cashu:localhost:3338").unwrap();
-        assert_eq!(id.0, "cashu:http://localhost:3338");
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_preserves_explicit_scheme() {
-        let id = network_id_for_spec("cashu:https://mint.example.com:8443").unwrap();
-        assert_eq!(id.0, "cashu:https://mint.example.com:8443");
-    }
-
-    #[test]
-    fn network_id_for_fedimint_spec_is_unchanged() {
-        let id = network_id_for_spec("fedimint:fed1qabc").unwrap();
-        assert_eq!(id.0, "fedimint:fed1qabc");
-    }
-
-    #[test]
-    fn normalize_network_id_adds_scheme_to_cashu() {
-        assert_eq!(
-            normalize_network_id(&NetworkId("cashu:localhost:8093".to_string())).0,
-            "cashu:http://localhost:8093"
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}::1"))).unwrap(),
+            "http://::1"
         );
         assert_eq!(
-            normalize_network_id(&NetworkId("cashu:mint.example.com".to_string())).0,
-            "cashu:https://mint.example.com"
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}[::1]:3338")))
+                .unwrap(),
+            "http://[::1]:3338"
         );
     }
 
     #[test]
-    fn normalize_network_id_passes_explicit_scheme_through() {
+    fn network_id_for_cashu_spec_uses_canonical_form() {
+        let id = network_id_for_spec("cashu::mint.example.com").unwrap();
+        assert_eq!(id.0, "cashu::mint.example.com");
+    }
+
+    #[test]
+    fn network_id_for_cashu_spec_loopback_uses_canonical_form() {
+        let id = network_id_for_spec("cashu::localhost:3338").unwrap();
+        assert_eq!(id.0, "cashu::localhost:3338");
+    }
+
+    #[test]
+    fn network_id_for_cashu_spec_rejects_legacy_single_colon() {
+        assert!(network_id_for_spec("cashu:localhost:3338").is_err());
+    }
+
+    #[test]
+    fn network_id_for_cashu_spec_rejects_explicit_scheme() {
+        assert!(network_id_for_spec("cashu::https://mint.example.com").is_err());
+    }
+
+    #[test]
+    fn network_id_for_fedimint_spec_uses_canonical_form() {
+        let id = network_id_for_spec("fedimint::fed1qabc").unwrap();
+        assert_eq!(id.0, "fedimint::fed1qabc");
+    }
+
+    #[test]
+    fn network_id_for_fedimint_spec_rejects_legacy_single_colon() {
+        assert!(network_id_for_spec("fedimint:fed1qabc").is_err());
+    }
+
+    #[test]
+    fn network_id_for_cashu_spec_rejects_empty_host() {
+        assert!(network_id_for_spec("cashu::").is_err());
+    }
+
+    #[test]
+    fn network_id_for_fedimint_spec_rejects_empty_invite() {
+        assert!(network_id_for_spec("fedimint::").is_err());
+    }
+
+    #[test]
+    fn canonicalize_passes_through_canonical_cashu() {
         assert_eq!(
-            normalize_network_id(&NetworkId("cashu:https://mint.example.com".to_string())).0,
-            "cashu:https://mint.example.com"
+            canonicalize_network_id(&NetworkId("cashu::localhost:3338".to_string())).0,
+            "cashu::localhost:3338"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("cashu::mint.example.com".to_string())).0,
+            "cashu::mint.example.com"
         );
     }
 
     #[test]
-    fn normalize_network_id_leaves_other_kinds_alone() {
+    fn canonicalize_passes_through_canonical_fedimint() {
         assert_eq!(
-            normalize_network_id(&NetworkId("fedimint:fed1qabc".to_string())).0,
-            "fedimint:fed1qabc"
+            canonicalize_network_id(&NetworkId("fedimint::fed1qabc".to_string())).0,
+            "fedimint::fed1qabc"
+        );
+    }
+
+    #[test]
+    fn canonicalize_leaves_other_kinds_alone() {
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("liquid".to_string())).0,
+            "liquid"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("ark".to_string())).0,
+            "ark"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("rootstock".to_string())).0,
+            "rootstock"
+        );
+    }
+
+    #[test]
+    fn canonicalize_does_not_convert_legacy_or_invalid_forms() {
+        // Legacy single-colon forms are NOT converted — the router will
+        // reject the iroh instruction at adapter-lookup time. The
+        // canonicalize function only ever passes through valid input.
+        for raw in [
+            "cashu:localhost:3338",
+            "cashu:https://mint.example.com",
+            "fedimint:fed1qabc",
+            "cashu:",
+            "fedimint:",
+            "cashu::",
+            "fedimint::",
+            "cashu::https://mint.example.com",
+        ] {
+            let id = NetworkId(raw.to_string());
+            assert_eq!(canonicalize_network_id(&id).0, raw);
+        }
+    }
+
+    #[test]
+    fn normalize_network_id_passes_through_canonical() {
+        assert_eq!(
+            normalize_network_id(&NetworkId("cashu::localhost:8093".to_string())).0,
+            "cashu::localhost:8093"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("cashu::mint.example.com".to_string())).0,
+            "cashu::mint.example.com"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("fedimint::fed1qabc".to_string())).0,
+            "fedimint::fed1qabc"
         );
         assert_eq!(
             normalize_network_id(&NetworkId("liquid".to_string())).0,

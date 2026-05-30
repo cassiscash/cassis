@@ -274,7 +274,10 @@ impl FedimintAdapter {
     }
 
     fn db_dir_for(network_id: &NetworkId) -> PathBuf {
-        let slug = network_id.0.strip_prefix("fedimint:").unwrap_or(&network_id.0);
+        let slug = network_id
+            .0
+            .strip_prefix("fedimint::")
+            .unwrap_or(&network_id.0);
         let safe: String = slug
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })

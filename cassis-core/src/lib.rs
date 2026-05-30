@@ -60,6 +60,97 @@ impl From<&str> for NetworkId {
     }
 }
 
+/// Canonical `NetworkId` format for cashu and fedimint, used on the wire
+/// (iroh `HopInstruction`) and in Nostr route-announcement `d` tags.
+///
+/// * cashu: `cashu::<host[:port]>` — the address has no scheme. The scheme
+///   is derived implicitly from the host at connection time: loopback
+///   (`localhost`, `127.0.0.1`, `::1`) is `http`, anything else is `https`.
+/// * fedimint: `fedimint::<invite_code>` — the invite code is the address.
+///
+/// The address part for cashu is the bare `host[:port]`. The address part
+/// for fedimint is the federation's invite code. No other form is accepted
+/// on the wire or in Nostr events.
+pub const CASHU_NETWORK_ID_PREFIX: &str = "cashu::";
+pub const FEDIMINT_NETWORK_ID_PREFIX: &str = "fedimint::";
+
+/// Build the canonical `NetworkId` for a cashu mint, given the bare
+/// `host[:port]` (no scheme). The scheme is decided at connection time.
+pub fn cashu_network_id(host: &str) -> NetworkId {
+    NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}{host}"))
+}
+
+/// Build the canonical `NetworkId` for a fedimint federation, given its
+/// invite code (no prefix).
+pub fn fedimint_network_id(invite_code: &str) -> NetworkId {
+    NetworkId(format!("{FEDIMINT_NETWORK_ID_PREFIX}{invite_code}"))
+}
+
+/// Build the canonical `NetworkId` for a kind without a parameter
+/// (liquid, ark, rootstock).
+pub fn simple_network_id(kind: &str) -> NetworkId {
+    NetworkId(kind.to_string())
+}
+
+/// Pass-through used by the router to canonicalize `HopInstruction`
+/// network ids before adapter lookup. Only the canonical on-the-wire
+/// form (`cashu::<host>`, `fedimint::<invite>`, or the simple kinds
+/// `liquid` / `ark` / `rootstock`) round-trips; anything else is
+/// returned unchanged so the adapter lookup rejects it.
+pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
+    if let Some(rest) = id.0.strip_prefix(CASHU_NETWORK_ID_PREFIX) {
+        if !rest.is_empty() && !rest.contains("://") {
+            return id.clone();
+        }
+    }
+    if let Some(rest) = id.0.strip_prefix(FEDIMINT_NETWORK_ID_PREFIX) {
+        if !rest.is_empty() {
+            return id.clone();
+        }
+    }
+    if id.0 == "liquid" || id.0 == "ark" || id.0 == "rootstock" {
+        return id.clone();
+    }
+    id.clone()
+}
+
+/// Build the full mint URL for a cashu network id, choosing the
+/// scheme from the host: `http` for loopback (`localhost`, `127.0.0.1`,
+/// `::1`), `https` for everything else. Returns an error if the
+/// network id is not a cashu id.
+pub fn cashu_mint_url(network_id: &NetworkId) -> Result<String, String> {
+    let host = network_id
+        .0
+        .strip_prefix(CASHU_NETWORK_ID_PREFIX)
+        .ok_or_else(|| format!("network id {network_id} is not a cashu id"))?;
+    if host.is_empty() {
+        return Err(format!("network id {network_id} has no host"));
+    }
+    if host.contains("://") {
+        return Err(format!(
+            "network id {network_id} must not contain a scheme"
+        ));
+    }
+    let scheme = if is_loopback_host(host) { "http" } else { "https" };
+    Ok(format!("{scheme}://{host}"))
+}
+
+/// True if `host` is a loopback address (`localhost`, `127.0.0.1`,
+/// `::1`, with or without a port and IPv6 brackets).
+pub fn is_loopback_host(host: &str) -> bool {
+    let host_part: &str = if let Some(rest) = host.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => host,
+        }
+    } else if host == "::1" || host.starts_with("::1:") {
+        "::1"
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(host_part, "localhost" | "127.0.0.1" | "::1")
+}
+
 /// A directed route offered by a node: receive on `from`, send on `to`.
 /// Each announcement has its own fee schedule, parsed from kind-35515 event tags.
 #[derive(Clone, Debug, Serialize, Deserialize)]

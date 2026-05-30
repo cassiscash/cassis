@@ -7,7 +7,7 @@ use cassis_keys::DerivedKeys;
 use crate::cli::NetSpec;
 
 /// Construct receiver + sender adapters for a list of network specs
-/// (e.g. parsed from `--network cashu:host` flags). Each spec uses
+/// (e.g. parsed from `--network cashu::host` flags). Each spec uses
 /// the same key-derivation scheme `cassis-router` does, so the
 /// node's identity is consistent across the two binaries.
 pub async fn build_receivers(
@@ -54,7 +54,7 @@ async fn build_receiver(spec: &NetSpec, derived: &DerivedKeys) -> Result<Adapter
         .unwrap_or([0u8; 32]);
     match spec {
         #[cfg(feature = "cashu")]
-        NetSpec::Cashu { mint_url } => {
+        NetSpec::Cashu { mint_url, host: _ } => {
             let adapter = Arc::new(
                 cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.clone(), sk)
                     .map_err(|e| format!("cashu adapter init failed: {e}"))?,
