@@ -486,26 +486,25 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// always allowed to spend per NUT-14).
     async fn claim_incoming(
         &self,
-        htlc: &IncomingHtlc,
+        payment_hash: Bytes32,
         preimage: Bytes32,
     ) -> Result<(), HtlcError> {
-        let arrival = {
+        let (arrival, deadline) = {
             let incoming = self.incoming.lock().await;
-            incoming
-                .get(&htlc.payment_hash)
-                .map(|s| s.arrival.clone())
-        };
-        let Some(arrival) = arrival else {
-            return Err(HtlcError::InvalidParams(format!(
-                "no incoming HTLC registered for {:?}",
-                htlc.payment_hash
-            )));
+            match incoming.get(&payment_hash) {
+                Some(s) => (s.arrival.clone(), s.deadline),
+                None => {
+                    return Err(HtlcError::InvalidParams(format!(
+                        "no incoming HTLC registered for {payment_hash:?}"
+                    )));
+                }
+            }
         };
         // Block (with a small grace) until the sender's proofs
         // have landed in the shared store. The cross-network
         // hop layer is responsible for actually moving the
         // proofs between adapters.
-        let grace = wait_grace_secs(htlc.expiry);
+        let grace = wait_grace_secs(deadline);
         if tokio::time::timeout(std::time::Duration::from_secs(grace), arrival.notified())
             .await
             .is_err()
@@ -518,10 +517,9 @@ impl NetworkRouterAdapter for CashuAdapter {
         // Pull the locked proofs from the shared store.
         let locked: Proofs = {
             let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&htlc.payment_hash).ok_or_else(|| {
+            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
                 HtlcError::Network(format!(
-                    "no outgoing HTLC proofs for {:?}",
-                    htlc.payment_hash
+                    "no outgoing HTLC proofs for {payment_hash:?}"
                 ))
             })?;
             let proofs = slot.proofs.lock().await.clone();
@@ -581,7 +579,7 @@ impl NetworkRouterAdapter for CashuAdapter {
 
         // Drop the receiver's wait registration.
         let mut incoming = self.incoming.lock().await;
-        incoming.remove(&htlc.payment_hash);
+        incoming.remove(&payment_hash);
         Ok(())
     }
 
@@ -589,25 +587,23 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// We swap the locked proofs back at the mint with
     /// unrestricted output conditions (no witness). NUT-14
     /// allows the sender path once the locktime is reached.
-    async fn refund_outgoing(&self, htlc: &OutgoingHtlc) -> Result<(), HtlcError> {
-        let proofs: Proofs = {
+    async fn refund_outgoing(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
+        let (proofs, locktime) = {
             let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&htlc.payment_hash).ok_or_else(|| {
+            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
                 HtlcError::InvalidParams(format!(
-                    "no outgoing HTLC for {:?}",
-                    htlc.payment_hash
+                    "no outgoing HTLC for {payment_hash:?}"
                 ))
             })?;
             let proofs = slot.proofs.lock().await.clone();
-            drop(outgoing);
-            proofs
+            (proofs, slot.locktime)
         };
         if proofs.is_empty() {
             return Err(HtlcError::InvalidParams(
                 "outgoing HTLC has no proofs".into(),
             ));
         }
-        if now_unix_secs() <= htlc.expiry {
+        if now_unix_secs() <= locktime {
             return Err(HtlcError::InvalidParams(
                 "locktime has not yet passed; cannot refund".into(),
             ));
@@ -644,7 +640,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         let _ = Self::unblind_response(response, triples, &keys)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let mut outgoing = self.outgoing.lock().await;
-        outgoing.remove(&htlc.payment_hash);
+        outgoing.remove(&payment_hash);
         Ok(())
     }
 
@@ -655,13 +651,13 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// the proof's witness.
     async fn watch_preimage(
         &self,
-        htlc: &OutgoingHtlc,
+        payment_hash: Bytes32,
         deadline: u64,
     ) -> Result<Bytes32, WatchError> {
         let proofs: Proofs = {
             let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&htlc.payment_hash).ok_or_else(|| {
-                WatchError::Network(format!("no outgoing HTLC for {:?}", htlc.payment_hash))
+            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
+                WatchError::Network(format!("no outgoing HTLC for {payment_hash:?}"))
             })?;
             let proofs = slot.proofs.lock().await.clone();
             drop(outgoing);

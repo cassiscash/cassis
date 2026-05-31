@@ -849,9 +849,7 @@ dependencies = [
  "rand 0.8.5",
  "ritualistic",
  "serde",
- "sha2",
  "thiserror 1.0.69",
- "tokio",
 ]
 
 [[package]]

@@ -41,19 +41,19 @@ impl NetworkRouterAdapter for ArkAdapter {
 
     async fn claim_incoming(
         &self,
-        _htlc: &IncomingHtlc,
+        _payment_hash: Bytes32,
         _preimage: Bytes32,
     ) -> Result<(), HtlcError> {
         Err(HtlcError::Unimplemented)
     }
 
-    async fn refund_outgoing(&self, _htlc: &OutgoingHtlc) -> Result<(), HtlcError> {
+    async fn refund_outgoing(&self, _payment_hash: Bytes32) -> Result<(), HtlcError> {
         Err(HtlcError::Unimplemented)
     }
 
     async fn watch_preimage(
         &self,
-        _htlc: &OutgoingHtlc,
+        _payment_hash: Bytes32,
         _deadline: u64,
     ) -> Result<Bytes32, WatchError> {
         Err(WatchError::Unimplemented)

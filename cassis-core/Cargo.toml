@@ -11,6 +11,4 @@ lowercase-hex = { version = "0.1", features = ["alloc"] }
 rand = "0.8"
 ritualistic = "0.1.1"
 serde = { version = "1.0", features = ["derive"] }
-sha2 = "0.10"
 thiserror = "1.0"
-tokio = { version = "1", features = ["sync"] }
