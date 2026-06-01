@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cassis_client::ReceiveFlowError;
-use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter};
+use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter, PaymentStatus};
 use cassis_keys as keys;
 use clap::Parser;
 use log::{error, info, warn};
@@ -112,7 +112,7 @@ fn map_recv_err(e: ReceiveFlowError) -> String {
 async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) -> Result<(), String> {
     let invoice: Invoice = serde_json::from_str(&invoice_str)
         .map_err(|e| format!("invalid invoice JSON: {e}"))?;
-    let sender_network = NetworkId(from);
+    let sender_network = NetworkId(from.clone());
     let dest_network = invoice
         .networks
         .first()
@@ -151,9 +151,36 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) -
             hop.outgoing.0,
         );
     }
-    println!(
-        "(cassis-cli pay is currently a route lookup; full settlement uses `cassis-router`)"
+
+    let net_spec = NetSpec::parse(&from)?;
+    let specs = vec![net_spec];
+    let mnemonic = load_mnemonic()?;
+    let derived = derive_for(&mnemonic, &specs)?;
+    let senders = adapters::build_senders(&specs, &derived).await?;
+    let client = cassis_client::CassisClient::new(senders, relays).await;
+    info!(
+        target: "cassis_cli",
+        "preparing hops and sending HTLC for payment_hash={}",
+        invoice.payment_hash,
     );
+    let result = client
+        .pay(invoice, sender_network)
+        .await
+        .map_err(|e| format!("pay: {e}"))?;
+    match result.status {
+        PaymentStatus::Completed => {
+            println!("status:       completed");
+            if let Some(preimage) = result.preimage {
+                println!("preimage:     {preimage}");
+            }
+        }
+        PaymentStatus::Refunded => {
+            println!("status:       refunded (deadline exceeded)");
+        }
+        PaymentStatus::Failed => {
+            println!("status:       failed");
+        }
+    }
     Ok(())
 }
 
