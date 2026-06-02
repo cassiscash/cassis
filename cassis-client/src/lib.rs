@@ -9,7 +9,8 @@ use cassis_routing::{
 };
 use log::{debug, info};
 use futures::future::try_join_all;
-use iroh::Endpoint;
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -103,7 +104,7 @@ impl CassisClient {
         senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
         nostr_relays: Vec<String>,
     ) -> Self {
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(presets::N0)
             .bind()
             .await
             .expect("failed to bind iroh endpoint for client");
@@ -122,7 +123,7 @@ impl CassisClient {
         receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
         nostr_relays: Vec<String>,
     ) -> Self {
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(presets::N0)
             .bind()
             .await
             .expect("failed to bind iroh endpoint for client");
@@ -196,7 +197,7 @@ impl CassisClient {
             expiries
         );
 
-        let instructions: Vec<(iroh::NodeAddr, HopInstruction)> = route
+        let instructions: Vec<(EndpointAddr, HopInstruction)> = route
             .iter()
             .enumerate()
             .map(|(idx, hop)| {

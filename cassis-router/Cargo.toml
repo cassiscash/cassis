@@ -8,15 +8,15 @@ cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
 cassis-keys = { path = "../cassis-keys" }
 cassis-routing = { path = "../cassis-routing" }
-env_logger = "0.11"
-log = "0.4"
-clap = { version = "4", features = ["derive"] }
-iroh = "0.35"
-lowercase-hex = "0.1"
+env_logger = "0.11.11"
+log = "0.4.33"
+clap = { version = "4.6.6", features = ["derive"] }
+iroh = "1.0.3"
+lowercase-hex = "0.1.1"
 ritualistic = "0.1.1"
-rustls = "0.23"
-thiserror = "1.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+rustls = "0.23.43"
+thiserror = "1.0.69"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 [dependencies.cassis-cashu]
 path = "../networks/cassis-cashu"

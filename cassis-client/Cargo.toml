@@ -7,7 +7,7 @@ edition.workspace = true
 cassis-core = { path = "../cassis-core" }
 cassis-routing = { path = "../cassis-routing" }
 cassis-iroh = { path = "../cassis-iroh" }
-futures = "0.3"
-iroh = "0.35"
-log = "0.4"
-thiserror = "1.0"
+futures = "0.3.33"
+iroh = "1.0.3"
+log = "0.4.33"
+thiserror = "1.0.69"

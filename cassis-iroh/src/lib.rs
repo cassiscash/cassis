@@ -1,7 +1,9 @@
 use cassis_core::{HopAck, HopInstruction, HopReject, RouteAnnouncement};
+use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, NodeAddr, SecretKey};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 use log::{debug, error, info, warn};
+use std::error::Error as _;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -26,11 +28,11 @@ enum Frame {
     HopAck(HopAck),
 }
 
-/// Build a [`NodeAddr`] from a route announcement's iroh fields.
-pub fn node_addr_from_announcement(ann: &RouteAnnouncement) -> Result<NodeAddr, IrohError> {
+/// Build an [`EndpointAddr`] from a route announcement's iroh fields.
+pub fn node_addr_from_announcement(ann: &RouteAnnouncement) -> Result<EndpointAddr, IrohError> {
     let peer_id =
         iroh::PublicKey::from_str(&ann.iroh_peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
-    let mut addr = NodeAddr::new(peer_id);
+    let mut addr = EndpointAddr::new(peer_id);
     if let Some(relay_url) = &ann.iroh_relay {
         let relay = iroh::RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
         addr = addr.with_relay_url(relay);
@@ -58,34 +60,37 @@ impl IrohClient {
     /// over the relay don't time out.
     pub async fn bind() -> Result<Self, IrohError> {
         info!(target: "iroh_client", "binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(presets::N0)
             .alpns(vec![ALPN_PROTOCOL.to_vec()])
-            .tls_x509()
             .bind()
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
-        info!(target: "iroh_client", "bound peer_id={}", endpoint.node_id());
+        info!(target: "iroh_client", "bound peer_id={}", endpoint.id());
         Ok(Self::new(endpoint))
     }
 
     pub async fn send_instruction(
         &self,
-        addr: NodeAddr,
+        addr: EndpointAddr,
         instruction: HopInstruction,
     ) -> Result<HopAck, IrohError> {
+        let relay = addr.relay_urls().next();
+        let direct = addr.ip_addrs().count();
         info!(
             target: "iroh_client",
             "connecting to {} (relay={:?}, direct_addrs={})...",
-            addr.node_id,
-            addr.relay_url(),
-            addr.direct_addresses().count()
+            addr.id,
+            relay,
+            direct
         );
         let conn = match self.endpoint.connect(addr, ALPN_PROTOCOL).await {
             Ok(c) => c,
             Err(e) => {
-                error!(target: "iroh_client", "connect error:");
-                for cause in e.chain() {
+                error!(target: "iroh_client", "connect error: {e}");
+                let mut source = e.source();
+                while let Some(cause) = source {
                     error!(target: "iroh_client", "  caused by: {cause}");
+                    source = cause.source();
                 }
                 return Err(IrohError::Io(format!("{e:#}")));
             }
@@ -151,10 +156,9 @@ pub struct IrohServer {
 impl IrohServer {
     pub async fn new(secret_key: SecretKey) -> Result<(Self, SecretKey), IrohError> {
         info!(target: "iroh_server", "binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![ALPN_PROTOCOL.to_vec()])
-            .tls_x509()
             .bind()
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
@@ -166,17 +170,22 @@ impl IrohServer {
         );
         let home_relay = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            endpoint.home_relay().initialized(),
+            endpoint.online(),
         )
         .await
         {
-            Ok(Ok(url)) => {
-                info!(target: "iroh_server", "home relay established: {url}");
-                Some(url.to_string())
-            }
-            Ok(Err(e)) => {
-                warn!(target: "iroh_server", "home_relay watcher error: {e}");
-                None
+            Ok(()) => {
+                let url = endpoint.addr().relay_urls().next().cloned();
+                match url {
+                    Some(url) => {
+                        info!(target: "iroh_server", "home relay established: {url}");
+                        Some(url.to_string())
+                    }
+                    None => {
+                        warn!(target: "iroh_server", "endpoint online but no relay URL available");
+                        None
+                    }
+                }
             }
             Err(_) => {
                 warn!(
@@ -209,20 +218,20 @@ impl IrohServer {
         info!(target: "iroh_server", "entering accept loop");
         loop {
             debug!(target: "iroh_server", "waiting for incoming connection...");
-            let connecting = match self.endpoint.accept().await {
-                Some(c) => c,
+            let incoming = match self.endpoint.accept().await {
+                Some(i) => i,
                 None => {
                     error!(target: "iroh_server", "accept() returned None, endpoint closed");
                     return Err(IrohError::Closed);
                 }
             };
-            debug!(target: "iroh_server", "got incoming connecting future, awaiting handshake...");
-            let conn = match connecting.await {
+            debug!(target: "iroh_server", "got incoming, awaiting handshake...");
+            let conn = match incoming.await {
                 Ok(c) => {
                     info!(
                         target: "iroh_server",
                         "handshake complete from remote={:?}",
-                        c.remote_node_id().ok()
+                        c.remote_id()
                     );
                     c
                 }
@@ -250,7 +259,7 @@ async fn handle_conn(
     handler: Arc<
         dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
             + Send
-            + Sync,
+        + Sync,
     >,
 ) -> Result<(), IrohError> {
     debug!(target: "iroh_server", "accept_bi waiting for stream...");

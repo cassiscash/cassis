@@ -17,19 +17,19 @@ cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
 cassis-keys = { path = "../cassis-keys" }
 cassis-routing = { path = "../cassis-routing" }
-clap = { version = "4", features = ["derive"] }
-rand = "0.8"
-sha2 = "0.10"
-env_logger = "0.11"
-futures = "0.3"
-iroh = "0.35"
-log = "0.4"
-lowercase-hex = "0.1"
+clap = { version = "4.6.6", features = ["derive"] }
+rand = "0.8.7"
+sha2 = "0.10.9"
+env_logger = "0.11.11"
+futures = "0.3.33"
+iroh = "1.0.3"
+log = "0.4.33"
+lowercase-hex = "0.1.1"
 minisqlite = { git = "https://github.com/cursor/minisqlite" }
-rustls = "0.23"
-serde_json = "1.0"
-thiserror = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+rustls = "0.23.43"
+serde_json = "1.0.151"
+thiserror = "1.0.69"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 
 [dependencies.cassis-cashu]
 path = "../networks/cassis-cashu"
