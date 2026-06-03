@@ -124,14 +124,14 @@ impl MintClient {
         let url = self
             .mint_url
             .join(path)
-            .map_err(|e| CashuError::Http(e.to_string()))?;
+            .map_err(|e| self.http_err(e.to_string()))?;
         let resp = self
             .http
             .get(url)
             .send()
             .await
-            .map_err(|e| CashuError::Http(e.to_string()))?;
-        Self::parse_response(resp).await
+            .map_err(|e| self.http_err(e.to_string()))?;
+        self.parse_response(resp).await
     }
 
     async fn post<T: serde::de::DeserializeOwned, B: serde::Serialize>(
@@ -142,27 +142,35 @@ impl MintClient {
         let url = self
             .mint_url
             .join(path)
-            .map_err(|e| CashuError::Http(e.to_string()))?;
+            .map_err(|e| self.http_err(e.to_string()))?;
         let resp = self
             .http
             .post(url)
             .json(body)
             .send()
             .await
-            .map_err(|e| CashuError::Http(e.to_string()))?;
-        Self::parse_response(resp).await
+            .map_err(|e| self.http_err(e.to_string()))?;
+        self.parse_response(resp).await
+    }
+
+    fn http_err(&self, detail: String) -> CashuError {
+        CashuError::Http(format!("mint {}: {detail}", self.mint_url))
     }
 
     async fn parse_response<T: serde::de::DeserializeOwned>(
+        &self,
         resp: reqwest::Response,
     ) -> CashuResult<T> {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(CashuError::Mint(format!("HTTP {status}: {text}")));
+            return Err(CashuError::Mint(format!(
+                "mint {}: HTTP {status}: {text}",
+                self.mint_url
+            )));
         }
         resp.json::<T>()
             .await
-            .map_err(|e| CashuError::Deserialize(e.to_string()))
+            .map_err(|e| CashuError::Deserialize(format!("mint {}: {e}", self.mint_url)))
     }
 }
