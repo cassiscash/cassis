@@ -109,6 +109,110 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
     id.clone()
 }
 
+/// Alias for [`canonicalize_network_id`] kept around for router
+/// call-sites that want to read more like English.
+pub fn normalize_network_id(network_id: &NetworkId) -> NetworkId {
+    canonicalize_network_id(network_id)
+}
+
+/// Split a network spec into `(kind, param)`. The canonical
+/// separator is `::`; a single `:` (e.g. `cashu:host:port`) is *not*
+/// accepted and yields `(spec, None)`, which downstream parsing
+/// rejects.
+pub fn split_spec(spec: &str) -> (&str, Option<&str>) {
+    if let Some((kind, param)) = spec.split_once("::") {
+        return (kind, Some(param));
+    }
+    (spec, None)
+}
+
+/// Compute the [`NetworkId`] for a network spec without building the
+/// adapter. Each kind is gated behind its own cargo feature; if a
+/// spec is passed for a kind whose feature is not enabled, a clear
+/// error is returned. Used by `cassis-router` (and any other binary)
+/// to convert CLI `--network <spec>` arguments into network ids
+/// before key derivation.
+#[allow(unused_variables)] // `param` is only used inside feature-gated arms.
+pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
+    let (kind, param) = split_spec(spec);
+    match kind {
+        #[cfg(feature = "cashu")]
+        "cashu" => {
+            let host = param.ok_or_else(|| {
+                "network 'cashu' requires a host, e.g. cashu::mint.example.com or \
+                 cashu::localhost:3338"
+                    .to_string()
+            })?;
+            if host.is_empty() {
+                return Err(
+                    "network 'cashu' requires a non-empty host, e.g. cashu::mint.example.com"
+                        .to_string(),
+                );
+            }
+            if host.contains("://") {
+                return Err(
+                    "network 'cashu' must not include a scheme; \
+                     drop the http:// or https:// prefix and use cashu::<host> instead"
+                        .to_string(),
+                );
+            }
+            Ok(cashu_network_id(host))
+        }
+        #[cfg(not(feature = "cashu"))]
+        "cashu" => Err(
+            "network 'cashu' requested but cassis-core was not compiled with the 'cashu' feature"
+                .to_string(),
+        ),
+
+        "fedimint" => Err(
+            "network 'fedimint' is not supported by cassis-router; \
+             use cassis-cli to receive on a fedimint federation"
+                .to_string(),
+        ),
+
+        #[cfg(feature = "liquid")]
+        "liquid" => {
+            if param.is_some() {
+                return Err("network 'liquid' does not take a parameter".into());
+            }
+            Ok(NetworkId("liquid".to_string()))
+        }
+        #[cfg(not(feature = "liquid"))]
+        "liquid" => Err(
+            "network 'liquid' requested but cassis-core was not compiled with the 'liquid' feature"
+                .to_string(),
+        ),
+
+        #[cfg(feature = "ark")]
+        "ark" => {
+            if param.is_some() {
+                return Err("network 'ark' does not take a parameter".into());
+            }
+            Ok(NetworkId("ark".to_string()))
+        }
+        #[cfg(not(feature = "ark"))]
+        "ark" => Err(
+            "network 'ark' requested but cassis-core was not compiled with the 'ark' feature"
+                .to_string(),
+        ),
+
+        #[cfg(feature = "rootstock")]
+        "rootstock" => {
+            if param.is_some() {
+                return Err("network 'rootstock' does not take a parameter".into());
+            }
+            Ok(NetworkId("rootstock".to_string()))
+        }
+        #[cfg(not(feature = "rootstock"))]
+        "rootstock" => Err(
+            "network 'rootstock' requested but cassis-core was not compiled with the 'rootstock' feature"
+                .to_string(),
+        ),
+
+        _ => Err(format!("unsupported network kind '{kind}'")),
+    }
+}
+
 /// Build the full mint URL for a cashu network id, choosing the
 /// scheme from the host: `http` for loopback (`localhost`, `127.0.0.1`,
 /// `::1`), `https` for everything else. Returns an error if the
@@ -608,4 +712,287 @@ fn _assert_send_sync<T: Send + Sync + ?Sized>() {
     assert::<dyn NetworkRouterAdapter>();
     assert::<dyn NetworkReceiverAdapter>();
     assert::<dyn NetworkSenderAdapter>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_spec_splits_on_double_colon() {
+        assert_eq!(split_spec("cashu::mint.example.com"), ("cashu", Some("mint.example.com")));
+        assert_eq!(split_spec("liquid"), ("liquid", None));
+    }
+
+    #[test]
+    fn split_spec_treats_single_colon_as_whole_kind() {
+        assert_eq!(split_spec("cashu:host:port"), ("cashu:host:port", None));
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn network_id_for_cashu_spec_uses_canonical_form() {
+        let id = network_id_for_spec("cashu::mint.example.com").unwrap();
+        assert_eq!(id.0, "cashu::mint.example.com");
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn network_id_for_cashu_spec_loopback_uses_canonical_form() {
+        let id = network_id_for_spec("cashu::localhost:3338").unwrap();
+        assert_eq!(id.0, "cashu::localhost:3338");
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn network_id_for_cashu_spec_rejects_legacy_single_colon() {
+        assert!(network_id_for_spec("cashu:localhost:3338").is_err());
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn network_id_for_cashu_spec_rejects_explicit_scheme() {
+        assert!(network_id_for_spec("cashu::https://mint.example.com").is_err());
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn network_id_for_cashu_spec_rejects_empty_host() {
+        assert!(network_id_for_spec("cashu::").is_err());
+    }
+
+    #[cfg(not(feature = "cashu"))]
+    #[test]
+    fn network_id_for_cashu_spec_reports_missing_feature() {
+        let err = network_id_for_spec("cashu::mint.example.com").unwrap_err();
+        assert!(
+            err.contains("'cashu' feature"),
+            "expected feature-related error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn network_id_for_fedimint_spec_is_rejected() {
+        let err = network_id_for_spec("fedimint::fed1qabc").unwrap_err();
+        assert!(
+            err.contains("fedimint"),
+            "expected fedimint-related error, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "liquid")]
+    #[test]
+    fn network_id_for_liquid_spec_uses_canonical_form() {
+        let id = network_id_for_spec("liquid").unwrap();
+        assert_eq!(id.0, "liquid");
+    }
+
+    #[cfg(feature = "liquid")]
+    #[test]
+    fn network_id_for_liquid_spec_rejects_parameter() {
+        assert!(network_id_for_spec("liquid::foo").is_err());
+    }
+
+    #[cfg(not(feature = "liquid"))]
+    #[test]
+    fn network_id_for_liquid_spec_reports_missing_feature() {
+        let err = network_id_for_spec("liquid").unwrap_err();
+        assert!(
+            err.contains("'liquid' feature"),
+            "expected feature-related error, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "ark")]
+    #[test]
+    fn network_id_for_ark_spec_uses_canonical_form() {
+        let id = network_id_for_spec("ark").unwrap();
+        assert_eq!(id.0, "ark");
+    }
+
+    #[cfg(feature = "ark")]
+    #[test]
+    fn network_id_for_ark_spec_rejects_parameter() {
+        assert!(network_id_for_spec("ark::foo").is_err());
+    }
+
+    #[cfg(not(feature = "ark"))]
+    #[test]
+    fn network_id_for_ark_spec_reports_missing_feature() {
+        let err = network_id_for_spec("ark").unwrap_err();
+        assert!(
+            err.contains("'ark' feature"),
+            "expected feature-related error, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "rootstock")]
+    #[test]
+    fn network_id_for_rootstock_spec_uses_canonical_form() {
+        let id = network_id_for_spec("rootstock").unwrap();
+        assert_eq!(id.0, "rootstock");
+    }
+
+    #[cfg(feature = "rootstock")]
+    #[test]
+    fn network_id_for_rootstock_spec_rejects_parameter() {
+        assert!(network_id_for_spec("rootstock::foo").is_err());
+    }
+
+    #[cfg(not(feature = "rootstock"))]
+    #[test]
+    fn network_id_for_rootstock_spec_reports_missing_feature() {
+        let err = network_id_for_spec("rootstock").unwrap_err();
+        assert!(
+            err.contains("'rootstock' feature"),
+            "expected feature-related error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn network_id_for_spec_rejects_unknown_kind() {
+        assert!(network_id_for_spec("foo").is_err());
+        assert!(network_id_for_spec("foo::bar").is_err());
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn cashu_mint_url_uses_https_for_remote_hostname() {
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}mint.example.com")))
+                .unwrap(),
+            "https://mint.example.com"
+        );
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn cashu_mint_url_uses_https_for_hostname_with_port() {
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!(
+                "{CASHU_NETWORK_ID_PREFIX}mint.example.com:3338"
+            )))
+            .unwrap(),
+            "https://mint.example.com:3338"
+        );
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn cashu_mint_url_uses_http_for_localhost() {
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost")))
+                .unwrap(),
+            "http://localhost"
+        );
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost:3338")))
+                .unwrap(),
+            "http://localhost:3338"
+        );
+    }
+
+    #[cfg(feature = "cashu")]
+    #[test]
+    fn cashu_mint_url_uses_http_for_loopback_ips() {
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1")))
+                .unwrap(),
+            "http://127.0.0.1"
+        );
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1:3338")))
+                .unwrap(),
+            "http://127.0.0.1:3338"
+        );
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}::1"))).unwrap(),
+            "http://::1"
+        );
+        assert_eq!(
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}[::1]:3338")))
+                .unwrap(),
+            "http://[::1]:3338"
+        );
+    }
+
+    #[test]
+    fn canonicalize_passes_through_canonical_cashu() {
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("cashu::localhost:3338".to_string())).0,
+            "cashu::localhost:3338"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("cashu::mint.example.com".to_string())).0,
+            "cashu::mint.example.com"
+        );
+    }
+
+    #[test]
+    fn canonicalize_passes_through_canonical_fedimint() {
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("fedimint::fed1qabc".to_string())).0,
+            "fedimint::fed1qabc"
+        );
+    }
+
+    #[test]
+    fn canonicalize_leaves_other_kinds_alone() {
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("liquid".to_string())).0,
+            "liquid"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("ark".to_string())).0,
+            "ark"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("rootstock".to_string())).0,
+            "rootstock"
+        );
+    }
+
+    #[test]
+    fn canonicalize_does_not_convert_legacy_or_invalid_forms() {
+        // Legacy single-colon forms are NOT converted — downstream
+        // lookups reject the iroh instruction at adapter-lookup time.
+        // The canonicalize function only ever passes through valid input.
+        for raw in [
+            "cashu:localhost:3338",
+            "cashu:https://mint.example.com",
+            "fedimint:fed1qabc",
+            "cashu:",
+            "fedimint:",
+            "cashu::",
+            "fedimint::",
+            "cashu::https://mint.example.com",
+        ] {
+            let id = NetworkId(raw.to_string());
+            assert_eq!(canonicalize_network_id(&id).0, raw);
+        }
+    }
+
+    #[test]
+    fn normalize_network_id_passes_through_canonical() {
+        assert_eq!(
+            normalize_network_id(&NetworkId("cashu::localhost:8093".to_string())).0,
+            "cashu::localhost:8093"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("cashu::mint.example.com".to_string())).0,
+            "cashu::mint.example.com"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("fedimint::fed1qabc".to_string())).0,
+            "fedimint::fed1qabc"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("liquid".to_string())).0,
+            "liquid"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("ark".to_string())).0,
+            "ark"
+        );
+    }
 }

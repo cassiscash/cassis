@@ -1,15 +1,9 @@
 use cassis_core::{
-    canonicalize_network_id, cashu_mint_url, cashu_network_id, fedimint_network_id, Bytes32,
-    HopAck, HopInstruction, HopReject, NetworkId, NetworkSenderAdapter, SendError,
+    network_id_for_spec, normalize_network_id, split_spec, Bytes32, HopAck, HopInstruction,
+    HopReject, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
 };
-#[cfg(any(
-    feature = "cashu",
-    feature = "fedimint",
-    feature = "ark",
-    feature = "liquid",
-    feature = "rootstock",
-))]
-use cassis_core::NetworkReceiverAdapter;
+#[cfg(feature = "cashu")]
+use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_iroh::IrohServer;
 use cassis_keys as keys;
 use clap::Parser;
@@ -188,86 +182,17 @@ async fn main() {
     info!(target: "cassis_router", "shutting down");
 }
 
-/// Compute the [`NetworkId`] for a network spec without building the adapter.
-fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
-    let (kind, param) = split_spec(spec);
-    match kind {
-        "cashu" => {
-            let host = param.ok_or_else(|| {
-                "network 'cashu' requires a host, e.g. cashu::mint.example.com or \
-                 cashu::localhost:3338"
-                    .to_string()
-            })?;
-            if host.is_empty() {
-                return Err(
-                    "network 'cashu' requires a non-empty host, e.g. cashu::mint.example.com"
-                        .to_string(),
-                );
-            }
-            if host.contains("://") {
-                return Err(
-                    "network 'cashu' must not include a scheme; \
-                     drop the http:// or https:// prefix and use cashu::<host> instead"
-                        .to_string(),
-                );
-            }
-            Ok(cashu_network_id(host))
-        }
-        "fedimint" => {
-            let address = param.ok_or_else(|| {
-                "network 'fedimint' requires an invite code, e.g. fedimint::fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
-                    .to_string()
-            })?;
-            if address.is_empty() {
-                return Err(
-                    "network 'fedimint' requires a non-empty invite code".to_string(),
-                );
-            }
-            Ok(fedimint_network_id(address))
-        }
-        "liquid" => {
-            if param.is_some() {
-                return Err("network 'liquid' does not take a parameter".into());
-            }
-            Ok(NetworkId("liquid".to_string()))
-        }
-        "ark" => {
-            if param.is_some() {
-                return Err("network 'ark' does not take a parameter".into());
-            }
-            Ok(NetworkId("ark".to_string()))
-        }
-        "rootstock" => {
-            if param.is_some() {
-                return Err("network 'rootstock' does not take a parameter".into());
-            }
-            Ok(NetworkId("rootstock".to_string()))
-        }
-        _ => Err(format!("unsupported network kind '{kind}'")),
-    }
-}
-
-fn split_spec(spec: &str) -> (&str, Option<&str>) {
-    if let Some((kind, param)) = spec.split_once("::") {
-        return (kind, Some(param));
-    }
-    (spec, None)
-}
-
-fn normalize_network_id(network_id: &NetworkId) -> NetworkId {
-    canonicalize_network_id(network_id)
-}
-
-/// Per-network entry the router tracks. Only the outgoing side
-/// (sender) is used; `incoming_delta_secs` is read off the
-/// `NetworkReceiverAdapter` *at construction* and cached, so the
-/// router can validate timelocks without ever calling into the
-/// receiver runtime. The router no longer plays the receiver role;
-/// the `cassis-cli` does that.
+/// Per-network entry the router tracks. The router holds a
+/// [`NetworkRouterAdapter`] (the low-level HTLC-instrument trait) and
+/// *never* a [`NetworkReceiverAdapter`] or [`NetworkSenderAdapter`]
+/// (those are user-facing wrappers used by `cassis-cli`).
+/// `incoming_delta_secs` is read off the same adapter at construction
+/// and cached, so the router can validate timelocks without ever
+/// calling into any user-facing trait.
 #[derive(Clone)]
 pub struct NetworkEntry {
     pub network_id: NetworkId,
-    pub sender: Arc<dyn NetworkSenderAdapter>,
+    pub adapter: Arc<dyn NetworkRouterAdapter>,
     pub incoming_delta_secs: u64,
 }
 
@@ -294,20 +219,14 @@ async fn build_adapter(
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
-            let adapter = Arc::new(
+            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
                 cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url, sk)
                     .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
-            // Borrow the per-network receiver for its `incoming_delta_secs`
-            // (cashu gets this from the blanket impl) and then drop.
-            let incoming_delta_secs = {
-                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
-                receiver.incoming_delta_secs()
-            };
-            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
-                sender,
+                adapter,
                 incoming_delta_secs,
             })
         }
@@ -318,44 +237,9 @@ async fn build_adapter(
                 .into(),
         ),
 
-        #[cfg(feature = "fedimint")]
-        "fedimint" => {
-            let address = param.ok_or_else(|| {
-                "network 'fedimint' requires an invite code or pre-joined DB identifier, \
-                 e.g. fedimint::fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t..."
-                    .to_string()
-            })?;
-            let network_id = fedimint_network_id(address);
-            let sk = derived
-                .networks
-                .get(&network_id)
-                .map(|k| *k.as_bytes())
-                .unwrap_or([0u8; 32]);
-            let adapter = match cassis_fedimint::FedimintAdapter::new(
-                network_id.clone(),
-                address.to_string(),
-                sk,
-            )
-            .await
-            {
-                Ok(adapter) => Arc::new(adapter),
-                Err(err) => return Err(err),
-            };
-            let incoming_delta_secs = {
-                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
-                receiver.incoming_delta_secs()
-            };
-            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(NetworkEntry {
-                network_id,
-                sender,
-                incoming_delta_secs,
-            })
-        }
-
-        #[cfg(not(feature = "fedimint"))]
         "fedimint" => Err(
-            "network 'fedimint' requested but cassis-router was not compiled with the 'fedimint' feature"
+            "network 'fedimint' is not supported by cassis-router; \
+             use cassis-cli to receive on a fedimint federation"
                 .into(),
         ),
 
@@ -365,15 +249,12 @@ async fn build_adapter(
                 return Err("network 'liquid' does not take a parameter".into());
             }
             let network_id = NetworkId("liquid".to_string());
-            let adapter = Arc::new(cassis_liquid::LiquidAdapter::new(network_id.clone()));
-            let incoming_delta_secs = {
-                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
-                receiver.incoming_delta_secs()
-            };
-            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            let adapter: Arc<dyn NetworkRouterAdapter> =
+                Arc::new(cassis_liquid::LiquidAdapter::new(network_id.clone()));
+            let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
-                sender,
+                adapter,
                 incoming_delta_secs,
             })
         }
@@ -390,15 +271,12 @@ async fn build_adapter(
                 return Err("network 'ark' does not take a parameter".into());
             }
             let network_id = NetworkId("ark".to_string());
-            let adapter = Arc::new(cassis_arkade::ArkAdapter::new(network_id.clone()));
-            let incoming_delta_secs = {
-                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
-                receiver.incoming_delta_secs()
-            };
-            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            let adapter: Arc<dyn NetworkRouterAdapter> =
+                Arc::new(cassis_arkade::ArkAdapter::new(network_id.clone()));
+            let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
-                sender,
+                adapter,
                 incoming_delta_secs,
             })
         }
@@ -414,15 +292,12 @@ async fn build_adapter(
                 return Err("network 'rootstock' does not take a parameter".into());
             }
             let network_id = NetworkId("rootstock".to_string());
-            let adapter = Arc::new(cassis_rootstock::RootstockAdapter::new(network_id.clone()));
-            let incoming_delta_secs = {
-                let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
-                receiver.incoming_delta_secs()
-            };
-            let sender: Arc<dyn NetworkSenderAdapter> = adapter;
+            let adapter: Arc<dyn NetworkRouterAdapter> =
+                Arc::new(cassis_rootstock::RootstockAdapter::new(network_id.clone()));
+            let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
-                sender,
+                adapter,
                 incoming_delta_secs,
             })
         }
@@ -484,9 +359,71 @@ impl CassisRouter {
 
         let adapters = self.adapters.clone();
         let pending = Arc::clone(&self.pending);
-        let inst = instruction.clone();
         tokio::spawn(async move {
-            watch_instruction(inst, adapters, pending).await;
+    let outgoing_entry = match adapters.get(&instruction.outgoing_network) {
+        Some(entry) => entry,
+        None => {
+            remove_pending(&pending, instruction.payment_hash).await;
+            return;
+        }
+    };
+
+    let htlc: OutgoingHtlc = match outgoing_entry
+        .adapter
+        .create_outgoing_htlc(
+            instruction.payment_hash,
+            instruction.amount_msat,
+            instruction.outgoing_expiry,
+            &instruction.recipient,
+        )
+        .await
+    {
+        Ok(htlc) => {
+            info!(
+                target: "cassis_router",
+                "  outgoing HTLC on {} for {} ({} msat)",
+                htlc.network, htlc.recipient, htlc.amount_msat,
+            );
+            htlc
+        }
+        Err(err) => {
+            warn!(
+                target: "cassis_router",
+                "  create_outgoing_htlc failed on {}: {:?}",
+                instruction.outgoing_network, err
+            );
+            remove_pending(&pending, instruction.payment_hash).await;
+            return;
+        }
+    };
+
+    match outgoing_entry
+        .adapter
+        .watch_preimage(htlc.payment_hash, instruction.outgoing_expiry)
+        .await
+    {
+        Ok(_preimage) => {
+            info!(
+                target: "cassis_router",
+                "  outgoing settled on {} (preimage revealed upstream)",
+                instruction.outgoing_network
+            );
+        }
+        Err(WatchError::DeadlineExceeded) => {
+            warn!(target: "cassis_router", "  deadline exceeded, refunding outgoing");
+            let _ = outgoing_entry.adapter.refund_outgoing(htlc.payment_hash).await;
+        }
+        Err(err) => {
+            error!(
+                target: "cassis_router",
+                "  error watching payment on {}: {:?}",
+                instruction.outgoing_network, err
+            );
+            let _ = outgoing_entry.adapter.refund_outgoing(htlc.payment_hash).await;
+        }
+    }
+
+    remove_pending(&pending, instruction.payment_hash).await;
         });
 
         Ok(HopAck {
@@ -511,7 +448,7 @@ impl CassisRouter {
         if instruction.payment_hash.0.iter().all(|byte| *byte == 0) {
             return Err(HopReject {
                 payment_hash: instruction.payment_hash,
-                reason: format!("zero payment hash, accepted: non-zero hash"),
+                reason: "zero payment hash, accepted: non-zero hash".to_string(),
             });
         }
 
@@ -568,78 +505,6 @@ impl CassisRouter {
 
         Ok(())
     }
-}
-
-async fn watch_instruction(
-    instruction: HopInstruction,
-    adapters: HashMap<NetworkId, NetworkEntry>,
-    pending: PendingMap,
-) {
-    let outgoing_entry = match adapters.get(&instruction.outgoing_network) {
-        Some(entry) => entry,
-        None => {
-            remove_pending(&pending, instruction.payment_hash).await;
-            return;
-        }
-    };
-
-    let payment = match outgoing_entry
-        .sender
-        .pay_invoice(
-            instruction.payment_hash,
-            instruction.amount_msat,
-            &instruction.recipient,
-            &instruction.outgoing_network,
-            instruction.outgoing_expiry,
-        )
-        .await
-    {
-        Ok(payment) => {
-            info!(
-                target: "cassis_router",
-                "  outgoing payment on {} for {}",
-                payment.destination_network, payment.destination_pubkey
-            );
-            payment
-        }
-        Err(err) => {
-            warn!(
-                target: "cassis_router",
-                "  pay_invoice failed on {}: {:?}",
-                instruction.outgoing_network, err
-            );
-            remove_pending(&pending, instruction.payment_hash).await;
-            return;
-        }
-    };
-
-    match outgoing_entry
-        .sender
-        .watch_payment(payment.clone(), instruction.outgoing_expiry)
-        .await
-    {
-        Ok(_preimage) => {
-            info!(
-                target: "cassis_router",
-                "  outgoing settled on {} (preimage revealed upstream)",
-                instruction.outgoing_network
-            );
-        }
-        Err(SendError::DeadlineExceeded) => {
-            warn!(target: "cassis_router", "  deadline exceeded, refunding outgoing");
-            let _ = outgoing_entry.sender.refund_payment(payment).await;
-        }
-        Err(err) => {
-            error!(
-                target: "cassis_router",
-                "  error watching payment on {}: {:?}",
-                instruction.outgoing_network, err
-            );
-            let _ = outgoing_entry.sender.refund_payment(payment).await;
-        }
-    }
-
-    remove_pending(&pending, instruction.payment_hash).await;
 }
 
 async fn remove_pending(pending: &PendingMap, payment_hash: Bytes32) {
@@ -728,191 +593,5 @@ async fn publish_route_announcements(
         for failure in &failed {
             warn!(target: "cassis_router", "    rejected by {failure}");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cassis_core::CASHU_NETWORK_ID_PREFIX;
-
-    #[test]
-    fn cashu_mint_url_uses_https_for_remote_hostname() {
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}mint.example.com")))
-                .unwrap(),
-            "https://mint.example.com"
-        );
-    }
-
-    #[test]
-    fn cashu_mint_url_uses_https_for_hostname_with_port() {
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!(
-                "{CASHU_NETWORK_ID_PREFIX}mint.example.com:3338"
-            )))
-            .unwrap(),
-            "https://mint.example.com:3338"
-        );
-    }
-
-    #[test]
-    fn cashu_mint_url_uses_http_for_localhost() {
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost")))
-                .unwrap(),
-            "http://localhost"
-        );
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost:3338")))
-                .unwrap(),
-            "http://localhost:3338"
-        );
-    }
-
-    #[test]
-    fn cashu_mint_url_uses_http_for_loopback_ips() {
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1")))
-                .unwrap(),
-            "http://127.0.0.1"
-        );
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1:3338")))
-                .unwrap(),
-            "http://127.0.0.1:3338"
-        );
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}::1"))).unwrap(),
-            "http://::1"
-        );
-        assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}[::1]:3338")))
-                .unwrap(),
-            "http://[::1]:3338"
-        );
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_uses_canonical_form() {
-        let id = network_id_for_spec("cashu::mint.example.com").unwrap();
-        assert_eq!(id.0, "cashu::mint.example.com");
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_loopback_uses_canonical_form() {
-        let id = network_id_for_spec("cashu::localhost:3338").unwrap();
-        assert_eq!(id.0, "cashu::localhost:3338");
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_rejects_legacy_single_colon() {
-        assert!(network_id_for_spec("cashu:localhost:3338").is_err());
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_rejects_explicit_scheme() {
-        assert!(network_id_for_spec("cashu::https://mint.example.com").is_err());
-    }
-
-    #[test]
-    fn network_id_for_fedimint_spec_uses_canonical_form() {
-        let id = network_id_for_spec("fedimint::fed1qabc").unwrap();
-        assert_eq!(id.0, "fedimint::fed1qabc");
-    }
-
-    #[test]
-    fn network_id_for_fedimint_spec_rejects_legacy_single_colon() {
-        assert!(network_id_for_spec("fedimint:fed1qabc").is_err());
-    }
-
-    #[test]
-    fn network_id_for_cashu_spec_rejects_empty_host() {
-        assert!(network_id_for_spec("cashu::").is_err());
-    }
-
-    #[test]
-    fn network_id_for_fedimint_spec_rejects_empty_invite() {
-        assert!(network_id_for_spec("fedimint::").is_err());
-    }
-
-    #[test]
-    fn canonicalize_passes_through_canonical_cashu() {
-        assert_eq!(
-            canonicalize_network_id(&NetworkId("cashu::localhost:3338".to_string())).0,
-            "cashu::localhost:3338"
-        );
-        assert_eq!(
-            canonicalize_network_id(&NetworkId("cashu::mint.example.com".to_string())).0,
-            "cashu::mint.example.com"
-        );
-    }
-
-    #[test]
-    fn canonicalize_passes_through_canonical_fedimint() {
-        assert_eq!(
-            canonicalize_network_id(&NetworkId("fedimint::fed1qabc".to_string())).0,
-            "fedimint::fed1qabc"
-        );
-    }
-
-    #[test]
-    fn canonicalize_leaves_other_kinds_alone() {
-        assert_eq!(
-            canonicalize_network_id(&NetworkId("liquid".to_string())).0,
-            "liquid"
-        );
-        assert_eq!(
-            canonicalize_network_id(&NetworkId("ark".to_string())).0,
-            "ark"
-        );
-        assert_eq!(
-            canonicalize_network_id(&NetworkId("rootstock".to_string())).0,
-            "rootstock"
-        );
-    }
-
-    #[test]
-    fn canonicalize_does_not_convert_legacy_or_invalid_forms() {
-        // Legacy single-colon forms are NOT converted — the router will
-        // reject the iroh instruction at adapter-lookup time. The
-        // canonicalize function only ever passes through valid input.
-        for raw in [
-            "cashu:localhost:3338",
-            "cashu:https://mint.example.com",
-            "fedimint:fed1qabc",
-            "cashu:",
-            "fedimint:",
-            "cashu::",
-            "fedimint::",
-            "cashu::https://mint.example.com",
-        ] {
-            let id = NetworkId(raw.to_string());
-            assert_eq!(canonicalize_network_id(&id).0, raw);
-        }
-    }
-
-    #[test]
-    fn normalize_network_id_passes_through_canonical() {
-        assert_eq!(
-            normalize_network_id(&NetworkId("cashu::localhost:8093".to_string())).0,
-            "cashu::localhost:8093"
-        );
-        assert_eq!(
-            normalize_network_id(&NetworkId("cashu::mint.example.com".to_string())).0,
-            "cashu::mint.example.com"
-        );
-        assert_eq!(
-            normalize_network_id(&NetworkId("fedimint::fed1qabc".to_string())).0,
-            "fedimint::fed1qabc"
-        );
-        assert_eq!(
-            normalize_network_id(&NetworkId("liquid".to_string())).0,
-            "liquid"
-        );
-        assert_eq!(
-            normalize_network_id(&NetworkId("ark".to_string())).0,
-            "ark"
-        );
     }
 }

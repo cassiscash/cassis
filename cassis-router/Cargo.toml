@@ -22,10 +22,6 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal",
 path = "../networks/cassis-cashu"
 optional = true
 
-[dependencies.cassis-fedimint]
-path = "../networks/cassis-fedimint"
-optional = true
-
 [dependencies.cassis-arkade]
 path = "../networks/cassis-arkade"
 optional = true
@@ -39,8 +35,7 @@ path = "../networks/cassis-liquid"
 optional = true
 
 [features]
-ark = ["cassis-arkade"]
-cashu = ["cassis-cashu"]
-liquid = ["cassis-liquid"]
-fedimint = ["cassis-fedimint"]
-rootstock = ["cassis-rootstock"]
+ark = ["dep:cassis-arkade", "cassis-core/ark"]
+cashu = ["dep:cassis-cashu", "cassis-core/cashu"]
+liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
+rootstock = ["dep:cassis-rootstock", "cassis-core/rootstock"]
