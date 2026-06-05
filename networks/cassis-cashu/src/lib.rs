@@ -9,11 +9,10 @@ use cashu::nuts::nut12::ProofDleq;
 use cashu::nuts::nut14::HTLCWitness;
 use cashu::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Proof, Witness};
 use cashu::secret::Secret;
-use cashu::MintUrl;
 use cashu::Amount;
+use cashu::MintUrl;
 use cassis_core::{
-    Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    WatchError,
+    Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -25,7 +24,9 @@ mod htlc;
 mod mint_client;
 
 use errors::{CashuError, CashuResult};
-use htlc::{add_preimage_to_proofs, build_htlc_outputs, htlc_conditions, proof_y, verify_proofs_htlc};
+use htlc::{
+    add_preimage_to_proofs, build_htlc_outputs, htlc_conditions, proof_y, verify_proofs_htlc,
+};
 use mint_client::MintClient;
 
 pub use errors::CashuError as Error;
@@ -100,11 +101,7 @@ impl CashuAdapter {
     /// cashu [`MintUrl`]; there is no fallback because a real mint
     /// URL is the only way any cashu method (NUT-01, NUT-02, NUT-03,
     /// NUT-04, NUT-05, NUT-07, …) can succeed.
-    pub fn new(
-        network_id: NetworkId,
-        mint_url: String,
-        secret_key: [u8; 32],
-    ) -> CashuResult<Self> {
+    pub fn new(network_id: NetworkId, mint_url: String, secret_key: [u8; 32]) -> CashuResult<Self> {
         let mint_url = MintUrl::from_str(&mint_url)
             .map_err(|e| CashuError::Nuts(format!("invalid mint url '{mint_url}': {e}")))?;
         let client = MintClient::new(mint_url.clone(), None);
@@ -131,11 +128,7 @@ impl CashuAdapter {
             }
         }
         let resp: KeysetResponse = self.client.get_keysets().await?;
-        let active: Vec<KeySetInfo> = resp
-            .keysets
-            .into_iter()
-            .filter(|k| k.active)
-            .collect();
+        let active: Vec<KeySetInfo> = resp.keysets.into_iter().filter(|k| k.active).collect();
         let mut guard = self.keysets.lock().await;
         *guard = active.clone();
         Ok(active)
@@ -264,8 +257,10 @@ impl CashuAdapter {
         n: usize,
         keyset_id: KeysetId,
         amounts: &[Amount],
-    ) -> CashuResult<(Vec<(Secret, cashu::nuts::nut01::SecretKey, Amount)>, Vec<BlindedMessage>)>
-    {
+    ) -> CashuResult<(
+        Vec<(Secret, cashu::nuts::nut01::SecretKey, Amount)>,
+        Vec<BlindedMessage>,
+    )> {
         let mut triples = Vec::with_capacity(n);
         let mut outputs = Vec::with_capacity(n);
         for &amount in amounts {
@@ -292,9 +287,7 @@ impl CashuAdapter {
                 .ok_or_else(|| CashuError::Nuts("amount key missing".into()))?;
             let c = unblind_message(&sig.c, &r, &amount_key)
                 .map_err(|e| CashuError::Nuts(format!("unblind: {e}")))?;
-            let dleq: Option<ProofDleq> = sig
-                .dleq
-                .map(|d| ProofDleq::new(d.e, d.s, r.clone()));
+            let dleq: Option<ProofDleq> = sig.dleq.map(|d| ProofDleq::new(d.e, d.s, r.clone()));
             proofs.push(Proof {
                 amount,
                 keyset_id: sig.keyset_id,
@@ -401,11 +394,12 @@ impl NetworkRouterAdapter for CashuAdapter {
         // Build the HTLC-locked outputs. The mint signs them
         // under the spending conditions embedded in each
         // blinded-message secret.
-        let outputs = build_htlc_outputs(amount_sat, keyset_id, &payment_hash.0, expiry)
-            .map_err(|e| match e {
+        let outputs = build_htlc_outputs(amount_sat, keyset_id, &payment_hash.0, expiry).map_err(
+            |e| match e {
                 CashuError::HtlcExpired => HtlcError::InvalidParams("expiry in past".into()),
                 other => HtlcError::Network(other.to_string()),
-            })?;
+            },
+        )?;
         let output_blinded = outputs
             .premints
             .iter()
@@ -518,9 +512,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         let locked: Proofs = {
             let outgoing = self.outgoing.lock().await;
             let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                HtlcError::Network(format!(
-                    "no outgoing HTLC proofs for {payment_hash:?}"
-                ))
+                HtlcError::Network(format!("no outgoing HTLC proofs for {payment_hash:?}"))
             })?;
             let proofs = slot.proofs.lock().await.clone();
             drop(outgoing);
@@ -551,9 +543,7 @@ impl NetworkRouterAdapter for CashuAdapter {
             .find(|k| k.id == keyset_id)
             .cloned()
             .ok_or_else(|| {
-                HtlcError::Network(format!(
-                    "mint no longer advertises keyset {keyset_id}"
-                ))
+                HtlcError::Network(format!("mint no longer advertises keyset {keyset_id}"))
             })?;
         let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
         let split = Self::split_for_swap(total_sat, &fee_and_amounts)
@@ -591,9 +581,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         let (proofs, locktime) = {
             let outgoing = self.outgoing.lock().await;
             let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                HtlcError::InvalidParams(format!(
-                    "no outgoing HTLC for {payment_hash:?}"
-                ))
+                HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
             })?;
             let proofs = slot.proofs.lock().await.clone();
             (proofs, slot.locktime)
@@ -618,9 +606,7 @@ impl NetworkRouterAdapter for CashuAdapter {
             .find(|k| k.id == keyset_id)
             .cloned()
             .ok_or_else(|| {
-                HtlcError::Network(format!(
-                    "mint no longer advertises keyset {keyset_id}"
-                ))
+                HtlcError::Network(format!("mint no longer advertises keyset {keyset_id}"))
             })?;
         let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
         let split = Self::split_for_swap(total_sat, &fee_and_amounts)
@@ -743,17 +729,16 @@ mod tests {
             "not a url".to_string(),
             [0u8; 32],
         );
-        assert!(adapter.is_err(), "garbage url must be rejected, not silently replaced");
+        assert!(
+            adapter.is_err(),
+            "garbage url must be rejected, not silently replaced"
+        );
     }
 
     #[test]
     fn new_rejects_empty_mint_url() {
-        let adapter = CashuAdapter::new(
-            NetworkId("cashu::".to_string()),
-            "".to_string(),
-            [0u8; 32],
-        );
+        let adapter =
+            CashuAdapter::new(NetworkId("cashu::".to_string()), "".to_string(), [0u8; 32]);
         assert!(adapter.is_err(), "empty url must be rejected");
     }
 }
-

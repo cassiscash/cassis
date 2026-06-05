@@ -84,7 +84,11 @@ pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<Derive
         networks.insert(network_id, secret);
     }
 
-    Ok(DerivedKeys { nostr, iroh, networks })
+    Ok(DerivedKeys {
+        nostr,
+        iroh,
+        networks,
+    })
 }
 
 /// Generate a fresh 12-word BIP39 mnemonic using the OS CSPRNG.
@@ -123,9 +127,7 @@ fn derive_secret_key(seed: &[u8; 64], label: &[u8]) -> Result<SecretKey, String>
         }
 
         if counter == u32::MAX {
-            return Err(
-                String::from_utf8_lossy(label).into_owned(),
-            );
+            return Err(String::from_utf8_lossy(label).into_owned());
         }
     }
     unreachable!()
@@ -184,7 +186,10 @@ mod tests {
             a.networks.get(&ids[0]).unwrap().as_bytes(),
             b.networks.get(&ids[0]).unwrap().as_bytes()
         );
-        assert_ne!(a.nostr.as_bytes(), a.networks.get(&ids[0]).unwrap().as_bytes());
+        assert_ne!(
+            a.nostr.as_bytes(),
+            a.networks.get(&ids[0]).unwrap().as_bytes()
+        );
     }
 
     #[test]

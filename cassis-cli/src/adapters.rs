@@ -61,42 +61,59 @@ async fn build_receiver(spec: &NetSpec, derived: &DerivedKeys) -> Result<Adapter
             );
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(AdapterPair { network_id, receiver, sender })
+            Ok(AdapterPair {
+                network_id,
+                receiver,
+                sender,
+            })
         }
         #[cfg(feature = "fedimint")]
         NetSpec::Fedimint { address } => {
-            let adapter = cassis_fedimint::FedimintAdapter::new(
-                network_id.clone(),
-                address.clone(),
-                sk,
-            )
-            .await
-            .map_err(|e| format!("fedimint adapter init failed: {e}"))?;
+            let adapter =
+                cassis_fedimint::FedimintAdapter::new(network_id.clone(), address.clone(), sk)
+                    .await
+                    .map_err(|e| format!("fedimint adapter init failed: {e}"))?;
             let adapter = Arc::new(adapter);
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(AdapterPair { network_id, receiver, sender })
+            Ok(AdapterPair {
+                network_id,
+                receiver,
+                sender,
+            })
         }
         #[cfg(feature = "liquid")]
         NetSpec::Liquid => {
             let adapter = Arc::new(cassis_liquid::LiquidAdapter::new(network_id.clone()));
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(AdapterPair { network_id, receiver, sender })
+            Ok(AdapterPair {
+                network_id,
+                receiver,
+                sender,
+            })
         }
         #[cfg(feature = "ark")]
         NetSpec::Ark => {
             let adapter = Arc::new(cassis_arkade::ArkAdapter::new(network_id.clone()));
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(AdapterPair { network_id, receiver, sender })
+            Ok(AdapterPair {
+                network_id,
+                receiver,
+                sender,
+            })
         }
         #[cfg(feature = "rootstock")]
         NetSpec::Rootstock => {
             let adapter = Arc::new(cassis_rootstock::RootstockAdapter::new(network_id.clone()));
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
-            Ok(AdapterPair { network_id, receiver, sender })
+            Ok(AdapterPair {
+                network_id,
+                receiver,
+                sender,
+            })
         }
         #[allow(unreachable_patterns)]
         _ => Err(format!(

@@ -7,10 +7,10 @@ use cassis_routing::{
     build_graph, compute_hop_expiries, fallback_incoming_delta, fallback_transit_slack,
     fetch_announcements, find_route as find_route_in_graph,
 };
-use log::{debug, info};
 use futures::future::try_join_all;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
+use log::{debug, info};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -140,15 +140,13 @@ impl CassisClient {
         invoice: Invoice,
         sender_network: NetworkId,
     ) -> Result<PaymentResult, PayError> {
-        let dest_network = invoice.networks.first().ok_or_else(|| {
-            PayError::Route("invoice has no network".to_string())
-        })?.clone();
+        let dest_network = invoice
+            .networks
+            .first()
+            .ok_or_else(|| PayError::Route("invoice has no network".to_string()))?
+            .clone();
         let route = self
-            .find_route(
-                &dest_network,
-                invoice.amount_msat,
-                sender_network.clone(),
-            )
+            .find_route(&dest_network, invoice.amount_msat, sender_network.clone())
             .await
             .map_err(|err| PayError::Route(err.to_string()))?;
 
@@ -225,10 +223,9 @@ impl CassisClient {
             })
             .collect::<Result<Vec<_>, PayError>>()?;
 
-        let ack_futures = instructions.into_iter().map(|(addr, instruction)| {
-            self.iroh_client
-                .send_instruction(addr, instruction)
-        });
+        let ack_futures = instructions
+            .into_iter()
+            .map(|(addr, instruction)| self.iroh_client.send_instruction(addr, instruction));
         let acks: Vec<cassis_core::HopAck> = try_join_all(ack_futures).await?;
         if acks.iter().any(|ack| !ack.accepted) {
             return Err(PayError::Route("hop rejected".to_string()));
@@ -253,10 +250,7 @@ impl CassisClient {
             .await
             .map_err(|err| PayError::Io(err.to_string()))?;
 
-        match sender
-            .watch_payment(payment.clone(), payment.expiry)
-            .await
-        {
+        match sender.watch_payment(payment.clone(), payment.expiry).await {
             Ok(preimage) => Ok(PaymentResult {
                 status: PaymentStatus::Completed,
                 preimage: Some(preimage),
@@ -281,11 +275,20 @@ impl CassisClient {
         amount_msat: u64,
         sender_network: NetworkId,
     ) -> Result<Vec<RouteHop>, RouteError> {
-        find_route(&self.nostr_relays, destination_network, amount_msat, &sender_network).await
+        find_route(
+            &self.nostr_relays,
+            destination_network,
+            amount_msat,
+            &sender_network,
+        )
+        .await
     }
 
     /// Look up the receiver adapter for `network`.
-    fn receiver_for(&self, network: &NetworkId) -> Result<Arc<dyn NetworkReceiverAdapter>, ReceiveFlowError> {
+    fn receiver_for(
+        &self,
+        network: &NetworkId,
+    ) -> Result<Arc<dyn NetworkReceiverAdapter>, ReceiveFlowError> {
         self.receivers
             .get(network)
             .cloned()
@@ -351,9 +354,13 @@ impl CassisClient {
         deadline: u64,
         description: Option<String>,
     ) -> Result<ReceiveResult, ReceiveFlowError> {
-        let invoice = self.create_invoice(network, amount_msat, deadline, description).await?;
+        let invoice = self
+            .create_invoice(network, amount_msat, deadline, description)
+            .await?;
         let payment_hash = invoice.payment_hash;
-        let preimage = self.wait_for_incoming(network, payment_hash, deadline).await?;
+        let preimage = self
+            .wait_for_incoming(network, payment_hash, deadline)
+            .await?;
         self.claim_invoice(network, payment_hash, preimage).await?;
         Ok(ReceiveResult {
             payment_hash,

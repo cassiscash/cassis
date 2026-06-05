@@ -1,11 +1,7 @@
 use cassis_core::{cashu_mint_url, cashu_network_id, fedimint_network_id, NetworkId};
 use clap::{Parser, Subcommand};
 
-const DEFAULT_NOSTR_RELAYS: &[&str] = &[
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://nostr.mom",
-];
+const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
 
 pub fn default_nostr_relays() -> Vec<String> {
     DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
@@ -152,8 +148,7 @@ impl NetSpec {
             #[cfg(feature = "cashu")]
             "cashu" => {
                 let host = param.ok_or_else(|| {
-                    "network 'cashu' requires a host, e.g. cashu::mint.example.com"
-                        .to_string()
+                    "network 'cashu' requires a host, e.g. cashu::mint.example.com".to_string()
                 })?;
                 if host.is_empty() {
                     return Err(
@@ -162,15 +157,13 @@ impl NetSpec {
                     );
                 }
                 if host.contains("://") {
-                    return Err(
-                        "network 'cashu' must not include a scheme; \
+                    return Err("network 'cashu' must not include a scheme; \
                          drop the http:// or https:// prefix and use cashu::<host> instead"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 let network_id = cashu_network_id(host);
-                let mint_url = cashu_mint_url(&network_id)
-                    .map_err(|e| format!("cashu mint url: {e}"))?;
+                let mint_url =
+                    cashu_mint_url(&network_id).map_err(|e| format!("cashu mint url: {e}"))?;
                 Ok(NetSpec::Cashu {
                     mint_url,
                     host: host.to_string(),
@@ -184,9 +177,7 @@ impl NetSpec {
                         .to_string()
                 })?;
                 if address.is_empty() {
-                    return Err(
-                        "network 'fedimint' requires a non-empty invite code".to_string(),
-                    );
+                    return Err("network 'fedimint' requires a non-empty invite code".to_string());
                 }
                 Ok(NetSpec::Fedimint {
                     address: address.to_string(),
@@ -324,7 +315,10 @@ mod tests {
     #[test]
     fn prefixes_match_core_constants() {
         assert_eq!(NetSpec::parse("cashu::x").unwrap().kind_name(), "cashu");
-        assert_eq!(NetSpec::parse("fedimint::x").unwrap().kind_name(), "fedimint");
+        assert_eq!(
+            NetSpec::parse("fedimint::x").unwrap().kind_name(),
+            "fedimint"
+        );
         assert_eq!(CASHU_NETWORK_ID_PREFIX, "cashu::");
         assert_eq!(FEDIMINT_NETWORK_ID_PREFIX, "fedimint::");
     }

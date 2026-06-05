@@ -1,4 +1,3 @@
-
 //! Fedimint network adapter (LNv2).
 //!
 //! A cassis node acts as a Fedimint client of one federation, with the
@@ -72,7 +71,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bitcoin::hashes::{Hash, sha256};
+use bitcoin::hashes::{sha256, Hash};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::core::OperationId;
 use fedimint_core::db::Database;
@@ -215,9 +214,10 @@ impl FedimintAdapter {
             .map_err(|e| format!("failed to create db dir {}: {e}", db_dir.display()))?;
         let db_path = db_dir.join("db");
         let db: Database = Database::new(
-            fedimint_rocksdb::RocksDb::build(db_path).open().await.map_err(|e| {
-                format!("failed to open RocksDb at {}: {e}", db_dir.display())
-            })?,
+            fedimint_rocksdb::RocksDb::build(db_path)
+                .open()
+                .await
+                .map_err(|e| format!("failed to open RocksDb at {}: {e}", db_dir.display()))?,
             ModuleRegistry::default(),
         );
 
@@ -280,7 +280,13 @@ impl FedimintAdapter {
             .unwrap_or(&network_id.0);
         let safe: String = slug
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         PathBuf::from(format!("./cassis-fedimint-db/{safe}"))
     }
@@ -346,13 +352,11 @@ impl NetworkReceiverAdapter for FedimintAdapter {
             serde_json::Value::Null,
         );
 
-        let (invoice, operation_id) = tokio::time::timeout(
-            Self::deadline_to_timeout(expiry),
-            receive_fut,
-        )
-        .await
-        .map_err(|_| ReceiveError::DeadlineExceeded)?
-        .map_err(|e| ReceiveError::Network(format!("receive failed: {e:?}")))?;
+        let (invoice, operation_id) =
+            tokio::time::timeout(Self::deadline_to_timeout(expiry), receive_fut)
+                .await
+                .map_err(|_| ReceiveError::DeadlineExceeded)?
+                .map_err(|e| ReceiveError::Network(format!("receive failed: {e:?}")))?;
 
         let payment_hash = Bytes32(invoice.payment_hash().to_byte_array());
         let invoice_str = invoice.to_string();
@@ -370,8 +374,7 @@ impl NetworkReceiverAdapter for FedimintAdapter {
 
         debug!(
             ?payment_hash,
-            amount_msat,
-            "fedimint incoming invoice created"
+            amount_msat, "fedimint incoming invoice created"
         );
 
         Ok(cassis_core::Invoice {
@@ -537,9 +540,7 @@ impl NetworkSenderAdapter for FedimintAdapter {
         }
 
         let invoice: Bolt11Invoice = destination_pubkey.parse().map_err(|e| {
-            SendError::InvalidParams(format!(
-                "destination_pubkey is not a Bolt11 invoice: {e}"
-            ))
+            SendError::InvalidParams(format!("destination_pubkey is not a Bolt11 invoice: {e}"))
         })?;
 
         let invoice_amount_msat = invoice
@@ -578,8 +579,7 @@ impl NetworkSenderAdapter for FedimintAdapter {
 
         debug!(
             ?invoice_payment_hash,
-            amount_msat,
-            "fedimint outgoing payment initiated"
+            amount_msat, "fedimint outgoing payment initiated"
         );
 
         Ok(OutgoingPayment {

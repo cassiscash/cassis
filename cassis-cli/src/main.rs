@@ -30,18 +30,42 @@ async fn main() {
 
     let cli = Cli::parse();
     let result: Result<(), String> = match cli.command {
-        Commands::Pay { invoice, from, nostr_relay } => cmd_pay(invoice, from, nostr_relay).await,
-        Commands::Invoice { amount, network, payee, description, expires_at, wait, timeout } => {
-            cmd_invoice(amount, network, payee, description, expires_at, wait, timeout).await
+        Commands::Pay {
+            invoice,
+            from,
+            nostr_relay,
+        } => cmd_pay(invoice, from, nostr_relay).await,
+        Commands::Invoice {
+            amount,
+            network,
+            payee,
+            description,
+            expires_at,
+            wait,
+            timeout,
+        } => {
+            cmd_invoice(
+                amount,
+                network,
+                payee,
+                description,
+                expires_at,
+                wait,
+                timeout,
+            )
+            .await
         }
         Commands::Receive => cmd_receive().await,
         Commands::Invoices { command } => match command {
             InvoicesCommands::List { status } => cmd_invoices_list(status),
             InvoicesCommands::Show { payment_hash } => cmd_invoices_show(payment_hash),
         },
-        Commands::Route { destination_pubkey, amount, from, nostr_relay } => {
-            cmd_route(destination_pubkey, amount, from, nostr_relay).await
-        }
+        Commands::Route {
+            destination_pubkey,
+            amount,
+            from,
+            nostr_relay,
+        } => cmd_route(destination_pubkey, amount, from, nostr_relay).await,
         Commands::Node { command } => match command {
             cli::NodeCommands::Info => {
                 println!("node info: use `cassis-cli seed show` and `cassis-cli invoices list`");
@@ -109,9 +133,13 @@ fn map_recv_err(e: ReceiveFlowError) -> String {
 // pay
 // ---------------------------------------------------------------------------
 
-async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) -> Result<(), String> {
-    let invoice: Invoice = serde_json::from_str(&invoice_str)
-        .map_err(|e| format!("invalid invoice JSON: {e}"))?;
+async fn cmd_pay(
+    invoice_str: String,
+    from: String,
+    nostr_relays: Vec<String>,
+) -> Result<(), String> {
+    let invoice: Invoice =
+        serde_json::from_str(&invoice_str).map_err(|e| format!("invalid invoice JSON: {e}"))?;
     let sender_network = NetworkId(from.clone());
     let dest_network = invoice
         .networks
@@ -128,9 +156,10 @@ async fn cmd_pay(invoice_str: String, from: String, nostr_relays: Vec<String>) -
     } else {
         nostr_relays
     };
-    let route = cassis_client::find_route(&relays, &dest_network, invoice.amount_msat, &sender_network)
-        .await
-        .map_err(|e| format!("route lookup: {e}"))?;
+    let route =
+        cassis_client::find_route(&relays, &dest_network, invoice.amount_msat, &sender_network)
+            .await
+            .map_err(|e| format!("route lookup: {e}"))?;
     if route.is_empty() {
         return Err("empty route".to_string());
     }
@@ -285,7 +314,10 @@ fn hash_preimage(preimage: [u8; 32]) -> [u8; 32] {
 fn parse_payment_hash(s: &str) -> Result<Bytes32, String> {
     let s = s.trim();
     if s.len() != 64 {
-        return Err(format!("payment hash must be 64 hex chars, got {}", s.len()));
+        return Err(format!(
+            "payment hash must be 64 hex chars, got {}",
+            s.len()
+        ));
     }
     let mut out = [0u8; 32];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
@@ -321,11 +353,7 @@ async fn cmd_receive() -> Result<(), String> {
         .list(Some(InvoiceStatus::Pending))
         .map_err(map_store_err)?
         .into_iter()
-        .filter(|r| {
-            specs
-                .iter()
-                .any(|s| s.network_id() == r.network_id)
-        })
+        .filter(|r| specs.iter().any(|s| s.network_id() == r.network_id))
         .collect();
     info!(
         target: "cassis_cli",
@@ -433,7 +461,10 @@ fn cmd_invoices_show(payment_hash_str: String) -> Result<(), String> {
     println!("amount_msat:  {}", row.amount_msat);
     println!("network:      {}", row.network_id);
     println!("payee:        {}", row.payee.as_deref().unwrap_or("-"));
-    println!("description:  {}", row.description.as_deref().unwrap_or("-"));
+    println!(
+        "description:  {}",
+        row.description.as_deref().unwrap_or("-")
+    );
     println!("expires_at:   {}", row.expires_at);
     println!("status:       {}", row.status.as_str());
     println!("created_at:   {}", row.created_at);
@@ -488,8 +519,7 @@ async fn cmd_route(
 // ---------------------------------------------------------------------------
 
 fn cmd_seed_init(force: bool) -> Result<(), String> {
-    let home = paths::ensure_cassis_home()
-        .map_err(|e| format!("creating cassis home: {e}"))?;
+    let home = paths::ensure_cassis_home().map_err(|e| format!("creating cassis home: {e}"))?;
     let path = seed_store::seed_path(&home);
     let mnemonic = keys::generate_mnemonic().map_err(|e| e.to_string())?;
     seed_store::write_mnemonic(&path, &mnemonic, force)
@@ -535,9 +565,7 @@ fn load_registered_networks(store: &mut Store) -> Result<Vec<String>, String> {
     use minisqlite::Value;
     store
         .conn()
-        .execute(
-            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
-        )
+        .execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")
         .map_err(map_sql_err)?;
     let result = store
         .conn()

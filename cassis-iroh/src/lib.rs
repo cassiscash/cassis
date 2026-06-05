@@ -3,8 +3,8 @@ use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use log::{debug, error, info, warn};
-use std::error::Error as _;
 use serde::{Deserialize, Serialize};
+use std::error::Error as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -34,7 +34,8 @@ pub fn node_addr_from_announcement(ann: &RouteAnnouncement) -> Result<EndpointAd
         iroh::PublicKey::from_str(&ann.iroh_peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
     let mut addr = EndpointAddr::new(peer_id);
     if let Some(relay_url) = &ann.iroh_relay {
-        let relay = iroh::RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
+        let relay =
+            iroh::RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
         addr = addr.with_relay_url(relay);
     }
     Ok(addr)
@@ -196,7 +197,13 @@ impl IrohServer {
                 None
             }
         };
-        Ok((Self { endpoint, home_relay }, key))
+        Ok((
+            Self {
+                endpoint,
+                home_relay,
+            },
+            key,
+        ))
     }
 
     pub fn peer_id(&self) -> iroh::PublicKey {
@@ -210,7 +217,10 @@ impl IrohServer {
     pub async fn run(
         self,
         handler: Arc<
-            dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
+            dyn Fn(
+                    HopInstruction,
+                )
+                    -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -259,7 +269,7 @@ async fn handle_conn(
     handler: Arc<
         dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
             + Send
-        + Sync,
+            + Sync,
     >,
 ) -> Result<(), IrohError> {
     debug!(target: "iroh_server", "accept_bi waiting for stream...");
@@ -275,7 +285,8 @@ async fn handle_conn(
         .map_err(|e| IrohError::Io(e.to_string()))?;
     debug!(target: "iroh_server", "read {} byte(s) of payload", buf.len());
 
-    let frame: Frame = postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
+    let frame: Frame =
+        postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
     debug!(target: "iroh_server", "decoded frame, dispatching to handler");
     let response = match frame {
         Frame::HopInstruction(inst) => {
@@ -315,8 +326,7 @@ async fn handle_conn(
         _ => return Err(IrohError::Protocol("expected HopInstruction".into())),
     };
 
-    let data =
-        postcard::to_allocvec(&response).map_err(|e| IrohError::Protocol(e.to_string()))?;
+    let data = postcard::to_allocvec(&response).map_err(|e| IrohError::Protocol(e.to_string()))?;
     debug!(target: "iroh_server", "writing {} byte(s) of response", data.len());
     writer
         .write_all(&data)

@@ -36,10 +36,7 @@ pub fn payment_hash_hex(payment_hash: &[u8; 32]) -> String {
 /// available at `locktime` (unix seconds). `locktime` is required to
 /// be in the future; the resulting [`SpendingConditions`] embed it
 /// as a tag so the mint will accept the swap.
-pub fn htlc_conditions(
-    payment_hash: &[u8; 32],
-    locktime: u64,
-) -> CashuResult<SpendingConditions> {
+pub fn htlc_conditions(payment_hash: &[u8; 32], locktime: u64) -> CashuResult<SpendingConditions> {
     let conditions = Conditions::new(Some(locktime), None, None, None, None, None)
         .map_err(|e| CashuError::Nuts(format!("invalid NUT-10 conditions: {e}")))?;
     SpendingConditions::new_htlc_hash(&payment_hash_hex(payment_hash), Some(conditions))
@@ -241,7 +238,12 @@ mod tests {
         let out = build_htlc_outputs(4, keyset_id, &hash, locktime).expect("valid");
         let (preimage, _blinded_message, r, amount) = {
             let pm = &out.premints[0];
-            (pm.secret.clone(), pm.blinded_message.clone(), pm.r.clone(), pm.amount)
+            (
+                pm.secret.clone(),
+                pm.blinded_message.clone(),
+                pm.r.clone(),
+                pm.amount,
+            )
         };
         // Build a fake proof with a witness and check preimage
         // round-trip. We can't easily construct a real
@@ -271,7 +273,9 @@ mod tests {
         let hash = [0u8; 32];
         let s = payment_hash_hex(&hash);
         assert_eq!(s.len(), 64);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -281,4 +285,3 @@ mod tests {
         assert!(assert_locktime_in_future(unix_time().saturating_sub(1)).is_err());
     }
 }
-

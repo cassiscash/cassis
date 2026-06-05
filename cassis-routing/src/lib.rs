@@ -96,10 +96,7 @@ impl NostrAnnouncer {
         Self { relays }
     }
 
-    pub async fn publish_once(
-        &self,
-        _announcement: &RouteAnnouncement,
-    ) -> Result<(), NostrError> {
+    pub async fn publish_once(&self, _announcement: &RouteAnnouncement) -> Result<(), NostrError> {
         Err(NostrError::Unimplemented)
     }
 
@@ -354,8 +351,7 @@ pub fn find_route(
     let goal = goal.ok_or(RouteError::NoRoute)?;
     let mut hops_rev: Vec<(RouteAnnouncement, NetworkId, NetworkId)> = Vec::new();
     let mut current = goal.clone();
-    let mut outgoing_for_current: Option<NetworkId> =
-        Some(graph.nodes[goal.node_idx].to.clone());
+    let mut outgoing_for_current: Option<NetworkId> = Some(graph.nodes[goal.node_idx].to.clone());
     let mut hop_idx = 0u64;
 
     loop {
@@ -364,7 +360,9 @@ pub fn find_route(
             .get(current.node_idx)
             .ok_or_else(|| RouteError::InvalidGraph("node missing".to_string()))?;
         let incoming = current.incoming.clone();
-        let outgoing = outgoing_for_current.clone().unwrap_or_else(|| incoming.clone());
+        let outgoing = outgoing_for_current
+            .clone()
+            .unwrap_or_else(|| incoming.clone());
         debug!(
             target: "nostr",
             "  backtrack hop {hop_idx}: route #{} ({}) in={incoming} out={outgoing}",
@@ -372,11 +370,7 @@ pub fn find_route(
             node.node_pubkey
         );
         hop_idx += 1;
-        hops_rev.push((
-            node.clone(),
-            incoming.clone(),
-            outgoing.clone(),
-        ));
+        hops_rev.push((node.clone(), incoming.clone(), outgoing.clone()));
 
         if let Some((prev_state, prev_outgoing)) = prev.get(&current) {
             current = prev_state.clone();
@@ -403,9 +397,7 @@ pub fn compute_hop_expiries(now: u64, deltas: &[u64]) -> Vec<u64> {
 }
 
 fn node_fee_msat(node: &RouteAnnouncement, amount_msat: u64) -> u64 {
-    let fee_ppm = (node.fee_ppm as u128)
-        .saturating_mul(amount_msat as u128)
-        / 1_000_000u128;
+    let fee_ppm = (node.fee_ppm as u128).saturating_mul(amount_msat as u128) / 1_000_000u128;
     let fee = node.fee_base_msat as u128 + fee_ppm;
     fee.min(u64::MAX as u128) as u64
 }
@@ -478,33 +470,36 @@ mod tests {
         let hops = route.unwrap();
         assert_eq!(hops.len(), 1, "single-hop route");
         assert_eq!(hops[0].0.node_pubkey.0, key_x());
-        assert_eq!(hops[0].1.0, "A", "incoming is A");
-        assert_eq!(hops[0].2.0, "B", "outgoing is destination network B");
+        assert_eq!(hops[0].1 .0, "A", "incoming is A");
+        assert_eq!(hops[0].2 .0, "B", "outgoing is destination network B");
     }
 
     #[test]
     fn two_hop_route_a_to_c_via_b() {
-        let graph = build_graph(vec![
-            route(key_x(), "A", "B"),
-            route(key_y(), "B", "C"),
-        ]);
+        let graph = build_graph(vec![route(key_x(), "A", "B"), route(key_y(), "B", "C")]);
         let route = find_route(&graph, &NetworkId("C".into()), 1000, &NetworkId("A".into()));
         assert!(route.is_ok(), "should find route A->B->C");
         let hops = route.unwrap();
         assert_eq!(hops.len(), 2);
         assert_eq!(hops[0].0.node_pubkey.0, key_x());
-        assert_eq!(hops[0].1.0, "A");
-        assert_eq!(hops[0].2.0, "B");
+        assert_eq!(hops[0].1 .0, "A");
+        assert_eq!(hops[0].2 .0, "B");
         assert_eq!(hops[1].0.node_pubkey.0, key_y());
-        assert_eq!(hops[1].1.0, "B");
-        assert_eq!(hops[1].2.0, "C", "last hop's outgoing is the destination network");
+        assert_eq!(hops[1].1 .0, "B");
+        assert_eq!(
+            hops[1].2 .0, "C",
+            "last hop's outgoing is the destination network"
+        );
     }
 
     #[test]
     fn reverse_route_not_found_when_only_a_to_b_exists() {
         let graph = build_graph(vec![route(key_x(), "A", "B")]);
         let route = find_route(&graph, &NetworkId("A".into()), 1000, &NetworkId("B".into()));
-        assert!(route.is_err(), "B->A should not exist when only A->B announced");
+        assert!(
+            route.is_err(),
+            "B->A should not exist when only A->B announced"
+        );
     }
 
     #[test]
@@ -632,7 +627,10 @@ mod tests {
             "fetch should be bounded by the wrap, took {elapsed:?}"
         );
         assert!(
-            matches!(result, Ok(_) | Err(NostrError::Timeout) | Err(NostrError::Network(_))),
+            matches!(
+                result,
+                Ok(_) | Err(NostrError::Timeout) | Err(NostrError::Network(_))
+            ),
             "unexpected variant: {result:?}"
         );
     }

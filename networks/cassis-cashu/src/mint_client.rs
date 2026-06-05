@@ -71,10 +71,7 @@ impl MintClient {
     }
 
     /// `POST /v1/mint/bolt11` — mint tokens from a BOLT11 quote (NUT-04).
-    pub async fn mint_bolt11(
-        &self,
-        request: &MintRequest<String>,
-    ) -> CashuResult<MintResponse> {
+    pub async fn mint_bolt11(&self, request: &MintRequest<String>) -> CashuResult<MintResponse> {
         self.post("/v1/mint/bolt11", request).await
     }
 

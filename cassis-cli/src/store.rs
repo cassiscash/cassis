@@ -168,7 +168,11 @@ impl Store {
              FROM invoices {} ORDER BY created_at DESC;",
             where_clause
         ))?;
-        result.rows.iter().map(|r| row_from_values(r.as_slice())).collect()
+        result
+            .rows
+            .iter()
+            .map(|r| row_from_values(r.as_slice()))
+            .collect()
     }
 }
 

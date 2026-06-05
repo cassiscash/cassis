@@ -23,7 +23,10 @@ pub fn write_mnemonic(path: &Path, mnemonic: &str, force: bool) -> std::io::Resu
         Ok(_) if !force => {
             return Err(std::io::Error::new(
                 ErrorKind::AlreadyExists,
-                format!("seed file already exists at {}; pass --force to overwrite", path.display()),
+                format!(
+                    "seed file already exists at {}; pass --force to overwrite",
+                    path.display()
+                ),
             ));
         }
         Ok(_) => {}

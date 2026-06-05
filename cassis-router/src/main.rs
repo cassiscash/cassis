@@ -1,9 +1,9 @@
+#[cfg(feature = "cashu")]
+use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
     network_id_for_spec, normalize_network_id, split_spec, Bytes32, HopAck, HopInstruction,
     HopReject, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
 };
-#[cfg(feature = "cashu")]
-use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_iroh::IrohServer;
 use cassis_keys as keys;
 use clap::Parser;
@@ -16,17 +16,15 @@ use tokio::sync::Mutex;
 
 const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 
-const DEFAULT_NOSTR_RELAYS: &[&str] = &[
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://nostr.mom",
-];
+const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
 
 type PendingMap = Arc<Mutex<HashMap<Bytes32, HopInstruction>>>;
 
 #[derive(Parser)]
 #[command(name = "cassis-router")]
-#[command(about = "Cassis multi-network routing daemon (router only; receivers live in cassis-cli)")]
+#[command(
+    about = "Cassis multi-network routing daemon (router only; receivers live in cassis-cli)"
+)]
 struct Cli {
     /// Networks to route between. The format depends on the network kind:
     ///     cashu::<host[:port]>     e.g. cashu::mint.example.com (https) or
@@ -141,8 +139,9 @@ async fn main() {
     let router = Arc::new(CassisRouter::new(adapters));
     let handler_router = router.clone();
 
-    let (iroh_server, iroh_secret) =
-        IrohServer::new(derived.iroh.clone()).await.expect("failed to bind iroh endpoint");
+    let (iroh_server, iroh_secret) = IrohServer::new(derived.iroh.clone())
+        .await
+        .expect("failed to bind iroh endpoint");
     let iroh_peer_id = iroh_secret.public();
     let iroh_relay = iroh_server
         .home_relay()
@@ -197,10 +196,7 @@ pub struct NetworkEntry {
 }
 
 #[allow(unused_variables)]
-async fn build_adapter(
-    spec: &str,
-    derived: &keys::DerivedKeys,
-) -> Result<NetworkEntry, String> {
+async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<NetworkEntry, String> {
     let (kind, param) = split_spec(spec);
 
     match kind {
@@ -360,70 +356,76 @@ impl CassisRouter {
         let adapters = self.adapters.clone();
         let pending = Arc::clone(&self.pending);
         tokio::spawn(async move {
-    let outgoing_entry = match adapters.get(&instruction.outgoing_network) {
-        Some(entry) => entry,
-        None => {
+            let outgoing_entry = match adapters.get(&instruction.outgoing_network) {
+                Some(entry) => entry,
+                None => {
+                    remove_pending(&pending, instruction.payment_hash).await;
+                    return;
+                }
+            };
+
+            let htlc: OutgoingHtlc = match outgoing_entry
+                .adapter
+                .create_outgoing_htlc(
+                    instruction.payment_hash,
+                    instruction.amount_msat,
+                    instruction.outgoing_expiry,
+                    &instruction.recipient,
+                )
+                .await
+            {
+                Ok(htlc) => {
+                    info!(
+                        target: "cassis_router",
+                        "  outgoing HTLC on {} for {} ({} msat)",
+                        htlc.network, htlc.recipient, htlc.amount_msat,
+                    );
+                    htlc
+                }
+                Err(err) => {
+                    warn!(
+                        target: "cassis_router",
+                        "  create_outgoing_htlc failed on {}: {:?}",
+                        instruction.outgoing_network, err
+                    );
+                    remove_pending(&pending, instruction.payment_hash).await;
+                    return;
+                }
+            };
+
+            match outgoing_entry
+                .adapter
+                .watch_preimage(htlc.payment_hash, instruction.outgoing_expiry)
+                .await
+            {
+                Ok(_preimage) => {
+                    info!(
+                        target: "cassis_router",
+                        "  outgoing settled on {} (preimage revealed upstream)",
+                        instruction.outgoing_network
+                    );
+                }
+                Err(WatchError::DeadlineExceeded) => {
+                    warn!(target: "cassis_router", "  deadline exceeded, refunding outgoing");
+                    let _ = outgoing_entry
+                        .adapter
+                        .refund_outgoing(htlc.payment_hash)
+                        .await;
+                }
+                Err(err) => {
+                    error!(
+                        target: "cassis_router",
+                        "  error watching payment on {}: {:?}",
+                        instruction.outgoing_network, err
+                    );
+                    let _ = outgoing_entry
+                        .adapter
+                        .refund_outgoing(htlc.payment_hash)
+                        .await;
+                }
+            }
+
             remove_pending(&pending, instruction.payment_hash).await;
-            return;
-        }
-    };
-
-    let htlc: OutgoingHtlc = match outgoing_entry
-        .adapter
-        .create_outgoing_htlc(
-            instruction.payment_hash,
-            instruction.amount_msat,
-            instruction.outgoing_expiry,
-            &instruction.recipient,
-        )
-        .await
-    {
-        Ok(htlc) => {
-            info!(
-                target: "cassis_router",
-                "  outgoing HTLC on {} for {} ({} msat)",
-                htlc.network, htlc.recipient, htlc.amount_msat,
-            );
-            htlc
-        }
-        Err(err) => {
-            warn!(
-                target: "cassis_router",
-                "  create_outgoing_htlc failed on {}: {:?}",
-                instruction.outgoing_network, err
-            );
-            remove_pending(&pending, instruction.payment_hash).await;
-            return;
-        }
-    };
-
-    match outgoing_entry
-        .adapter
-        .watch_preimage(htlc.payment_hash, instruction.outgoing_expiry)
-        .await
-    {
-        Ok(_preimage) => {
-            info!(
-                target: "cassis_router",
-                "  outgoing settled on {} (preimage revealed upstream)",
-                instruction.outgoing_network
-            );
-        }
-        Err(WatchError::DeadlineExceeded) => {
-            warn!(target: "cassis_router", "  deadline exceeded, refunding outgoing");
-            let _ = outgoing_entry.adapter.refund_outgoing(htlc.payment_hash).await;
-        }
-        Err(err) => {
-            error!(
-                target: "cassis_router",
-                "  error watching payment on {}: {:?}",
-                instruction.outgoing_network, err
-            );
-            let _ = outgoing_entry.adapter.refund_outgoing(htlc.payment_hash).await;
-        }
-    }
-
-    remove_pending(&pending, instruction.payment_hash).await;
         });
 
         Ok(HopAck {
@@ -536,11 +538,7 @@ async fn publish_route_announcements(
 
     let pairs: Vec<(NetworkId, NetworkId)> = network_ids
         .iter()
-        .flat_map(|from| {
-            network_ids
-                .iter()
-                .map(move |to| (from.clone(), to.clone()))
-        })
+        .flat_map(|from| network_ids.iter().map(move |to| (from.clone(), to.clone())))
         .filter(|(from, to)| from != to)
         .collect();
 
@@ -557,10 +555,17 @@ async fn publish_route_announcements(
                 kind: Kind(NOSTR_KIND_ROUTE_ANNOUNCEMENT),
                 tags: Tags(vec![
                     vec!["d".to_string(), d_tag.clone()],
-                    vec!["iroh".to_string(), iroh_peer_id.to_string(), iroh_relay.to_string()],
+                    vec![
+                        "iroh".to_string(),
+                        iroh_peer_id.to_string(),
+                        iroh_relay.to_string(),
+                    ],
                     vec!["fee_base_msat".to_string(), fee_base_msat.to_string()],
                     vec!["fee_ppm".to_string(), fee_ppm.to_string()],
-                    vec!["transit_slack_secs".to_string(), transit_slack_secs.to_string()],
+                    vec![
+                        "transit_slack_secs".to_string(),
+                        transit_slack_secs.to_string(),
+                    ],
                 ]),
                 content: String::new(),
             };

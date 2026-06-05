@@ -226,11 +226,13 @@ pub fn cashu_mint_url(network_id: &NetworkId) -> Result<String, String> {
         return Err(format!("network id {network_id} has no host"));
     }
     if host.contains("://") {
-        return Err(format!(
-            "network id {network_id} must not contain a scheme"
-        ));
+        return Err(format!("network id {network_id} must not contain a scheme"));
     }
-    let scheme = if is_loopback_host(host) { "http" } else { "https" };
+    let scheme = if is_loopback_host(host) {
+        "http"
+    } else {
+        "https"
+    };
     Ok(format!("{scheme}://{host}"))
 }
 
@@ -720,7 +722,10 @@ mod tests {
 
     #[test]
     fn split_spec_splits_on_double_colon() {
-        assert_eq!(split_spec("cashu::mint.example.com"), ("cashu", Some("mint.example.com")));
+        assert_eq!(
+            split_spec("cashu::mint.example.com"),
+            ("cashu", Some("mint.example.com"))
+        );
         assert_eq!(split_spec("liquid"), ("liquid", None));
     }
 
@@ -859,8 +864,10 @@ mod tests {
     #[test]
     fn cashu_mint_url_uses_https_for_remote_hostname() {
         assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}mint.example.com")))
-                .unwrap(),
+            cashu_mint_url(&NetworkId(format!(
+                "{CASHU_NETWORK_ID_PREFIX}mint.example.com"
+            )))
+            .unwrap(),
             "https://mint.example.com"
         );
     }
@@ -881,13 +888,14 @@ mod tests {
     #[test]
     fn cashu_mint_url_uses_http_for_localhost() {
         assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost")))
-                .unwrap(),
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost"))).unwrap(),
             "http://localhost"
         );
         assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}localhost:3338")))
-                .unwrap(),
+            cashu_mint_url(&NetworkId(format!(
+                "{CASHU_NETWORK_ID_PREFIX}localhost:3338"
+            )))
+            .unwrap(),
             "http://localhost:3338"
         );
     }
@@ -896,13 +904,14 @@ mod tests {
     #[test]
     fn cashu_mint_url_uses_http_for_loopback_ips() {
         assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1")))
-                .unwrap(),
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1"))).unwrap(),
             "http://127.0.0.1"
         );
         assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}127.0.0.1:3338")))
-                .unwrap(),
+            cashu_mint_url(&NetworkId(format!(
+                "{CASHU_NETWORK_ID_PREFIX}127.0.0.1:3338"
+            )))
+            .unwrap(),
             "http://127.0.0.1:3338"
         );
         assert_eq!(
@@ -910,8 +919,7 @@ mod tests {
             "http://::1"
         );
         assert_eq!(
-            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}[::1]:3338")))
-                .unwrap(),
+            cashu_mint_url(&NetworkId(format!("{CASHU_NETWORK_ID_PREFIX}[::1]:3338"))).unwrap(),
             "http://[::1]:3338"
         );
     }
@@ -990,9 +998,6 @@ mod tests {
             normalize_network_id(&NetworkId("liquid".to_string())).0,
             "liquid"
         );
-        assert_eq!(
-            normalize_network_id(&NetworkId("ark".to_string())).0,
-            "ark"
-        );
+        assert_eq!(normalize_network_id(&NetworkId("ark".to_string())).0, "ark");
     }
 }
