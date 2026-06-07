@@ -8,6 +8,7 @@ default = []
 
 [dependencies]
 async-trait = "0.1.91"
+base64 = "0.22.1"
 cassis-core = { path = "../../cassis-core" }
 cashu = { version = "0.17.3", features = ["wallet"] }
 lowercase-hex = "0.1.1"

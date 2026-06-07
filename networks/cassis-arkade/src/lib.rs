@@ -59,6 +59,34 @@ impl NetworkRouterAdapter for ArkAdapter {
         Err(WatchError::Unimplemented)
     }
 
+    async fn can_route(&self, _amount_msat: u64) -> Result<(), HtlcError> {
+        Err(HtlcError::Unimplemented)
+    }
+
+    async fn verify_incoming_htlc(
+        &self,
+        _descriptor: &cassis_core::HtlcDescriptor,
+        _payment_hash: Bytes32,
+    ) -> Result<(), HtlcError> {
+        Err(HtlcError::Unimplemented)
+    }
+
+    async fn accept_incoming_htlc(
+        &self,
+        _payment_hash: Bytes32,
+        _descriptor: &cassis_core::HtlcDescriptor,
+        _deadline: u64,
+    ) -> Result<(), HtlcError> {
+        Err(HtlcError::Unimplemented)
+    }
+
+    async fn outgoing_htlc_descriptor(
+        &self,
+        _payment_hash: Bytes32,
+    ) -> Result<cassis_core::HtlcDescriptor, HtlcError> {
+        Err(HtlcError::Unimplemented)
+    }
+
     fn incoming_delta_secs(&self) -> u64 {
         10
     }

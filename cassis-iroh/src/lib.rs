@@ -1,7 +1,10 @@
-use cassis_core::{HopAck, HopInstruction, HopReject, RouteAnnouncement};
+use cassis_core::{
+    Bytes32, HopCommit, HopCommitted, HopDispatch, HopDispatched, HopPrepare, HopPrepared,
+    HtlcDescriptor, NetworkId,
+};
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl, SecretKey};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
@@ -22,20 +25,60 @@ pub enum IrohError {
     Closed,
 }
 
-#[derive(Serialize, Deserialize)]
-enum Frame {
-    HopInstruction(HopInstruction),
-    HopAck(HopAck),
+/// Every message the hop protocol carries on the wire. The
+/// `Direction` tag discriminates sender vs receiver roles; the
+/// router (intermediate hop) handles `Prepare`, `Prepared`,
+/// `Dispatch`, `Dispatched`; the payee (final hop) handles
+/// `Commit` and `Committed`. Both peers run the same
+/// [`IrohServer`] and dispatch by the tag.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Frame {
+    Prepare(HopPrepare),
+    Prepared(HopPrepared),
+    Dispatch(HopDispatch),
+    Dispatched(HopDispatched),
+    Commit(HopCommit),
+    Committed(HopCommitted),
+}
+
+impl Frame {
+    pub fn payment_hash(&self) -> Bytes32 {
+        match self {
+            Frame::Prepare(m) => m.payment_hash,
+            Frame::Prepared(m) => m.payment_hash,
+            Frame::Dispatch(m) => m.payment_hash,
+            Frame::Dispatched(m) => m.payment_hash,
+            Frame::Commit(m) => m.payment_hash,
+            Frame::Committed(m) => m.payment_hash,
+        }
+    }
 }
 
 /// Build an [`EndpointAddr`] from a route announcement's iroh fields.
-pub fn node_addr_from_announcement(ann: &RouteAnnouncement) -> Result<EndpointAddr, IrohError> {
+pub fn node_addr_from_announcement(
+    ann: &cassis_core::RouteAnnouncement,
+) -> Result<EndpointAddr, IrohError> {
     let peer_id =
-        iroh::PublicKey::from_str(&ann.iroh_peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
+        PublicKey::from_str(&ann.iroh_peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
     let mut addr = EndpointAddr::new(peer_id);
     if let Some(relay_url) = &ann.iroh_relay {
-        let relay =
-            iroh::RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
+        let relay = RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
+        addr = addr.with_relay_url(relay);
+    }
+    Ok(addr)
+}
+
+/// Build an [`EndpointAddr`] for a payee (receiver) from an
+/// [`Invoice`](cassis_core::Invoice) that carries optional
+/// `iroh_peer_id` / `iroh_relay` fields.
+pub fn node_addr_from_invoice(
+    peer_id: &str,
+    relay: Option<&str>,
+) -> Result<EndpointAddr, IrohError> {
+    let id = PublicKey::from_str(peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
+    let mut addr = EndpointAddr::new(id);
+    if let Some(relay_url) = relay {
+        let relay = RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
         addr = addr.with_relay_url(relay);
     }
     Ok(addr)
@@ -55,10 +98,6 @@ impl IrohClient {
     }
 
     /// Build a new client endpoint with the same defaults as the server.
-    ///
-    /// Use this instead of constructing an [`iroh::Endpoint`] by hand so that
-    /// the TLS authentication mode matches the server's and QUIC handshakes
-    /// over the relay don't time out.
     pub async fn bind() -> Result<Self, IrohError> {
         info!(target: "iroh_client", "binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
         let endpoint = Endpoint::builder(presets::N0)
@@ -70,19 +109,28 @@ impl IrohClient {
         Ok(Self::new(endpoint))
     }
 
-    pub async fn send_instruction(
+    pub fn peer_id(&self) -> PublicKey {
+        self.endpoint.id()
+    }
+
+    /// Underlying endpoint; exposed so callers can publish route
+    /// announcements or do other transport-level work.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    async fn round_trip(
         &self,
         addr: EndpointAddr,
-        instruction: HopInstruction,
-    ) -> Result<HopAck, IrohError> {
+        send: Frame,
+        op: &'static str,
+    ) -> Result<Frame, IrohError> {
         let relay = addr.relay_urls().next();
         let direct = addr.ip_addrs().count();
         info!(
             target: "iroh_client",
-            "connecting to {} (relay={:?}, direct_addrs={})...",
-            addr.id,
-            relay,
-            direct
+            "{op}: connecting to {} (relay={:?}, direct_addrs={})...",
+            addr.id, relay, direct
         );
         let conn = match self.endpoint.connect(addr, ALPN_PROTOCOL).await {
             Ok(c) => c,
@@ -96,31 +144,25 @@ impl IrohClient {
                 return Err(IrohError::Io(format!("{e:#}")));
             }
         };
-        debug!(target: "iroh_client", "connected, opening bi stream...");
+        debug!(target: "iroh_client", "{op}: connected, opening bi stream...");
 
         let (mut writer, mut reader) = conn
             .open_bi()
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
-        debug!(target: "iroh_client", "stream opened, writing frame...");
+        debug!(target: "iroh_client", "{op}: stream opened, writing frame...");
 
-        let frame = Frame::HopInstruction(instruction.clone());
-        let data = postcard::to_allocvec(&frame).map_err(|e| IrohError::Protocol(e.to_string()))?;
-        debug!(
-            target: "iroh_client",
-            "sending HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
-            lowercase_hex::encode(instruction.payment_hash),
-            instruction.amount_msat,
-            instruction.incoming_network.0,
-            instruction.outgoing_network.0,
-            instruction.recipient,
-        );
+        let data = postcard::to_allocvec(&send).map_err(|e| IrohError::Protocol(e.to_string()))?;
         writer
             .write_all(&data)
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
         let _ = writer.finish();
-        debug!(target: "iroh_client", "wrote {} byte(s), awaiting response...", data.len());
+        debug!(
+            target: "iroh_client",
+            "{op}: wrote {} byte(s), awaiting response...",
+            data.len()
+        );
 
         let buf = match reader.read_to_end(1024 * 1024).await {
             Ok(b) => b,
@@ -129,24 +171,75 @@ impl IrohClient {
                 return Err(IrohError::Io(format!("read error: {e:?}")));
             }
         };
-        debug!(target: "iroh_client", "got {} byte(s) of response", buf.len());
+        debug!(
+            target: "iroh_client",
+            "{op}: got {} byte(s) of response",
+            buf.len()
+        );
 
         let frame: Frame =
             postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
-        match frame {
-            Frame::HopAck(ack) => {
-                info!(
-                    target: "iroh_client",
-                    "received HopAck(payment_hash={}, accepted={}, reason={:?})",
-                    lowercase_hex::encode(ack.payment_hash),
-                    ack.accepted,
-                    ack.reason,
-                );
-                Ok(ack)
-            }
-            _ => Err(IrohError::Protocol("unexpected frame".into())),
+        Ok(frame)
+    }
+
+    pub async fn send_prepare(
+        &self,
+        addr: EndpointAddr,
+        prepare: HopPrepare,
+    ) -> Result<HopPrepared, IrohError> {
+        let reply = self
+            .round_trip(addr, Frame::Prepare(prepare), "send_prepare")
+            .await?;
+        match reply {
+            Frame::Prepared(m) => Ok(m),
+            other => Err(IrohError::Protocol(format!(
+                "send_prepare: unexpected reply frame {:?}",
+                other
+            ))),
         }
     }
+
+    pub async fn send_dispatch(
+        &self,
+        addr: EndpointAddr,
+        dispatch: HopDispatch,
+    ) -> Result<HopDispatched, IrohError> {
+        let reply = self
+            .round_trip(addr, Frame::Dispatch(dispatch), "send_dispatch")
+            .await?;
+        match reply {
+            Frame::Dispatched(m) => Ok(m),
+            other => Err(IrohError::Protocol(format!(
+                "send_dispatch: unexpected reply frame {:?}",
+                other
+            ))),
+        }
+    }
+
+    pub async fn send_commit(
+        &self,
+        addr: EndpointAddr,
+        commit: HopCommit,
+    ) -> Result<HopCommitted, IrohError> {
+        let reply = self
+            .round_trip(addr, Frame::Commit(commit), "send_commit")
+            .await?;
+        match reply {
+            Frame::Committed(m) => Ok(m),
+            other => Err(IrohError::Protocol(format!(
+                "send_commit: unexpected reply frame {:?}",
+                other
+            ))),
+        }
+    }
+}
+
+/// Identifier the handler uses to log which direction a frame
+/// came from. Useful for routing to a router vs receiver handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    SenderSide,
+    ReceiverSide,
 }
 
 pub struct IrohServer {
@@ -206,7 +299,7 @@ impl IrohServer {
         ))
     }
 
-    pub fn peer_id(&self) -> iroh::PublicKey {
+    pub fn peer_id(&self) -> PublicKey {
         self.endpoint.secret_key().public()
     }
 
@@ -217,10 +310,7 @@ impl IrohServer {
     pub async fn run(
         self,
         handler: Arc<
-            dyn Fn(
-                    HopInstruction,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
+            dyn Fn(Frame) -> Pin<Box<dyn Future<Output = Result<Frame, IrohError>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -267,7 +357,7 @@ impl IrohServer {
 async fn handle_conn(
     conn: Connection,
     handler: Arc<
-        dyn Fn(HopInstruction) -> Pin<Box<dyn Future<Output = Result<HopAck, HopReject>> + Send>>
+        dyn Fn(Frame) -> Pin<Box<dyn Future<Output = Result<Frame, IrohError>> + Send>>
             + Send
             + Sync,
     >,
@@ -287,43 +377,17 @@ async fn handle_conn(
 
     let frame: Frame =
         postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
-    debug!(target: "iroh_server", "decoded frame, dispatching to handler");
-    let response = match frame {
-        Frame::HopInstruction(inst) => {
-            info!(
-                target: "iroh_server",
-                "received HopInstruction(payment_hash={}, amount_msat={}, incoming={}, outgoing={}, recipient={})",
-                lowercase_hex::encode(inst.payment_hash),
-                inst.amount_msat,
-                inst.incoming_network.0,
-                inst.outgoing_network.0,
-                inst.recipient,
-            );
-            match handler(inst).await {
-                Ok(ack) => {
-                    info!(
-                        target: "iroh_server",
-                        "handler returned HopAck(payment_hash={}, accepted=true)",
-                        lowercase_hex::encode(ack.payment_hash),
-                    );
-                    Frame::HopAck(ack)
-                }
-                Err(reject) => {
-                    warn!(
-                        target: "iroh_server",
-                        "handler rejected payment_hash={}: {}",
-                        lowercase_hex::encode(reject.payment_hash),
-                        reject.reason
-                    );
-                    Frame::HopAck(HopAck {
-                        payment_hash: reject.payment_hash,
-                        accepted: false,
-                        reason: Some(reject.reason),
-                    })
-                }
-            }
+    debug!(
+        target: "iroh_server",
+        "decoded frame, dispatching to handler (payment_hash={})",
+        frame.payment_hash()
+    );
+    let response = match handler(frame).await {
+        Ok(frame) => frame,
+        Err(e) => {
+            error!(target: "iroh_server", "handler returned error: {e}");
+            return Err(e);
         }
-        _ => return Err(IrohError::Protocol("expected HopInstruction".into())),
     };
 
     let data = postcard::to_allocvec(&response).map_err(|e| IrohError::Protocol(e.to_string()))?;
@@ -342,4 +406,22 @@ async fn handle_conn(
     debug!(target: "iroh_server", "connection closed by peer: {close_reason}");
 
     Ok(())
+}
+
+/// Convenience: build a [`HopCommit`] from the wire-level fields a
+/// payee needs to claim the final HTLC.
+pub fn build_commit(
+    payment_hash: Bytes32,
+    amount_msat: u64,
+    network: NetworkId,
+    incoming_deadline: u64,
+    incoming_descriptor: HtlcDescriptor,
+) -> HopCommit {
+    HopCommit {
+        payment_hash,
+        amount_msat,
+        network,
+        incoming_deadline,
+        incoming_descriptor,
+    }
 }

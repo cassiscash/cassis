@@ -1,24 +1,29 @@
 #[cfg(feature = "cashu")]
 use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
-    network_id_for_spec, normalize_network_id, split_spec, Bytes32, HopAck, HopInstruction,
-    HopReject, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
+    network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDispatch,
+    HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, NetworkId, NetworkRouterAdapter,
+    WatchError,
 };
-use cassis_iroh::IrohServer;
+use cassis_iroh::{Frame, IrohError, IrohServer};
 use cassis_keys as keys;
 use clap::Parser;
 use log::{debug, error, info, warn};
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
 
-type PendingMap = Arc<Mutex<HashMap<Bytes32, HopInstruction>>>;
+/// How often the per-dispatch poll task wakes up to check whether
+/// the receiver of an outgoing HTLC has revealed the preimage.
+const POLL_INTERVAL_SECS: u64 = 30;
+
+type PreparedMap = Arc<Mutex<HashMap<Bytes32, HopPrepare>>>;
 
 #[derive(Parser)]
 #[command(name = "cassis-router")]
@@ -138,6 +143,7 @@ async fn main() {
 
     let router = Arc::new(CassisRouter::new(adapters));
     let handler_router = router.clone();
+    let poll_router = router.clone();
 
     let (iroh_server, iroh_secret) = IrohServer::new(derived.iroh.clone())
         .await
@@ -151,21 +157,20 @@ async fn main() {
 
     tokio::spawn(async move {
         let handler = Arc::new(
-            move |inst: HopInstruction| -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<HopAck, HopReject>> + Send>,
+            move |frame: Frame| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Frame, IrohError>> + Send>,
             > {
                 let router = handler_router.clone();
-                Box::pin(async move {
-                    match router.handle_instruction(inst).await {
-                        Ok(ack) => Ok(ack),
-                        Err(reject) => Err(reject),
-                    }
-                })
+                Box::pin(async move { router.handle_frame(frame).await })
             },
         );
         if let Err(e) = iroh_server.run(handler).await {
             error!(target: "cassis_router", "iroh server error: {e}");
         }
+    });
+
+    tokio::spawn(async move {
+        poll_router.run_poll_loop().await;
     });
 
     publish_route_announcements(
@@ -197,7 +202,7 @@ pub struct NetworkEntry {
 
 #[allow(unused_variables)]
 async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<NetworkEntry, String> {
-    let (kind, param) = split_spec(spec);
+    let (kind, param) = cassis_core::split_spec(spec);
 
     match kind {
         #[cfg(feature = "cashu")]
@@ -308,210 +313,474 @@ async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<Networ
     }
 }
 
+/// Per-dispatch state the router retains between DISPATCH and the
+/// eventual claim. `outgoing_deadline` is the unix-second cutoff
+/// the router passes to the adapter's `watch_preimage`; once
+/// exceeded, the dispatch is refunded (outgoing side) and the
+/// incoming side is left to expire on its own.
+struct DispatchedHop {
+    prepare: HopPrepare,
+    /// Unix seconds; the router stops polling after this and runs
+    /// the refund path on the outgoing side.
+    outgoing_deadline: u64,
+}
+
 pub struct CassisRouter {
     pub adapters: HashMap<NetworkId, NetworkEntry>,
-    pending: PendingMap,
+    prepared: PreparedMap,
+    dispatched: Arc<Mutex<HashMap<Bytes32, DispatchedHop>>>,
 }
 
 impl CassisRouter {
     pub fn new(adapters: HashMap<NetworkId, NetworkEntry>) -> Self {
         Self {
             adapters,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            prepared: Arc::new(Mutex::new(HashMap::new())),
+            dispatched: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn handle_instruction(
-        &self,
-        mut instruction: HopInstruction,
-    ) -> Result<HopAck, HopReject> {
-        let incoming_raw = instruction.incoming_network.clone();
-        let outgoing_raw = instruction.outgoing_network.clone();
-        instruction.incoming_network = normalize_network_id(&instruction.incoming_network);
-        instruction.outgoing_network = normalize_network_id(&instruction.outgoing_network);
-        if instruction.incoming_network != incoming_raw
-            || instruction.outgoing_network != outgoing_raw
-        {
+    /// Top-level dispatcher: turn a [`Frame`] into the matching
+    /// reply [`Frame`]. The router only handles Prepare / Prepared /
+    /// Dispatch / Dispatched; Commit / Committed flow directly from
+    /// sender to receiver (payee's `cassis-cli`) without crossing
+    /// a router hop.
+    pub async fn handle_frame(&self, frame: Frame) -> Result<Frame, IrohError> {
+        match frame {
+            Frame::Prepare(p) => self
+                .handle_prepare(p)
+                .await
+                .map(Frame::Prepared)
+                .map_err(internal),
+            Frame::Dispatch(d) => self
+                .handle_dispatch(d)
+                .await
+                .map(Frame::Dispatched)
+                .map_err(internal),
+            Frame::Commit(c) => self
+                .handle_commit(c)
+                .await
+                .map(Frame::Committed)
+                .map_err(internal),
+            other => Err(IrohError::Protocol(format!(
+                "router received unexpected frame {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// PREPARE handler: validate the request, check funds on the
+    /// outgoing side, store the spec. Do NOT create any HTLCs.
+    async fn handle_prepare(&self, mut prepare: HopPrepare) -> Result<HopPrepared, String> {
+        let incoming_raw = prepare.incoming_network.clone();
+        let outgoing_raw = prepare.outgoing_network.clone();
+        prepare.incoming_network = normalize_network_id(&prepare.incoming_network);
+        prepare.outgoing_network = normalize_network_id(&prepare.outgoing_network);
+        if prepare.incoming_network != incoming_raw || prepare.outgoing_network != outgoing_raw {
             debug!(
                 target: "cassis_router",
                 "canonicalized network ids: incoming {} -> {}, outgoing {} -> {}",
-                incoming_raw, instruction.incoming_network,
-                outgoing_raw, instruction.outgoing_network,
+                incoming_raw, prepare.incoming_network,
+                outgoing_raw, prepare.outgoing_network,
             );
         }
         info!(
             target: "cassis_router",
-            "iroh instruction: {} msat {} -> {} via {}",
-            instruction.amount_msat,
-            instruction.incoming_network,
-            instruction.outgoing_network,
-            instruction.recipient,
+            "iroh PREPARE: {} msat {} -> {} via {}",
+            prepare.amount_msat,
+            prepare.incoming_network,
+            prepare.outgoing_network,
+            prepare.recipient,
         );
-        self.validate_instruction(&instruction)?;
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(instruction.payment_hash, instruction.clone());
+        self.validate_prepare(&prepare)?;
+
+        // Funds check on the outgoing side: the adapter must
+        // be able to back the HTLC right now. The default
+        // (cashu) sums the local balance; stub adapters
+        // return Unimplemented and we surface that as a
+        // rejection.
+        let outgoing_entry = self
+            .adapters
+            .get(&prepare.outgoing_network)
+            .ok_or_else(|| format!("outgoing network unsupported"))?;
+        if let Err(e) = outgoing_entry.adapter.can_route(prepare.amount_msat).await {
+            return Ok(HopPrepared {
+                payment_hash: prepare.payment_hash,
+                accepted: false,
+                reason: Some(format!("can_route failed: {e}")),
+            });
         }
 
-        let adapters = self.adapters.clone();
-        let pending = Arc::clone(&self.pending);
-        tokio::spawn(async move {
-            let outgoing_entry = match adapters.get(&instruction.outgoing_network) {
-                Some(entry) => entry,
-                None => {
-                    remove_pending(&pending, instruction.payment_hash).await;
-                    return;
-                }
-            };
-
-            let htlc: OutgoingHtlc = match outgoing_entry
-                .adapter
-                .create_outgoing_htlc(
-                    instruction.payment_hash,
-                    instruction.amount_msat,
-                    instruction.outgoing_expiry,
-                    &instruction.recipient,
-                )
-                .await
-            {
-                Ok(htlc) => {
-                    info!(
-                        target: "cassis_router",
-                        "  outgoing HTLC on {} for {} ({} msat)",
-                        htlc.network, htlc.recipient, htlc.amount_msat,
-                    );
-                    htlc
-                }
-                Err(err) => {
-                    warn!(
-                        target: "cassis_router",
-                        "  create_outgoing_htlc failed on {}: {:?}",
-                        instruction.outgoing_network, err
-                    );
-                    remove_pending(&pending, instruction.payment_hash).await;
-                    return;
-                }
-            };
-
-            match outgoing_entry
-                .adapter
-                .watch_preimage(htlc.payment_hash, instruction.outgoing_expiry)
-                .await
-            {
-                Ok(_preimage) => {
-                    info!(
-                        target: "cassis_router",
-                        "  outgoing settled on {} (preimage revealed upstream)",
-                        instruction.outgoing_network
-                    );
-                }
-                Err(WatchError::DeadlineExceeded) => {
-                    warn!(target: "cassis_router", "  deadline exceeded, refunding outgoing");
-                    let _ = outgoing_entry
-                        .adapter
-                        .refund_outgoing(htlc.payment_hash)
-                        .await;
-                }
-                Err(err) => {
-                    error!(
-                        target: "cassis_router",
-                        "  error watching payment on {}: {:?}",
-                        instruction.outgoing_network, err
-                    );
-                    let _ = outgoing_entry
-                        .adapter
-                        .refund_outgoing(htlc.payment_hash)
-                        .await;
-                }
-            }
-
-            remove_pending(&pending, instruction.payment_hash).await;
-        });
-
-        Ok(HopAck {
-            payment_hash: instruction.payment_hash,
+        let mut prepared = self.prepared.lock().await;
+        prepared.insert(prepare.payment_hash, prepare.clone());
+        Ok(HopPrepared {
+            payment_hash: prepare.payment_hash,
             accepted: true,
             reason: None,
         })
     }
 
-    fn validate_instruction(&self, instruction: &HopInstruction) -> Result<(), HopReject> {
-        debug!(
+    /// DISPATCH handler: verify the incoming HTLC is claimable on
+    /// the hop's incoming adapter, then create the outgoing HTLC
+    /// on the outgoing adapter and stash state for the poll loop.
+    async fn handle_dispatch(&self, dispatch: HopDispatch) -> Result<HopDispatched, String> {
+        info!(
             target: "cassis_router",
-            "validate_instruction: payment_hash={}, amount_msat={}, incoming={}, outgoing={}, \
-             incoming_deadline={}, outgoing_expiry={}",
-            lowercase_hex::encode(instruction.payment_hash),
-            instruction.amount_msat,
-            instruction.incoming_network,
-            instruction.outgoing_network,
-            instruction.incoming_deadline,
-            instruction.outgoing_expiry,
+            "iroh DISPATCH: {} msat {} -> {} via {}",
+            dispatch.amount_msat,
+            dispatch.incoming_network,
+            dispatch.outgoing_network,
+            dispatch.recipient,
         );
-        if instruction.payment_hash.0.iter().all(|byte| *byte == 0) {
-            return Err(HopReject {
-                payment_hash: instruction.payment_hash,
-                reason: "zero payment hash, accepted: non-zero hash".to_string(),
-            });
+
+        // Look up the matching PREPARE; the sender must have
+        // PREPAREd us first.
+        let prepare = {
+            let prepared = self.prepared.lock().await;
+            prepared.get(&dispatch.payment_hash).cloned()
+        };
+        let prepare = match prepare {
+            Some(p) => p,
+            None => {
+                return Err(format!(
+                    "no matching PREPARE for payment_hash={:?}",
+                    dispatch.payment_hash
+                ));
+            }
+        };
+        if prepare.incoming_network != dispatch.incoming_network
+            || prepare.outgoing_network != dispatch.outgoing_network
+            || prepare.amount_msat != dispatch.amount_msat
+            || prepare.recipient != dispatch.recipient
+        {
+            return Err(format!(
+                "DISPATCH specs do not match PREPARE: \
+                 prepare(in={}, out={}, amt={}, to={}) vs \
+                 dispatch(in={}, out={}, amt={}, to={})",
+                prepare.incoming_network,
+                prepare.outgoing_network,
+                prepare.amount_msat,
+                prepare.recipient,
+                dispatch.incoming_network,
+                dispatch.outgoing_network,
+                dispatch.amount_msat,
+                dispatch.recipient,
+            ));
         }
 
-        if instruction.amount_msat == 0 {
-            return Err(HopReject {
-                payment_hash: instruction.payment_hash,
-                reason: format!(
-                    "amount must be positive, accepted: > 0, actual: {}",
-                    instruction.amount_msat
-                ),
-            });
+        let incoming_entry = self
+            .adapters
+            .get(&dispatch.incoming_network)
+            .ok_or_else(|| format!("incoming network unsupported"))?;
+        let outgoing_entry = self
+            .adapters
+            .get(&dispatch.outgoing_network)
+            .ok_or_else(|| format!("outgoing network unsupported"))?;
+
+        // Verify the incoming HTLC is really claimable on this
+        // adapter (e.g. cashu: NUT-14 proofs decode and
+        // reference the right payment hash).
+        if let Err(e) = incoming_entry
+            .adapter
+            .verify_incoming_htlc(&dispatch.incoming_descriptor, dispatch.payment_hash)
+            .await
+        {
+            return Err(format!("incoming HTLC not claimable: {e}"));
         }
 
+        // Stash the incoming descriptor so a later
+        // claim_incoming can find it after the preimage is
+        // known.
+        if let Err(e) = incoming_entry
+            .adapter
+            .accept_incoming_htlc(
+                dispatch.payment_hash,
+                &dispatch.incoming_descriptor,
+                dispatch.incoming_deadline,
+            )
+            .await
+        {
+            return Err(format!("accept_incoming_htlc failed: {e}"));
+        }
+
+        // Now create the outgoing HTLC on the next network.
+        match outgoing_entry
+            .adapter
+            .create_outgoing_htlc(
+                dispatch.payment_hash,
+                dispatch.amount_msat,
+                dispatch.outgoing_expiry,
+                &dispatch.recipient,
+            )
+            .await
+        {
+            Ok(htlc) => {
+                info!(
+                    target: "cassis_router",
+                    "  outgoing HTLC on {} for {} ({} msat)",
+                    htlc.network, htlc.recipient, htlc.amount_msat,
+                );
+            }
+            Err(err) => {
+                return Err(format!(
+                    "create_outgoing_htlc failed on {}: {err}",
+                    dispatch.outgoing_network
+                ));
+            }
+        };
+
+        let outgoing_descriptor: HtlcDescriptor = match outgoing_entry
+            .adapter
+            .outgoing_htlc_descriptor(dispatch.payment_hash)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                return Err(format!("outgoing_htlc_descriptor failed: {e}"));
+            }
+        };
+
+        // Record dispatched state for the poll loop.
+        {
+            let mut dispatched = self.dispatched.lock().await;
+            dispatched.insert(
+                dispatch.payment_hash,
+                DispatchedHop {
+                    prepare: dispatch.clone().into_prepare(),
+                    outgoing_deadline: dispatch.outgoing_expiry,
+                },
+            );
+        }
+        // Drop the prepared entry; the spec has been used.
+        {
+            let mut prepared = self.prepared.lock().await;
+            prepared.remove(&dispatch.payment_hash);
+        }
+
+        Ok(HopDispatched {
+            payment_hash: dispatch.payment_hash,
+            outgoing_descriptor,
+        })
+    }
+
+    /// COMMIT handler. Routers don't normally receive COMMIT
+    /// (the sender sends COMMIT directly to the final receiver),
+    /// but we accept it defensively in case the route has zero
+    /// hops (sender == receiver) and the call loops back through
+    /// us. In that case we just acknowledge the payment hash.
+    async fn handle_commit(&self, commit: HopCommit) -> Result<HopCommitted, String> {
+        info!(
+            target: "cassis_router",
+            "iroh COMMIT (received by router, unusual): {} msat on {}",
+            commit.amount_msat, commit.network,
+        );
+        // Routers don't hold preimages; the final receiver
+        // does. The COMMIT handler on a router is a no-op that
+        // returns a zero preimage so the sender can detect the
+        // misroute if it ever happens. The normal path skips
+        // routers entirely for COMMIT.
+        Ok(HopCommitted {
+            payment_hash: commit.payment_hash,
+            preimage: Bytes32([0u8; 32]),
+        })
+    }
+
+    /// Background task: every [`POLL_INTERVAL_SECS`] seconds, walk
+    /// the dispatched table and poll each outgoing HTLC for the
+    /// preimage. When the preimage is known, claim the incoming
+    /// HTLC on the incoming adapter with the same preimage.
+    /// On deadline, refund the outgoing side and drop the
+    /// dispatch row.
+    async fn run_poll_loop(self: Arc<Self>) {
+        let interval = Duration::from_secs(POLL_INTERVAL_SECS);
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(e) = self.poll_once().await {
+                warn!(target: "cassis_router", "poll_once error: {e}");
+            }
+        }
+    }
+
+    async fn poll_once(&self) -> Result<(), String> {
+        // Snapshot the payment hashes under the lock, then drop
+        // it before doing network work.
+        let snapshot: Vec<(Bytes32, HopPrepare, u64)> = {
+            let dispatched = self.dispatched.lock().await;
+            dispatched
+                .iter()
+                .map(|(ph, d)| (*ph, d.prepare.clone(), d.outgoing_deadline))
+                .collect()
+        };
+        let now = unix_now();
+        for (payment_hash, prepare, outgoing_deadline) in snapshot {
+            if now >= outgoing_deadline {
+                warn!(
+                    target: "cassis_router",
+                    "  outgoing deadline exceeded for {payment_hash}, refunding"
+                );
+                self.refund_dispatched(payment_hash, &prepare).await;
+                continue;
+            }
+            let outgoing_entry = match self.adapters.get(&prepare.outgoing_network) {
+                Some(e) => e,
+                None => {
+                    self.drop_dispatched(payment_hash).await;
+                    continue;
+                }
+            };
+            // Use a short poll deadline so the loop keeps
+            // making progress even when nothing has settled.
+            let poll_deadline = now.saturating_add(POLL_INTERVAL_SECS);
+            match outgoing_entry
+                .adapter
+                .watch_preimage(payment_hash, poll_deadline)
+                .await
+            {
+                Ok(preimage) => {
+                    info!(
+                        target: "cassis_router",
+                        "  preimage revealed for {payment_hash} on {}, claiming incoming",
+                        prepare.outgoing_network,
+                    );
+                    self.claim_incoming(payment_hash, &prepare, preimage).await;
+                }
+                Err(WatchError::DeadlineExceeded) => {
+                    debug!(
+                        target: "cassis_router",
+                        "  poll for {payment_hash}: no preimage yet"
+                    );
+                }
+                Err(WatchError::Network(err)) => {
+                    warn!(
+                        target: "cassis_router",
+                        "  poll for {payment_hash} network error: {err}"
+                    );
+                }
+                Err(WatchError::Unimplemented) => {
+                    debug!(
+                        target: "cassis_router",
+                        "  poll for {payment_hash}: adapter watch_preimage unimplemented"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn claim_incoming(&self, payment_hash: Bytes32, prepare: &HopPrepare, preimage: Bytes32) {
+        let incoming_entry = match self.adapters.get(&prepare.incoming_network) {
+            Some(e) => e,
+            None => {
+                self.drop_dispatched(payment_hash).await;
+                return;
+            }
+        };
+        match incoming_entry
+            .adapter
+            .claim_incoming(payment_hash, preimage)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    target: "cassis_router",
+                    "  incoming HTLC claimed on {} for {payment_hash}",
+                    prepare.incoming_network,
+                );
+            }
+            Err(err) => {
+                error!(
+                    target: "cassis_router",
+                    "  claim_incoming failed for {payment_hash} on {}: {err}",
+                    prepare.incoming_network,
+                );
+            }
+        }
+        self.drop_dispatched(payment_hash).await;
+    }
+
+    async fn refund_dispatched(&self, payment_hash: Bytes32, prepare: &HopPrepare) {
+        if let Some(entry) = self.adapters.get(&prepare.outgoing_network) {
+            if let Err(e) = entry.adapter.refund_outgoing(payment_hash).await {
+                warn!(
+                    target: "cassis_router",
+                    "  refund_outgoing failed for {payment_hash}: {e}"
+                );
+            }
+        }
+        self.drop_dispatched(payment_hash).await;
+    }
+
+    async fn drop_dispatched(&self, payment_hash: Bytes32) {
+        let mut dispatched = self.dispatched.lock().await;
+        dispatched.remove(&payment_hash);
+    }
+
+    fn validate_prepare(&self, prepare: &HopPrepare) -> Result<(), String> {
+        if prepare.payment_hash.0.iter().all(|byte| *byte == 0) {
+            return Err("zero payment hash".to_string());
+        }
+        if prepare.amount_msat == 0 {
+            return Err(format!(
+                "amount must be positive, got {}",
+                prepare.amount_msat
+            ));
+        }
         let incoming = self
             .adapters
-            .get(&instruction.incoming_network)
-            .ok_or_else(|| HopReject {
-                payment_hash: instruction.payment_hash,
-                reason: format!(
+            .get(&prepare.incoming_network)
+            .ok_or_else(|| {
+                format!(
                     "incoming network unsupported, accepted: {:?}, actual: {}",
                     self.adapters.keys().collect::<Vec<_>>(),
-                    instruction.incoming_network
-                ),
+                    prepare.incoming_network
+                )
             })?;
-        if !self.adapters.contains_key(&instruction.outgoing_network) {
-            return Err(HopReject {
-                payment_hash: instruction.payment_hash,
-                reason: format!(
-                    "outgoing network unsupported, accepted: {:?}, actual: {}",
-                    self.adapters.keys().collect::<Vec<_>>(),
-                    instruction.outgoing_network
-                ),
-            });
+        if !self.adapters.contains_key(&prepare.outgoing_network) {
+            return Err(format!(
+                "outgoing network unsupported, accepted: {:?}, actual: {}",
+                self.adapters.keys().collect::<Vec<_>>(),
+                prepare.outgoing_network
+            ));
         }
-
         let now = unix_now();
         let required_delta = incoming.incoming_delta_secs;
         let min_deadline = now.saturating_add(required_delta);
-        debug!(
-            target: "cassis_router",
-            "validate_instruction: incoming_network={}, incoming_delta={required_delta}, \
-             now={now}, min_deadline={min_deadline}, actual={}",
-            instruction.incoming_network, instruction.incoming_deadline
-        );
-        if instruction.incoming_deadline < min_deadline {
-            return Err(HopReject {
-                payment_hash: instruction.payment_hash,
-                reason: format!(
-                    "incoming deadline too soon, accepted: >= {}, actual: {}",
-                    min_deadline, instruction.incoming_deadline
-                ),
-            });
+        if prepare.incoming_deadline < min_deadline {
+            return Err(format!(
+                "incoming deadline too soon, accepted: >= {}, actual: {}",
+                min_deadline, prepare.incoming_deadline
+            ));
         }
-
         Ok(())
     }
 }
 
-async fn remove_pending(pending: &PendingMap, payment_hash: Bytes32) {
-    let mut pending = pending.lock().await;
-    pending.remove(&payment_hash);
+/// Tiny shim: lift a string rejection into an iroh-level
+/// [`IrohError`]. The frame's `payment_hash` is lost here; the
+/// peer's handler will see the error in the protocol layer and
+/// the local log carries the hash.
+fn internal<E: std::fmt::Display>(e: E) -> IrohError {
+    IrohError::Protocol(e.to_string())
+}
+
+trait HopDispatchExt {
+    fn into_prepare(self) -> HopPrepare;
+}
+
+impl HopDispatchExt for HopDispatch {
+    fn into_prepare(self) -> HopPrepare {
+        HopPrepare {
+            payment_hash: self.payment_hash,
+            amount_msat: self.amount_msat,
+            incoming_network: self.incoming_network,
+            outgoing_network: self.outgoing_network,
+            incoming_deadline: self.incoming_deadline,
+            outgoing_expiry: self.outgoing_expiry,
+            recipient: self.recipient,
+        }
+    }
 }
 
 fn unix_now() -> u64 {

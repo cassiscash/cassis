@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cassis_client::ReceiveFlowError;
 use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter, PaymentStatus};
+use cassis_iroh::{Frame, IrohServer};
 use cassis_keys as keys;
 use clap::Parser;
 use log::{error, info, warn};
@@ -189,7 +190,7 @@ async fn cmd_pay(
     let client = cassis_client::CassisClient::new(senders, relays).await;
     info!(
         target: "cassis_cli",
-        "preparing hops and sending HTLC for payment_hash={}",
+        "PREPARE/DISPATCH/COMMIT for payment_hash={}",
         invoice.payment_hash,
     );
     let result = client
@@ -235,6 +236,16 @@ async fn cmd_invoice(
     let ttl = 600u64;
     let invoice_expiry = expires_at.unwrap_or(now + ttl);
 
+    // Derive the iroh endpoint info so the payer can dial
+    // the COMMIT directly. Empty network id is fine when the
+    // CLI doesn't need to publish an iroh endpoint (e.g.
+    // single-process tests) but for production flows we
+    // always include it.
+    let mnemonic = load_mnemonic()?;
+    let specs = vec![net_spec.clone()];
+    let derived = derive_for(&mnemonic, &specs)?;
+    let (iroh_peer_id, iroh_relay) = iroh_endpoint_info(&derived.iroh).await?;
+
     let mut store = open_store()?;
     let row = InvoiceRow {
         payment_hash: Bytes32(payment_hash),
@@ -256,6 +267,8 @@ async fn cmd_invoice(
         expires_at: invoice_expiry,
         networks: vec![network_id.clone()],
         description,
+        iroh_peer_id: Some(iroh_peer_id),
+        iroh_relay: Some(iroh_relay),
     };
     println!("payment_hash: {}", Bytes32(payment_hash));
     println!("preimage:     {}", lowercase_hex::encode(preimage));
@@ -269,10 +282,7 @@ async fn cmd_invoice(
     if !wait {
         return Ok(());
     }
-    info!(target: "cassis_cli", "waiting for upstream to fund (timeout={timeout}s)...");
-    let mnemonic = load_mnemonic()?;
-    let specs = vec![net_spec];
-    let derived = derive_for(&mnemonic, &specs)?;
+    info!(target: "cassis_cli", "waiting for COMMIT or upstream fund (timeout={timeout}s)...");
     let receivers = adapters::build_receivers(&specs, &derived).await?;
     let client = cassis_client::CassisClient::with_receivers(
         HashMap::new(),
@@ -294,6 +304,23 @@ async fn cmd_invoice(
         .map_err(map_store_err)?;
     println!("status:       claimed");
     Ok(())
+}
+
+/// Bind an iroh endpoint with the same identity the node will
+/// later use as a COMMIT receiver, and return its public peer
+/// id and home relay. Used to populate [`Invoice::iroh_peer_id`]
+/// and [`Invoice::iroh_relay`].
+async fn iroh_endpoint_info(secret: &iroh::SecretKey) -> Result<(String, String), String> {
+    let (server, _) = IrohServer::new(secret.clone())
+        .await
+        .map_err(|e| format!("bind iroh endpoint: {e}"))?;
+    let peer_id = server.peer_id().to_string();
+    let relay = server
+        .home_relay()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| cassis_iroh::DEFAULT_IROH_RELAY.to_string());
+    // Drop the server; we just wanted the identity / relay.
+    Ok((peer_id, relay))
 }
 
 fn generate_preimage() -> [u8; 32] {
@@ -362,15 +389,47 @@ async fn cmd_receive() -> Result<(), String> {
         pending.len()
     );
 
-    let _client = cassis_client::CassisClient::with_receivers(
-        HashMap::new(),
-        receivers.clone(),
-        cli::default_nostr_relays(),
-    )
-    .await;
-
     let receiver_map: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>> =
         Arc::new(receivers);
+
+    // Run the COMMIT-handler iroh server in the background.
+    // It owns its own copy of the receiver map.
+    let commit_receivers = receiver_map.clone();
+    let commit_secret = derived.iroh.clone();
+    let (iroh_server, iroh_secret) = IrohServer::new(commit_secret)
+        .await
+        .map_err(|e| format!("bind iroh endpoint: {e}"))?;
+    let iroh_peer_id = iroh_secret.public().to_string();
+    let iroh_relay = iroh_server
+        .home_relay()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| cassis_iroh::DEFAULT_IROH_RELAY.to_string());
+    info!(
+        target: "cassis_cli",
+        "receive: listening for COMMIT on iroh peer_id={iroh_peer_id} relay={iroh_relay}"
+    );
+    let commit_handler_receivers = commit_receivers.clone();
+    let commit_handler_store_path = paths::store_path();
+    tokio::spawn(async move {
+        let handler = Arc::new(move |frame: Frame| {
+            let receivers = commit_handler_receivers.clone();
+            let store_path = commit_handler_store_path.clone();
+            Box::pin(async move { handle_commit_frame(frame, receivers, store_path).await })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Result<Frame, cassis_iroh::IrohError>>
+                            + Send,
+                    >,
+                >
+        });
+        if let Err(e) = iroh_server.run(handler).await {
+            error!(target: "cassis_cli", "iroh server error: {e}");
+        }
+    });
+
+    // Also claim any pending invoices via the legacy
+    // watch_incoming path (single-process / direct-sender
+    // case). The COMMIT flow covers the multi-hop case.
     let mut tasks = Vec::new();
     for row in pending {
         let receiver_map = receiver_map.clone();
@@ -384,8 +443,99 @@ async fn cmd_receive() -> Result<(), String> {
     for t in tasks {
         let _ = t.await;
     }
-    println!("receive: all pending invoices processed (use `cassis-cli invoices list` to inspect)");
+    println!("receive: ready (peer_id={iroh_peer_id}); use Ctrl-C to stop");
+    println!("receive: COMMIT handler running in background; pending invoices processed");
+    // Block until Ctrl-C: the COMMIT handler keeps the
+    // process alive via the spawned iroh server task.
+    tokio::signal::ctrl_c().await.ok();
+    info!(target: "cassis_cli", "shutting down");
     Ok(())
+}
+
+/// COMMIT handler used by `cmd_receive`. On a Commit frame:
+/// look up the local invoice, verify the descriptor is for
+/// the right payment hash, claim the incoming HTLC on the
+/// receiver adapter with the stored preimage, mark the
+/// invoice claimed, and return a Committed frame.
+async fn handle_commit_frame(
+    frame: Frame,
+    receivers: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>>,
+    store_path: std::path::PathBuf,
+) -> Result<Frame, cassis_iroh::IrohError> {
+    let commit = match frame {
+        Frame::Commit(c) => c,
+        other => {
+            return Err(cassis_iroh::IrohError::Protocol(format!(
+                "payee expected Commit, got {:?}",
+                other
+            )))
+        }
+    };
+    info!(
+        target: "cassis_cli",
+        "COMMIT received: payment_hash={} amount={} msat network={}",
+        commit.payment_hash, commit.amount_msat, commit.network
+    );
+    // Open the store, do the synchronous lookup, and close
+    // before any async work — the underlying minisqlite
+    // engine is not Send, so we can't hold the Store across
+    // an await. Captured only what we need: the stored
+    // preimage.
+    let preimage = {
+        let mut store = Store::open(&store_path)
+            .map_err(|e| cassis_iroh::IrohError::Protocol(format!("opening store: {e}")))?;
+        let row = store.get(&commit.payment_hash).map_err(|e| {
+            cassis_iroh::IrohError::Protocol(format!(
+                "no local invoice for {}: {e}",
+                commit.payment_hash
+            ))
+        })?;
+        if row.network_id != commit.network {
+            return Err(cassis_iroh::IrohError::Protocol(format!(
+                "COMMIT network mismatch: invoice says {}, COMMIT says {}",
+                row.network_id, commit.network
+            )));
+        }
+        if row.amount_msat != commit.amount_msat {
+            return Err(cassis_iroh::IrohError::Protocol(format!(
+                "COMMIT amount mismatch: invoice says {}, COMMIT says {}",
+                row.amount_msat, commit.amount_msat
+            )));
+        }
+        row.preimage
+    };
+    let receiver = receivers.get(&commit.network).ok_or_else(|| {
+        cassis_iroh::IrohError::Protocol(format!("no receiver adapter for {}", commit.network))
+    })?;
+    // Hand the descriptor to the adapter so it can find the
+    // HTLC; then claim with the locally-stored preimage.
+    receiver
+        .accept_incoming_via_descriptor(
+            commit.payment_hash,
+            &commit.incoming_descriptor,
+            commit.incoming_deadline,
+        )
+        .await
+        .map_err(|e| cassis_iroh::IrohError::Protocol(format!("accept incoming htlc: {e}")))?;
+    receiver
+        .claim_incoming(commit.payment_hash, Bytes32(preimage))
+        .await
+        .map_err(|e| cassis_iroh::IrohError::Protocol(format!("claim_incoming: {e}")))?;
+    // Mark claimed in a fresh short-lived store handle.
+    let mut store = Store::open(&store_path)
+        .map_err(|e| cassis_iroh::IrohError::Protocol(format!("reopen store: {e}")))?;
+    store
+        .mark_status(&commit.payment_hash, InvoiceStatus::Claimed)
+        .map_err(|e| cassis_iroh::IrohError::Protocol(format!("store: {e}")))?;
+    info!(
+        target: "cassis_cli",
+        "COMMIT handled: claimed {} on {}",
+        commit.payment_hash, commit.network
+    );
+    Ok(Frame::Committed(cassis_core::HopCommitted {
+        payment_hash: commit.payment_hash,
+        preimage: Bytes32(preimage),
+    }))
 }
 
 async fn claim_one(
@@ -485,14 +635,14 @@ async fn cmd_route(
     destination_pubkey: String,
     amount: u64,
     from: String,
-    nostr_relays: Vec<String>,
+    nostr_relay: Vec<String>,
 ) -> Result<(), String> {
     let sender_network = NetworkId(from);
     let dest_network = NetworkId(destination_pubkey);
-    let relays = if nostr_relays.is_empty() {
+    let relays = if nostr_relay.is_empty() {
         cli::default_nostr_relays()
     } else {
-        nostr_relays
+        nostr_relay
     };
     info!(target: "cassis_cli", "fetching route announcements from {} relay(s)...", relays.len());
     let route = cassis_client::find_route(&relays, &dest_network, amount, &sender_network)

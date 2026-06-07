@@ -864,6 +864,7 @@ name = "cassis-cashu"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "cashu",
  "cassis-core",
  "lowercase-hex",
@@ -913,6 +914,7 @@ dependencies = [
  "futures",
  "iroh 1.0.3",
  "log",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
 ]
 

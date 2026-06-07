@@ -10,4 +10,5 @@ cassis-iroh = { path = "../cassis-iroh" }
 futures = "0.3.33"
 iroh = "1.0.3"
 log = "0.4.33"
+sha2 = "0.10.9"
 thiserror = "1.0.69"

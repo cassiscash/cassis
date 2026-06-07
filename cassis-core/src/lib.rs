@@ -287,6 +287,17 @@ pub struct Invoice {
     pub expires_at: u64,
     pub networks: Vec<NetworkId>,
     pub description: Option<String>,
+    /// Iroh peer id of the payee's `cassis-cli` endpoint, used by
+    /// the payer to send the final COMMIT message directly. `None`
+    /// for invoices not produced by a cassis receiver (e.g. raw
+    /// bolt11 on a non-cassis endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh_peer_id: Option<String>,
+    /// Home relay URL for the payee's iroh endpoint, if any. The
+    /// payer uses this to dial the payee even when direct addresses
+    /// aren't known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh_relay: Option<String>,
 }
 
 /// Handle to an in-flight outgoing payment initiated by
@@ -314,6 +325,86 @@ pub struct HopInstruction {
     pub recipient: String,
 }
 
+/// PREPARE message (sender -> router): ask a hop to reserve capacity
+/// for a payment without yet committing to it. The router checks
+/// basic invariants (non-zero hash, positive amount, supported
+/// networks, timelock defaults, funds on the outgoing side) and
+/// replies with [`HopPrepared`]. The actual HTLCs are only created
+/// after a matching DISPATCH message arrives.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopPrepare {
+    pub payment_hash: Bytes32,
+    pub amount_msat: u64,
+    pub incoming_network: NetworkId,
+    pub outgoing_network: NetworkId,
+    pub incoming_deadline: u64,
+    pub outgoing_expiry: u64,
+    pub recipient: String,
+}
+
+/// Reply to [`HopPrepare`]. `accepted=true` means the hop has
+/// reserved capacity and is ready to receive a matching DISPATCH.
+/// `accepted=false` carries a human-readable reason; the sender is
+/// expected to abort the whole payment if any hop rejects.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopPrepared {
+    pub payment_hash: Bytes32,
+    pub accepted: bool,
+    pub reason: Option<String>,
+}
+
+/// DISPATCH message (sender -> router): tells a hop that a real
+/// incoming HTLC matching its previous PREPARE has been deployed on
+/// the hop's incoming network. The descriptor is the network-specific
+/// payload the receiver of the HTLC needs to claim it (e.g. for
+/// cashu: a list of base64-encoded NUT-14 proofs). The router
+/// verifies the HTLC is really claimable, then creates an outgoing
+/// HTLC and replies with its descriptor in [`HopDispatched`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopDispatch {
+    pub payment_hash: Bytes32,
+    pub amount_msat: u64,
+    pub incoming_network: NetworkId,
+    pub outgoing_network: NetworkId,
+    pub incoming_deadline: u64,
+    pub outgoing_expiry: u64,
+    pub recipient: String,
+    /// Network-specific handle to the deployed incoming HTLC.
+    pub incoming_descriptor: HtlcDescriptor,
+}
+
+/// Reply to [`HopDispatch`]. Carries the descriptor of the outgoing
+/// HTLC the router has just created on its outgoing network. The
+/// sender passes it to the next hop's DISPATCH.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopDispatched {
+    pub payment_hash: Bytes32,
+    pub outgoing_descriptor: HtlcDescriptor,
+}
+
+/// COMMIT message (sender -> final receiver): sent directly from the
+/// payer to the payee (not through routers) to claim the final
+/// incoming HTLC. The receiver verifies the HTLC matches the local
+/// invoice, claims it with the preimage it already stored, and
+/// replies with the preimage in [`HopCommitted`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopCommit {
+    pub payment_hash: Bytes32,
+    pub amount_msat: u64,
+    pub network: NetworkId,
+    pub incoming_deadline: u64,
+    pub incoming_descriptor: HtlcDescriptor,
+}
+
+/// Reply to [`HopCommit`]. Carries the preimage the receiver used to
+/// claim the HTLC. The sender now has the proof-of-payment and the
+/// whole route is settled.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopCommitted {
+    pub payment_hash: Bytes32,
+    pub preimage: Bytes32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopAck {
     pub payment_hash: Bytes32,
@@ -325,6 +416,40 @@ pub struct HopAck {
 pub struct HopReject {
     pub payment_hash: Bytes32,
     pub reason: String,
+}
+
+/// Network-specific handle to a deployed HTLC. Each variant encodes
+/// exactly what the receiver of the HTLC on that network needs in
+/// order to claim it (or, in the case of networks that "sell their
+/// own preimage", to observe the settlement).
+///
+/// The tag is the network's [`NetworkId`] (cassis canonical form),
+/// not a free-form string, so the wire decoder rejects descriptors
+/// that don't match the hop they're attached to. Variants for
+/// networks whose adapter is still a stub carry no payload; they
+/// only exist so the type stays exhaustive and JSON shape is
+/// preserved across upgrades.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "network", content = "payload")]
+pub enum HtlcDescriptor {
+    /// NUT-14 HTLC locked ecash proofs, one base64-encoded JSON
+    /// NUT-00 [`Proof`] per element.
+    #[serde(rename = "cashu")]
+    Cashu { proofs_b64: Vec<String> },
+    /// Stub for liquid: no on-wire shape yet.
+    #[serde(rename = "liquid")]
+    Liquid {},
+    /// Stub for ark: no on-wire shape yet.
+    #[serde(rename = "ark")]
+    Ark {},
+    /// Stub for rootstock: no on-wire shape yet.
+    #[serde(rename = "rootstock")]
+    Rootstock {},
+    /// Fedimint LNv2 contract, identified by the Bolt11 invoice the
+    /// counter-party must pay. Fedimint "sells its own preimage" so
+    /// the descriptor is the invoice, not a proof set.
+    #[serde(rename = "fedimint")]
+    Fedimint { invoice: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -463,6 +588,59 @@ pub trait NetworkRouterAdapter: Send + Sync {
         payment_hash: Bytes32,
         deadline: u64,
     ) -> Result<Bytes32, WatchError>;
+
+    /// PREPARE-time check: does this adapter have enough funds /
+    /// capacity to route `amount_msat` on its network right now?
+    /// Called for the hop's *outgoing* adapter so the router can
+    /// reject a PREPARE before any HTLCs are deployed. Default
+    /// implementation accepts unconditionally so stub adapters don't
+    /// have to implement it.
+    async fn can_route(&self, _amount_msat: u64) -> Result<(), HtlcError> {
+        Ok(())
+    }
+
+    /// DISPATCH-time check: is `descriptor` really claimable on
+    /// this adapter for the given `payment_hash`? The router calls
+    /// this on the hop's *incoming* adapter right after receiving a
+    /// DISPATCH and before creating the outgoing HTLC. For cashu this
+    /// verifies the NUT-14 proofs decode, are HTLC-locked, and
+    /// reference the right payment hash. Default rejects so
+    /// unimplemented networks fail closed.
+    async fn verify_incoming_htlc(
+        &self,
+        _descriptor: &HtlcDescriptor,
+        _payment_hash: Bytes32,
+    ) -> Result<(), HtlcError> {
+        Err(HtlcError::Unimplemented)
+    }
+
+    /// Accept an incoming HTLC for later claim. Called on the
+    /// hop's *incoming* adapter during DISPATCH: stores the HTLC
+    /// payload (e.g. cashu proofs) so a later
+    /// [`NetworkRouterAdapter::claim_incoming`] call can find it.
+    /// Default is a no-op for stub networks.
+    async fn accept_incoming_htlc(
+        &self,
+        _payment_hash: Bytes32,
+        _descriptor: &HtlcDescriptor,
+        _deadline: u64,
+    ) -> Result<(), HtlcError> {
+        Ok(())
+    }
+
+    /// DISPATCH-time accessor: return the network-specific handle
+    /// to the outgoing HTLC just produced by
+    /// [`NetworkRouterAdapter::create_outgoing_htlc`]. Called on the
+    /// hop's *outgoing* adapter to build the [`HopDispatched`]
+    /// reply. For cashu this serializes the locked proofs as
+    /// base64. Default is unimplemented so stub networks fail
+    /// closed.
+    async fn outgoing_htlc_descriptor(
+        &self,
+        _payment_hash: Bytes32,
+    ) -> Result<HtlcDescriptor, HtlcError> {
+        Err(HtlcError::Unimplemented)
+    }
 }
 
 /// User-facing "receive" side of a network: create an invoice that
@@ -516,6 +694,21 @@ pub trait NetworkReceiverAdapter: Send + Sync {
         payment_hash: Bytes32,
         preimage: Bytes32,
     ) -> Result<(), ReceiveError>;
+
+    /// Store the wire-level handle to an incoming HTLC the
+    /// sender pushed at us. The COMMIT flow uses this so the
+    /// payee can claim a HTLC it learned about via
+    /// [`crate::HopCommit`] instead of waiting for the network
+    /// to detect an incoming payment. Default is a no-op so
+    /// stub networks don't have to implement it.
+    async fn accept_incoming_via_descriptor(
+        &self,
+        _payment_hash: Bytes32,
+        _descriptor: &HtlcDescriptor,
+        _deadline: u64,
+    ) -> Result<(), ReceiveError> {
+        Ok(())
+    }
 }
 
 /// User-facing "send" side of a network: pay an invoice on the
@@ -555,6 +748,21 @@ pub trait NetworkSenderAdapter: Send + Sync {
     /// hasn't completed yet; implementations may be no-ops once the
     /// preimage is revealed.
     async fn refund_payment(&self, payment: OutgoingPayment) -> Result<(), SendError>;
+
+    /// Returns the wire-level handle to the outgoing HTLC just
+    /// produced by [`NetworkSenderAdapter::pay_invoice`]. Used by
+    /// the multi-hop client to forward the descriptor to the next
+    /// router hop's DISPATCH. For router-style networks the
+    /// blanket impl forwards to
+    /// [`NetworkRouterAdapter::outgoing_htlc_descriptor`]; sender-
+    /// only networks (fedimint) return
+    /// [`SendError::Unimplemented`].
+    async fn outgoing_htlc_descriptor(
+        &self,
+        _payment_hash: Bytes32,
+    ) -> Result<HtlcDescriptor, SendError> {
+        Err(SendError::Unimplemented)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +822,8 @@ where
             expires_at: expiry,
             networks: vec![network_id],
             description,
+            iroh_peer_id: None,
+            iroh_relay: None,
         })
     }
 
@@ -636,6 +846,20 @@ where
         preimage: Bytes32,
     ) -> Result<(), ReceiveError> {
         NetworkRouterAdapter::claim_incoming(self, payment_hash, preimage)
+            .await
+            .map_err(|e| match e {
+                HtlcError::InvalidParams(msg) => ReceiveError::InvalidParams(msg),
+                other => ReceiveError::Network(other.to_string()),
+            })
+    }
+
+    async fn accept_incoming_via_descriptor(
+        &self,
+        payment_hash: Bytes32,
+        descriptor: &HtlcDescriptor,
+        deadline: u64,
+    ) -> Result<(), ReceiveError> {
+        NetworkRouterAdapter::accept_incoming_htlc(self, payment_hash, descriptor, deadline)
             .await
             .map_err(|e| match e {
                 HtlcError::InvalidParams(msg) => ReceiveError::InvalidParams(msg),
@@ -697,6 +921,18 @@ where
 
     async fn refund_payment(&self, payment: OutgoingPayment) -> Result<(), SendError> {
         NetworkRouterAdapter::refund_outgoing(self, payment.payment_hash)
+            .await
+            .map_err(|e| match e {
+                HtlcError::InvalidParams(msg) => SendError::InvalidParams(msg),
+                other => SendError::Network(other.to_string()),
+            })
+    }
+
+    async fn outgoing_htlc_descriptor(
+        &self,
+        payment_hash: Bytes32,
+    ) -> Result<HtlcDescriptor, SendError> {
+        NetworkRouterAdapter::outgoing_htlc_descriptor(self, payment_hash)
             .await
             .map_err(|e| match e {
                 HtlcError::InvalidParams(msg) => SendError::InvalidParams(msg),

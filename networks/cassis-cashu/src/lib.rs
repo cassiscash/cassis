@@ -1,18 +1,21 @@
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use cashu::amount::{FeeAndAmounts, SplitTarget};
 use cashu::dhke::{blind_message, unblind_message};
-use cashu::nuts::nut00::{BlindedMessage, Proofs};
+use cashu::nuts::nut00::{BlindedMessage, Proof, Proofs};
 use cashu::nuts::nut02::Id as KeysetId;
 use cashu::nuts::nut07::{CheckStateRequest, State as ProofState};
 use cashu::nuts::nut10::SpendingConditions;
 use cashu::nuts::nut12::ProofDleq;
 use cashu::nuts::nut14::HTLCWitness;
-use cashu::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Proof, Witness};
+use cashu::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Witness};
 use cashu::secret::Secret;
 use cashu::Amount;
 use cashu::MintUrl;
 use cassis_core::{
-    Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
+    OutgoingHtlc, WatchError,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -41,9 +44,18 @@ pub struct PendingIncoming {
     /// Unix deadline after which the receiver gives up waiting
     /// for the sender's proofs to arrive.
     deadline: u64,
+    /// HTLC-locked proofs the sender (or previous hop) pushed to
+    /// us. Populated by
+    /// [`NetworkRouterAdapter::accept_incoming_htlc`] in the
+    /// multi-hop flow, or by
+    /// [`NetworkRouterAdapter::create_outgoing_htlc`] in the
+    /// single-process test flow. None until then; in the
+    /// single-process test the create-side fills it in and
+    /// notifies `arrival`.
+    proofs: Mutex<Option<Proofs>>,
     /// Notified when the matching HTLC proofs have been deposited
-    /// into the shared store by the cross-network hop layer (or,
-    /// in tests, by [`CashuAdapter::deposit_outgoing_proofs`]).
+    /// by the create-side or by
+    /// [`NetworkRouterAdapter::accept_incoming_htlc`].
     arrival: Arc<Notify>,
 }
 
@@ -210,11 +222,14 @@ impl CashuAdapter {
     /// Look up a receiver-side pending incoming HTLC.
     pub async fn incoming_slot(&self, payment_hash: Bytes32) -> Option<PendingIncoming> {
         let incoming = self.incoming.lock().await;
-        incoming.get(&payment_hash).map(|s| PendingIncoming {
-            payment_hash_hex: s.payment_hash_hex.clone(),
-            amount_sat: s.amount_sat,
-            deadline: s.deadline,
-            arrival: s.arrival.clone(),
+        let slot = incoming.get(&payment_hash)?;
+        let proofs = slot.proofs.lock().await.clone();
+        Some(PendingIncoming {
+            payment_hash_hex: slot.payment_hash_hex.clone(),
+            amount_sat: slot.amount_sat,
+            deadline: slot.deadline,
+            proofs: Mutex::new(proofs),
+            arrival: slot.arrival.clone(),
         })
     }
 
@@ -324,7 +339,7 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// [`CashuAdapter::incoming`] and return immediately; the
     /// actual wait happens at
     /// [`NetworkRouterAdapter::claim_incoming`] time, where we
-    /// block on a [`Notify`] until the sender's proofs land.
+    /// block on a [`Notify`] until the proofs land.
     async fn watch_incoming_htlc(
         &self,
         payment_hash: Bytes32,
@@ -342,6 +357,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                 payment_hash_hex,
                 amount_sat: min_amount_sat,
                 deadline,
+                proofs: Mutex::new(None),
                 arrival,
             },
         );
@@ -451,15 +467,24 @@ impl NetworkRouterAdapter for CashuAdapter {
                     conditions: htlc_conditions(&payment_hash.0, expiry)
                         .map_err(|e| HtlcError::InvalidParams(e.to_string()))?,
                     keyset_id,
-                    proofs: Mutex::new(proofs),
+                    proofs: Mutex::new(proofs.clone()),
                     recipient: recipient.to_string(),
                 },
             );
         }
-        // Wake any receiver awaiting these proofs.
+        // Cross-pollinate the incoming map so a same-process
+        // claim_incoming call (legacy test path) can find the
+        // proofs without going through the cross-network
+        // descriptor. The arrival notify wakes any waiting
+        // claimer.
         let arrival = {
-            let incoming = self.incoming.lock().await;
-            incoming.get(&payment_hash).map(|s| s.arrival.clone())
+            let mut incoming = self.incoming.lock().await;
+            if let Some(slot) = incoming.get_mut(&payment_hash) {
+                *slot.proofs.lock().await = Some(proofs.clone());
+                Some(slot.arrival.clone())
+            } else {
+                None
+            }
         };
         if let Some(arrival) = arrival {
             arrival.notify_one();
@@ -483,10 +508,10 @@ impl NetworkRouterAdapter for CashuAdapter {
         payment_hash: Bytes32,
         preimage: Bytes32,
     ) -> Result<(), HtlcError> {
-        let (arrival, deadline) = {
+        let (arrival, deadline, proofs_slot) = {
             let incoming = self.incoming.lock().await;
             match incoming.get(&payment_hash) {
-                Some(s) => (s.arrival.clone(), s.deadline),
+                Some(s) => (s.arrival.clone(), s.deadline, s.proofs.lock().await.clone()),
                 None => {
                     return Err(HtlcError::InvalidParams(format!(
                         "no incoming HTLC registered for {payment_hash:?}"
@@ -494,29 +519,31 @@ impl NetworkRouterAdapter for CashuAdapter {
                 }
             }
         };
-        // Block (with a small grace) until the sender's proofs
-        // have landed in the shared store. The cross-network
-        // hop layer is responsible for actually moving the
-        // proofs between adapters.
-        let grace = wait_grace_secs(deadline);
-        if tokio::time::timeout(std::time::Duration::from_secs(grace), arrival.notified())
-            .await
-            .is_err()
-        {
-            return Err(HtlcError::Network(
-                "timed out waiting for HTLC proofs to arrive".into(),
-            ));
+        // Block (with a small grace) until the proofs have
+        // landed. The cross-network hop layer populates them
+        // either via create_outgoing_htlc (same-process test
+        // path) or via accept_incoming_htlc (multi-hop path).
+        if proofs_slot.is_none() {
+            let grace = wait_grace_secs(deadline);
+            if tokio::time::timeout(std::time::Duration::from_secs(grace), arrival.notified())
+                .await
+                .is_err()
+            {
+                return Err(HtlcError::Network(
+                    "timed out waiting for HTLC proofs to arrive".into(),
+                ));
+            }
         }
 
-        // Pull the locked proofs from the shared store.
+        // Re-read after the (possible) wait.
         let locked: Proofs = {
-            let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                HtlcError::Network(format!("no outgoing HTLC proofs for {payment_hash:?}"))
+            let incoming = self.incoming.lock().await;
+            let slot = incoming.get(&payment_hash).ok_or_else(|| {
+                HtlcError::Network(format!("no incoming HTLC for {payment_hash:?}"))
             })?;
             let proofs = slot.proofs.lock().await.clone();
-            drop(outgoing);
-            proofs
+            drop(incoming);
+            proofs.ok_or_else(|| HtlcError::Network("HTLC proofs missing".into()))?
         };
         if locked.is_empty() {
             return Err(HtlcError::Network("HTLC proofs missing".into()));
@@ -694,6 +721,166 @@ impl NetworkRouterAdapter for CashuAdapter {
             }
             tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    /// PREPARE-time check: do we have enough unrestricted ecash
+    /// in the local balance to back an outgoing HTLC of
+    /// `amount_msat`? We round up to sats the same way
+    /// [`NetworkRouterAdapter::create_outgoing_htlc`] does, so
+    /// a green light here means the actual swap won't fail for
+    /// lack of funds.
+    async fn can_route(&self, amount_msat: u64) -> Result<(), HtlcError> {
+        let amount_sat = amount_msat.div_ceil(1000).max(1);
+        let keyset_id = self
+            .active_keyset_id()
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        let balance = self.available.lock().await;
+        let total_sat: u64 = balance
+            .iter()
+            .filter(|p| p.keyset_id == keyset_id)
+            .map(|p| u64::from(p.amount))
+            .sum();
+        if total_sat < amount_sat {
+            return Err(HtlcError::InvalidParams(format!(
+                "insufficient cashu balance: need {amount_sat} sat, have {total_sat} sat"
+            )));
+        }
+        Ok(())
+    }
+
+    /// DISPATCH-time verify: does `descriptor` decode to NUT-14
+    /// HTLC proofs locked to `payment_hash`? Caller is the hop's
+    /// *incoming* adapter, called right after the router receives
+    /// a DISPATCH and before it commits an outgoing HTLC.
+    async fn verify_incoming_htlc(
+        &self,
+        descriptor: &HtlcDescriptor,
+        payment_hash: Bytes32,
+    ) -> Result<(), HtlcError> {
+        let proofs = proofs_from_descriptor(descriptor)?;
+        verify_proofs_htlc(&proofs).map_err(|e| HtlcError::Network(e.to_string()))?;
+        // Each proof's NUT-14 secret embeds the payment hash;
+        // verify they all match. Proofs are `verify_htlc`-valid
+        // by the call above, so the secret is parseable and
+        // tagged HTLC.
+        let expected = htlc::payment_hash_hex(&payment_hash.0);
+        for proof in &proofs {
+            // The proof's `secret` field is a `cashu::secret::Secret`
+            // (a JSON-encoded NUT-10 payload). Decode it via FromStr
+            // so we can pull out the NUT-14 payment hash.
+            let raw = proof.secret.to_string();
+            let nut10: cashu::nuts::nut10::Secret = serde_json::from_str(&raw)
+                .map_err(|e| HtlcError::Network(format!("decode proof secret: {e}")))?;
+            if nut10.kind() != cashu::nuts::nut10::Kind::HTLC {
+                return Err(HtlcError::InvalidParams(format!(
+                    "proof secret kind {:?} is not HTLC",
+                    nut10.kind()
+                )));
+            }
+            let data = nut10.secret_data().data().to_string();
+            if data != expected {
+                return Err(HtlcError::InvalidParams(format!(
+                    "proof HTLC hash mismatch: expected {expected}, got {data}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// DISPATCH-time accept: store the proofs from `descriptor` in
+    /// the incoming map and notify any waiting claimer. Called
+    /// after [`NetworkRouterAdapter::verify_incoming_htlc`]
+    /// succeeds. The hop is then free to create its outgoing
+    /// HTLC.
+    async fn accept_incoming_htlc(
+        &self,
+        payment_hash: Bytes32,
+        descriptor: &HtlcDescriptor,
+        deadline: u64,
+    ) -> Result<(), HtlcError> {
+        let proofs = proofs_from_descriptor(descriptor)?;
+        verify_proofs_htlc(&proofs).map_err(|e| HtlcError::Network(e.to_string()))?;
+        let amount_sat: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
+        let payment_hash_hex = htlc::payment_hash_hex(&payment_hash.0);
+        let mut incoming = self.incoming.lock().await;
+        match incoming.get_mut(&payment_hash) {
+            Some(slot) => {
+                *slot.proofs.lock().await = Some(proofs);
+            }
+            None => {
+                let slot = PendingIncoming {
+                    payment_hash_hex,
+                    amount_sat,
+                    deadline,
+                    proofs: Mutex::new(Some(proofs)),
+                    arrival: Arc::new(Notify::new()),
+                };
+                incoming.insert(payment_hash, slot);
+            }
+        }
+        let arrival = incoming
+            .get(&payment_hash)
+            .map(|s| s.arrival.clone())
+            .ok_or_else(|| HtlcError::Network("incoming slot vanished".into()))?;
+        drop(incoming);
+        arrival.notify_one();
+        Ok(())
+    }
+
+    /// DISPATCH-time accessor: serialize the proofs of the
+    /// outgoing HTLC just produced by
+    /// [`NetworkRouterAdapter::create_outgoing_htlc`] as a
+    /// [`HtlcDescriptor::Cashu`] for the hop's reply.
+    async fn outgoing_htlc_descriptor(
+        &self,
+        payment_hash: Bytes32,
+    ) -> Result<HtlcDescriptor, HtlcError> {
+        let proofs: Proofs = {
+            let outgoing = self.outgoing.lock().await;
+            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
+                HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
+            })?;
+            let cloned = slot.proofs.lock().await.clone();
+            let _ = slot;
+            let _ = outgoing;
+            cloned
+        };
+        if proofs.is_empty() {
+            return Err(HtlcError::Network("outgoing HTLC has no proofs".into()));
+        }
+        let mut encoded = Vec::with_capacity(proofs.len());
+        for proof in &proofs {
+            let json = serde_json::to_string(proof)
+                .map_err(|e| HtlcError::Network(format!("encode proof: {e}")))?;
+            encoded.push(BASE64.encode(json.as_bytes()));
+        }
+        Ok(HtlcDescriptor::Cashu {
+            proofs_b64: encoded,
+        })
+    }
+}
+
+/// Decode the base64-encoded NUT-14 proof list out of a
+/// [`HtlcDescriptor::Cashu`]. Any other variant is a hard error:
+/// cashu is the only network with a populated descriptor today.
+fn proofs_from_descriptor(descriptor: &HtlcDescriptor) -> Result<Proofs, HtlcError> {
+    match descriptor {
+        HtlcDescriptor::Cashu { proofs_b64 } => {
+            let mut out = Vec::with_capacity(proofs_b64.len());
+            for s in proofs_b64 {
+                let raw = BASE64
+                    .decode(s)
+                    .map_err(|e| HtlcError::Network(format!("base64 decode: {e}")))?;
+                let proof: Proof = serde_json::from_slice(&raw)
+                    .map_err(|e| HtlcError::Network(format!("decode proof: {e}")))?;
+                out.push(proof);
+            }
+            Ok(out)
+        }
+        other => Err(HtlcError::Network(format!(
+            "unsupported htlc descriptor for cashu network: {other:?}"
+        ))),
     }
 }
 

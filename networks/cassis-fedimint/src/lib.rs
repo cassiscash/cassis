@@ -384,6 +384,8 @@ impl NetworkReceiverAdapter for FedimintAdapter {
             expires_at: expiry,
             networks: vec![self.network_id.clone()],
             description: Some(DEFAULT_INVOICE_DESCRIPTION.to_string()),
+            iroh_peer_id: None,
+            iroh_relay: None,
         })
     }
 

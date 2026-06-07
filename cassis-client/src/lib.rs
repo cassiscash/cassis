@@ -1,8 +1,9 @@
 use cassis_core::{
-    Bytes32, HopInstruction, Invoice, NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter,
-    PaymentResult, PaymentStatus, ReceiveError, RouteHop, SendError,
+    Bytes32, HopCommit, HopDispatch, HopPrepare, HtlcDescriptor, Invoice, NetworkId,
+    NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment, PaymentResult, PaymentStatus,
+    RouteHop, SendError,
 };
-use cassis_iroh::{node_addr_from_announcement, IrohClient};
+use cassis_iroh::{node_addr_from_announcement, node_addr_from_invoice, IrohClient};
 use cassis_routing::{
     build_graph, compute_hop_expiries, fallback_incoming_delta, fallback_transit_slack,
     fetch_announcements, find_route as find_route_in_graph,
@@ -10,7 +11,7 @@ use cassis_routing::{
 use futures::future::try_join_all;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
-use log::{debug, info};
+use log::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,6 +21,10 @@ pub enum PayError {
     Route(String),
     #[error("io error: {0}")]
     Io(String),
+    #[error("hop rejected at index {index}: {reason}")]
+    HopRejected { index: usize, reason: String },
+    #[error("payee commit failed: {0}")]
+    Commit(String),
     #[error("unimplemented")]
     Unimplemented,
 }
@@ -35,11 +40,9 @@ pub enum ReceiveFlowError {
     #[error("network not registered: {0}")]
     UnknownNetwork(String),
     #[error("receive error: {0}")]
-    Receive(#[from] ReceiveError),
+    Receive(#[from] cassis_core::ReceiveError),
 }
 
-/// Outcome of a one-shot `receive` call. Either the upstream funded
-/// the invoice (and the receiver claimed it) or the call gave up.
 #[derive(Clone, Debug)]
 pub struct ReceiveResult {
     pub payment_hash: Bytes32,
@@ -56,12 +59,6 @@ pub enum RouteError {
     Unimplemented,
 }
 
-/// Find a route to `destination` from `sender_network`, fetching route
-/// announcements from the given Nostr relays and running Dijkstra.
-///
-/// This is a standalone function so callers that only need route lookup
-/// (e.g. `cassis-cli`) don't have to construct a full `CassisClient` with
-/// network adapters.
 pub async fn find_route(
     relays: &[String],
     destination_network: &NetworkId,
@@ -86,11 +83,6 @@ pub async fn find_route(
     Ok(hops)
 }
 
-/// Pure-sender client: holds a map from `NetworkId` to a
-/// `NetworkSenderAdapter` (the user-facing "pay invoice" trait). Any
-/// `NetworkRouterAdapter` is automatically a sender via the blanket
-/// impl in `cassis-core`, so router-style networks can be passed in
-/// the same way.
 pub struct CassisClient {
     pub senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
     pub receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
@@ -99,7 +91,6 @@ pub struct CassisClient {
 }
 
 impl CassisClient {
-    /// Build a sender-only client. Use this for pay-only flows.
     pub async fn new(
         senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
         nostr_relays: Vec<String>,
@@ -116,8 +107,6 @@ impl CassisClient {
         }
     }
 
-    /// Build a client with both sender and receiver adapters. Use
-    /// this for CLI-style flows that pay and receive.
     pub async fn with_receivers(
         senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
         receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
@@ -135,6 +124,26 @@ impl CassisClient {
         }
     }
 
+    pub fn iroh_client(&self) -> &IrohClient {
+        &self.iroh_client
+    }
+
+    pub fn peer_id(&self) -> String {
+        self.iroh_client.peer_id().to_string()
+    }
+
+    /// Drive the multi-hop PREPARE / DISPATCH / COMMIT protocol
+    /// described in the user-facing docs:
+    ///
+    /// 1. PREPARE every router hop in order; abort if any rejects.
+    /// 2. Create the first HTLC on the sender's network
+    ///    (the sender adapter's `pay_invoice`).
+    /// 3. Walk the route: DISPATCH to hop `i` with the descriptor
+    ///    returned by hop `i-1` (or by `pay_invoice` for the
+    ///    first hop).
+    /// 4. After the last router, COMMIT directly to the payee's
+    ///    iroh endpoint with the final descriptor and wait for
+    ///    the preimage.
     pub async fn pay(
         &self,
         invoice: Invoice,
@@ -151,17 +160,18 @@ impl CassisClient {
             .map_err(|err| PayError::Route(err.to_string()))?;
 
         if route.is_empty() {
-            return Err(PayError::Route("empty route".to_string()));
+            // No router hops: payer == payee. Just send COMMIT
+            // to the payee (ourselves or another cassis-cli
+            // instance) and claim via the local receiver
+            // adapter. The CLI side is responsible for setting
+            // up the local receive flow; here we just pass the
+            // invoice through.
+            return Err(PayError::Route(
+                "empty route: same-network pay not implemented; use the receiver adapter directly"
+                    .to_string(),
+            ));
         }
 
-        // Per-hop incoming delta: prefer the value the operator published on
-        // the announcement; fall back to a per-network default. Each hop
-        // also receives a transit slack (published or fallback) to absorb
-        // in-flight latency and clock skew between sender and that hop.
-        // The effective buffer per hop is `delta + slack`. The cascade
-        // grows off `now` per hop, independent of the invoice's
-        // `expires_at`, so the sender's incoming_deadline is `now` plus
-        // the sum of all effective buffers.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -182,91 +192,163 @@ impl CassisClient {
                 delta.saturating_add(slack)
             })
             .collect();
-        info!(
-            target: "cassis_client",
-            "computing hop deadlines: now={now}, route_len={}, buffers={:?}",
-            route.len(),
-            buffers
-        );
         let expiries = compute_hop_expiries(now, &buffers);
-        info!(
-            target: "cassis_client",
-            "computed hop expiries (oldest first): {:?}",
-            expiries
-        );
 
-        let instructions: Vec<(EndpointAddr, HopInstruction)> = route
+        // Step 1: PREPARE every hop.
+        let addrs: Vec<EndpointAddr> = route
             .iter()
-            .enumerate()
-            .map(|(idx, hop)| {
-                let addr = node_addr_from_announcement(&hop.node)
-                    .map_err(|e| PayError::Io(e.to_string()))?;
-                let incoming_deadline = expiries.get(idx).copied().unwrap_or(now);
-                let outgoing_expiry = expiries.get(idx + 1).copied().unwrap_or(now);
-                debug!(
-                    target: "cassis_client",
-                    "  hop {idx}: incoming_network={}, outgoing_network={}, \
-                     incoming_deadline={incoming_deadline}, outgoing_expiry={outgoing_expiry}, \
-                     recipient={}",
-                    hop.incoming, hop.outgoing, hop.node.node_pubkey
-                );
-                let instruction = HopInstruction {
-                    payment_hash: invoice.payment_hash,
-                    amount_msat: invoice.amount_msat,
-                    incoming_network: hop.incoming.clone(),
-                    outgoing_network: hop.outgoing.clone(),
-                    incoming_deadline,
-                    outgoing_expiry,
-                    recipient: hop.node.node_pubkey.to_string(),
-                };
-                Ok((addr, instruction))
+            .map(|hop| {
+                node_addr_from_announcement(&hop.node).map_err(|e| PayError::Io(e.to_string()))
             })
             .collect::<Result<Vec<_>, PayError>>()?;
 
-        let ack_futures = instructions
+        let prepares: Vec<HopPrepare> = route
+            .iter()
+            .enumerate()
+            .map(|(idx, hop)| HopPrepare {
+                payment_hash: invoice.payment_hash,
+                amount_msat: invoice.amount_msat,
+                incoming_network: hop.incoming.clone(),
+                outgoing_network: hop.outgoing.clone(),
+                incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
+                outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
+                recipient: hop.node.node_pubkey.to_string(),
+            })
+            .collect();
+        let prepared_futures = prepares
             .into_iter()
-            .map(|(addr, instruction)| self.iroh_client.send_instruction(addr, instruction));
-        let acks: Vec<cassis_core::HopAck> = try_join_all(ack_futures).await?;
-        if acks.iter().any(|ack| !ack.accepted) {
-            return Err(PayError::Route("hop rejected".to_string()));
+            .zip(addrs.iter().cloned())
+            .map(|(p, addr)| self.iroh_client.send_prepare(addr, p));
+        let prepared: Vec<cassis_core::HopPrepared> = try_join_all(prepared_futures).await?;
+        for (i, ack) in prepared.iter().enumerate() {
+            if !ack.accepted {
+                return Err(PayError::HopRejected {
+                    index: i,
+                    reason: ack.reason.clone().unwrap_or_else(|| "unknown".to_string()),
+                });
+            }
         }
 
+        // Step 2: pay the first hop. The sender adapter creates
+        // the first HTLC and returns the OutgoingPayment
+        // descriptor (cashu proofs, etc.).
         let first_hop = route
             .first()
             .ok_or_else(|| PayError::Route("route missing".to_string()))?;
         let sender = self
             .senders
             .get(&sender_network)
-            .ok_or_else(|| PayError::Route("sender network adapter missing".to_string()))?;
-
-        let payment = sender
+            .ok_or_else(|| PayError::Route("sender network adapter missing".to_string()))?
+            .clone();
+        let first_outgoing_expiry = expiries.get(1).copied().unwrap_or(now);
+        let first_payment: OutgoingPayment = sender
             .pay_invoice(
                 invoice.payment_hash,
                 invoice.amount_msat,
                 &first_hop.node.node_pubkey.to_string(),
                 &first_hop.outgoing,
-                expiries.get(1).copied().unwrap_or(now),
+                first_outgoing_expiry,
             )
             .await
             .map_err(|err| PayError::Io(err.to_string()))?;
+        // The descriptor of the first HTLC is the descriptor
+        // the sender adapter hands to the first router. We get
+        // it via the router trait method; the blanket impl
+        // does the lookup.
+        let first_descriptor: HtlcDescriptor = sender
+            .outgoing_htlc_descriptor(invoice.payment_hash)
+            .await
+            .map_err(|e| PayError::Io(e.to_string()))?;
 
-        match sender.watch_payment(payment.clone(), payment.expiry).await {
-            Ok(preimage) => Ok(PaymentResult {
-                status: PaymentStatus::Completed,
-                preimage: Some(preimage),
-            }),
+        // Step 3: walk the route. `descriptor` carries the
+        // HTLC info for the *incoming* side of the next hop.
+        let mut descriptor = first_descriptor;
+        for (i, hop) in route.iter().enumerate() {
+            let dispatch = HopDispatch {
+                payment_hash: invoice.payment_hash,
+                amount_msat: invoice.amount_msat,
+                incoming_network: hop.incoming.clone(),
+                outgoing_network: hop.outgoing.clone(),
+                incoming_deadline: expiries.get(i).copied().unwrap_or(now),
+                outgoing_expiry: expiries.get(i + 1).copied().unwrap_or(now),
+                recipient: hop.node.node_pubkey.to_string(),
+                incoming_descriptor: descriptor,
+            };
+            debug!(
+                target: "cassis_client",
+                "  DISPATCH hop {i}: in={} out={} amount={} msat",
+                hop.incoming, hop.outgoing, invoice.amount_msat
+            );
+            let reply = self
+                .iroh_client
+                .send_dispatch(addrs[i].clone(), dispatch)
+                .await?;
+            descriptor = reply.outgoing_descriptor;
+        }
+
+        // Step 4: COMMIT to the payee. The last `descriptor`
+        // describes the HTLC deployed on the payee's incoming
+        // network.
+        let peer_id = invoice
+            .iroh_peer_id
+            .as_deref()
+            .ok_or_else(|| PayError::Commit("invoice missing payee iroh_peer_id".to_string()))?;
+        let payee_addr = node_addr_from_invoice(peer_id, invoice.iroh_relay.as_deref())
+            .map_err(|e| PayError::Commit(format!("payee addr: {e}")))?;
+        let commit = HopCommit {
+            payment_hash: invoice.payment_hash,
+            amount_msat: invoice.amount_msat,
+            network: dest_network.clone(),
+            incoming_deadline: invoice.expires_at,
+            incoming_descriptor: descriptor,
+        };
+        let committed = self.iroh_client.send_commit(payee_addr, commit).await?;
+        let preimage = committed.preimage;
+        if preimage.0 == [0u8; 32] {
+            return Err(PayError::Commit(
+                "payee returned zero preimage (misroute or commit handler missing)".to_string(),
+            ));
+        }
+
+        // Step 5: verify the preimage actually matches the
+        // payment hash before returning success. Cheap local
+        // check; protects against accidental misroutes.
+        if !preimage_matches(&preimage, &invoice.payment_hash) {
+            return Err(PayError::Commit(format!(
+                "payee preimage does not hash to payment hash {}",
+                invoice.payment_hash
+            )));
+        }
+
+        // The first-hop HTLC is what the sender adapter
+        // already created. Its preimage should now be
+        // available on the sender network; surface a
+        // best-effort claim result. We do not block the
+        // caller on the sender-side watch because the
+        // preimage is already proven by the payee.
+        match sender
+            .watch_payment(first_payment.clone(), first_payment.expiry)
+            .await
+        {
+            Ok(_) => {}
             Err(SendError::DeadlineExceeded) => {
-                let _ = sender.refund_payment(payment).await;
-                Ok(PaymentResult {
-                    status: PaymentStatus::Refunded,
-                    preimage: None,
-                })
+                warn!(
+                    target: "cassis_client",
+                    "  sender-side watch timed out (preimage already proven by COMMIT)"
+                );
             }
             Err(err) => {
-                let _ = sender.refund_payment(payment).await;
-                Err(PayError::Io(err.to_string()))
+                warn!(
+                    target: "cassis_client",
+                    "  sender-side watch error: {err} (preimage already proven by COMMIT)"
+                );
             }
         }
+
+        Ok(PaymentResult {
+            status: PaymentStatus::Completed,
+            preimage: Some(preimage),
+        })
     }
 
     pub async fn find_route(
@@ -284,7 +366,6 @@ impl CassisClient {
         .await
     }
 
-    /// Look up the receiver adapter for `network`.
     fn receiver_for(
         &self,
         network: &NetworkId,
@@ -295,11 +376,6 @@ impl CassisClient {
             .ok_or_else(|| ReceiveFlowError::UnknownNetwork(network.0.clone()))
     }
 
-    /// Register an incoming invoice on `network` and return the
-    /// network's `Invoice` (whose `payment_hash` is what the upstream
-    /// will fund). The CLI is expected to persist a row tied to
-    /// `payment_hash` before returning to the user; this method does
-    /// not store anything.
     pub async fn create_invoice(
         &self,
         network: &NetworkId,
@@ -314,11 +390,6 @@ impl CassisClient {
         Ok(invoice)
     }
 
-    /// Block until the upstream hop funds the invoice (or the
-    /// `deadline` expires) and return the preimage the network
-    /// revealed. For "sells its own preimage" networks (fedimint)
-    /// the preimage is owned by the network; the returned bytes are
-    /// informational.
     pub async fn wait_for_incoming(
         &self,
         network: &NetworkId,
@@ -330,8 +401,6 @@ impl CassisClient {
         Ok(preimage)
     }
 
-    /// Settle the invoice: release the preimage to the network and
-    /// mark the incoming side paid.
     pub async fn claim_invoice(
         &self,
         network: &NetworkId,
@@ -343,10 +412,6 @@ impl CassisClient {
         Ok(())
     }
 
-    /// Convenience: `create_invoice` followed by `wait_for_incoming`
-    /// (bounded by `deadline`) and `claim_invoice`. The caller is
-    /// expected to have persisted the preimage before calling this
-    /// — the client does not own the secret.
     pub async fn receive(
         &self,
         network: &NetworkId,
@@ -367,4 +432,17 @@ impl CassisClient {
             preimage: Some(preimage),
         })
     }
+}
+
+/// Local helper: verify a candidate preimage hashes to the
+/// expected payment hash. Cheap, local sanity check before
+/// declaring the payment settled.
+fn preimage_matches(preimage: &Bytes32, payment_hash: &Bytes32) -> bool {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(preimage.0);
+    let out = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&out);
+    hash == payment_hash.0
 }
