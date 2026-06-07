@@ -37,6 +37,34 @@ pub async fn build_senders(
     Ok(out)
 }
 
+/// Build a concrete [`cassis_cashu::CashuAdapter`] for a single
+/// cashu spec. Used by the `cassis-cli cashu` wallet
+/// subcommands, which need the wallet methods
+/// (`redeem_proofs`, `swap_proofs_for_amount`) that aren't
+/// visible through the `NetworkReceiverAdapter` /
+/// `NetworkSenderAdapter` trait objects.
+#[cfg(feature = "cashu")]
+#[allow(unreachable_patterns)]
+pub async fn build_cashu_adapter(
+    spec: &NetSpec,
+    derived: &DerivedKeys,
+) -> Result<Arc<cassis_cashu::CashuAdapter>, String> {
+    match spec {
+        NetSpec::Cashu { mint_url, host: _ } => {
+            let network_id = spec.network_id();
+            let sk = derived
+                .networks
+                .get(&network_id)
+                .map(|k| *k.as_bytes())
+                .unwrap_or([0u8; 32]);
+            let adapter = cassis_cashu::CashuAdapter::new(network_id, mint_url.clone(), sk)
+                .map_err(|e| format!("cashu adapter init failed: {e}"))?;
+            Ok(Arc::new(adapter))
+        }
+        _ => Err(format!("expected a cashu spec, got {}", spec.kind_name())),
+    }
+}
+
 pub struct AdapterPair {
     pub network_id: NetworkId,
     pub receiver: Arc<dyn NetworkReceiverAdapter>,

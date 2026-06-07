@@ -3,7 +3,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cashu::amount::{FeeAndAmounts, SplitTarget};
 use cashu::dhke::{blind_message, unblind_message};
-use cashu::nuts::nut00::{BlindedMessage, Proof, Proofs};
+use cashu::nuts::nut00::{BlindedMessage, Proofs};
 use cashu::nuts::nut02::Id as KeysetId;
 use cashu::nuts::nut07::{CheckStateRequest, State as ProofState};
 use cashu::nuts::nut10::SpendingConditions;
@@ -32,6 +32,7 @@ use htlc::{
 };
 use mint_client::MintClient;
 
+pub use cashu::nuts::nut00::Proof;
 pub use errors::CashuError as Error;
 
 /// Receiver-side state for an outstanding incoming HTLC.
@@ -315,6 +316,172 @@ impl CashuAdapter {
         }
         Ok(proofs)
     }
+
+    /// Pure NUT-03 swap: take any set of valid proofs in, return
+    /// the new proofs in the active keyset. The caller decides
+    /// what to do with the inputs (e.g. drop them, since the mint
+    /// has burned them) and the outputs (e.g. persist into a local
+    /// wallet DB). Used by the wallet's "receive" flow to swap
+    /// arbitrary proofs into the wallet's preferred keyset.
+    pub async fn redeem_proofs(&self, proofs: Proofs) -> CashuResult<Proofs> {
+        if proofs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keyset_id = self.active_keyset_id().await?;
+        let keysets = self.ensure_keysets().await?;
+        let keyset = keysets
+            .iter()
+            .find(|k| k.id == keyset_id)
+            .cloned()
+            .ok_or(CashuError::NoKeyset)?;
+        let total: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
+        let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
+        let split = Self::split_for_swap(total, &fee_and_amounts)?;
+        let keys = self.get_keys(&keyset_id).await?;
+        let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)?;
+        let request = cashu::nuts::nut03::SwapRequest::new(proofs, outputs);
+        let response = self.client.swap(&request).await?;
+        Self::unblind_response(response, triples, &keys)
+    }
+
+    /// Per-input fee (in sats) for the keyset the inputs are in.
+    /// Rounds up: a 3-input swap on a keyset with input_fee_ppk
+    /// 1000 pays 3 sats.
+    fn input_fee_sat(num_inputs: usize, input_fee_ppk: u64) -> u64 {
+        (input_fee_ppk.saturating_mul(num_inputs as u64)).div_ceil(1000)
+    }
+
+    /// Greedy pick: from `available` (assumed sorted by the
+    /// caller) take the first proofs in `keyset_id` until their
+    /// total amount is at least `min_total_sat`. Returns
+    /// `(picked, picked_total)`. Empty `available` or no
+    /// matching keyset returns `([], 0)`.
+    fn pick_inputs(
+        available: &[Proof],
+        keyset_id: KeysetId,
+        min_total_sat: u64,
+    ) -> (Vec<Proof>, u64) {
+        let mut picked: Vec<Proof> = Vec::new();
+        let mut total: u64 = 0;
+        for proof in available {
+            if proof.keyset_id != keyset_id {
+                continue;
+            }
+            picked.push(proof.clone());
+            total = total.saturating_add(u64::from(proof.amount));
+            if total >= min_total_sat {
+                break;
+            }
+        }
+        (picked, total)
+    }
+
+    /// Wallet "send" helper: pick proofs from `available` whose
+    /// net amount (after the mint's per-input fee) covers
+    /// `amount_sat`, swap them at the mint, and return the
+    /// outgoing proofs (for the recipient) plus the change proofs
+    /// (for the wallet) plus the inputs the caller should mark
+    /// spent.
+    ///
+    /// Only proofs in the active keyset are eligible; the input
+    /// fee is deducted by the mint and the surplus is returned as
+    /// change. Empty `available` or insufficient funds is an
+    /// error.
+    pub async fn swap_proofs_for_amount(
+        &self,
+        amount_sat: u64,
+        available: Vec<Proof>,
+    ) -> CashuResult<SendResult> {
+        if amount_sat == 0 {
+            return Err(CashuError::Nuts("amount must be > 0".into()));
+        }
+        let keyset_id = self.active_keyset_id().await?;
+        let keysets = self.ensure_keysets().await?;
+        let keyset = keysets
+            .iter()
+            .find(|k| k.id == keyset_id)
+            .cloned()
+            .ok_or(CashuError::NoKeyset)?;
+        let input_fee_ppk = keyset.input_fee_ppk;
+
+        // First pass: pick conservatively ignoring the fee. If
+        // we don't have enough, fail fast.
+        let (picked_first, total_first) = Self::pick_inputs(&available, keyset_id, amount_sat);
+        if total_first < amount_sat {
+            return Err(CashuError::Nuts(format!(
+                "insufficient cashu balance: need {amount_sat} sat, have {total_first} sat"
+            )));
+        }
+
+        // Add a small buffer for the input fee. Round up the
+        // number of inputs we expect to need; the worst case is
+        // every pick adds fee.
+        let needed_with_fee =
+            amount_sat.saturating_add(Self::input_fee_sat(picked_first.len(), input_fee_ppk));
+        let (picked, total_in) = if total_first >= needed_with_fee {
+            (picked_first, total_first)
+        } else {
+            // Pick one more input to cover the fee; if we run out
+            // the loop will stop and we'll fail below.
+            Self::pick_inputs(&available, keyset_id, needed_with_fee)
+        };
+        let fee_sat = Self::input_fee_sat(picked.len(), input_fee_ppk);
+        if total_in < amount_sat.saturating_add(fee_sat) {
+            return Err(CashuError::Nuts(format!(
+                "insufficient cashu balance after fee: need {} sat (amount + fee), have {} sat",
+                amount_sat.saturating_add(fee_sat),
+                total_in
+            )));
+        }
+        let change_sat = total_in.saturating_sub(amount_sat).saturating_sub(fee_sat);
+
+        // Build outputs: amount_sat for the recipient + change_sat
+        // back to the wallet, each in the active keyset's
+        // denomination schedule.
+        let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
+        let output_amounts = Self::split_for_swap(amount_sat, &fee_and_amounts)?;
+        let change_amounts = if change_sat > 0 {
+            Self::split_for_swap(change_sat, &fee_and_amounts)?
+        } else {
+            Vec::new()
+        };
+        let n_output = output_amounts.len();
+        let mut all_amounts = output_amounts;
+        all_amounts.extend(change_amounts);
+
+        let keys = self.get_keys(&keyset_id).await?;
+        let (triples, blinded_outputs) =
+            Self::fresh_outputs(all_amounts.len(), keyset_id, &all_amounts)?;
+        let request = cashu::nuts::nut03::SwapRequest::new(picked.clone(), blinded_outputs);
+        let response = self.client.swap(&request).await?;
+        let new_proofs = Self::unblind_response(response, triples, &keys)?;
+        // The mint returns signatures in the same order as the
+        // blinded messages; the first n_output are the
+        // recipient's portion, the rest is change.
+        if new_proofs.len() < n_output {
+            return Err(CashuError::Nuts(format!(
+                "mint returned {} proofs, expected at least {n_output}",
+                new_proofs.len()
+            )));
+        }
+        let (output, change) = new_proofs.split_at(n_output);
+        Ok(SendResult {
+            inputs_used: picked,
+            output: output.to_vec(),
+            change: change.to_vec(),
+        })
+    }
+}
+
+/// Result of [`CashuAdapter::swap_proofs_for_amount`]. The caller
+/// marks `inputs_used` as spent (the mint already burned them)
+/// and persists `change` in its local wallet; `output` is the
+/// proof set to hand to the recipient.
+#[derive(Clone, Debug)]
+pub struct SendResult {
+    pub inputs_used: Vec<Proof>,
+    pub output: Vec<Proof>,
+    pub change: Vec<Proof>,
 }
 
 #[async_trait]
@@ -927,5 +1094,88 @@ mod tests {
         let adapter =
             CashuAdapter::new(NetworkId("cashu::".to_string()), "".to_string(), [0u8; 32]);
         assert!(adapter.is_err(), "empty url must be rejected");
+    }
+
+    #[test]
+    fn input_fee_zero_ppk_pays_nothing() {
+        assert_eq!(CashuAdapter::input_fee_sat(0, 0), 0);
+        assert_eq!(CashuAdapter::input_fee_sat(10, 0), 0);
+    }
+
+    #[test]
+    fn input_fee_one_ppk_rounds_up() {
+        // 1000 ppk = 1 sat per input. 3 inputs = 3 sats.
+        assert_eq!(CashuAdapter::input_fee_sat(1, 1000), 1);
+        assert_eq!(CashuAdapter::input_fee_sat(3, 1000), 3);
+        // 500 ppk = 0.5 sat per input, rounds up.
+        assert_eq!(CashuAdapter::input_fee_sat(1, 500), 1);
+        assert_eq!(CashuAdapter::input_fee_sat(2, 500), 1);
+    }
+
+    #[test]
+    fn input_fee_does_not_panic_on_large_ppk() {
+        // Saturating mul: a 32-bit ppk times a 32-bit count is
+        // bounded; the function must not overflow.
+        let _ = CashuAdapter::input_fee_sat(usize::MAX, u64::MAX);
+    }
+
+    fn fake_proof(amount: u64, keyset: KeysetId) -> Proof {
+        Proof {
+            amount: Amount::from(amount),
+            keyset_id: keyset,
+            secret: Secret::generate(),
+            c: cashu::nuts::nut01::PublicKey::from_str(
+                "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        }
+    }
+
+    #[test]
+    fn pick_inputs_skips_wrong_keyset() {
+        let target = KeysetId::from_str("009a1f293253e41e").unwrap();
+        let other = KeysetId::from_str("009a1f293253e41f").unwrap();
+        let proofs = vec![
+            fake_proof(1, other),
+            fake_proof(2, target),
+            fake_proof(4, other),
+            fake_proof(8, target),
+        ];
+        let (picked, total) = CashuAdapter::pick_inputs(&proofs, target, 5);
+        // 2-sat is the first matching proof; 4-sat is skipped
+        // (wrong keyset); 8-sat is the second matching proof
+        // and meets the 5-sat target. Both target-keyset
+        // proofs are picked, the other-keyset one is not.
+        assert_eq!(picked.len(), 2);
+        assert_eq!(total, 10);
+        assert!(picked.iter().all(|p| p.keyset_id == target));
+    }
+
+    #[test]
+    fn pick_inputs_stops_once_target_reached() {
+        let target = KeysetId::from_str("009a1f293253e41e").unwrap();
+        let proofs = vec![
+            fake_proof(1, target),
+            fake_proof(2, target),
+            fake_proof(4, target),
+        ];
+        let (picked, total) = CashuAdapter::pick_inputs(&proofs, target, 3);
+        // 1 + 2 already meets the 3-sat target; the 4 should
+        // not be picked.
+        assert_eq!(picked.len(), 2);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn pick_inputs_returns_empty_when_nothing_matches() {
+        let target = KeysetId::from_str("009a1f293253e41e").unwrap();
+        let other = KeysetId::from_str("009a1f293253e41f").unwrap();
+        let proofs = vec![fake_proof(1, other), fake_proof(2, other)];
+        let (picked, total) = CashuAdapter::pick_inputs(&proofs, target, 1);
+        assert!(picked.is_empty());
+        assert_eq!(total, 0);
     }
 }

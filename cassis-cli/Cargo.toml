@@ -30,10 +30,16 @@ rustls = "0.23.43"
 serde_json = "1.0.151"
 thiserror = "1.0.69"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+base64 = "0.22.1"
 
 [dependencies.cassis-cashu]
 path = "../networks/cassis-cashu"
 optional = true
+
+[dev-dependencies]
+# Used only by the cashu wallet store tests; same version
+# `cassis-cashu` pulls in transitively.
+cashu = { version = "0.17.3", features = ["wallet"] }
 
 [dependencies.cassis-fedimint]
 path = "../networks/cassis-fedimint"

@@ -1,4 +1,8 @@
-use cassis_core::{cashu_mint_url, cashu_network_id, fedimint_network_id, NetworkId};
+#[cfg(feature = "fedimint")]
+use cassis_core::fedimint_network_id;
+use cassis_core::NetworkId;
+#[cfg(feature = "cashu")]
+use cassis_core::{cashu_mint_url, cashu_network_id};
 use clap::{Parser, Subcommand};
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
@@ -88,6 +92,55 @@ pub enum Commands {
     Register {
         #[arg(long, action = clap::ArgAction::Append, value_name = "SPEC")]
         network: Vec<String>,
+    },
+    /// Local cashu wallet. Only available when the CLI is built
+    /// with the `cashu` cargo feature.
+    #[cfg(feature = "cashu")]
+    Cashu {
+        #[command(subcommand)]
+        command: CashuCommands,
+    },
+}
+
+#[cfg(feature = "cashu")]
+#[derive(Subcommand, Debug)]
+pub enum CashuCommands {
+    /// Send `amount` sat by picking proofs from the local
+    /// wallet, swapping them at the mint, and printing a
+    /// base64-encoded proof set the recipient can paste into
+    /// their own `cashu receive`.
+    Send {
+        /// Network spec, e.g. `cashu::mint.example.com`. Must
+        /// match an adapter the local wallet can talk to
+        /// (same mint the local proofs were redeemed from).
+        #[arg(long)]
+        network: String,
+        /// Amount to send, in sats. Must be a positive integer;
+        /// the wallet will pick proofs whose net amount (after
+        /// the mint's per-input fee) covers this value and
+        /// return the surplus as change.
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Redeem a base64-encoded proof set against the local
+    /// mint, swap the proofs into the wallet's active keyset,
+    /// and persist the result.
+    Receive {
+        /// Network spec, e.g. `cashu::mint.example.com`. Must
+        /// match the mint the pasted proof was issued by.
+        #[arg(long)]
+        network: String,
+        /// Base64-encoded JSON value: a single proof or a list
+        /// of proofs. The base64 form is the same one
+        /// `cashu send` prints; raw JSON also works.
+        #[arg(long = "proof")]
+        proof: String,
+    },
+    /// Show the local wallet's per-mint balance and proof count.
+    /// No mint arg = every registered mint.
+    Balance {
+        #[arg(long)]
+        network: Option<String>,
     },
 }
 
@@ -261,6 +314,7 @@ mod tests {
         canonicalize_network_id, CASHU_NETWORK_ID_PREFIX, FEDIMINT_NETWORK_ID_PREFIX,
     };
 
+    #[cfg(feature = "cashu")]
     #[test]
     fn parse_canonical_cashu_spec_uses_canonical_form() {
         let spec = NetSpec::parse("cashu::mint.example.com").unwrap();
@@ -272,6 +326,7 @@ mod tests {
         assert_eq!(mint_url, "https://mint.example.com");
     }
 
+    #[cfg(feature = "cashu")]
     #[test]
     fn parse_canonical_cashu_loopback_uses_canonical_form() {
         let spec = NetSpec::parse("cashu::localhost:3338").unwrap();

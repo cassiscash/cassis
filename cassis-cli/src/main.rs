@@ -17,7 +17,11 @@ use log::{error, info, warn};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "cashu")]
+use cli::CashuCommands;
 use cli::{Cli, Commands, InvoicesCommands, NetSpec, SeedCommands};
+#[cfg(feature = "cashu")]
+use store::CashuProofRow;
 use store::{InvoiceRow, InvoiceStatus, Store, StoreError};
 
 #[tokio::main]
@@ -78,6 +82,12 @@ async fn main() {
             SeedCommands::Show => cmd_seed_show(),
         },
         Commands::Register { network } => cmd_register(network),
+        #[cfg(feature = "cashu")]
+        Commands::Cashu { command } => match command {
+            CashuCommands::Send { network, amount } => cmd_cashu_send(network, amount).await,
+            CashuCommands::Receive { network, proof } => cmd_cashu_receive(network, proof).await,
+            CashuCommands::Balance { network } => cmd_cashu_balance(network).await,
+        },
     };
     if let Err(e) = result {
         error!(target: "cassis_cli", "{e}");
@@ -742,5 +752,260 @@ fn save_registered_networks(store: &mut Store, networks: &[String]) -> Result<()
              ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
         ))
         .map_err(map_sql_err)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// cashu wallet (only with the `cashu` feature)
+//
+// The `cassis-cli cashu` subcommands drive a local NUT-03
+// wallet: `send` picks proofs from the local store, swaps
+// them at the mint, and prints a base64-encoded proof set for
+// the recipient; `receive` decodes a base64 proof set, swaps
+// it into the wallet's active keyset, and persists the
+// result. There is no Lightning integration here — funds
+// enter and leave the wallet only through the cashu mint.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cashu")]
+fn load_cashu_wallet(
+    network: &str,
+) -> Result<(NetSpec, keys::DerivedKeys, Arc<cassis_cashu::CashuAdapter>), String> {
+    let spec = NetSpec::parse(network)?;
+    if !matches!(spec, NetSpec::Cashu { .. }) {
+        return Err(format!(
+            "expected a cashu spec like cashu::host, got '{network}'"
+        ));
+    }
+    let specs = vec![spec.clone()];
+    let mnemonic = load_mnemonic()?;
+    let derived = derive_for(&mnemonic, &specs)?;
+    let adapter = futures::executor::block_on(adapters::build_cashu_adapter(&spec, &derived))?;
+    Ok((spec, derived, adapter))
+}
+
+#[cfg(feature = "cashu")]
+fn encode_proofs_base64(proofs: &[cassis_cashu::Proof]) -> Result<String, String> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    let mut encoded = Vec::with_capacity(proofs.len());
+    for proof in proofs {
+        let json = serde_json::to_vec(proof).map_err(|e| format!("encode proof: {e}"))?;
+        encoded.push(BASE64.encode(json));
+    }
+    // Same wire shape as `HtlcDescriptor::Cashu` so the value
+    // round-trips through `cassis-cashu::proofs_from_descriptor`
+    // without extra glue.
+    let wrapper = serde_json::json!({
+        "proofs_b64": encoded,
+    });
+    let json = serde_json::to_string(&wrapper).map_err(|e| format!("encode proof set: {e}"))?;
+    Ok(BASE64.encode(json))
+}
+
+#[cfg(feature = "cashu")]
+fn decode_proofs_base64(s: &str) -> Result<Vec<cassis_cashu::Proof>, String> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    let trimmed = s.trim();
+    // First try the wrapped `{"proofs_b64":[...]}` form that
+    // `encode_proofs_base64` produces. Fall back to a bare
+    // JSON array of proofs (no base64) and finally a single
+    // JSON object as a one-element list, in that order.
+    if let Ok(bytes) = BASE64.decode(trimmed) {
+        if let Ok(wrapper) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(arr) = wrapper.get("proofs_b64").and_then(|v| v.as_array()) {
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let s = item
+                        .as_str()
+                        .ok_or_else(|| "proofs_b64 entry is not a string".to_string())?;
+                    let raw = BASE64
+                        .decode(s)
+                        .map_err(|e| format!("base64 decode inner: {e}"))?;
+                    let proof: cassis_cashu::Proof = serde_json::from_slice(&raw)
+                        .map_err(|e| format!("decode inner proof: {e}"))?;
+                    out.push(proof);
+                }
+                return Ok(out);
+            }
+        }
+    }
+    if let Ok(arr) = serde_json::from_str::<Vec<cassis_cashu::Proof>>(trimmed) {
+        return Ok(arr);
+    }
+    if let Ok(single) = serde_json::from_str::<cassis_cashu::Proof>(trimmed) {
+        return Ok(vec![single]);
+    }
+    Err(
+        "proof must be a base64-encoded {\"proofs_b64\":[...]} wrapper, \
+         a JSON array of cashu proofs, or a single cashu proof JSON object"
+            .to_string(),
+    )
+}
+
+#[cfg(feature = "cashu")]
+async fn cmd_cashu_send(network: String, amount: u64) -> Result<(), String> {
+    if amount == 0 {
+        return Err("amount must be > 0".to_string());
+    }
+    let (spec, _derived, adapter) = load_cashu_wallet(&network)?;
+    let mint_url =
+        cassis_core::cashu_mint_url(&spec.network_id()).map_err(|e| format!("mint url: {e}"))?;
+
+    let mut store = open_store()?;
+    let rows: Vec<CashuProofRow> = store.list_cashu_proofs(&mint_url).map_err(map_store_err)?;
+    if rows.is_empty() {
+        return Err(format!(
+            "no local cashu proofs for {mint_url}; run `cassis-cli cashu receive` first"
+        ));
+    }
+    let available: Vec<cassis_cashu::Proof> = rows
+        .iter()
+        .map(|r| -> Result<cassis_cashu::Proof, String> {
+            serde_json::from_slice(&r.proof_blob)
+                .map_err(|e| format!("decode local proof id={}: {e}", r.id))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let balance: u64 = rows.iter().map(|r| r.amount_sat).sum();
+    info!(
+        target: "cassis_cli",
+        "cashu send: {amount} sat from {mint_url} (local balance {balance} sat, {} proof(s))",
+        rows.len()
+    );
+
+    let send_result = adapter
+        .swap_proofs_for_amount(amount, available)
+        .await
+        .map_err(|e| format!("cashu send: {e}"))?;
+
+    // Mark the consumed inputs spent and persist any change.
+    let consumed_ids: Vec<i64> = rows
+        .iter()
+        .filter(|r| {
+            send_result.inputs_used.iter().any(|p| {
+                // Match by `(amount, secret)` — proofs aren't
+                // globally unique but the local store never holds
+                // two with the same secret at the same time.
+                r.amount_sat == u64::from(p.amount)
+                    && r.proof_blob == serde_json::to_vec(p).unwrap_or_default().as_slice()
+            })
+        })
+        .map(|r| r.id)
+        .collect();
+    if consumed_ids.len() != send_result.inputs_used.len() {
+        return Err(format!(
+            "internal: matched {} local rows for {} inputs; aborting before mutating the store",
+            consumed_ids.len(),
+            send_result.inputs_used.len()
+        ));
+    }
+    store
+        .delete_cashu_proofs(&consumed_ids)
+        .map_err(map_store_err)?;
+    if !send_result.change.is_empty() {
+        store
+            .insert_cashu_proofs(&mint_url, &send_result.change)
+            .map_err(map_store_err)?;
+    }
+
+    let token = encode_proofs_base64(&send_result.output)?;
+    let change_sat: u64 = send_result.change.iter().map(|p| u64::from(p.amount)).sum();
+    let recipient_sat: u64 = send_result.output.iter().map(|p| u64::from(p.amount)).sum();
+    info!(
+        target: "cassis_cli",
+        "cashu send: produced {recipient_sat} sat for recipient, {change_sat} sat change, \
+         spent {} input(s)",
+        send_result.inputs_used.len()
+    );
+    println!("status:       ok");
+    println!("mint:         {mint_url}");
+    println!("amount_sat:   {recipient_sat}");
+    println!("change_sat:   {change_sat}");
+    println!("inputs_used:  {}", send_result.inputs_used.len());
+    println!("proof_b64:    {token}");
+    Ok(())
+}
+
+#[cfg(feature = "cashu")]
+async fn cmd_cashu_receive(network: String, proof: String) -> Result<(), String> {
+    let (spec, _derived, adapter) = load_cashu_wallet(&network)?;
+    let mint_url =
+        cassis_core::cashu_mint_url(&spec.network_id()).map_err(|e| format!("mint url: {e}"))?;
+    let incoming = decode_proofs_base64(&proof)?;
+    if incoming.is_empty() {
+        return Err("no proofs in input".to_string());
+    }
+    let total_in: u64 = incoming.iter().map(|p| u64::from(p.amount)).sum();
+    let n_in = incoming.len();
+    info!(
+        target: "cassis_cli",
+        "cashu receive: {n_in} proof(s) totaling {total_in} sat at {mint_url}"
+    );
+    let new_proofs = adapter
+        .redeem_proofs(incoming)
+        .await
+        .map_err(|e| format!("cashu receive: {e}"))?;
+    if new_proofs.is_empty() {
+        return Err("mint returned no proofs (swap produced empty output)".to_string());
+    }
+    let total_out: u64 = new_proofs.iter().map(|p| u64::from(p.amount)).sum();
+    let mut store = open_store()?;
+    store
+        .insert_cashu_proofs(&mint_url, &new_proofs)
+        .map_err(map_store_err)?;
+    info!(
+        target: "cassis_cli",
+        "cashu receive: stored {} new proof(s) totaling {total_out} sat at {mint_url}",
+        new_proofs.len()
+    );
+    println!("status:       ok");
+    println!("mint:         {mint_url}");
+    println!("proofs_in:    {n_in} ({total_in} sat)");
+    println!("proofs_out:   {} ({total_out} sat)", new_proofs.len());
+    Ok(())
+}
+
+#[cfg(feature = "cashu")]
+async fn cmd_cashu_balance(network: Option<String>) -> Result<(), String> {
+    let mut store = open_store()?;
+    match network {
+        Some(spec_str) => {
+            let net_id = NetSpec::parse(&spec_str)?.network_id();
+            let mint_url =
+                cassis_core::cashu_mint_url(&net_id).map_err(|e| format!("mint url: {e}"))?;
+            let total = store.cashu_balance(&mint_url).map_err(map_store_err)?;
+            let rows = store.list_cashu_proofs(&mint_url).map_err(map_store_err)?;
+            println!("mint:        {mint_url}");
+            println!("balance_sat: {total}");
+            println!("proofs:      {}", rows.len());
+        }
+        None => {
+            let registered = load_registered_networks(&mut store)?;
+            let mut any = false;
+            for raw in &registered {
+                let spec = match NetSpec::parse(raw) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                // Only cashu mints carry a local proof wallet.
+                if !matches!(spec, NetSpec::Cashu { .. }) {
+                    continue;
+                }
+                let net_id = spec.network_id();
+                let mint_url = match cassis_core::cashu_mint_url(&net_id) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let total = store.cashu_balance(&mint_url).map_err(map_store_err)?;
+                let rows = store.list_cashu_proofs(&mint_url).map_err(map_store_err)?;
+                println!("{mint_url}  {total} sat ({} proof(s))", rows.len());
+                any = true;
+            }
+            if !any {
+                println!("(no registered cashu mints)");
+            }
+        }
+    }
     Ok(())
 }

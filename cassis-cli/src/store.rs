@@ -3,6 +3,33 @@ use minisqlite::{Connection, Error as SqlError, Value};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "cashu")]
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS invoices (
+    payment_hash TEXT PRIMARY KEY,
+    preimage     BLOB NOT NULL,
+    amount_msat  INTEGER NOT NULL,
+    network_id   TEXT NOT NULL,
+    payee        TEXT,
+    description  TEXT,
+    expires_at   INTEGER NOT NULL,
+    status       TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    claimed_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices(status);
+
+CREATE TABLE IF NOT EXISTS cashu_proofs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint_url     TEXT NOT NULL,
+    amount_sat   INTEGER NOT NULL,
+    proof_blob   BLOB NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cashu_proofs_mint_idx ON cashu_proofs(mint_url);
+";
+
+#[cfg(not(feature = "cashu"))]
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS invoices (
     payment_hash TEXT PRIMARY KEY,
@@ -295,6 +322,137 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// Cashu proofs (only with the `cashu` feature)
+//
+// The wallet stores NUT-00 `Proof` objects as JSON blobs in a
+// dedicated `cashu_proofs` table. Each row carries its own
+// `mint_url` and `amount_sat` so we can list / sum without
+// deserializing the blob. The `id` is a local synthetic; it
+// is NOT a cashu protocol concept and is only used by the
+// wallet to mark specific rows as spent.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cashu")]
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct CashuProofRow {
+    pub id: i64,
+    pub mint_url: String,
+    pub amount_sat: u64,
+    /// JSON-serialized cashu `Proof`.
+    pub proof_blob: Vec<u8>,
+    pub created_at: u64,
+}
+
+#[cfg(feature = "cashu")]
+impl Store {
+    /// Append a batch of proofs to the wallet for `mint_url`.
+    /// Each proof is its own row so the wallet can delete
+    /// individual proofs when sending.
+    pub fn insert_cashu_proofs(
+        &mut self,
+        mint_url: &str,
+        proofs: &[cassis_cashu::Proof],
+    ) -> Result<(), StoreError> {
+        let now = unix_now();
+        for proof in proofs {
+            let amount_sat = u64::from(proof.amount);
+            let blob = serde_json::to_vec(proof)
+                .map_err(|e| StoreError::Invalid(format!("encode proof: {e}")))?;
+            self.conn.execute(&format!(
+                "INSERT INTO cashu_proofs (mint_url, amount_sat, proof_blob, created_at) \
+                 VALUES ('{}', {}, X'{}', {});",
+                mint_url.replace('\'', "''"),
+                amount_sat,
+                hex::encode(&blob),
+                now,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// List every proof for `mint_url` in insertion order. The
+    /// wallet's `send` flow uses this to build the input set
+    /// for [`crate::cmd_cashu_send`].
+    pub fn list_cashu_proofs(&mut self, mint_url: &str) -> Result<Vec<CashuProofRow>, StoreError> {
+        let result = self.conn.query(&format!(
+            "SELECT id, mint_url, amount_sat, proof_blob, created_at \
+             FROM cashu_proofs WHERE mint_url='{}' \
+             ORDER BY id ASC;",
+            mint_url.replace('\'', "''"),
+        ))?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in result.rows.iter() {
+            out.push(cashu_proof_row_from_values(row.as_slice())?);
+        }
+        Ok(out)
+    }
+
+    /// Delete proofs by their local row ids. Used after a
+    /// successful `swap_proofs_for_amount` to mark the inputs
+    /// spent (the mint already burned them at the swap).
+    pub fn delete_cashu_proofs(&mut self, ids: &[i64]) -> Result<(), StoreError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn
+            .execute(&format!("DELETE FROM cashu_proofs WHERE id IN ({list});"))?;
+        Ok(())
+    }
+
+    /// Total balance (in sats) for `mint_url`. Convenience
+    /// wrapper around [`Store::list_cashu_proofs`] for CLI
+    /// status output.
+    pub fn cashu_balance(&mut self, mint_url: &str) -> Result<u64, StoreError> {
+        let result = self.conn.query(&format!(
+            "SELECT COALESCE(SUM(amount_sat), 0) AS total FROM cashu_proofs WHERE mint_url='{}';",
+            mint_url.replace('\'', "''"),
+        ))?;
+        let total = result
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| match v {
+                Value::Integer(i) => Some(*i as u64),
+                _ => None,
+            })
+            .unwrap_or(0);
+        Ok(total)
+    }
+}
+
+#[cfg(feature = "cashu")]
+fn cashu_proof_row_from_values(row: &[Value]) -> Result<CashuProofRow, StoreError> {
+    let id = int_at(row, 0, "id")?;
+    let mint_url = text_at(row, 1, "mint_url")?;
+    let amount_sat = int_at(row, 2, "amount_sat")? as u64;
+    let proof_blob = blob_at_var(row, 3, "proof_blob")?;
+    let created_at = int_at(row, 4, "created_at")? as u64;
+    Ok(CashuProofRow {
+        id,
+        mint_url,
+        amount_sat,
+        proof_blob,
+        created_at,
+    })
+}
+
+#[cfg(feature = "cashu")]
+fn blob_at_var(row: &[Value], idx: usize, field: &str) -> Result<Vec<u8>, StoreError> {
+    match row.get(idx) {
+        Some(Value::Blob(b)) => Ok(b.clone()),
+        other => Err(StoreError::Invalid(format!(
+            "{field}: expected blob, got {other:?}"
+        ))),
+    }
+}
+
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         let mut s = String::with_capacity(bytes.as_ref().len() * 2);
@@ -302,5 +460,127 @@ mod hex {
             s.push_str(&format!("{b:02x}"));
         }
         s
+    }
+}
+
+#[cfg(all(test, feature = "cashu"))]
+mod cashu_tests {
+    use super::*;
+    use cashu::nuts::nut01::PublicKey;
+    use cashu::nuts::nut02::Id as KeysetId;
+    use cashu::Amount;
+    use cassis_cashu::Proof;
+    use std::str::FromStr;
+
+    fn fake_proof(amount_sat: u64, secret_seed: &str) -> Proof {
+        // Hand-rolled so the test doesn't need a mint: a real
+        // `Proof` carries a mint signature on `C`, but the
+        // store layer only needs the JSON shape to round-trip.
+        Proof {
+            amount: Amount::from(amount_sat),
+            keyset_id: KeysetId::from_str("009a1f293253e41e").unwrap(),
+            secret: cashu::secret::Secret::new(secret_seed),
+            c: PublicKey::from_str(
+                "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        }
+    }
+
+    fn open_in_memory() -> Store {
+        Store::in_memory().expect("open in-memory store")
+    }
+
+    #[test]
+    fn cashu_proofs_round_trip_through_store() {
+        let mut store = open_in_memory();
+        let proofs = vec![fake_proof(2, "a"), fake_proof(1, "b")];
+        store
+            .insert_cashu_proofs("cashu::mint.example.com", &proofs)
+            .expect("insert");
+        let rows = store
+            .list_cashu_proofs("cashu::mint.example.com")
+            .expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].amount_sat, 2);
+        assert_eq!(rows[1].amount_sat, 1);
+        let total = store
+            .cashu_balance("cashu::mint.example.com")
+            .expect("balance");
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn cashu_proofs_are_partitioned_by_mint() {
+        let mut store = open_in_memory();
+        let a = vec![fake_proof(2, "a")];
+        let b = vec![fake_proof(4, "b"), fake_proof(8, "c")];
+        store
+            .insert_cashu_proofs("https://a.example.com", &a)
+            .expect("insert a");
+        store
+            .insert_cashu_proofs("https://b.example.com", &b)
+            .expect("insert b");
+        assert_eq!(
+            store
+                .list_cashu_proofs("https://a.example.com")
+                .expect("list a")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_cashu_proofs("https://b.example.com")
+                .expect("list b")
+                .len(),
+            2
+        );
+        assert_eq!(
+            store.cashu_balance("https://a.example.com").expect("bal a"),
+            2
+        );
+        assert_eq!(
+            store.cashu_balance("https://b.example.com").expect("bal b"),
+            12
+        );
+    }
+
+    #[test]
+    fn cashu_proofs_can_be_deleted_by_id() {
+        let mut store = open_in_memory();
+        let proofs = vec![fake_proof(1, "a"), fake_proof(2, "b"), fake_proof(4, "c")];
+        store
+            .insert_cashu_proofs("https://mint.example.com", &proofs)
+            .expect("insert");
+        let rows = store
+            .list_cashu_proofs("https://mint.example.com")
+            .expect("list");
+        let drop: Vec<i64> = rows.iter().take(2).map(|r| r.id).collect();
+        store.delete_cashu_proofs(&drop).expect("delete");
+        let remaining = store
+            .list_cashu_proofs("https://mint.example.com")
+            .expect("list again");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].amount_sat, 4);
+    }
+
+    #[test]
+    fn delete_cashu_proofs_with_empty_ids_is_noop() {
+        let mut store = open_in_memory();
+        let proofs = vec![fake_proof(1, "a")];
+        store
+            .insert_cashu_proofs("https://mint.example.com", &proofs)
+            .expect("insert");
+        store.delete_cashu_proofs(&[]).expect("empty delete");
+        assert_eq!(
+            store
+                .list_cashu_proofs("https://mint.example.com")
+                .expect("list")
+                .len(),
+            1
+        );
     }
 }
