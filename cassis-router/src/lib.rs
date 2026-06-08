@@ -1,3 +1,17 @@
+//! Cassis multi-network routing daemon, as a library.
+//!
+//! Hosts the [`CassisRouter`] state machine, the per-network
+//! adapter construction, the iroh server loop, and the
+//! 30-second preimage poll loop. The CLI's `router run`
+//! subcommand builds a [`RouterConfig`] and hands it to
+//! [`run_router`]; no other entry point is supported.
+//!
+//! Replaces the old standalone `cassis-router` binary. The
+//! router reads its seed from the same config directory the
+//! wallet uses (`$CASSIS_HOME` / `$HOME/.cassis` / `--home`)
+//! and announces routes for the same networks the wallet is
+//! registered against.
+
 #[cfg(feature = "cashu")]
 use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
@@ -7,7 +21,6 @@ use cassis_core::{
 };
 use cassis_iroh::{Frame, IrohError, IrohServer};
 use cassis_keys as keys;
-use clap::Parser;
 use log::{debug, error, info, warn};
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
@@ -19,92 +32,53 @@ const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
 
-/// How often the per-dispatch poll task wakes up to check whether
-/// the receiver of an outgoing HTLC has revealed the preimage.
+/// How often the per-dispatch poll task wakes up to check
+/// whether the receiver of an outgoing HTLC has revealed the
+/// preimage.
 const POLL_INTERVAL_SECS: u64 = 30;
 
-type PreparedMap = Arc<Mutex<HashMap<Bytes32, HopPrepare>>>;
-
-#[derive(Parser)]
-#[command(name = "cassis-router")]
-#[command(
-    about = "Cassis multi-network routing daemon (router only; receivers live in cassis-cli)"
-)]
-struct Cli {
-    /// Networks to route between. The format depends on the network kind:
-    ///     cashu::<host[:port]>     e.g. cashu::mint.example.com (https) or
-    ///                              cashu::localhost:3338 (http, since loopback)
-    ///     fedimint::<invite_code>  e.g. fedimint::fed1qgqrg5c3plq3tts70rt7q3l4yy2v9m9te5t...
-    ///     liquid               (no parameter)
-    ///     ark                  (no parameter)
-    ///     rootstock            (no parameter)
-    ///
-    /// The `cashu::` and `fedimint::` forms are the canonical on-the-wire
-    /// syntax used in Nostr route announcements and iroh `HopInstruction`s.
-    /// For `cashu` the scheme is never part of the id: `localhost`/
-    /// `127.0.0.1`/`::1` are always `http`, everything else is `https`.
-    ///
-    /// At least two are required so the daemon can route between them.
-    /// The same kind may be repeated with different parameters.
-    #[arg(long, action = clap::ArgAction::Append, value_name = "SPEC")]
-    network: Vec<String>,
-
-    /// Nostr relays to publish route announcements to.
-    /// Defaults to a built-in list when none are provided.
-    #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
-    nostr_relay: Vec<String>,
-
-    /// BIP39 mnemonic seed (12 words, space-separated) from which every key the
-    /// daemon uses is derived deterministically: the nostr signing key and one
-    /// key per network adapter.
-    #[arg(long, value_name = "MNEMONIC")]
-    seed: String,
+/// Top-level configuration for [`run_router`].
+#[derive(Clone)]
+pub struct RouterConfig {
+    /// Network specs in the same `--network` format the old
+    /// `cassis-router` binary accepted (`cashu::host`,
+    /// `fedimint::invite`, `liquid`, `ark`, `rootstock`).
+    pub network_specs: Vec<String>,
+    /// Nostr relays to publish route announcements to. When
+    /// empty, [`DEFAULT_NOSTR_RELAYS`] is used.
+    pub nostr_relays: Vec<String>,
+    /// Keys derived from the same BIP39 seed the wallet uses.
+    /// The router consumes `derived.iroh` for its iroh
+    /// endpoint and `derived.networks` for per-network
+    /// adapter signing.
+    pub derived_keys: keys::DerivedKeys,
 }
 
-#[tokio::main]
-async fn main() {
-    cassis_core::logging::init_logging();
-
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install default rustls crypto provider");
-
-    let cli = Cli::parse();
-
-    if cli.network.len() < 2 {
-        error!(
-            target: "cassis_router",
+/// Run the router daemon. Blocks until Ctrl-C. The caller
+/// must have already initialized logging
+/// ([`cassis_core::logging::init_logging`]).
+pub async fn run_router(config: RouterConfig) -> Result<(), String> {
+    if config.network_specs.len() < 2 {
+        return Err(format!(
             "at least two --network flags are required for routing, got {}",
-            cli.network.len()
-        );
-        std::process::exit(2);
+            config.network_specs.len()
+        ));
     }
 
-    let network_ids: Vec<NetworkId> = cli
-        .network
+    let network_ids: Vec<NetworkId> = config
+        .network_specs
         .iter()
         .map(|spec| network_id_for_spec(spec))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|err| {
-            error!(target: "cassis_router", "{err}");
-            std::process::exit(2);
-        });
-
-    let derived = match keys::derive_keys(&cli.seed, network_ids.clone()) {
-        Ok(keys) => keys,
-        Err(err) => {
-            error!(target: "cassis_router", "invalid --seed: {err}");
-            std::process::exit(2);
-        }
-    };
+        .collect::<Result<Vec<_>, _>>()?;
+    let _ = network_ids; // Used by build_adapter below; held for the diagnostic.
 
     info!(
         target: "cassis_router",
         "derived nostr signing key: {} ({})",
-        derived.nostr.to_nsec(),
-        derived.nostr.pubkey().to_hex()
+        config.derived_keys.nostr.to_nsec(),
+        config.derived_keys.nostr.pubkey().to_hex()
     );
-    for (network_id, sk) in &derived.networks {
+    for (network_id, sk) in &config.derived_keys.networks {
         info!(
             target: "cassis_router",
             "  derived key for {network_id}: pubkey={}",
@@ -113,47 +87,51 @@ async fn main() {
     }
 
     let mut adapters: HashMap<NetworkId, NetworkEntry> = HashMap::new();
-    for spec in &cli.network {
-        match build_adapter(spec, &derived).await {
+    for spec in &config.network_specs {
+        match build_adapter(spec, &config.derived_keys).await {
             Ok(entry) => {
                 adapters.insert(entry.network_id.clone(), entry);
             }
             Err(err) => {
-                error!(target: "cassis_router", "{err}");
-                std::process::exit(2);
+                return Err(err);
             }
         }
     }
 
     if adapters.len() < 2 {
-        error!(target: "cassis_router", "at least two distinct networks are required for routing");
-        std::process::exit(2);
+        return Err("at least two distinct networks are required for routing".to_string());
     }
 
-    info!(target: "cassis_router", "routing between {} networks:", adapters.len());
+    info!(
+        target: "cassis_router",
+        "routing between {} networks:", adapters.len()
+    );
     for id in adapters.keys() {
         info!(target: "cassis_router", "  - {id}");
     }
 
-    let relay_urls = if cli.nostr_relay.is_empty() {
+    let relay_urls = if config.nostr_relays.is_empty() {
         DEFAULT_NOSTR_RELAYS.iter().map(|s| s.to_string()).collect()
     } else {
-        cli.nostr_relay.clone()
+        config.nostr_relays.clone()
     };
 
     let router = Arc::new(CassisRouter::new(adapters));
     let handler_router = router.clone();
     let poll_router = router.clone();
 
-    let (iroh_server, iroh_secret) = IrohServer::new(derived.iroh.clone())
+    let (iroh_server, iroh_secret) = IrohServer::new(config.derived_keys.iroh.clone())
         .await
-        .expect("failed to bind iroh endpoint");
+        .map_err(|e| format!("failed to bind iroh endpoint: {e}"))?;
     let iroh_peer_id = iroh_secret.public();
     let iroh_relay = iroh_server
         .home_relay()
         .map(|s| s.to_string())
         .unwrap_or_else(|| cassis_iroh::DEFAULT_IROH_RELAY.to_string());
-    info!(target: "cassis_router", "iroh endpoint: {iroh_peer_id} relay: {iroh_relay}");
+    info!(
+        target: "cassis_router",
+        "iroh endpoint: {iroh_peer_id} relay: {iroh_relay}"
+    );
 
     tokio::spawn(async move {
         let handler = Arc::new(
@@ -176,7 +154,7 @@ async fn main() {
     publish_route_announcements(
         &router.adapters,
         relay_urls,
-        &derived.nostr,
+        &config.derived_keys.nostr,
         &iroh_peer_id.to_string(),
         &iroh_relay,
     )
@@ -184,15 +162,17 @@ async fn main() {
 
     tokio::signal::ctrl_c().await.ok();
     info!(target: "cassis_router", "shutting down");
+    Ok(())
 }
 
 /// Per-network entry the router tracks. The router holds a
-/// [`NetworkRouterAdapter`] (the low-level HTLC-instrument trait) and
-/// *never* a [`NetworkReceiverAdapter`] or [`NetworkSenderAdapter`]
-/// (those are user-facing wrappers used by `cassis-cli`).
-/// `incoming_delta_secs` is read off the same adapter at construction
-/// and cached, so the router can validate timelocks without ever
-/// calling into any user-facing trait.
+/// [`NetworkRouterAdapter`] (the low-level HTLC-instrument
+/// trait) and *never* a `NetworkReceiverAdapter` or
+/// `NetworkSenderAdapter` (those are user-facing wrappers
+/// used by `cassis-cli`). `incoming_delta_secs` is read off
+/// the same adapter at construction and cached, so the
+/// router can validate timelocks without ever calling into
+/// any user-facing trait.
 #[derive(Clone)]
 pub struct NetworkEntry {
     pub network_id: NetworkId,
@@ -213,8 +193,8 @@ async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<Networ
                     .to_string()
             })?;
             let network_id = cashu_network_id(host);
-            let mint_url = cashu_mint_url(&network_id)
-                .map_err(|e| format!("cashu mint url: {e}"))?;
+            let mint_url =
+                cashu_mint_url(&network_id).map_err(|e| format!("cashu mint url: {e}"))?;
             let sk = derived
                 .networks
                 .get(&network_id)
@@ -284,7 +264,8 @@ async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<Networ
 
         #[cfg(not(feature = "ark"))]
         "ark" => Err(
-            "network 'ark' requested but cassis-router was not compiled with the 'ark' feature".into(),
+            "network 'ark' requested but cassis-router was not compiled with the 'ark' feature"
+                .into(),
         ),
 
         #[cfg(feature = "rootstock")]
@@ -293,8 +274,9 @@ async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<Networ
                 return Err("network 'rootstock' does not take a parameter".into());
             }
             let network_id = NetworkId("rootstock".to_string());
-            let adapter: Arc<dyn NetworkRouterAdapter> =
-                Arc::new(cassis_rootstock::RootstockAdapter::new(network_id.clone()));
+            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
+                cassis_rootstock::RootstockAdapter::new(network_id.clone()),
+            );
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
@@ -313,15 +295,16 @@ async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<Networ
     }
 }
 
-/// Per-dispatch state the router retains between DISPATCH and the
-/// eventual claim. `outgoing_deadline` is the unix-second cutoff
-/// the router passes to the adapter's `watch_preimage`; once
-/// exceeded, the dispatch is refunded (outgoing side) and the
-/// incoming side is left to expire on its own.
+/// Per-dispatch state the router retains between DISPATCH
+/// and the eventual claim. `outgoing_deadline` is the
+/// unix-second cutoff the router passes to the adapter's
+/// `watch_preimage`; once exceeded, the dispatch is refunded
+/// (outgoing side) and the incoming side is left to expire
+/// on its own.
 struct DispatchedHop {
     prepare: HopPrepare,
-    /// Unix seconds; the router stops polling after this and runs
-    /// the refund path on the outgoing side.
+    /// Unix seconds; the router stops polling after this and
+    /// runs the refund path on the outgoing side.
     outgoing_deadline: u64,
 }
 
@@ -340,11 +323,11 @@ impl CassisRouter {
         }
     }
 
-    /// Top-level dispatcher: turn a [`Frame`] into the matching
-    /// reply [`Frame`]. The router only handles Prepare / Prepared /
-    /// Dispatch / Dispatched; Commit / Committed flow directly from
-    /// sender to receiver (payee's `cassis-cli`) without crossing
-    /// a router hop.
+    /// Top-level dispatcher: turn a [`Frame`] into the
+    /// matching reply [`Frame`]. The router only handles
+    /// Prepare / Prepared / Dispatch / Dispatched; Commit /
+    /// Committed flow directly from sender to receiver
+    /// (payee's `cassis-cli`) without crossing a router hop.
     pub async fn handle_frame(&self, frame: Frame) -> Result<Frame, IrohError> {
         match frame {
             Frame::Prepare(p) => self
@@ -369,8 +352,9 @@ impl CassisRouter {
         }
     }
 
-    /// PREPARE handler: validate the request, check funds on the
-    /// outgoing side, store the spec. Do NOT create any HTLCs.
+    /// PREPARE handler: validate the request, check funds on
+    /// the outgoing side, store the spec. Do NOT create any
+    /// HTLCs.
     async fn handle_prepare(&self, mut prepare: HopPrepare) -> Result<HopPrepared, String> {
         let incoming_raw = prepare.incoming_network.clone();
         let outgoing_raw = prepare.outgoing_network.clone();
@@ -402,7 +386,7 @@ impl CassisRouter {
         let outgoing_entry = self
             .adapters
             .get(&prepare.outgoing_network)
-            .ok_or_else(|| format!("outgoing network unsupported"))?;
+            .ok_or_else(|| "outgoing network unsupported".to_string())?;
         if let Err(e) = outgoing_entry.adapter.can_route(prepare.amount_msat).await {
             return Ok(HopPrepared {
                 payment_hash: prepare.payment_hash,
@@ -420,9 +404,10 @@ impl CassisRouter {
         })
     }
 
-    /// DISPATCH handler: verify the incoming HTLC is claimable on
-    /// the hop's incoming adapter, then create the outgoing HTLC
-    /// on the outgoing adapter and stash state for the poll loop.
+    /// DISPATCH handler: verify the incoming HTLC is
+    /// claimable on the hop's incoming adapter, then create
+    /// the outgoing HTLC on the outgoing adapter and stash
+    /// state for the poll loop.
     async fn handle_dispatch(&self, dispatch: HopDispatch) -> Result<HopDispatched, String> {
         info!(
             target: "cassis_router",
@@ -471,14 +456,14 @@ impl CassisRouter {
         let incoming_entry = self
             .adapters
             .get(&dispatch.incoming_network)
-            .ok_or_else(|| format!("incoming network unsupported"))?;
+            .ok_or_else(|| "incoming network unsupported".to_string())?;
         let outgoing_entry = self
             .adapters
             .get(&dispatch.outgoing_network)
-            .ok_or_else(|| format!("outgoing network unsupported"))?;
+            .ok_or_else(|| "outgoing network unsupported".to_string())?;
 
-        // Verify the incoming HTLC is really claimable on this
-        // adapter (e.g. cashu: NUT-14 proofs decode and
+        // Verify the incoming HTLC is really claimable on
+        // this adapter (e.g. cashu: NUT-14 proofs decode and
         // reference the right payment hash).
         if let Err(e) = incoming_entry
             .adapter
@@ -564,10 +549,11 @@ impl CassisRouter {
     }
 
     /// COMMIT handler. Routers don't normally receive COMMIT
-    /// (the sender sends COMMIT directly to the final receiver),
-    /// but we accept it defensively in case the route has zero
-    /// hops (sender == receiver) and the call loops back through
-    /// us. In that case we just acknowledge the payment hash.
+    /// (the sender sends COMMIT directly to the final
+    /// receiver), but we accept it defensively in case the
+    /// route has zero hops (sender == receiver) and the call
+    /// loops back through us. In that case we just
+    /// acknowledge the payment hash.
     async fn handle_commit(&self, commit: HopCommit) -> Result<HopCommitted, String> {
         info!(
             target: "cassis_router",
@@ -575,22 +561,22 @@ impl CassisRouter {
             commit.amount_msat, commit.network,
         );
         // Routers don't hold preimages; the final receiver
-        // does. The COMMIT handler on a router is a no-op that
-        // returns a zero preimage so the sender can detect the
-        // misroute if it ever happens. The normal path skips
-        // routers entirely for COMMIT.
+        // does. The COMMIT handler on a router is a no-op
+        // that returns a zero preimage so the sender can
+        // detect the misroute if it ever happens. The normal
+        // path skips routers entirely for COMMIT.
         Ok(HopCommitted {
             payment_hash: commit.payment_hash,
             preimage: Bytes32([0u8; 32]),
         })
     }
 
-    /// Background task: every [`POLL_INTERVAL_SECS`] seconds, walk
-    /// the dispatched table and poll each outgoing HTLC for the
-    /// preimage. When the preimage is known, claim the incoming
-    /// HTLC on the incoming adapter with the same preimage.
-    /// On deadline, refund the outgoing side and drop the
-    /// dispatch row.
+    /// Background task: every [`POLL_INTERVAL_SECS`] seconds,
+    /// walk the dispatched table and poll each outgoing HTLC
+    /// for the preimage. When the preimage is known, claim
+    /// the incoming HTLC on the incoming adapter with the
+    /// same preimage. On deadline, refund the outgoing side
+    /// and drop the dispatch row.
     async fn run_poll_loop(self: Arc<Self>) {
         let interval = Duration::from_secs(POLL_INTERVAL_SECS);
         let mut ticker = tokio::time::interval(interval);
@@ -604,8 +590,8 @@ impl CassisRouter {
     }
 
     async fn poll_once(&self) -> Result<(), String> {
-        // Snapshot the payment hashes under the lock, then drop
-        // it before doing network work.
+        // Snapshot the payment hashes under the lock, then
+        // drop it before doing network work.
         let snapshot: Vec<(Bytes32, HopPrepare, u64)> = {
             let dispatched = self.dispatched.lock().await;
             dispatched
@@ -757,10 +743,12 @@ impl CassisRouter {
     }
 }
 
+type PreparedMap = Arc<Mutex<HashMap<Bytes32, HopPrepare>>>;
+
 /// Tiny shim: lift a string rejection into an iroh-level
-/// [`IrohError`]. The frame's `payment_hash` is lost here; the
-/// peer's handler will see the error in the protocol layer and
-/// the local log carries the hash.
+/// [`IrohError`]. The frame's `payment_hash` is lost here;
+/// the peer's handler will see the error in the protocol
+/// layer and the local log carries the hash.
 fn internal<E: std::fmt::Display>(e: E) -> IrohError {
     IrohError::Protocol(e.to_string())
 }

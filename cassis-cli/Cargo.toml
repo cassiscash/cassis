@@ -16,6 +16,7 @@ cassis-client = { path = "../cassis-client" }
 cassis-core = { path = "../cassis-core" }
 cassis-iroh = { path = "../cassis-iroh" }
 cassis-keys = { path = "../cassis-keys" }
+cassis-router = { path = "../cassis-router" }
 cassis-routing = { path = "../cassis-routing" }
 clap = { version = "4.6.6", features = ["derive"] }
 rand = "0.8.7"

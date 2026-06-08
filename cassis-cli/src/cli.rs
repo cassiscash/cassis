@@ -15,6 +15,13 @@ pub fn default_nostr_relays() -> Vec<String> {
 #[command(name = "cassis-cli")]
 #[command(about = "Cassis command-line interface (pay, receive, manage)")]
 pub struct Cli {
+    /// Override the cassis config directory. Defaults to
+    /// `$CASSIS_HOME` if set, otherwise `$HOME/.cassis`. Every
+    /// subcommand reads the seed, store, and registered
+    /// networks from this directory.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub home: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -99,6 +106,23 @@ pub enum Commands {
     Cashu {
         #[command(subcommand)]
         command: CashuCommands,
+    },
+    /// Run the multi-network routing daemon. Reads the seed
+    /// from the configured home dir and uses the same store
+    /// the wallet does. Replaces the standalone `cassis-router`
+    /// binary.
+    Router {
+        /// Networks to route between (e.g. `cashu::mint.example.com`,
+        /// `liquid`, `ark`). At least two distinct networks are
+        /// required. If empty, falls back to the list of
+        /// networks already registered via
+        /// `cassis-cli register --network <spec>`.
+        #[arg(long, action = clap::ArgAction::Append, value_name = "SPEC")]
+        network: Vec<String>,
+        /// Nostr relays to publish route announcements to.
+        /// Defaults to a built-in list when none are provided.
+        #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
+        nostr_relay: Vec<String>,
     },
 }
 

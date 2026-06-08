@@ -34,6 +34,12 @@ async fn main() {
     }
 
     let cli = Cli::parse();
+    // Apply --home before any path is read. Threads see this
+    // override via `paths::cassis_home()` for the rest of
+    // the process.
+    if let Some(home) = cli.home.as_deref() {
+        paths::set_home_override(std::path::PathBuf::from(home));
+    }
     let result: Result<(), String> = match cli.command {
         Commands::Pay {
             invoice,
@@ -88,6 +94,10 @@ async fn main() {
             CashuCommands::Receive { network, proof } => cmd_cashu_receive(network, proof).await,
             CashuCommands::Balance { network } => cmd_cashu_balance(network).await,
         },
+        Commands::Router {
+            network,
+            nostr_relay,
+        } => cmd_router_run(network, nostr_relay).await,
     };
     if let Err(e) = result {
         error!(target: "cassis_cli", "{e}");
@@ -1008,4 +1018,67 @@ async fn cmd_cashu_balance(network: Option<String>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// router
+// ---------------------------------------------------------------------------
+
+/// Build the network spec list for the router. If the user
+/// passed `--network` flags we use those verbatim; otherwise
+/// we read the list the wallet registered in the local store.
+/// In either case the seeds' deterministic key derivation
+/// gives the router the same per-network signing keys the
+/// wallet already uses.
+fn router_network_specs(flag_specs: Vec<String>) -> Result<Vec<String>, String> {
+    if !flag_specs.is_empty() {
+        return Ok(flag_specs);
+    }
+    let mut store = open_store()?;
+    let registered = load_registered_networks(&mut store)?;
+    if registered.is_empty() {
+        return Err("no --network flags and no networks registered; \
+             run `cassis-cli register --network <spec>` first \
+             (or pass --network on the command line)"
+            .to_string());
+    }
+    // Validate the registered strings: a stale or hand-edited
+    // entry shouldn't crash the daemon with a cryptic error
+    // halfway through startup.
+    for raw in &registered {
+        NetSpec::parse(raw)?;
+    }
+    Ok(registered)
+}
+
+/// Long-running `cassis-cli router` subcommand. Reads the
+/// seed from the configured home dir (same as the wallet),
+/// derives one signing key per network, and hands everything
+/// to `cassis_router::run_router`.
+async fn cmd_router_run(network: Vec<String>, nostr_relay: Vec<String>) -> Result<(), String> {
+    let network_specs = router_network_specs(network)?;
+    if network_specs.len() < 2 {
+        return Err(format!(
+            "router needs at least two distinct networks, got {}",
+            network_specs.len()
+        ));
+    }
+    let mnemonic = load_mnemonic()?;
+    let net_specs_for_keys: Vec<NetSpec> = network_specs
+        .iter()
+        .map(|raw| NetSpec::parse(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    let derived = derive_for(&mnemonic, &net_specs_for_keys)?;
+    info!(
+        target: "cassis_cli",
+        "router: starting with {} network(s), home = {}",
+        network_specs.len(),
+        paths::cassis_home().display()
+    );
+    let config = cassis_router::RouterConfig {
+        network_specs,
+        nostr_relays: nostr_relay,
+        derived_keys: derived,
+    };
+    cassis_router::run_router(config).await
 }
