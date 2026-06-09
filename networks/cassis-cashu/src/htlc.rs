@@ -15,13 +15,13 @@
 //!   ([`verify_proofs_htlc`], [`extract_preimage`], [`proof_y`]).
 
 #[allow(unused_imports)]
-use cashu::dhke::{blind_message, construct_proofs as dhke_construct_proofs};
-use cashu::nuts::nut00::{BlindedMessage, PreMint, Proof, Proofs};
-use cashu::nuts::nut10::{Secret as Nut10Secret, SpendingConditions};
-use cashu::nuts::{Conditions, Id as KeysetId, Witness};
-use cashu::secret::Secret;
-use cashu::util::unix_time;
-use cashu::Amount;
+use cdk::dhke::{blind_message, construct_proofs as dhke_construct_proofs};
+use cdk::nuts::nut00::{BlindedMessage, PreMint, Proof, Proofs};
+use cdk::nuts::nut10::{Secret as Nut10Secret, SpendingConditions};
+use cdk::nuts::{Conditions, Id as KeysetId, Witness};
+use cdk::secret::Secret;
+use cdk::util::unix_time;
+use cdk::Amount;
 
 use crate::errors::{CashuError, CashuResult};
 
@@ -97,7 +97,7 @@ pub fn build_htlc_outputs(
 /// two (1, 2, 4, …, 2^31). Sufficient for splitting amounts into
 /// HTLC-locked outputs when the caller doesn't track a per-keyset
 /// fee schedule of its own.
-pub fn default_fee_and_amounts() -> cashu::amount::FeeAndAmounts {
+pub fn default_fee_and_amounts() -> cdk::amount::FeeAndAmounts {
     (0u64, (0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>()).into()
 }
 
@@ -116,9 +116,9 @@ pub fn add_preimage_to_proofs(proofs: &mut [Proof], preimage: &[u8; 32]) {
 /// state the caller used to construct the swap request.
 #[allow(dead_code)]
 pub fn construct_proofs(
-    response: cashu::nuts::nut03::SwapResponse,
+    response: cdk::nuts::nut03::SwapResponse,
     premints: Vec<PreMint>,
-    keys: &cashu::nuts::Keys,
+    keys: &cdk::nuts::Keys,
 ) -> CashuResult<Proofs> {
     let mut secrets = Vec::with_capacity(premints.len());
     let mut rs = Vec::with_capacity(premints.len());
@@ -162,7 +162,7 @@ pub fn extract_preimage(proofs: &[Proof]) -> CashuResult<[u8; 32]> {
 /// Compute the Y (hash-to-curve of the secret) for a proof. NUT-07's
 /// `check_state` request takes Ys, not full proofs, so callers need
 /// this to poll the mint.
-pub fn proof_y(proof: &Proof) -> CashuResult<cashu::nuts::PublicKey> {
+pub fn proof_y(proof: &Proof) -> CashuResult<cdk::nuts::PublicKey> {
     proof
         .y()
         .map_err(|e| CashuError::Nuts(format!("proof.y: {e}")))
@@ -170,7 +170,7 @@ pub fn proof_y(proof: &Proof) -> CashuResult<cashu::nuts::PublicKey> {
 
 /// Re-export so callers don't need to import the underlying NUT-14 type.
 #[allow(unused_imports)]
-pub use cashu::nuts::nut14::HTLCWitness;
+pub use cdk::nuts::nut14::HTLCWitness;
 
 /// Assert that a locktime (unix seconds) is strictly in the future.
 #[allow(dead_code)]
@@ -184,7 +184,7 @@ pub fn assert_locktime_in_future(locktime: u64) -> CashuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cashu::nuts::nut02::Id as KeysetId;
+    use cdk::nuts::nut02::Id as KeysetId;
     use std::str::FromStr;
 
     fn random_payment_hash() -> [u8; 32] {
@@ -253,7 +253,7 @@ mod tests {
             amount,
             keyset_id,
             secret: preimage,
-            c: cashu::nuts::nut01::PublicKey::from_str(
+            c: cdk::nuts::nut01::PublicKey::from_str(
                 "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
             )
             .unwrap(),

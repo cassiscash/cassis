@@ -131,8 +131,8 @@ pub enum Commands {
 pub enum CashuCommands {
     /// Send `amount` sat by picking proofs from the local
     /// wallet, swapping them at the mint, and printing a
-    /// base64-encoded proof set the recipient can paste into
-    /// their own `cashu receive`.
+    /// NUT-00 cashu token (`cashuB...`) the recipient can
+    /// paste into their own `cashu receive`.
     Send {
         /// Network spec, e.g. `cashu::mint.example.com`. Must
         /// match an adapter the local wallet can talk to
@@ -146,17 +146,15 @@ pub enum CashuCommands {
         #[arg(long)]
         amount: u64,
     },
-    /// Redeem a base64-encoded proof set against the local
-    /// mint, swap the proofs into the wallet's active keyset,
-    /// and persist the result.
+    /// Redeem a NUT-00 cashu token, swap it into the
+    /// wallet's active keyset at the mint the proofs came
+    /// from, and persist the result. The mint URL is read
+    /// from the token itself, so no `--network` flag is
+    /// needed: the proof is its own address.
     Receive {
-        /// Network spec, e.g. `cashu::mint.example.com`. Must
-        /// match the mint the pasted proof was issued by.
-        #[arg(long)]
-        network: String,
-        /// Base64-encoded JSON value: a single proof or a list
-        /// of proofs. The base64 form is the same one
-        /// `cashu send` prints; raw JSON also works.
+        /// A NUT-00 cashu token string. The wallet accepts
+        /// both V3 (`cashuA...`) and V4 (`cashuB...`) tokens
+        /// from any cashu v1.0+ wallet.
         #[arg(long = "proof")]
         proof: String,
     },

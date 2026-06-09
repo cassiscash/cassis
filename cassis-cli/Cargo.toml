@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-cashu = ["dep:cassis-cashu"]
+cashu = ["dep:cassis-cashu", "dep:cdk"]
 fedimint = ["dep:cassis-fedimint"]
 ark = ["dep:cassis-arkade"]
 liquid = ["dep:cassis-liquid"]
@@ -37,10 +37,13 @@ base64 = "0.22.1"
 path = "../networks/cassis-cashu"
 optional = true
 
-[dev-dependencies]
-# Used only by the cashu wallet store tests; same version
+# Used by the cashu wallet subcommands to encode / decode
+# NUT-00 tokens via `cdk::nuts::Token`. Same version
 # `cassis-cashu` pulls in transitively.
-cashu = { version = "0.17.3", features = ["wallet"] }
+[dependencies.cdk]
+version = "0.17.3"
+features = ["wallet"]
+optional = true
 
 [dependencies.cassis-fedimint]
 path = "../networks/cassis-fedimint"

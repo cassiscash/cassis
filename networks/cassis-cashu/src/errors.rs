@@ -23,3 +23,19 @@ pub enum CashuError {
     #[error("htlc expired")]
     HtlcExpired,
 }
+
+/// Map a `cdk::Error` (the error type used by the wallet HTTP
+/// client and the protocol layer) into a [`CashuError`]. The
+/// cdk error carries a human-readable message plus, for
+/// HTTP-level failures, the status code; we surface the whole
+/// thing so the router / wallet logs stay debuggable.
+impl From<cdk::Error> for CashuError {
+    fn from(e: cdk::Error) -> Self {
+        match &e {
+            cdk::Error::HttpError(Some(code), msg) => {
+                CashuError::Http(format!("HTTP {code}: {msg}"))
+            }
+            _ => CashuError::Mint(e.to_string()),
+        }
+    }
+}

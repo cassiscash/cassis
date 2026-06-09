@@ -65,6 +65,57 @@ pub async fn build_cashu_adapter(
     }
 }
 
+/// Same as [`build_cashu_adapter`] but takes a raw mint URL
+/// instead of a parsed `NetSpec`. The receive flow uses this
+/// when the mint URL comes out of the proof string itself
+/// rather than from `--network` / the registered networks.
+#[cfg(feature = "cashu")]
+pub async fn build_cashu_adapter_from_url(
+    mint_url: &str,
+    derived: &DerivedKeys,
+) -> Result<(NetSpec, Arc<cassis_cashu::CashuAdapter>), String> {
+    let host = mint_url_to_host(mint_url)?;
+    let network_id = cassis_core::cashu_network_id(&host);
+    let sk = derived
+        .networks
+        .get(&network_id)
+        .map(|k| *k.as_bytes())
+        .unwrap_or([0u8; 32]);
+    let adapter = cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.to_string(), sk)
+        .map_err(|e| format!("cashu adapter init failed: {e}"))?;
+    // `cashu_mint_url` rebuilds the canonical form
+    // (lowercased scheme/host, trimmed trailing slash) so the
+    // adapter stores the same string everywhere else.
+    let canonical = cassis_core::cashu_mint_url(&network_id)
+        .map_err(|e| format!("canonicalize mint url: {e}"))?;
+    let spec = NetSpec::Cashu {
+        mint_url: canonical,
+        host,
+    };
+    Ok((spec, Arc::new(adapter)))
+}
+
+/// Extract `host[:port]` from a cashu mint URL. The cashu
+/// `MintUrl` keeps the canonical `{scheme}://{host}/{path}`
+/// form, so we slice on the scheme separator and the first
+/// following slash.
+#[cfg(feature = "cashu")]
+pub fn mint_url_to_host(mint_url: &str) -> Result<String, String> {
+    let trimmed = mint_url.trim().trim_end_matches('/');
+    let after_scheme = trimmed
+        .split_once("://")
+        .ok_or_else(|| format!("mint url missing scheme: '{mint_url}'"))?
+        .1;
+    let host = after_scheme
+        .split('/')
+        .next()
+        .ok_or_else(|| format!("mint url missing host: '{mint_url}'"))?;
+    if host.is_empty() {
+        return Err(format!("mint url has empty host: '{mint_url}'"));
+    }
+    Ok(host.to_string())
+}
+
 pub struct AdapterPair {
     pub network_id: NetworkId,
     pub receiver: Arc<dyn NetworkReceiverAdapter>,

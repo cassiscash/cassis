@@ -10,9 +10,13 @@ default = []
 async-trait = "0.1.91"
 base64 = "0.22.1"
 cassis-core = { path = "../../cassis-core" }
-cashu = { version = "0.17.3", features = ["wallet"] }
+# cdk re-exports the full `cashu` type surface (cdk::nuts,
+# cdk::Amount, cdk::MintUrl, cdk::dhke, ...) and provides the
+# wallet HTTP client (cdk::wallet::HttpClient implementing
+# cdk::wallet::MintConnector). `wallet` is enabled so the
+# HTTP client is available.
+cdk = { version = "0.17.3", features = ["wallet"] }
 lowercase-hex = "0.1.1"
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "1.0.69"

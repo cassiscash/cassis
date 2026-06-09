@@ -1,18 +1,19 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use cashu::amount::{FeeAndAmounts, SplitTarget};
-use cashu::dhke::{blind_message, unblind_message};
-use cashu::nuts::nut00::{BlindedMessage, Proofs};
-use cashu::nuts::nut02::Id as KeysetId;
-use cashu::nuts::nut07::{CheckStateRequest, State as ProofState};
-use cashu::nuts::nut10::SpendingConditions;
-use cashu::nuts::nut12::ProofDleq;
-use cashu::nuts::nut14::HTLCWitness;
-use cashu::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Witness};
-use cashu::secret::Secret;
-use cashu::Amount;
-use cashu::MintUrl;
+use cdk::amount::{FeeAndAmounts, SplitTarget};
+use cdk::dhke::{blind_message, unblind_message};
+use cdk::nuts::nut00::{BlindedMessage, Proofs};
+use cdk::nuts::nut02::Id as KeysetId;
+use cdk::nuts::nut07::{CheckStateRequest, State as ProofState};
+use cdk::nuts::nut10::SpendingConditions;
+use cdk::nuts::nut12::ProofDleq;
+use cdk::nuts::nut14::HTLCWitness;
+use cdk::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Witness};
+use cdk::mint_url::MintUrl;
+use cdk::secret::Secret;
+use cdk::wallet::MintConnector;
+use cdk::Amount;
 use cassis_core::{
     Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
     OutgoingHtlc, WatchError,
@@ -24,15 +25,13 @@ use tokio::sync::{Mutex, Notify};
 
 mod errors;
 mod htlc;
-mod mint_client;
 
 use errors::{CashuError, CashuResult};
 use htlc::{
     add_preimage_to_proofs, build_htlc_outputs, htlc_conditions, proof_y, verify_proofs_htlc,
 };
-use mint_client::MintClient;
 
-pub use cashu::nuts::nut00::Proof;
+pub use cdk::nuts::nut00::Proof;
 pub use errors::CashuError as Error;
 
 /// Receiver-side state for an outstanding incoming HTLC.
@@ -88,7 +87,10 @@ pub struct CashuAdapter {
     network_id: NetworkId,
     #[allow(dead_code)]
     mint_url: MintUrl,
-    client: MintClient,
+    /// The mint HTTP client from the cdk wallet layer. It
+    /// implements [`MintConnector`], giving us the NUT-01/02/03/07
+    /// calls the adapter's DHKE and HTLC logic drives.
+    client: cdk::wallet::HttpClient,
     #[allow(dead_code)]
     secret_key: [u8; 32],
     keysets: Arc<Mutex<Vec<KeySetInfo>>>,
@@ -117,7 +119,7 @@ impl CashuAdapter {
     pub fn new(network_id: NetworkId, mint_url: String, secret_key: [u8; 32]) -> CashuResult<Self> {
         let mint_url = MintUrl::from_str(&mint_url)
             .map_err(|e| CashuError::Nuts(format!("invalid mint url '{mint_url}': {e}")))?;
-        let client = MintClient::new(mint_url.clone(), None);
+        let client = cdk::wallet::HttpClient::new(mint_url.clone(), None);
         Ok(Self {
             network_id,
             mint_url,
@@ -140,11 +142,19 @@ impl CashuAdapter {
                 return Ok(cached.clone());
             }
         }
-        let resp: KeysetResponse = self.client.get_keysets().await?;
+        let resp: KeysetResponse = self.client.get_mint_keysets().await?;
         let active: Vec<KeySetInfo> = resp.keysets.into_iter().filter(|k| k.active).collect();
         let mut guard = self.keysets.lock().await;
         *guard = active.clone();
         Ok(active)
+    }
+
+    /// Public accessor for the mint's active keyset table.
+    /// The wallet uses this when decoding a NUT-00 V3 token:
+    /// V3 carries short keyset ids, and `Token::proofs` needs
+    /// the full set to expand them.
+    pub async fn keysets(&self) -> CashuResult<Vec<KeySetInfo>> {
+        self.ensure_keysets().await
     }
 
     /// Pick the mint's active sat-denominated keyset id, falling
@@ -162,14 +172,12 @@ impl CashuAdapter {
 
     /// Fetch the public key material for `keyset_id` (NUT-01).
     /// Needed to unblind mint signatures back into spendable
-    /// ecash.
-    async fn get_keys(&self, keyset_id: &KeysetId) -> CashuResult<cashu::nuts::Keys> {
-        let resp = self.client.get_keys(keyset_id).await?;
-        resp.keysets
-            .into_iter()
-            .find(|ks| &ks.id == keyset_id)
-            .map(|ks| ks.keys)
-            .ok_or(CashuError::NoKeyset)
+    /// ecash. cdk's [`MintConnector::get_mint_keyset`] returns
+    /// the single `KeySet` directly (unlike the old
+    /// `KeysResponse` wrapper).
+    async fn get_keys(&self, keyset_id: &KeysetId) -> CashuResult<cdk::nuts::Keys> {
+        let ks = self.client.get_mint_keyset(*keyset_id).await?;
+        Ok(ks.keys)
     }
 
     /// Convert a sat-denominated amount into the keyset's
@@ -274,7 +282,7 @@ impl CashuAdapter {
         keyset_id: KeysetId,
         amounts: &[Amount],
     ) -> CashuResult<(
-        Vec<(Secret, cashu::nuts::nut01::SecretKey, Amount)>,
+        Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)>,
         Vec<BlindedMessage>,
     )> {
         let mut triples = Vec::with_capacity(n);
@@ -292,9 +300,9 @@ impl CashuAdapter {
     /// Unblind a swap response into [`Proof`]s using a parallel
     /// list of `(secret, r, amount)` triples.
     fn unblind_response(
-        response: cashu::nuts::nut03::SwapResponse,
-        triples: Vec<(Secret, cashu::nuts::nut01::SecretKey, Amount)>,
-        keys: &cashu::nuts::Keys,
+        response: cdk::nuts::nut03::SwapResponse,
+        triples: Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)>,
+        keys: &cdk::nuts::Keys,
     ) -> CashuResult<Proofs> {
         let mut proofs = Vec::with_capacity(response.signatures.len());
         for (sig, (secret, r, amount)) in response.signatures.into_iter().zip(triples) {
@@ -339,8 +347,8 @@ impl CashuAdapter {
         let split = Self::split_for_swap(total, &fee_and_amounts)?;
         let keys = self.get_keys(&keyset_id).await?;
         let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)?;
-        let request = cashu::nuts::nut03::SwapRequest::new(proofs, outputs);
-        let response = self.client.swap(&request).await?;
+        let request = cdk::nuts::nut03::SwapRequest::new(proofs, outputs);
+        let response = self.client.post_swap(request).await?;
         Self::unblind_response(response, triples, &keys)
     }
 
@@ -452,8 +460,8 @@ impl CashuAdapter {
         let keys = self.get_keys(&keyset_id).await?;
         let (triples, blinded_outputs) =
             Self::fresh_outputs(all_amounts.len(), keyset_id, &all_amounts)?;
-        let request = cashu::nuts::nut03::SwapRequest::new(picked.clone(), blinded_outputs);
-        let response = self.client.swap(&request).await?;
+        let request = cdk::nuts::nut03::SwapRequest::new(picked.clone(), blinded_outputs);
+        let response = self.client.post_swap(request).await?;
         let new_proofs = Self::unblind_response(response, triples, &keys)?;
         // The mint returns signatures in the same order as the
         // blinded messages; the first n_output are the
@@ -599,10 +607,10 @@ impl NetworkRouterAdapter for CashuAdapter {
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
 
-        let request = cashu::nuts::nut03::SwapRequest::new(inputs, output_blinded);
+        let request = cdk::nuts::nut03::SwapRequest::new(inputs, output_blinded);
         let response = self
             .client
-            .swap(&request)
+            .post_swap(request)
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let keys = self
@@ -614,7 +622,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         // order so the unblind lines up. The premints carry the
         // secrets and blinding factors; the response carries the
         // mint's blind signatures.
-        let triples: Vec<(Secret, cashu::nuts::nut01::SecretKey, Amount)> = outputs
+        let triples: Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)> = outputs
             .premints
             .into_iter()
             .map(|p| (p.secret, p.r, p.amount))
@@ -748,10 +756,10 @@ impl NetworkRouterAdapter for CashuAdapter {
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let request = cashu::nuts::nut03::SwapRequest::new(proofs, outputs);
+        let request = cdk::nuts::nut03::SwapRequest::new(proofs, outputs);
         let response = self
             .client
-            .swap(&request)
+            .post_swap(request)
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let new_proofs = Self::unblind_response(response, triples, &keys)
@@ -811,10 +819,10 @@ impl NetworkRouterAdapter for CashuAdapter {
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let request = cashu::nuts::nut03::SwapRequest::new(proofs, outputs);
+        let request = cdk::nuts::nut03::SwapRequest::new(proofs, outputs);
         let response = self
             .client
-            .swap(&request)
+            .post_swap(request)
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let _ = Self::unblind_response(response, triples, &keys)
@@ -857,7 +865,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         loop {
             let resp = self
                 .client
-                .check_state(&req)
+                .post_check_state(req.clone())
                 .await
                 .map_err(|e| WatchError::Network(e.to_string()))?;
             let spent = resp
@@ -874,7 +882,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                         ));
                     }
                 };
-                let bytes = cashu::util::hex::decode(&preimage_hex)
+                let bytes = cdk::util::hex::decode(&preimage_hex)
                     .map_err(|e| WatchError::Network(format!("decode preimage: {e}")))?;
                 if bytes.len() != 32 {
                     return Err(WatchError::Network("preimage wrong length".into()));
@@ -933,13 +941,13 @@ impl NetworkRouterAdapter for CashuAdapter {
         // tagged HTLC.
         let expected = htlc::payment_hash_hex(&payment_hash.0);
         for proof in &proofs {
-            // The proof's `secret` field is a `cashu::secret::Secret`
+            // The proof's `secret` field is a `cdk::secret::Secret`
             // (a JSON-encoded NUT-10 payload). Decode it via FromStr
             // so we can pull out the NUT-14 payment hash.
             let raw = proof.secret.to_string();
-            let nut10: cashu::nuts::nut10::Secret = serde_json::from_str(&raw)
+            let nut10: cdk::nuts::nut10::Secret = serde_json::from_str(&raw)
                 .map_err(|e| HtlcError::Network(format!("decode proof secret: {e}")))?;
-            if nut10.kind() != cashu::nuts::nut10::Kind::HTLC {
+            if nut10.kind() != cdk::nuts::nut10::Kind::HTLC {
                 return Err(HtlcError::InvalidParams(format!(
                     "proof secret kind {:?} is not HTLC",
                     nut10.kind()
@@ -1069,7 +1077,7 @@ mod tests {
     #[test]
     fn new_accepts_a_valid_mint_url() {
         let adapter = CashuAdapter::new(
-            NetworkId("cashu::mint.example.com".to_string()),
+            NetworkId("mint.example.com".to_string()),
             "https://mint.example.com".to_string(),
             [0u8; 32],
         );
@@ -1079,7 +1087,7 @@ mod tests {
     #[test]
     fn new_rejects_garbage_mint_url() {
         let adapter = CashuAdapter::new(
-            NetworkId("cashu::not a url".to_string()),
+            NetworkId("not a url".to_string()),
             "not a url".to_string(),
             [0u8; 32],
         );
@@ -1092,7 +1100,7 @@ mod tests {
     #[test]
     fn new_rejects_empty_mint_url() {
         let adapter =
-            CashuAdapter::new(NetworkId("cashu::".to_string()), "".to_string(), [0u8; 32]);
+            CashuAdapter::new(NetworkId("".to_string()), "".to_string(), [0u8; 32]);
         assert!(adapter.is_err(), "empty url must be rejected");
     }
 
@@ -1124,7 +1132,7 @@ mod tests {
             amount: Amount::from(amount),
             keyset_id: keyset,
             secret: Secret::generate(),
-            c: cashu::nuts::nut01::PublicKey::from_str(
+            c: cdk::nuts::nut01::PublicKey::from_str(
                 "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
             )
             .unwrap(),
