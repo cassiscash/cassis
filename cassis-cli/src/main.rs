@@ -927,8 +927,8 @@ async fn cmd_cashu_receive(proof: String) -> Result<(), String> {
     // always pass the mint's full keyset list — V3 needs it
     // and V4 ignores it.
     use std::str::FromStr as _;
-    let token = cdk::nuts::Token::from_str(proof.trim())
-        .map_err(|e| format!("decode cashu token: {e}"))?;
+    let token =
+        cdk::nuts::Token::from_str(proof.trim()).map_err(|e| format!("decode cashu token: {e}"))?;
     let mint_url = token
         .mint_url()
         .map_err(|e| format!("token has no mint url: {e}"))?

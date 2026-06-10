@@ -8,6 +8,7 @@ const CONTEXTS: &[(&str, &str, &str)] = &[
     ("nostr", "\x1b[33m", "nostr"),
     ("cassisd", "\x1b[36m", "cassisd"),
     ("cassis_cli", "\x1b[35m", "cassis-cli"),
+    ("cassis_client", "\x1b[33m", "cassis-client"),
 ];
 
 const OUR_TARGETS: &[&str] = &[
@@ -16,6 +17,7 @@ const OUR_TARGETS: &[&str] = &[
     "nostr",
     "cassisd",
     "cassis_cli",
+    "cassis_client",
 ];
 
 pub fn init_logging() {

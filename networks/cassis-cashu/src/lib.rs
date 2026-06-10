@@ -1,8 +1,13 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use cassis_core::{
+    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
+    OutgoingHtlc, WatchError,
+};
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
+use cdk::mint_url::MintUrl;
 use cdk::nuts::nut00::{BlindedMessage, Proofs};
 use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::nut07::{CheckStateRequest, State as ProofState};
@@ -10,14 +15,9 @@ use cdk::nuts::nut10::SpendingConditions;
 use cdk::nuts::nut12::ProofDleq;
 use cdk::nuts::nut14::HTLCWitness;
 use cdk::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Witness};
-use cdk::mint_url::MintUrl;
 use cdk::secret::Secret;
 use cdk::wallet::MintConnector;
 use cdk::Amount;
-use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, WatchError,
-};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -1099,8 +1099,7 @@ mod tests {
 
     #[test]
     fn new_rejects_empty_mint_url() {
-        let adapter =
-            CashuAdapter::new(NetworkId("".to_string()), "".to_string(), [0u8; 32]);
+        let adapter = CashuAdapter::new(NetworkId("".to_string()), "".to_string(), [0u8; 32]);
         assert!(adapter.is_err(), "empty url must be rejected");
     }
 

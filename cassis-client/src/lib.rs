@@ -11,7 +11,7 @@ use cassis_routing::{
 use futures::future::try_join_all;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -202,24 +202,73 @@ impl CassisClient {
             })
             .collect::<Result<Vec<_>, PayError>>()?;
 
-        let prepares: Vec<HopPrepare> = route
+        let prepares: Vec<(usize, HopPrepare)> = route
             .iter()
             .enumerate()
-            .map(|(idx, hop)| HopPrepare {
-                payment_hash: invoice.payment_hash,
-                amount_msat: invoice.amount_msat,
-                incoming_network: hop.incoming.clone(),
-                outgoing_network: hop.outgoing.clone(),
-                incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
-                outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
-                recipient: hop.node.node_pubkey.to_string(),
+            .map(|(idx, hop)| {
+                (
+                    idx,
+                    HopPrepare {
+                        payment_hash: invoice.payment_hash,
+                        amount_msat: invoice.amount_msat,
+                        incoming_network: hop.incoming.clone(),
+                        outgoing_network: hop.outgoing.clone(),
+                        incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
+                        outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
+                        recipient: hop.node.node_pubkey.to_string(),
+                    },
+                )
             })
             .collect();
         let prepared_futures = prepares
-            .into_iter()
-            .zip(addrs.iter().cloned())
-            .map(|(p, addr)| self.iroh_client.send_prepare(addr, p));
-        let prepared: Vec<cassis_core::HopPrepared> = try_join_all(prepared_futures).await?;
+            .iter()
+            .cloned()
+            .map(|(idx, p)| {
+                let peer = route[idx].node.node_pubkey;
+                let addr = addrs[idx].clone();
+                let route_len = route.len();
+                info!(
+                    target: "cassis_client",
+                    "PREPARE hop {idx}/{route_len}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+                     amount_msat={} incoming_deadline={} outgoing_expiry={} recipient={} payment_hash={}",
+                    p.incoming_network,
+                    p.outgoing_network,
+                    p.amount_msat,
+                    p.incoming_deadline,
+                    p.outgoing_expiry,
+                    p.recipient,
+                    p.payment_hash,
+                );
+                async move {
+                    let reply = self.iroh_client.send_prepare(addr, p.clone()).await;
+                    match &reply {
+                        Ok(ack) => info!(
+                            target: "cassis_client",
+                            "PREPARE hop {idx}/{route_len}: peer={peer} accepted={} reason={:?}",
+                            ack.accepted,
+                            ack.reason,
+                        ),
+                        Err(e) => info!(
+                            target: "cassis_client",
+                            "PREPARE hop {idx}/{route_len}: peer={peer} error={e}",
+                        ),
+                    }
+                    reply
+                }
+            });
+        let prepared_result = try_join_all(prepared_futures).await;
+        let prepared: Vec<cassis_core::HopPrepared> = match prepared_result {
+            Ok(p) => p,
+            Err(err) => {
+                // One hop failed. Drop every PREPARE future still
+                // in flight; `try_join_all` has already cancelled
+                // them on the first error. No cancellation message
+                // is sent — the surviving routers' reservations
+                // are simply abandoned and left to their own
+                // deadline.
+                return Err(PayError::from(err));
+            }
+        };
         for (i, ack) in prepared.iter().enumerate() {
             if !ack.accepted {
                 return Err(PayError::HopRejected {
@@ -274,6 +323,23 @@ impl CassisClient {
                 recipient: hop.node.node_pubkey.to_string(),
                 incoming_descriptor: descriptor,
             };
+            let peer = hop.node.node_pubkey;
+            let addr = addrs[i].clone();
+            info!(
+                target: "cassis_client",
+                "DISPATCH hop {i}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+                 amount_msat={} incoming_deadline={} outgoing_expiry={} recipient={} \
+                 payment_hash={} incoming_descriptor={:?}",
+                route.len(),
+                dispatch.incoming_network,
+                dispatch.outgoing_network,
+                dispatch.amount_msat,
+                dispatch.incoming_deadline,
+                dispatch.outgoing_expiry,
+                dispatch.recipient,
+                dispatch.payment_hash,
+                dispatch.incoming_descriptor,
+            );
             debug!(
                 target: "cassis_client",
                 "  DISPATCH hop {i}: in={} out={} amount={} msat",
@@ -281,8 +347,22 @@ impl CassisClient {
             );
             let reply = self
                 .iroh_client
-                .send_dispatch(addrs[i].clone(), dispatch)
-                .await?;
+                .send_dispatch(addr, dispatch)
+                .await
+                .map_err(|e| {
+                    info!(
+                        target: "cassis_client",
+                        "DISPATCH hop {i}/{}: peer={peer} error={e}",
+                        route.len(),
+                    );
+                    e
+                })?;
+            info!(
+                target: "cassis_client",
+                "DISPATCH hop {i}/{}: peer={peer} outgoing_descriptor={:?}",
+                route.len(),
+                reply.outgoing_descriptor,
+            );
             descriptor = reply.outgoing_descriptor;
         }
 
