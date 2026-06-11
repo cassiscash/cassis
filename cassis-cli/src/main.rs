@@ -20,8 +20,6 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "cashu")]
 use cli::CashuCommands;
 use cli::{Cli, Commands, InvoicesCommands, NetSpec, SeedCommands};
-#[cfg(feature = "cashu")]
-use store::CashuProofRow;
 use store::{InvoiceRow, InvoiceStatus, Store, StoreError};
 
 #[tokio::main]
@@ -839,61 +837,21 @@ async fn cmd_cashu_send(network: String, amount: u64) -> Result<(), String> {
     let mint_url =
         cassis_core::cashu_mint_url(&spec.network_id()).map_err(|e| format!("mint url: {e}"))?;
 
-    let mut store = open_store()?;
-    let rows: Vec<CashuProofRow> = store.list_cashu_proofs(&mint_url).map_err(map_store_err)?;
-    if rows.is_empty() {
-        return Err(format!(
-            "no local cashu proofs for {mint_url}; run `cassis-cli cashu receive` first"
-        ));
-    }
-    let available: Vec<cassis_cashu::Proof> = rows
+    let balance: u64 = adapter
+        .balance()
+        .await
         .iter()
-        .map(|r| -> Result<cassis_cashu::Proof, String> {
-            serde_json::from_slice(&r.proof_blob)
-                .map_err(|e| format!("decode local proof id={}: {e}", r.id))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let balance: u64 = rows.iter().map(|r| r.amount_sat).sum();
+        .map(|p| u64::from(p.amount))
+        .sum();
     info!(
         target: "cassis_cli",
-        "cashu send: {amount} sat from {mint_url} (local balance {balance} sat, {} proof(s))",
-        rows.len()
+        "cashu send: {amount} sat from {mint_url} (wallet balance {balance} sat)",
     );
 
     let send_result = adapter
-        .swap_proofs_for_amount(amount, available)
+        .swap_proofs_for_amount(amount)
         .await
         .map_err(|e| format!("cashu send: {e}"))?;
-
-    // Mark the consumed inputs spent and persist any change.
-    let consumed_ids: Vec<i64> = rows
-        .iter()
-        .filter(|r| {
-            send_result.inputs_used.iter().any(|p| {
-                // Match by `(amount, secret)` — proofs aren't
-                // globally unique but the local store never holds
-                // two with the same secret at the same time.
-                r.amount_sat == u64::from(p.amount)
-                    && r.proof_blob == serde_json::to_vec(p).unwrap_or_default().as_slice()
-            })
-        })
-        .map(|r| r.id)
-        .collect();
-    if consumed_ids.len() != send_result.inputs_used.len() {
-        return Err(format!(
-            "internal: matched {} local rows for {} inputs; aborting before mutating the store",
-            consumed_ids.len(),
-            send_result.inputs_used.len()
-        ));
-    }
-    store
-        .delete_cashu_proofs(&consumed_ids)
-        .map_err(map_store_err)?;
-    if !send_result.change.is_empty() {
-        store
-            .insert_cashu_proofs(&mint_url, &send_result.change)
-            .map_err(map_store_err)?;
-    }
 
     let token = encode_proof_token(&send_result.output, &mint_url)?;
     let change_sat: u64 = send_result.change.iter().map(|p| u64::from(p.amount)).sum();
@@ -970,10 +928,6 @@ async fn cmd_cashu_receive(proof: String) -> Result<(), String> {
         return Err("mint returned no proofs (swap produced empty output)".to_string());
     }
     let total_out: u64 = new_proofs.iter().map(|p| u64::from(p.amount)).sum();
-    let mut store = open_store()?;
-    store
-        .insert_cashu_proofs(&mint_url, &new_proofs)
-        .map_err(map_store_err)?;
     info!(
         target: "cassis_cli",
         "cashu receive: stored {} new proof(s) totaling {total_out} sat at {mint_url}",
@@ -1089,6 +1043,12 @@ async fn cmd_router_run(network: Vec<String>, nostr_relay: Vec<String>) -> Resul
         network_specs,
         nostr_relays: nostr_relay,
         derived_keys: derived,
+        #[cfg(feature = "cashu")]
+        cashu_store: {
+            let store: Arc<dyn cassis_cashu::CashuProofStore> =
+                Arc::new(store::CashuProofDb::new(paths::store_path()));
+            store
+        },
     };
     cassis_router::run_router(config).await
 }

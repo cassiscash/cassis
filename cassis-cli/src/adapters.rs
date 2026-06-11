@@ -57,7 +57,9 @@ pub async fn build_cashu_adapter(
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
-            let adapter = cassis_cashu::CashuAdapter::new(network_id, mint_url.clone(), sk)
+            let store: Arc<dyn cassis_cashu::CashuProofStore> =
+                Arc::new(crate::store::CashuProofDb::new(crate::paths::store_path()));
+            let adapter = cassis_cashu::CashuAdapter::new(network_id, mint_url.clone(), sk, store)
                 .map_err(|e| format!("cashu adapter init failed: {e}"))?;
             Ok(Arc::new(adapter))
         }
@@ -81,8 +83,11 @@ pub async fn build_cashu_adapter_from_url(
         .get(&network_id)
         .map(|k| *k.as_bytes())
         .unwrap_or([0u8; 32]);
-    let adapter = cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.to_string(), sk)
-        .map_err(|e| format!("cashu adapter init failed: {e}"))?;
+    let store: Arc<dyn cassis_cashu::CashuProofStore> =
+        Arc::new(crate::store::CashuProofDb::new(crate::paths::store_path()));
+    let adapter =
+        cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.to_string(), sk, store)
+            .map_err(|e| format!("cashu adapter init failed: {e}"))?;
     // `cashu_mint_url` rebuilds the canonical form
     // (lowercased scheme/host, trimmed trailing slash) so the
     // adapter stores the same string everywhere else.
@@ -134,8 +139,10 @@ async fn build_receiver(spec: &NetSpec, derived: &DerivedKeys) -> Result<Adapter
     match spec {
         #[cfg(feature = "cashu")]
         NetSpec::Cashu { mint_url, host: _ } => {
+            let store: Arc<dyn cassis_cashu::CashuProofStore> =
+                Arc::new(crate::store::CashuProofDb::new(crate::paths::store_path()));
             let adapter = Arc::new(
-                cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.clone(), sk)
+                cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.clone(), sk, store)
                     .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();

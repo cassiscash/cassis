@@ -52,6 +52,12 @@ pub struct RouterConfig {
     /// endpoint and `derived.networks` for per-network
     /// adapter signing.
     pub derived_keys: keys::DerivedKeys,
+    /// Persistence backend for cashu wallet proofs. The cashu
+    /// adapter reads and writes every held proof through this,
+    /// so balances survive router restarts. Required only when
+    /// the router is built with the `cashu` feature.
+    #[cfg(feature = "cashu")]
+    pub cashu_store: Arc<dyn cassis_cashu::CashuProofStore>,
 }
 
 /// Run the router daemon. Blocks until Ctrl-C. The caller
@@ -88,7 +94,14 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
 
     let mut adapters: HashMap<NetworkId, NetworkEntry> = HashMap::new();
     for spec in &config.network_specs {
-        match build_adapter(spec, &config.derived_keys).await {
+        match build_adapter(
+            spec,
+            &config.derived_keys,
+            #[cfg(feature = "cashu")]
+            &config.cashu_store,
+        )
+        .await
+        {
             Ok(entry) => {
                 adapters.insert(entry.network_id.clone(), entry);
             }
@@ -181,7 +194,11 @@ pub struct NetworkEntry {
 }
 
 #[allow(unused_variables)]
-async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<NetworkEntry, String> {
+async fn build_adapter(
+    spec: &str,
+    derived: &keys::DerivedKeys,
+    #[cfg(feature = "cashu")] cashu_store: &Arc<dyn cassis_cashu::CashuProofStore>,
+) -> Result<NetworkEntry, String> {
     let (kind, param) = cassis_core::split_spec(spec);
 
     match kind {
@@ -201,8 +218,13 @@ async fn build_adapter(spec: &str, derived: &keys::DerivedKeys) -> Result<Networ
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
             let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
-                cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url, sk)
-                    .map_err(|e| format!("cashu adapter init failed: {e}"))?,
+                cassis_cashu::CashuAdapter::new(
+                    network_id.clone(),
+                    mint_url,
+                    sk,
+                    cashu_store.clone(),
+                )
+                .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {

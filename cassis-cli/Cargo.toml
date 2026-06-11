@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-cashu = ["dep:cassis-cashu", "dep:cdk"]
+cashu = ["dep:cassis-cashu", "dep:cdk", "cassis-router/cashu", "cassis-core/cashu"]
 fedimint = ["dep:cassis-fedimint"]
 ark = ["dep:cassis-arkade"]
 liquid = ["dep:cassis-liquid"]

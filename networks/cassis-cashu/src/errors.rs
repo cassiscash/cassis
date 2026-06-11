@@ -22,6 +22,8 @@ pub enum CashuError {
     ProofsSpent,
     #[error("htlc expired")]
     HtlcExpired,
+    #[error("store error: {0}")]
+    Store(String),
 }
 
 /// Map a `cdk::Error` (the error type used by the wallet HTTP

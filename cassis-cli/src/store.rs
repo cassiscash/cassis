@@ -1,6 +1,8 @@
 use cassis_core::{Bytes32, NetworkId};
 use minisqlite::{Connection, Error as SqlError, Value};
 use std::path::Path;
+#[cfg(feature = "cashu")]
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "cashu")]
@@ -424,6 +426,77 @@ impl Store {
             })
             .unwrap_or(0);
         Ok(total)
+    }
+}
+
+/// A `CashuProofStore` implementation backed by the sqlite store
+/// file. Holds only the path, not a connection — minisqlite's
+/// `Connection` is not `Send`, so each operation opens a fresh,
+/// short-lived [`Store`] (same pattern the COMMIT handler uses).
+/// This keeps the adapter (which must be `Send + Sync`) free to
+/// share the store across threads.
+#[cfg(feature = "cashu")]
+#[derive(Clone)]
+pub struct CashuProofDb {
+    path: PathBuf,
+}
+
+#[cfg(feature = "cashu")]
+impl CashuProofDb {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+#[cfg(feature = "cashu")]
+impl cassis_cashu::CashuProofStore for CashuProofDb {
+    fn insert_proofs(
+        &self,
+        mint_url: &str,
+        proofs: &[cassis_cashu::Proof],
+    ) -> Result<(), cassis_cashu::Error> {
+        let mut store = Store::open(&self.path)?;
+        store.insert_cashu_proofs(mint_url, proofs)?;
+        Ok(())
+    }
+
+    fn list_proofs(&self, mint_url: &str) -> Result<Vec<cassis_cashu::Proof>, cassis_cashu::Error> {
+        let mut store = Store::open(&self.path)?;
+        let rows = store.list_cashu_proofs(mint_url)?;
+        rows.iter()
+            .map(|r| {
+                serde_json::from_slice(&r.proof_blob)
+                    .map_err(|e| cassis_cashu::Error::Store(format!("decode proof: {e}")))
+            })
+            .collect()
+    }
+
+    fn remove_proofs(
+        &self,
+        mint_url: &str,
+        proofs: &[cassis_cashu::Proof],
+    ) -> Result<(), cassis_cashu::Error> {
+        let mut store = Store::open(&self.path)?;
+        let rows = store.list_cashu_proofs(mint_url)?;
+        let drop_ids: Vec<i64> = rows
+            .iter()
+            .filter(|r| {
+                proofs.iter().any(|p| {
+                    r.amount_sat == u64::from(p.amount)
+                        && r.proof_blob == serde_json::to_vec(p).unwrap_or_default().as_slice()
+                })
+            })
+            .map(|r| r.id)
+            .collect();
+        store.delete_cashu_proofs(&drop_ids)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cashu")]
+impl From<StoreError> for cassis_cashu::Error {
+    fn from(e: StoreError) -> Self {
+        cassis_cashu::Error::Store(e.to_string())
     }
 }
 

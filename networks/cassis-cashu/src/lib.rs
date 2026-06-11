@@ -25,14 +25,15 @@ use tokio::sync::{Mutex, Notify};
 
 mod errors;
 mod htlc;
+mod store;
 
+pub use cdk::nuts::nut00::Proof;
+pub use errors::CashuError as Error;
 use errors::{CashuError, CashuResult};
 use htlc::{
     add_preimage_to_proofs, build_htlc_outputs, htlc_conditions, proof_y, verify_proofs_htlc,
 };
-
-pub use cdk::nuts::nut00::Proof;
-pub use errors::CashuError as Error;
+pub use store::CashuProofStore;
 
 /// Receiver-side state for an outstanding incoming HTLC.
 pub struct PendingIncoming {
@@ -87,6 +88,11 @@ pub struct CashuAdapter {
     network_id: NetworkId,
     #[allow(dead_code)]
     mint_url: MintUrl,
+    /// Canonical mint URL string, exactly as given to
+    /// [`CashuAdapter::new`]. This is the partition key used for
+    /// proof storage (matches `cassis_core::cashu_mint_url`, which
+    /// the wallet's sqlite store keys `cashu_proofs` rows by).
+    mint_url_str: String,
     /// The mint HTTP client from the cdk wallet layer. It
     /// implements [`MintConnector`], giving us the NUT-01/02/03/07
     /// calls the adapter's DHKE and HTLC logic drives.
@@ -102,11 +108,10 @@ pub struct CashuAdapter {
     /// In-flight incoming HTLCs we are expecting proofs for, keyed
     /// by the same payment hash.
     incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
-    /// Local ecash balance the adapter can spend. Funded by the
-    /// cross-network hop layer (Lightning deposit → NUT-04 mint →
-    /// NUT-03 swap into the active keyset) before any outgoing
-    /// HTLC is created.
-    available: Mutex<Vec<Proof>>,
+    /// Persistence for the wallet-held ecash. All proofs the adapter
+    /// receives (claims, deposits) are stored here and balances are
+    /// computed from it on demand — never held in a field.
+    store: Arc<dyn CashuProofStore>,
 }
 
 impl CashuAdapter {
@@ -115,20 +120,29 @@ impl CashuAdapter {
     /// Returns an error if `mint_url` is not a syntactically valid
     /// cashu [`MintUrl`]; there is no fallback because a real mint
     /// URL is the only way any cashu method (NUT-01, NUT-02, NUT-03,
-    /// NUT-04, NUT-05, NUT-07, …) can succeed.
-    pub fn new(network_id: NetworkId, mint_url: String, secret_key: [u8; 32]) -> CashuResult<Self> {
+    /// NUT-04, NUT-05, NUT-07, …) can succeed. `store` is the
+    /// persistence backend for the wallet-held proofs; balances are
+    /// always read back from it, never cached in the adapter.
+    pub fn new(
+        network_id: NetworkId,
+        mint_url: String,
+        secret_key: [u8; 32],
+        store: Arc<dyn CashuProofStore>,
+    ) -> CashuResult<Self> {
+        let mint_url_str = mint_url.clone();
         let mint_url = MintUrl::from_str(&mint_url)
             .map_err(|e| CashuError::Nuts(format!("invalid mint url '{mint_url}': {e}")))?;
         let client = cdk::wallet::HttpClient::new(mint_url.clone(), None);
         Ok(Self {
             network_id,
             mint_url,
+            mint_url_str,
             client,
             secret_key,
             keysets: Arc::new(Mutex::new(Vec::new())),
             outgoing: Mutex::new(HashMap::new()),
             incoming: Mutex::new(HashMap::new()),
-            available: Mutex::new(Vec::new()),
+            store,
         })
     }
 
@@ -204,18 +218,20 @@ impl CashuAdapter {
         Ok(split)
     }
 
-    /// Add unrestricted proofs to the adapter's local balance.
-    /// Production caller: the cross-network hop layer after
-    /// melting an incoming Lightning payment (NUT-05) or minting
-    /// via NUT-04. Test caller: a fixture.
-    pub async fn add_balance(&self, proofs: Vec<Proof>) {
-        let mut balance = self.available.lock().await;
-        balance.extend(proofs);
+    /// Persist new proofs to the wallet's store. Production caller:
+    /// the cross-network hop layer after melting an incoming
+    /// Lightning payment (NUT-05) or minting via NUT-04, and the
+    /// adapter itself after claiming an HTLC. Test caller: a fixture.
+    pub async fn add_balance(&self, proofs: Vec<Proof>) -> CashuResult<()> {
+        self.store.insert_proofs(&self.mint_url_str, &proofs)
     }
 
-    /// Test/diagnostic accessor: read the current local balance.
+    /// Test/diagnostic accessor: read the proofs currently held for
+    /// this mint from the store.
     pub async fn balance(&self) -> Vec<Proof> {
-        self.available.lock().await.clone()
+        self.store
+            .list_proofs(&self.mint_url_str)
+            .unwrap_or_default()
     }
 
     /// Look up a sender-side HTLC's proofs (test/diagnostic
@@ -242,7 +258,7 @@ impl CashuAdapter {
         })
     }
 
-    /// Pull unrestricted proofs from the local balance whose
+    /// Pull unrestricted proofs from the wallet store whose
     /// total amount is at least `amount_sat + fee_sat`. Returns
     /// the selected proofs and the change (if any) is left in
     /// place for the next call.
@@ -251,10 +267,10 @@ impl CashuAdapter {
         amount_sat: u64,
         keyset_id: KeysetId,
     ) -> CashuResult<Proofs> {
-        let balance = self.available.lock().await;
+        let proofs = self.store.list_proofs(&self.mint_url_str)?;
         let mut picked: Vec<Proof> = Vec::new();
         let mut total: u64 = 0;
-        for proof in balance.iter() {
+        for proof in proofs.iter() {
             if proof.keyset_id != keyset_id {
                 continue;
             }
@@ -326,11 +342,11 @@ impl CashuAdapter {
     }
 
     /// Pure NUT-03 swap: take any set of valid proofs in, return
-    /// the new proofs in the active keyset. The caller decides
-    /// what to do with the inputs (e.g. drop them, since the mint
-    /// has burned them) and the outputs (e.g. persist into a local
-    /// wallet DB). Used by the wallet's "receive" flow to swap
-    /// arbitrary proofs into the wallet's preferred keyset.
+    /// the new proofs in the active keyset. The inputs are burned
+    /// at the mint, and the outputs are persisted to the wallet
+    /// store before being returned. Used by the wallet's "receive"
+    /// flow to swap arbitrary proofs into the wallet's preferred
+    /// keyset.
     pub async fn redeem_proofs(&self, proofs: Proofs) -> CashuResult<Proofs> {
         if proofs.is_empty() {
             return Ok(Vec::new());
@@ -349,7 +365,9 @@ impl CashuAdapter {
         let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)?;
         let request = cdk::nuts::nut03::SwapRequest::new(proofs, outputs);
         let response = self.client.post_swap(request).await?;
-        Self::unblind_response(response, triples, &keys)
+        let new_proofs = Self::unblind_response(response, triples, &keys)?;
+        self.store.insert_proofs(&self.mint_url_str, &new_proofs)?;
+        Ok(new_proofs)
     }
 
     /// Per-input fee (in sats) for the keyset the inputs are in.
@@ -384,22 +402,18 @@ impl CashuAdapter {
         (picked, total)
     }
 
-    /// Wallet "send" helper: pick proofs from `available` whose
-    /// net amount (after the mint's per-input fee) covers
+    /// Wallet "send" helper: pick proofs from the wallet store
+    /// whose net amount (after the mint's per-input fee) covers
     /// `amount_sat`, swap them at the mint, and return the
     /// outgoing proofs (for the recipient) plus the change proofs
-    /// (for the wallet) plus the inputs the caller should mark
-    /// spent.
+    /// (for the wallet) plus the inputs the adapter has marked
+    /// spent. The consumed inputs are removed from the store and
+    /// the change is persisted automatically.
     ///
     /// Only proofs in the active keyset are eligible; the input
     /// fee is deducted by the mint and the surplus is returned as
-    /// change. Empty `available` or insufficient funds is an
-    /// error.
-    pub async fn swap_proofs_for_amount(
-        &self,
-        amount_sat: u64,
-        available: Vec<Proof>,
-    ) -> CashuResult<SendResult> {
+    /// change. Empty store or insufficient funds is an error.
+    pub async fn swap_proofs_for_amount(&self, amount_sat: u64) -> CashuResult<SendResult> {
         if amount_sat == 0 {
             return Err(CashuError::Nuts("amount must be > 0".into()));
         }
@@ -411,6 +425,7 @@ impl CashuAdapter {
             .cloned()
             .ok_or(CashuError::NoKeyset)?;
         let input_fee_ppk = keyset.input_fee_ppk;
+        let available = self.store.list_proofs(&self.mint_url_str)?;
 
         // First pass: pick conservatively ignoring the fee. If
         // we don't have enough, fail fast.
@@ -462,6 +477,9 @@ impl CashuAdapter {
             Self::fresh_outputs(all_amounts.len(), keyset_id, &all_amounts)?;
         let request = cdk::nuts::nut03::SwapRequest::new(picked.clone(), blinded_outputs);
         let response = self.client.post_swap(request).await?;
+        // The mint burned the picked inputs; drop them from the
+        // store so balances stay accurate.
+        self.store.remove_proofs(&self.mint_url_str, &picked)?;
         let new_proofs = Self::unblind_response(response, triples, &keys)?;
         // The mint returns signatures in the same order as the
         // blinded messages; the first n_output are the
@@ -473,6 +491,10 @@ impl CashuAdapter {
             )));
         }
         let (output, change) = new_proofs.split_at(n_output);
+        // Persist the change back to the wallet.
+        if !change.is_empty() {
+            self.store.insert_proofs(&self.mint_url_str, change)?;
+        }
         Ok(SendResult {
             inputs_used: picked,
             output: output.to_vec(),
@@ -481,9 +503,9 @@ impl CashuAdapter {
     }
 }
 
-/// Result of [`CashuAdapter::swap_proofs_for_amount`]. The caller
-/// marks `inputs_used` as spent (the mint already burned them)
-/// and persists `change` in its local wallet; `output` is the
+/// Result of [`CashuAdapter::swap_proofs_for_amount`]. The adapter
+/// has already removed `inputs_used` from the store (the mint burned
+/// them) and persisted `change` in the wallet; `output` is the
 /// proof set to hand to the recipient.
 #[derive(Clone, Debug)]
 pub struct SendResult {
@@ -607,11 +629,16 @@ impl NetworkRouterAdapter for CashuAdapter {
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
 
-        let request = cdk::nuts::nut03::SwapRequest::new(inputs, output_blinded);
+        let request = cdk::nuts::nut03::SwapRequest::new(inputs.clone(), output_blinded);
         let response = self
             .client
             .post_swap(request)
             .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        // The mint burned the input proofs at the swap; drop them
+        // from the wallet store so balances stay accurate.
+        self.store
+            .remove_proofs(&self.mint_url_str, &inputs)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let keys = self
             .get_keys(&keyset_id)
@@ -764,10 +791,11 @@ impl NetworkRouterAdapter for CashuAdapter {
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let new_proofs = Self::unblind_response(response, triples, &keys)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        // Add the freshly-minted proofs to the receiver's
-        // local balance so the adapter can spend them on
-        // future hops.
-        self.add_balance(new_proofs).await;
+        // Add the freshly-minted proofs to the receiver's wallet
+        // store so the adapter can spend them on future hops.
+        self.add_balance(new_proofs)
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
 
         // Drop the receiver's wait registration.
         let mut incoming = self.incoming.lock().await;
@@ -825,7 +853,12 @@ impl NetworkRouterAdapter for CashuAdapter {
             .post_swap(request)
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let _ = Self::unblind_response(response, triples, &keys)
+        // The refunded proofs are unrestricted ecash we hold again;
+        // persist them so the wallet can spend them later.
+        let refunded = Self::unblind_response(response, triples, &keys)
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        self.add_balance(refunded)
+            .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let mut outgoing = self.outgoing.lock().await;
         outgoing.remove(&payment_hash);
@@ -899,7 +932,7 @@ impl NetworkRouterAdapter for CashuAdapter {
     }
 
     /// PREPARE-time check: do we have enough unrestricted ecash
-    /// in the local balance to back an outgoing HTLC of
+    /// in the wallet store to back an outgoing HTLC of
     /// `amount_msat`? We round up to sats the same way
     /// [`NetworkRouterAdapter::create_outgoing_htlc`] does, so
     /// a green light here means the actual swap won't fail for
@@ -910,8 +943,12 @@ impl NetworkRouterAdapter for CashuAdapter {
             .active_keyset_id()
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let balance = self.available.lock().await;
-        let total_sat: u64 = balance
+        let proofs = self
+            .store
+            .list_proofs(&self.mint_url_str)
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+
+        let total_sat: u64 = proofs
             .iter()
             .filter(|p| p.keyset_id == keyset_id)
             .map(|p| u64::from(p.amount))
@@ -1073,6 +1110,11 @@ fn wait_grace_secs(deadline: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use store::InMemoryProofStore;
+
+    fn test_store() -> Arc<dyn CashuProofStore> {
+        Arc::new(InMemoryProofStore::new())
+    }
 
     #[test]
     fn new_accepts_a_valid_mint_url() {
@@ -1080,6 +1122,7 @@ mod tests {
             NetworkId("mint.example.com".to_string()),
             "https://mint.example.com".to_string(),
             [0u8; 32],
+            test_store(),
         );
         assert!(adapter.is_ok(), "valid url should construct");
     }
@@ -1090,6 +1133,7 @@ mod tests {
             NetworkId("not a url".to_string()),
             "not a url".to_string(),
             [0u8; 32],
+            test_store(),
         );
         assert!(
             adapter.is_err(),
@@ -1099,7 +1143,12 @@ mod tests {
 
     #[test]
     fn new_rejects_empty_mint_url() {
-        let adapter = CashuAdapter::new(NetworkId("".to_string()), "".to_string(), [0u8; 32]);
+        let adapter = CashuAdapter::new(
+            NetworkId("".to_string()),
+            "".to_string(),
+            [0u8; 32],
+            test_store(),
+        );
         assert!(adapter.is_err(), "empty url must be rejected");
     }
 
