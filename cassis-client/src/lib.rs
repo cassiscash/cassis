@@ -229,8 +229,9 @@ impl CassisClient {
                 let route_len = route.len();
                 info!(
                     target: "cassis_client",
-                    "PREPARE hop {idx}/{route_len}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+                    "PREPARE hop {}/{route_len}: peer={peer} addr={addr:?} incoming={} outgoing={} \
                      amount_msat={} incoming_deadline={} outgoing_expiry={} recipient={} payment_hash={}",
+                    idx+1,
                     p.incoming_network,
                     p.outgoing_network,
                     p.amount_msat,
@@ -244,13 +245,15 @@ impl CassisClient {
                     match &reply {
                         Ok(ack) => info!(
                             target: "cassis_client",
-                            "PREPARE hop {idx}/{route_len}: peer={peer} accepted={} reason={:?}",
+                            "PREPARE hop {}/{route_len}: peer={peer} accepted={} reason={:?}",
+                            idx+1,
                             ack.accepted,
                             ack.reason,
                         ),
                         Err(e) => info!(
                             target: "cassis_client",
-                            "PREPARE hop {idx}/{route_len}: peer={peer} error={e}",
+                            "PREPARE hop {}/{route_len}: peer={peer} error={e}",
+                            idx+1
                         ),
                     }
                     reply
