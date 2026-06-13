@@ -351,6 +351,51 @@ impl CassisRouter {
     /// Committed flow directly from sender to receiver
     /// (payee's `cassis-cli`) without crossing a router hop.
     pub async fn handle_frame(&self, frame: Frame) -> Result<Frame, IrohError> {
+        match &frame {
+            Frame::Prepare(p) => {
+                info!(
+                    target: "cassis_router",
+                    "received PREPARE: payment_hash={} amount_msat={} {} -> {} via {} \
+                     incoming_deadline={} outgoing_expiry={}",
+                    p.payment_hash,
+                    p.amount_msat,
+                    p.incoming_network,
+                    p.outgoing_network,
+                    p.recipient,
+                    p.incoming_deadline,
+                    p.outgoing_expiry,
+                );
+            }
+            Frame::Dispatch(d) => {
+                info!(
+                    target: "cassis_router",
+                    "received DISPATCH: payment_hash={} amount_msat={} {} -> {} via {} \
+                     incoming_deadline={} outgoing_expiry={}",
+                    d.payment_hash,
+                    d.amount_msat,
+                    d.incoming_network,
+                    d.outgoing_network,
+                    d.recipient,
+                    d.incoming_deadline,
+                    d.outgoing_expiry,
+                );
+            }
+            Frame::Commit(c) => {
+                info!(
+                    target: "cassis_router",
+                    "received COMMIT (unusual for a router): payment_hash={} amount_msat={} network={}",
+                    c.payment_hash, c.amount_msat, c.network,
+                );
+            }
+            other => {
+                warn!(
+                    target: "cassis_router",
+                    "received unexpected frame: payment_hash={} {:?}",
+                    other.payment_hash(),
+                    other,
+                );
+            }
+        }
         match frame {
             Frame::Prepare(p) => self
                 .handle_prepare(p)
@@ -390,14 +435,6 @@ impl CassisRouter {
                 outgoing_raw, prepare.outgoing_network,
             );
         }
-        info!(
-            target: "cassis_router",
-            "iroh PREPARE: {} msat {} -> {} via {}",
-            prepare.amount_msat,
-            prepare.incoming_network,
-            prepare.outgoing_network,
-            prepare.recipient,
-        );
         self.validate_prepare(&prepare)?;
 
         // Funds check on the outgoing side: the adapter must
@@ -410,6 +447,11 @@ impl CassisRouter {
             .get(&prepare.outgoing_network)
             .ok_or_else(|| "outgoing network unsupported".to_string())?;
         if let Err(e) = outgoing_entry.adapter.can_route(prepare.amount_msat).await {
+            warn!(
+                target: "cassis_router",
+                "PREPARE rejected: payment_hash={} reason=can_route failed: {e}",
+                prepare.payment_hash,
+            );
             return Ok(HopPrepared {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
@@ -419,6 +461,15 @@ impl CassisRouter {
 
         let mut prepared = self.prepared.lock().await;
         prepared.insert(prepare.payment_hash, prepare.clone());
+        info!(
+            target: "cassis_router",
+            "PREPARE accepted: payment_hash={} amount_msat={} {} -> {} via {}",
+            prepare.payment_hash,
+            prepare.amount_msat,
+            prepare.incoming_network,
+            prepare.outgoing_network,
+            prepare.recipient,
+        );
         Ok(HopPrepared {
             payment_hash: prepare.payment_hash,
             accepted: true,
@@ -431,15 +482,6 @@ impl CassisRouter {
     /// the outgoing HTLC on the outgoing adapter and stash
     /// state for the poll loop.
     async fn handle_dispatch(&self, dispatch: HopDispatch) -> Result<HopDispatched, String> {
-        info!(
-            target: "cassis_router",
-            "iroh DISPATCH: {} msat {} -> {} via {}",
-            dispatch.amount_msat,
-            dispatch.incoming_network,
-            dispatch.outgoing_network,
-            dispatch.recipient,
-        );
-
         // Look up the matching PREPARE; the sender must have
         // PREPAREd us first.
         let prepare = {
@@ -564,6 +606,17 @@ impl CassisRouter {
             prepared.remove(&dispatch.payment_hash);
         }
 
+        info!(
+            target: "cassis_router",
+            "DISPATCH done: payment_hash={} amount_msat={} {} -> {} via {} \
+             outgoing_descriptor={:?}",
+            dispatch.payment_hash,
+            dispatch.amount_msat,
+            dispatch.incoming_network,
+            dispatch.outgoing_network,
+            dispatch.recipient,
+            outgoing_descriptor,
+        );
         Ok(HopDispatched {
             payment_hash: dispatch.payment_hash,
             outgoing_descriptor,
@@ -579,8 +632,10 @@ impl CassisRouter {
     async fn handle_commit(&self, commit: HopCommit) -> Result<HopCommitted, String> {
         info!(
             target: "cassis_router",
-            "iroh COMMIT (received by router, unusual): {} msat on {}",
-            commit.amount_msat, commit.network,
+            "COMMIT (received by router, unusual): payment_hash={} amount_msat={} network={}",
+            commit.payment_hash,
+            commit.amount_msat,
+            commit.network,
         );
         // Routers don't hold preimages; the final receiver
         // does. The COMMIT handler on a router is a no-op
