@@ -7,6 +7,7 @@ const CONTEXTS: &[(&str, &str, &str)] = &[
     ("iroh_client", "\x1b[32m", "iroh client"),
     ("nostr", "\x1b[33m", "nostr"),
     ("cassisd", "\x1b[36m", "cassisd"),
+    ("cassis_router", "\x1b[36m", "router"),
     ("cassis_cli", "\x1b[35m", "cassis-cli"),
     ("cassis_client", "\x1b[33m", "cassis-client"),
 ];
@@ -16,6 +17,7 @@ const OUR_TARGETS: &[&str] = &[
     "iroh_client",
     "nostr",
     "cassisd",
+    "cassis_router",
     "cassis_cli",
     "cassis_client",
 ];
