@@ -1,6 +1,6 @@
 use cassis_core::{NetworkId, RouteAnnouncement};
 use log::{debug, info};
-use ritualistic::{Filter, Kind, Network, SubscriptionOptions};
+use ritualistic::{Filter, Kind, Network, SubscriptionOptions, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -13,6 +13,12 @@ pub use delta_table::{fallback_incoming_delta, fallback_transit_slack};
 /// Maximum time we wait for Nostr relays to respond in
 /// [`fetch_announcements`] before giving up.
 const FETCH_ANNOUNCEMENTS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Only consider route-announcement events published in the last
+/// day when building the routing graph. Stale announcements from
+/// routers that went offline are ignored, so route computation
+/// reflects nodes that are currently advertising.
+const ANNOUNCEMENTS_MAX_AGE_SECS: u32 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeGraph {
@@ -140,6 +146,13 @@ pub async fn fetch_announcements_with_timeout(
 
     let filter = Filter {
         kinds: Some(vec![Kind(KIND_ROUTE_ANNOUNCEMENT)]),
+        since: Some(Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0)
+                .saturating_sub(ANNOUNCEMENTS_MAX_AGE_SECS),
+        )),
         limit: Some(1000),
         ..Default::default()
     };
