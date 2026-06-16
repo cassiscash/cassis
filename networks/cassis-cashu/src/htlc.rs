@@ -132,13 +132,44 @@ pub fn construct_proofs(
 }
 
 /// Verify that a set of proofs is correctly locked under NUT-14
-/// HTLC conditions. Useful as a sanity check after receiving proofs
-/// from a peer or from the mint.
+/// HTLC conditions. Only meaningful once a preimage witness is
+/// attached (the receiver path) or after the locktime has passed
+/// (the sender-refund path); [`verify_htlc`] rejects a locked proof
+/// with no witness while its locktime is still in the future, because
+/// the refund path does not exist yet.
 pub fn verify_proofs_htlc(proofs: &[Proof]) -> CashuResult<()> {
     for proof in proofs {
         proof
             .verify_htlc()
             .map_err(|e| CashuError::Nuts(format!("HTLC verification failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Verify that `proofs` are structurally HTLC-locked to
+/// `payment_hash`, without requiring a preimage witness or a passed
+/// locktime. Each proof's secret must decode to a NUT-10 secret of
+/// HTLC kind whose `data` field is the payment hash. This is the
+/// check the sender runs right after a swap, and the mid-hop receiver
+/// runs at DISPATCH time, when the proofs are freshly locked and no
+/// witness is available yet.
+pub fn verify_proofs_htlc_locked(proofs: &[Proof], payment_hash: &[u8; 32]) -> CashuResult<()> {
+    let expected = payment_hash_hex(payment_hash);
+    for proof in proofs {
+        let nut10: Nut10Secret = serde_json::from_str(&proof.secret.to_string())
+            .map_err(|e| CashuError::Nuts(format!("decode proof secret: {e}")))?;
+        if nut10.kind() != cdk::nuts::nut10::Kind::HTLC {
+            return Err(CashuError::Nuts(format!(
+                "proof secret kind {:?} is not HTLC",
+                nut10.kind()
+            )));
+        }
+        let data = nut10.secret_data().data().to_string();
+        if data != expected {
+            return Err(CashuError::Nuts(format!(
+                "proof HTLC hash mismatch: expected {expected}, got {data}"
+            )));
+        }
     }
     Ok(())
 }

@@ -32,6 +32,7 @@ pub use errors::CashuError as Error;
 use errors::{CashuError, CashuResult};
 use htlc::{
     add_preimage_to_proofs, build_htlc_outputs, htlc_conditions, proof_y, verify_proofs_htlc,
+    verify_proofs_htlc_locked,
 };
 pub use store::CashuProofStore;
 
@@ -258,36 +259,6 @@ impl CashuAdapter {
         })
     }
 
-    /// Pull unrestricted proofs from the wallet store whose
-    /// total amount is at least `amount_sat + fee_sat`. Returns
-    /// the selected proofs and the change (if any) is left in
-    /// place for the next call.
-    async fn take_unrestricted_proofs(
-        &self,
-        amount_sat: u64,
-        keyset_id: KeysetId,
-    ) -> CashuResult<Proofs> {
-        let proofs = self.store.list_proofs(&self.mint_url_str)?;
-        let mut picked: Vec<Proof> = Vec::new();
-        let mut total: u64 = 0;
-        for proof in proofs.iter() {
-            if proof.keyset_id != keyset_id {
-                continue;
-            }
-            picked.push(proof.clone());
-            total = total.saturating_add(u64::from(proof.amount));
-            if total >= amount_sat {
-                break;
-            }
-        }
-        if total < amount_sat {
-            return Err(CashuError::Nuts(format!(
-                "insufficient balance: need {amount_sat} sat, have {total} sat"
-            )));
-        }
-        Ok(picked)
-    }
-
     /// Build `n` fresh blinding triples (`secret`, `r`,
     /// `amount`) for a swap's outputs. Uses [`Secret::generate`]
     /// for each output; NUT-13 deterministic chains would be
@@ -379,14 +350,17 @@ impl CashuAdapter {
 
     /// Greedy pick: from `available` (assumed sorted by the
     /// caller) take the first proofs in `keyset_id` until their
-    /// total amount is at least `min_total_sat`. Returns
-    /// `(picked, picked_total)`. Empty `available` or no
-    /// matching keyset returns `([], 0)`.
+    /// total amount covers `amount_sat` *plus* the mint's per-input
+    /// fee for the picked set. Returns `(picked, picked_total,
+    /// fee_sat)` where `picked_total >= amount_sat + fee_sat` when
+    /// enough proofs exist (the surplus is the change). Empty
+    /// `available` or no matching keyset returns `([], 0, 0)`.
     fn pick_inputs(
         available: &[Proof],
         keyset_id: KeysetId,
-        min_total_sat: u64,
-    ) -> (Vec<Proof>, u64) {
+        amount_sat: u64,
+        input_fee_ppk: u64,
+    ) -> (Vec<Proof>, u64, u64) {
         let mut picked: Vec<Proof> = Vec::new();
         let mut total: u64 = 0;
         for proof in available {
@@ -395,11 +369,13 @@ impl CashuAdapter {
             }
             picked.push(proof.clone());
             total = total.saturating_add(u64::from(proof.amount));
-            if total >= min_total_sat {
+            let fee_sat = Self::input_fee_sat(picked.len(), input_fee_ppk);
+            if total >= amount_sat.saturating_add(fee_sat) {
                 break;
             }
         }
-        (picked, total)
+        let fee_sat = Self::input_fee_sat(picked.len(), input_fee_ppk);
+        (picked, total, fee_sat)
     }
 
     /// Wallet "send" helper: pick proofs from the wallet store
@@ -427,31 +403,14 @@ impl CashuAdapter {
         let input_fee_ppk = keyset.input_fee_ppk;
         let available = self.store.list_proofs(&self.mint_url_str)?;
 
-        // First pass: pick conservatively ignoring the fee. If
-        // we don't have enough, fail fast.
-        let (picked_first, total_first) = Self::pick_inputs(&available, keyset_id, amount_sat);
-        if total_first < amount_sat {
-            return Err(CashuError::Nuts(format!(
-                "insufficient cashu balance: need {amount_sat} sat, have {total_first} sat"
-            )));
-        }
-
-        // Add a small buffer for the input fee. Round up the
-        // number of inputs we expect to need; the worst case is
-        // every pick adds fee.
-        let needed_with_fee =
-            amount_sat.saturating_add(Self::input_fee_sat(picked_first.len(), input_fee_ppk));
-        let (picked, total_in) = if total_first >= needed_with_fee {
-            (picked_first, total_first)
-        } else {
-            // Pick one more input to cover the fee; if we run out
-            // the loop will stop and we'll fail below.
-            Self::pick_inputs(&available, keyset_id, needed_with_fee)
-        };
-        let fee_sat = Self::input_fee_sat(picked.len(), input_fee_ppk);
+        // Pick inputs covering `amount_sat` plus the per-input fee.
+        // `pick_inputs` keeps adding proofs until the total is
+        // `>= amount_sat + fee`, so any surplus is change.
+        let (picked, total_in, fee_sat) =
+            Self::pick_inputs(&available, keyset_id, amount_sat, input_fee_ppk);
         if total_in < amount_sat.saturating_add(fee_sat) {
             return Err(CashuError::Nuts(format!(
-                "insufficient cashu balance after fee: need {} sat (amount + fee), have {} sat",
+                "insufficient cashu balance: need {} sat (amount + fee), have {} sat",
                 amount_sat.saturating_add(fee_sat),
                 total_in
             )));
@@ -613,21 +572,52 @@ impl NetworkRouterAdapter for CashuAdapter {
                 other => HtlcError::Network(other.to_string()),
             },
         )?;
-        let output_blinded = outputs
-            .premints
-            .iter()
-            .map(|p| p.blinded_message.clone())
-            .collect::<Vec<_>>();
+        let n_output = outputs.premints.len();
 
         // Pull unrestricted input proofs from the local
         // balance. The cross-network hop layer is expected to
         // top up the balance (NUT-04 mint, NUT-05 melt, or a
         // direct deposit) before any `pay_invoice` lands on the
-        // cashu network.
-        let inputs = self
-            .take_unrestricted_proofs(amount_sat, keyset_id)
-            .await
+        // cashu network. The greedy pick may overshoot
+        // `amount_sat`; the surplus is returned as change below,
+        // otherwise the mint rejects the swap as unbalanced
+        // (inputs must equal outputs + fee).
+        let available = self
+            .store
+            .list_proofs(&self.mint_url_str)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
+        let (inputs, inputs_total, fee_sat) =
+            Self::pick_inputs(&available, keyset_id, amount_sat, keyset.input_fee_ppk);
+        if inputs_total < amount_sat.saturating_add(fee_sat) {
+            return Err(HtlcError::Network(format!(
+                "insufficient cashu balance: need {} sat (amount + fee), have {} sat",
+                amount_sat.saturating_add(fee_sat),
+                inputs_total
+            )));
+        }
+        let change_sat = inputs_total
+            .saturating_sub(amount_sat)
+            .saturating_sub(fee_sat);
+
+        // Build unrestricted change outputs for the surplus so
+        // the swap stays balanced.
+        let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
+        let change_amounts = if change_sat > 0 {
+            Self::split_for_swap(change_sat, &fee_and_amounts)
+                .map_err(|e| HtlcError::Network(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let (change_triples, change_blinded) =
+            Self::fresh_outputs(change_amounts.len(), keyset_id, &change_amounts)
+                .map_err(|e| HtlcError::Network(e.to_string()))?;
+
+        let mut output_blinded = outputs
+            .premints
+            .iter()
+            .map(|p| p.blinded_message.clone())
+            .collect::<Vec<_>>();
+        output_blinded.extend(change_blinded);
 
         let request = cdk::nuts::nut03::SwapRequest::new(inputs.clone(), output_blinded);
         let response = self
@@ -648,16 +638,34 @@ impl NetworkRouterAdapter for CashuAdapter {
         // Re-build the (secret, r, amount) triples in the same
         // order so the unblind lines up. The premints carry the
         // secrets and blinding factors; the response carries the
-        // mint's blind signatures.
-        let triples: Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)> = outputs
+        // mint's blind signatures. HTLC premints come first,
+        // change triples after.
+        let mut triples: Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)> = outputs
             .premints
             .into_iter()
             .map(|p| (p.secret, p.r, p.amount))
             .collect();
-        let proofs = Self::unblind_response(response, triples, &keys)
+        triples.extend(change_triples);
+        let new_proofs = Self::unblind_response(response, triples, &keys)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        verify_proofs_htlc(&proofs).map_err(|e| HtlcError::Network(e.to_string()))?;
-        let _ = keyset; // currently unused beyond the lookup
+        if new_proofs.len() < n_output {
+            return Err(HtlcError::Network(format!(
+                "mint returned {} proofs, expected at least {n_output}",
+                new_proofs.len()
+            )));
+        }
+        let (proofs, change) = new_proofs.split_at(n_output);
+        // The proofs are freshly locked (no witness, locktime still in
+        // the future), so `verify_htlc` cannot validate them; check
+        // the secret structure against the payment hash instead.
+        verify_proofs_htlc_locked(proofs, &payment_hash.0)
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        // Persist the change back to the wallet.
+        if !change.is_empty() {
+            self.store
+                .insert_proofs(&self.mint_url_str, change)
+                .map_err(|e| HtlcError::Network(e.to_string()))?;
+        }
 
         {
             let mut outgoing = self.outgoing.lock().await;
@@ -669,7 +677,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                     conditions: htlc_conditions(&payment_hash.0, expiry)
                         .map_err(|e| HtlcError::InvalidParams(e.to_string()))?,
                     keyset_id,
-                    proofs: Mutex::new(proofs.clone()),
+                    proofs: Mutex::new(proofs.to_vec()),
                     recipient: recipient.to_string(),
                 },
             );
@@ -682,7 +690,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         let arrival = {
             let mut incoming = self.incoming.lock().await;
             if let Some(slot) = incoming.get_mut(&payment_hash) {
-                *slot.proofs.lock().await = Some(proofs.clone());
+                *slot.proofs.lock().await = Some(proofs.to_vec());
                 Some(slot.arrival.clone())
             } else {
                 None
@@ -971,32 +979,8 @@ impl NetworkRouterAdapter for CashuAdapter {
         payment_hash: Bytes32,
     ) -> Result<(), HtlcError> {
         let proofs = proofs_from_descriptor(descriptor)?;
-        verify_proofs_htlc(&proofs).map_err(|e| HtlcError::Network(e.to_string()))?;
-        // Each proof's NUT-14 secret embeds the payment hash;
-        // verify they all match. Proofs are `verify_htlc`-valid
-        // by the call above, so the secret is parseable and
-        // tagged HTLC.
-        let expected = htlc::payment_hash_hex(&payment_hash.0);
-        for proof in &proofs {
-            // The proof's `secret` field is a `cdk::secret::Secret`
-            // (a JSON-encoded NUT-10 payload). Decode it via FromStr
-            // so we can pull out the NUT-14 payment hash.
-            let raw = proof.secret.to_string();
-            let nut10: cdk::nuts::nut10::Secret = serde_json::from_str(&raw)
-                .map_err(|e| HtlcError::Network(format!("decode proof secret: {e}")))?;
-            if nut10.kind() != cdk::nuts::nut10::Kind::HTLC {
-                return Err(HtlcError::InvalidParams(format!(
-                    "proof secret kind {:?} is not HTLC",
-                    nut10.kind()
-                )));
-            }
-            let data = nut10.secret_data().data().to_string();
-            if data != expected {
-                return Err(HtlcError::InvalidParams(format!(
-                    "proof HTLC hash mismatch: expected {expected}, got {data}"
-                )));
-            }
-        }
+        verify_proofs_htlc_locked(&proofs, &payment_hash.0)
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
         Ok(())
     }
 
@@ -1012,7 +996,8 @@ impl NetworkRouterAdapter for CashuAdapter {
         deadline: u64,
     ) -> Result<(), HtlcError> {
         let proofs = proofs_from_descriptor(descriptor)?;
-        verify_proofs_htlc(&proofs).map_err(|e| HtlcError::Network(e.to_string()))?;
+        verify_proofs_htlc_locked(&proofs, &payment_hash.0)
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
         let amount_sat: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
         let payment_hash_hex = htlc::payment_hash_hex(&payment_hash.0);
         let mut incoming = self.incoming.lock().await;
@@ -1200,13 +1185,14 @@ mod tests {
             fake_proof(4, other),
             fake_proof(8, target),
         ];
-        let (picked, total) = CashuAdapter::pick_inputs(&proofs, target, 5);
+        let (picked, total, fee) = CashuAdapter::pick_inputs(&proofs, target, 5, 0);
         // 2-sat is the first matching proof; 4-sat is skipped
         // (wrong keyset); 8-sat is the second matching proof
         // and meets the 5-sat target. Both target-keyset
         // proofs are picked, the other-keyset one is not.
         assert_eq!(picked.len(), 2);
         assert_eq!(total, 10);
+        assert_eq!(fee, 0);
         assert!(picked.iter().all(|p| p.keyset_id == target));
     }
 
@@ -1218,11 +1204,12 @@ mod tests {
             fake_proof(2, target),
             fake_proof(4, target),
         ];
-        let (picked, total) = CashuAdapter::pick_inputs(&proofs, target, 3);
+        let (picked, total, fee) = CashuAdapter::pick_inputs(&proofs, target, 3, 0);
         // 1 + 2 already meets the 3-sat target; the 4 should
         // not be picked.
         assert_eq!(picked.len(), 2);
         assert_eq!(total, 3);
+        assert_eq!(fee, 0);
     }
 
     #[test]
@@ -1230,8 +1217,24 @@ mod tests {
         let target = KeysetId::from_str("009a1f293253e41e").unwrap();
         let other = KeysetId::from_str("009a1f293253e41f").unwrap();
         let proofs = vec![fake_proof(1, other), fake_proof(2, other)];
-        let (picked, total) = CashuAdapter::pick_inputs(&proofs, target, 1);
+        let (picked, total, fee) = CashuAdapter::pick_inputs(&proofs, target, 1, 0);
         assert!(picked.is_empty());
         assert_eq!(total, 0);
+        assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn pick_inputs_covers_amount_plus_fee() {
+        let target = KeysetId::from_str("009a1f293253e41e").unwrap();
+        // 1000 ppk = 1 sat per input.
+        let proofs = vec![fake_proof(4, target), fake_proof(8, target)];
+        // 4 sat covers amount 4 but not amount 4 + 1 sat fee;
+        // the picker must keep going and grab the 8.
+        let (picked, total, fee) = CashuAdapter::pick_inputs(&proofs, target, 4, 1000);
+        assert_eq!(picked.len(), 2);
+        assert_eq!(total, 12);
+        assert_eq!(fee, 2);
+        // total >= amount + fee holds.
+        assert!(total >= 4 + fee);
     }
 }
