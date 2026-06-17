@@ -330,9 +330,10 @@ impl CassisClient {
             let addr = addrs[i].clone();
             info!(
                 target: "cassis_client",
-                "DISPATCH hop {i}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+                "DISPATCH hop {}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
                  amount_msat={} incoming_deadline={} outgoing_expiry={} recipient={} \
                  payment_hash={} incoming_descriptor={:?}",
+                i+1,
                 route.len(),
                 dispatch.incoming_network,
                 dispatch.outgoing_network,
@@ -345,7 +346,8 @@ impl CassisClient {
             );
             debug!(
                 target: "cassis_client",
-                "  DISPATCH hop {i}: in={} out={} amount={} msat",
+                "  DISPATCH hop {}: in={} out={} amount={} msat",
+                i+1,
                 hop.incoming, hop.outgoing, invoice.amount_msat
             );
             let reply = self
@@ -355,14 +357,16 @@ impl CassisClient {
                 .map_err(|e| {
                     info!(
                         target: "cassis_client",
-                        "DISPATCH hop {i}/{}: peer={peer} error={e}",
+                        "DISPATCH hop {}/{}: peer={peer} error={e}",
+                        i+1,
                         route.len(),
                     );
                     e
                 })?;
             info!(
                 target: "cassis_client",
-                "DISPATCH hop {i}/{}: peer={peer} outgoing_descriptor={:?}",
+                "DISPATCH hop {}/{}: peer={peer} outgoing_descriptor={:?}",
+                i+1,
                 route.len(),
                 reply.outgoing_descriptor,
             );
