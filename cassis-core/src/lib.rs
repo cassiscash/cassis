@@ -423,32 +423,27 @@ pub struct HopReject {
 /// order to claim it (or, in the case of networks that "sell their
 /// own preimage", to observe the settlement).
 ///
-/// The tag is the network's [`NetworkId`] (cassis canonical form),
-/// not a free-form string, so the wire decoder rejects descriptors
-/// that don't match the hop they're attached to. Variants for
-/// networks whose adapter is still a stub carry no payload; they
-/// only exist so the type stays exhaustive and JSON shape is
-/// preserved across upgrades.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "network", content = "payload")]
+/// This type crosses the wire inside the hop protocol frames, which
+/// are serialized with postcard. Postcard cannot deserialize
+/// internally-tagged (`#[serde(tag, content)]`) enums — they require
+/// `deserialize_any`, which postcard rejects — so the enum must stay
+/// externally tagged. Variants for networks whose adapter is still a
+/// stub carry no payload; they only exist so the type stays
+/// exhaustive and JSON shape is preserved across upgrades.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HtlcDescriptor {
     /// NUT-14 HTLC locked ecash proofs, one base64-encoded JSON
     /// NUT-00 [`Proof`] per element.
-    #[serde(rename = "cashu")]
     Cashu { proofs_b64: Vec<String> },
     /// Stub for liquid: no on-wire shape yet.
-    #[serde(rename = "liquid")]
     Liquid {},
     /// Stub for ark: no on-wire shape yet.
-    #[serde(rename = "ark")]
     Ark {},
     /// Stub for rootstock: no on-wire shape yet.
-    #[serde(rename = "rootstock")]
     Rootstock {},
     /// Fedimint LNv2 contract, identified by the Bolt11 invoice the
     /// counter-party must pay. Fedimint "sells its own preimage" so
     /// the descriptor is the invoice, not a proof set.
-    #[serde(rename = "fedimint")]
     Fedimint { invoice: String },
 }
 

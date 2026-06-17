@@ -397,15 +397,31 @@ pub fn find_route(
     Ok(hops_rev)
 }
 
-pub fn compute_hop_expiries(now: u64, deltas: &[u64]) -> Vec<u64> {
+/// Compute cascading per-hop timelocks for a route.
+///
+/// `anchor` is the moment the payer decides to start the payment
+/// (unix seconds). Callers pass one buffer per leg — each router hop
+/// plus a final leg for the payee's own claim window. The returned
+/// vector has `deltas.len() + 1` entries where `expiries[i]` is hop
+/// `i`'s incoming deadline, `expiries[i + 1]` is hop `i`'s outgoing
+/// expiry, and `expiries[deltas.len()]` is the payer's floor. The
+/// cascade grows toward the sender off `anchor`, so the first hop's
+/// incoming deadline is the most generous (`anchor` + sum of all
+/// deltas) and the last router's outgoing expiry is `anchor` + the
+/// payee leg's buffer.
+///
+/// Callers must include the payee's buffer in `deltas`: without it
+/// the last router's outgoing expiry is exactly `anchor`, which every
+/// adapter rejects as an already-expired locktime.
+pub fn compute_hop_expiries(anchor: u64, deltas: &[u64]) -> Vec<u64> {
     let mut expiries = Vec::with_capacity(deltas.len() + 1);
     let mut cumulative: u64 = 0;
     for delta in deltas.iter().rev() {
         cumulative = cumulative.saturating_add(*delta);
-        expiries.push(now.saturating_add(cumulative));
+        expiries.push(anchor.saturating_add(cumulative));
     }
     expiries.reverse();
-    expiries.push(now);
+    expiries.push(anchor);
     expiries
 }
 
@@ -533,7 +549,7 @@ mod tests {
 
     #[test]
     fn compute_hop_expiries_empty_deltas() {
-        // No hops means just the recipient's expiry (equivalent to `now`),
+        // No hops means just the recipient's expiry (the anchor),
         // since no delta buffer accumulates.
         let expiries = compute_hop_expiries(1000, &[]);
         assert_eq!(expiries, vec![1000]);
@@ -541,9 +557,9 @@ mod tests {
 
     #[test]
     fn compute_hop_expiries_zero_deltas() {
-        // With all deltas zero, every entry equals `now`. The function
-        // returns N+1 entries for N hops so callers can index `idx`
-        // (incoming_deadline) and `idx+1` (outgoing_expiry).
+        // With all deltas zero, every entry equals the anchor. The
+        // function returns N+1 entries for N hops so callers can index
+        // `idx` (incoming_deadline) and `idx+1` (outgoing_expiry).
         let expiries = compute_hop_expiries(1000, &[0, 0, 0]);
         assert_eq!(expiries, vec![1000, 1000, 1000, 1000]);
     }
@@ -551,10 +567,10 @@ mod tests {
     #[test]
     fn compute_hop_expiries_cascade() {
         // deltas[i] is hop i's required buffer between receiving and
-        // forwarding. The cascade grows toward the sender off `now`,
-        // so the first hop's incoming deadline is the most generous
-        // (`now` + sum of all deltas) and the recipient's expiry is
-        // exactly `now`.
+        // forwarding. The cascade grows toward the sender off the
+        // anchor, so the first hop's incoming deadline is the most
+        // generous (anchor + sum of all deltas) and the recipient's
+        // expiry is exactly the anchor.
         let expiries = compute_hop_expiries(1000, &[10, 20, 30]);
         // expiries[3] = 1000 (recipient, no buffer remaining)
         // expiries[2] = 1000 + 30 = 1030
@@ -566,8 +582,8 @@ mod tests {
     #[test]
     fn compute_hop_expiries_saturates_on_overflow() {
         // Adding u64::MAX should saturate rather than panic. The
-        // recipient's entry (last) is anchored at `now`, not at the
-        // accumulated sum.
+        // recipient's entry (last) is anchored at the anchor, not at
+        // the accumulated sum.
         let expiries = compute_hop_expiries(1000, &[u64::MAX, u64::MAX, u64::MAX]);
         assert_eq!(expiries.len(), 4);
         // Monotonically non-increasing from sender to recipient.

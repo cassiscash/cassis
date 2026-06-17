@@ -219,9 +219,14 @@ mod tests {
     use std::str::FromStr;
 
     fn random_payment_hash() -> [u8; 32] {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut bytes = [0u8; 32];
-        for byte in bytes.iter_mut() {
-            *byte = (unix_time() as u8).wrapping_add(0x42);
+        let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let t = unix_time();
+        for (i, chunk) in bytes.chunks_mut(8).enumerate() {
+            let v = t ^ c ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            chunk.copy_from_slice(&v.to_le_bytes());
         }
         bytes
     }
@@ -297,6 +302,62 @@ mod tests {
         let extracted = extract_preimage(&[proof]).expect("preimage present");
         assert_eq!(extracted, preimage_bytes);
         let _ = r; // silence
+    }
+
+    #[test]
+    fn verify_proofs_htlc_locked_accepts_built_htlc_proofs() {
+        let hash = random_payment_hash();
+        let locktime = unix_time() + 60;
+        let keyset_id = KeysetId::from_str("009a1f293253e41e").unwrap();
+        let out = build_htlc_outputs(4, keyset_id, &hash, locktime).expect("valid");
+        // Hand-rolled proofs carrying the real HTLC secret (the
+        // C value is irrelevant to the structural check).
+        let proofs: Proofs = out
+            .premints
+            .into_iter()
+            .map(|pm| Proof {
+                amount: pm.amount,
+                keyset_id,
+                secret: pm.secret,
+                c: cdk::nuts::nut01::PublicKey::from_str(
+                    "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+                )
+                .unwrap(),
+                witness: None,
+                dleq: None,
+                p2pk_e: None,
+            })
+            .collect();
+        // The built HTLC secret must survive the round trip: it
+        // has to parse as a NUT-10 secret of HTLC kind whose
+        // `data` is the payment hash.
+        assert!(verify_proofs_htlc_locked(&proofs, &hash).is_ok());
+    }
+
+    #[test]
+    fn verify_proofs_htlc_locked_rejects_wrong_hash() {
+        let hash = random_payment_hash();
+        let locktime = unix_time() + 60;
+        let keyset_id = KeysetId::from_str("009a1f293253e41e").unwrap();
+        let out = build_htlc_outputs(4, keyset_id, &hash, locktime).expect("valid");
+        let proofs: Proofs = out
+            .premints
+            .into_iter()
+            .map(|pm| Proof {
+                amount: pm.amount,
+                keyset_id,
+                secret: pm.secret,
+                c: cdk::nuts::nut01::PublicKey::from_str(
+                    "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+                )
+                .unwrap(),
+                witness: None,
+                dleq: None,
+                p2pk_e: None,
+            })
+            .collect();
+        let other = random_payment_hash();
+        assert!(verify_proofs_htlc_locked(&proofs, &other).is_err());
     }
 
     #[test]

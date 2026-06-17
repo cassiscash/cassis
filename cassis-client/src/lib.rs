@@ -176,7 +176,7 @@ impl CassisClient {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let buffers: Vec<u64> = route
+        let mut buffers: Vec<u64> = route
             .iter()
             .map(|hop| {
                 let delta = if hop.node.incoming_delta_secs > 0 {
@@ -192,6 +192,16 @@ impl CassisClient {
                 delta.saturating_add(slack)
             })
             .collect();
+        // The cascade needs a buffer for the final leg to the payee as
+        // well: with only per-hop buffers it hands the last router an
+        // outgoing expiry of exactly `now`, which adapters reject as
+        // already expired. The cascade stays anchored at `now` — the
+        // moment the payer decides to start — and every leg (the
+        // routers plus the payee's claim window) stacks its buffer on
+        // top of the previous one toward the sender.
+        let payee_delta = fallback_incoming_delta(&dest_network);
+        let payee_slack = fallback_transit_slack(&dest_network);
+        buffers.push(payee_delta.saturating_add(payee_slack));
         let expiries = compute_hop_expiries(now, &buffers);
 
         // Step 1: PREPARE every hop.
@@ -292,7 +302,10 @@ impl CassisClient {
             .get(&sender_network)
             .ok_or_else(|| PayError::Route("sender network adapter missing".to_string()))?
             .clone();
-        let first_outgoing_expiry = expiries.get(1).copied().unwrap_or(now);
+        // The sender's outgoing HTLC is the first hop's *incoming*,
+        // so it must not expire before the first hop's incoming
+        // deadline (expiries[0]).
+        let first_outgoing_expiry = expiries.first().copied().unwrap_or(now);
         let first_payment: OutgoingPayment = sender
             .pay_invoice(
                 invoice.payment_hash,

@@ -425,3 +425,69 @@ pub fn build_commit(
         incoming_descriptor,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_frame_with_cashu_descriptor_round_trips_through_postcard() {
+        // Regression: HtlcDescriptor used to be internally-tagged
+        // (#[serde(tag, content)]), which postcard cannot
+        // deserialize (it needs deserialize_any). DISPATCH frames
+        // carry a descriptor, so any multi-hop pay would fail to
+        // decode on the router with postcard's WontImplement error
+        // and the connection would drop. External tagging round-trips
+        // fine.
+        let dispatch = Frame::Dispatch(HopDispatch {
+            payment_hash: Bytes32([0x42u8; 32]),
+            amount_msat: 10_000,
+            incoming_network: NetworkId("cashu::localhost:8093".into()),
+            outgoing_network: NetworkId("cashu::localhost:8092".into()),
+            incoming_deadline: 1_786_000_000,
+            outgoing_expiry: 1_785_999_900,
+            recipient: "peer-1".into(),
+            incoming_descriptor: HtlcDescriptor::Cashu {
+                proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into()],
+            },
+        });
+        let bytes = postcard::to_allocvec(&dispatch).expect("encode dispatch");
+        let decoded: Frame = postcard::from_bytes(&bytes).expect("decode dispatch");
+        match decoded {
+            Frame::Dispatch(d) => {
+                assert_eq!(d.amount_msat, 10_000);
+                assert_eq!(
+                    d.incoming_descriptor,
+                    HtlcDescriptor::Cashu {
+                        proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into(),],
+                    }
+                );
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_frame_with_fedimint_descriptor_round_trips_through_postcard() {
+        let commit = Frame::Commit(HopCommit {
+            payment_hash: Bytes32([0x24u8; 32]),
+            amount_msat: 1234,
+            network: NetworkId("fedimint::x".into()),
+            incoming_deadline: 1_786_000_000,
+            incoming_descriptor: HtlcDescriptor::Fedimint {
+                invoice: "lnbc...".into(),
+            },
+        });
+        let bytes = postcard::to_allocvec(&commit).expect("encode commit");
+        let decoded: Frame = postcard::from_bytes(&bytes).expect("decode commit");
+        match decoded {
+            Frame::Commit(c) => assert_eq!(
+                c.incoming_descriptor,
+                HtlcDescriptor::Fedimint {
+                    invoice: "lnbc...".into(),
+                }
+            ),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+}
