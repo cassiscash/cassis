@@ -62,6 +62,9 @@ impl From<&str> for NetworkId {
 ///   is derived implicitly from the host at connection time: loopback
 ///   (`localhost`, `127.0.0.1`, `::1`) is `http`, anything else is `https`.
 /// * fedimint: `fedimint::<invite_code>` — the invite code is the address.
+/// * rootstock: `rootstock` for mainnet; `rootstock::testnet` for the
+///   Boltz testnet deployment (chain id 31). The EtherSwap contract address
+///   differs per chain; the adapter picks the right one from the network id.
 ///
 /// The address part for cashu is the bare `host[:port]`. The address part
 /// for fedimint is the federation's invite code. No other form is accepted
@@ -90,8 +93,8 @@ pub fn simple_network_id(kind: &str) -> NetworkId {
 /// Pass-through used by the router to canonicalize `HopInstruction`
 /// network ids before adapter lookup. Only the canonical on-the-wire
 /// form (`cashu::<host>`, `fedimint::<invite>`, or the simple kinds
-/// `liquid` / `ark` / `rootstock`) round-trips; anything else is
-/// returned unchanged so the adapter lookup rejects it.
+/// `liquid` / `ark` / `rootstock` / `rootstock::testnet`) round-trips;
+/// anything else is returned unchanged so the adapter lookup rejects it.
 pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
     if let Some(rest) = id.0.strip_prefix(CASHU_NETWORK_ID_PREFIX) {
         if !rest.is_empty() && !rest.contains("://") {
@@ -103,7 +106,7 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
             return id.clone();
         }
     }
-    if id.0 == "liquid" || id.0 == "ark" || id.0 == "rootstock" {
+    if id.0 == "liquid" || id.0 == "ark" || id.0 == "rootstock" || id.0 == "rootstock::testnet" {
         return id.clone();
     }
     id.clone()
@@ -197,12 +200,13 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
         ),
 
         #[cfg(feature = "rootstock")]
-        "rootstock" => {
-            if param.is_some() {
-                return Err("network 'rootstock' does not take a parameter".into());
-            }
-            Ok(NetworkId("rootstock".to_string()))
-        }
+        "rootstock" => match param {
+            None => Ok(NetworkId("rootstock".to_string())),
+            Some("testnet") => Ok(NetworkId("rootstock::testnet".to_string())),
+            Some(other) => Err(format!(
+                "network 'rootstock' only accepts no parameter or 'testnet', got '{other}'"
+            )),
+        },
         #[cfg(not(feature = "rootstock"))]
         "rootstock" => Err(
             "network 'rootstock' requested but cassis-core was not compiled with the 'rootstock' feature"
@@ -439,8 +443,24 @@ pub enum HtlcDescriptor {
     Liquid {},
     /// Stub for ark: no on-wire shape yet.
     Ark {},
-    /// Stub for rootstock: no on-wire shape yet.
-    Rootstock {},
+    /// On-chain EtherSwap HTLC on Rootstock. Carries the
+    /// fields the receiver needs to claim:
+    /// `preimageHash` is the route's payment hash (the
+    /// receiver verifies it matches the incoming payment),
+    /// `amount` is locked RBTC in wei, `refundAddress` is
+    /// the address that locked the funds (the upstream
+    /// hop), `timelock` is a block height. The receiver
+    /// calls `claim(preimage, amount, refundAddress,
+    /// timelock)` from its own address — `msg.sender`
+    /// becomes the contract's `claimAddress`. The network
+    /// kind (mainnet vs testnet) is implied by the
+    /// `NetworkId` that carries the descriptor.
+    Rootstock {
+        contract: String,
+        amount_wei: u128,
+        refund_address: String,
+        timelock: u64,
+    },
     /// Fedimint LNv2 contract, identified by the Bolt11 invoice the
     /// counter-party must pay. Fedimint "sells its own preimage" so
     /// the descriptor is the invoice, not a proof set.
@@ -1071,7 +1091,14 @@ mod tests {
 
     #[cfg(feature = "rootstock")]
     #[test]
-    fn network_id_for_rootstock_spec_rejects_parameter() {
+    fn network_id_for_rootstock_testnet_spec_uses_canonical_form() {
+        let id = network_id_for_spec("rootstock::testnet").unwrap();
+        assert_eq!(id.0, "rootstock::testnet");
+    }
+
+    #[cfg(feature = "rootstock")]
+    #[test]
+    fn network_id_for_rootstock_spec_rejects_unknown_parameter() {
         assert!(network_id_for_spec("rootstock::foo").is_err());
     }
 
@@ -1189,6 +1216,10 @@ mod tests {
             canonicalize_network_id(&NetworkId("rootstock".to_string())).0,
             "rootstock"
         );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("rootstock::testnet".to_string())).0,
+            "rootstock::testnet"
+        );
     }
 
     #[test]
@@ -1230,5 +1261,13 @@ mod tests {
             "liquid"
         );
         assert_eq!(normalize_network_id(&NetworkId("ark".to_string())).0, "ark");
+        assert_eq!(
+            normalize_network_id(&NetworkId("rootstock".to_string())).0,
+            "rootstock"
+        );
+        assert_eq!(
+            normalize_network_id(&NetworkId("rootstock::testnet".to_string())).0,
+            "rootstock::testnet"
+        );
     }
 }

@@ -213,7 +213,7 @@ pub enum NetSpec {
     #[cfg(feature = "ark")]
     Ark,
     #[cfg(feature = "rootstock")]
-    Rootstock,
+    Rootstock { testnet: bool },
 }
 
 impl NetSpec {
@@ -273,12 +273,13 @@ impl NetSpec {
                 Ok(NetSpec::Ark)
             }
             #[cfg(feature = "rootstock")]
-            "rootstock" => {
-                if param.is_some() {
-                    return Err("network 'rootstock' does not take a parameter".into());
-                }
-                Ok(NetSpec::Rootstock)
-            }
+            "rootstock" => match param {
+                None => Ok(NetSpec::Rootstock { testnet: false }),
+                Some("testnet") => Ok(NetSpec::Rootstock { testnet: true }),
+                Some(other) => Err(format!(
+                    "network 'rootstock' only accepts no parameter or 'testnet', got '{other}'"
+                )),
+            },
             other => Err(format!(
                 "unsupported network kind '{other}' (compile cassis-cli with the matching feature)"
             )),
@@ -296,7 +297,7 @@ impl NetSpec {
             #[cfg(feature = "ark")]
             NetSpec::Ark => "ark",
             #[cfg(feature = "rootstock")]
-            NetSpec::Rootstock => "rootstock",
+            NetSpec::Rootstock { .. } => "rootstock",
             #[allow(unreachable_patterns)]
             _ => "unknown",
         }
@@ -313,7 +314,11 @@ impl NetSpec {
             #[cfg(feature = "ark")]
             NetSpec::Ark => NetworkId("ark".to_string()),
             #[cfg(feature = "rootstock")]
-            NetSpec::Rootstock => NetworkId("rootstock".to_string()),
+            NetSpec::Rootstock { testnet } => NetworkId(if *testnet {
+                "rootstock::testnet".to_string()
+            } else {
+                "rootstock".to_string()
+            }),
             #[allow(unreachable_patterns)]
             _ => NetworkId("unknown".to_string()),
         }

@@ -292,13 +292,24 @@ async fn build_adapter(
 
         #[cfg(feature = "rootstock")]
         "rootstock" => {
-            if param.is_some() {
-                return Err("network 'rootstock' does not take a parameter".into());
-            }
-            let network_id = NetworkId("rootstock".to_string());
-            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
-                cassis_rootstock::RootstockAdapter::new(network_id.clone()),
-            );
+            let network_id = match param {
+                None => NetworkId("rootstock".to_string()),
+                Some("testnet") => NetworkId("rootstock::testnet".to_string()),
+                Some(other) => {
+                    return Err(format!(
+                        "network 'rootstock' only accepts no parameter or 'testnet', got '{other}'"
+                    ));
+                }
+            };
+            let sk = derived
+                .networks
+                .get(&network_id)
+                .map(|k| *k.as_bytes())
+                .unwrap_or([0u8; 32]);
+            let cfg = cassis_rootstock::default_config(network_id.clone(), sk);
+            let adapter: Arc<dyn NetworkRouterAdapter> = cassis_rootstock::RootstockAdapter::new(cfg)
+                .await
+                .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,

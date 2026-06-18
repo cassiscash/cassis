@@ -191,8 +191,11 @@ async fn build_receiver(spec: &NetSpec, derived: &DerivedKeys) -> Result<Adapter
             })
         }
         #[cfg(feature = "rootstock")]
-        NetSpec::Rootstock => {
-            let adapter = Arc::new(cassis_rootstock::RootstockAdapter::new(network_id.clone()));
+        NetSpec::Rootstock { .. } => {
+            let cfg = cassis_rootstock::default_config(network_id.clone(), sk);
+            let adapter = cassis_rootstock::RootstockAdapter::new(cfg)
+                .await
+                .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
             let receiver: Arc<dyn NetworkReceiverAdapter> = adapter.clone();
             let sender: Arc<dyn NetworkSenderAdapter> = adapter;
             Ok(AdapterPair {
