@@ -107,6 +107,17 @@ pub enum Commands {
         #[command(subcommand)]
         command: CashuCommands,
     },
+    /// On-chain Rootstock operations. Only available when the
+    /// CLI is built with the `rootstock` cargo feature.
+    #[cfg(feature = "rootstock")]
+    Rootstock {
+        /// Network spec, `rootstock` (default) or
+        /// `rootstock::testnet`.
+        #[arg(long, default_value = "rootstock")]
+        network: String,
+        #[command(subcommand)]
+        command: RootstockCommands,
+    },
     /// Run the multi-network routing daemon. Reads the seed
     /// from the configured home dir and uses the same store
     /// the wallet does. Replaces the standalone `cassis-router`
@@ -163,6 +174,59 @@ pub enum CashuCommands {
     Balance {
         #[arg(long)]
         network: Option<String>,
+    },
+}
+
+#[cfg(feature = "rootstock")]
+#[derive(Subcommand, Debug)]
+pub enum RootstockCommands {
+    /// Send RBTC. Without a `--data`/`--args` pair this is a
+    /// plain value transfer of `--amount-msat` (must be > 0) to
+    /// `--to`. With `--data` (a JSON ABI function entry) and
+    /// `--args` (a JSON array), it broadcasts a signed write
+    /// call against `--to`, attaching `--amount-msat` (may be
+    /// 0) as value. Prints the tx hash immediately, then waits
+    /// for the receipt and prints status + gas used.
+    Send {
+        /// Recipient / contract EVM address (`0x`-prefixed, 20
+        /// bytes).
+        #[arg(long)]
+        to: String,
+        /// Amount to send, in msat. Converted to wei internally
+        /// at the `1 RBTC = 10^11 msat = 10^18 wei` rate. Must be
+        /// > 0 for a plain transfer; may be 0 for a `--data`
+        /// call.
+        #[arg(long, default_value_t = 0)]
+        amount_msat: u64,
+        /// JSON ABI function entry (name + typed inputs), e.g.
+        /// `{"name":"transfer","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[]}`.
+        /// When set, sends a write call instead of a transfer.
+        #[arg(long)]
+        data: Option<String>,
+        /// JSON array of args matching `--data`'s inputs, e.g.
+        /// `["0xabc...", 100]`.
+        #[arg(long)]
+        args: Option<String>,
+    },
+    /// Show the local EVM address derived from the seed for
+    /// the given network, plus the on-chain RBTC balance (in
+    /// msat).
+    Info,
+    /// Read-only `eth_call` against any contract. `--data` is a
+    /// JSON ABI function entry and `--args` a JSON array of
+    /// args; the raw returndata hex is printed to stdout. Useful
+    /// for inspecting the EtherSwap contract (e.g.
+    /// `swaps(preimage_hash)`).
+    Read {
+        /// Contract address (`0x`-prefixed, 20 bytes).
+        #[arg(long)]
+        to: String,
+        /// JSON ABI function entry (name + typed inputs).
+        #[arg(long)]
+        data: String,
+        /// JSON array of args matching `--data`'s inputs.
+        #[arg(long)]
+        args: String,
     },
 }
 

@@ -67,6 +67,38 @@ pub async fn build_cashu_adapter(
     }
 }
 
+/// Build a concrete [`cassis_rootstock::RootstockAdapter`] for a
+/// single rootstock spec. Used by the `cassis-cli rootstock`
+/// subcommands (`send`, `info`, `balance`, `call`), which need
+/// the on-chain methods (`transfer`, `balance_msat`,
+/// `eth_call`) that aren't visible through the trait objects.
+#[cfg(feature = "rootstock")]
+#[allow(unreachable_patterns)]
+pub async fn build_rootstock_adapter(
+    spec: &NetSpec,
+    derived: &DerivedKeys,
+) -> Result<Arc<cassis_rootstock::RootstockAdapter>, String> {
+    match spec {
+        NetSpec::Rootstock { .. } => {
+            let network_id = spec.network_id();
+            let sk = derived
+                .networks
+                .get(&network_id)
+                .map(|k| *k.as_bytes())
+                .unwrap_or([0u8; 32]);
+            let cfg = cassis_rootstock::default_config(network_id, sk);
+            let adapter = cassis_rootstock::RootstockAdapter::new(cfg)
+                .await
+                .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
+            Ok(adapter)
+        }
+        _ => Err(format!(
+            "expected a rootstock spec, got {}",
+            spec.kind_name()
+        )),
+    }
+}
+
 /// Same as [`build_cashu_adapter`] but takes a raw mint URL
 /// instead of a parsed `NetSpec`. The receive flow uses this
 /// when the mint URL comes out of the proof string itself

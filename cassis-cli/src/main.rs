@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "cashu")]
 use cli::CashuCommands;
+#[cfg(feature = "rootstock")]
+use cli::RootstockCommands;
 use cli::{Cli, Commands, InvoicesCommands, NetSpec, SeedCommands};
 use store::{InvoiceRow, InvoiceStatus, Store, StoreError};
 
@@ -91,6 +93,19 @@ async fn main() {
             CashuCommands::Send { network, amount } => cmd_cashu_send(network, amount).await,
             CashuCommands::Receive { proof } => cmd_cashu_receive(proof).await,
             CashuCommands::Balance { network } => cmd_cashu_balance(network).await,
+        },
+        #[cfg(feature = "rootstock")]
+        Commands::Rootstock { network, command } => match command {
+            RootstockCommands::Send {
+                to,
+                amount_msat,
+                data,
+                args,
+            } => cmd_rootstock_send(&network, to, amount_msat, data, args).await,
+            RootstockCommands::Info => cmd_rootstock_info(&network).await,
+            RootstockCommands::Read { to, data, args } => {
+                cmd_rootstock_read(&network, to, data, args).await
+            }
         },
         Commands::Router {
             network,
@@ -792,6 +807,23 @@ fn load_cashu_wallet(
     Ok((spec, derived, adapter))
 }
 
+#[cfg(feature = "rootstock")]
+async fn load_rootstock_adapter(
+    network: &str,
+) -> Result<(NetSpec, Arc<cassis_rootstock::RootstockAdapter>), String> {
+    let spec = NetSpec::parse(network)?;
+    if !matches!(spec, NetSpec::Rootstock { .. }) {
+        return Err(format!(
+            "expected a rootstock spec like `rootstock` or `rootstock::testnet`, got '{network}'"
+        ));
+    }
+    let specs = vec![spec.clone()];
+    let mnemonic = load_mnemonic()?;
+    let derived = derive_for(&mnemonic, &specs)?;
+    let adapter = adapters::build_rootstock_adapter(&spec, &derived).await?;
+    Ok((spec, adapter))
+}
+
 /// Encode `proofs` as a NUT-00 cashu token string. The
 /// output is `cashuB<base64url(cborm)>` (NUT-00 V4) when
 /// produced via `Token::new`, but the wallet accepts both
@@ -981,6 +1013,125 @@ async fn cmd_cashu_balance(network: Option<String>) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// rootstock (only with the `rootstock` feature)
+//
+// Plain on-chain RBTC operations: `send` is a value transfer or
+// a signed write contract call (JSON ABI + args, optional
+// value), `info` shows the local EVM address, `balance` queries
+// `eth_getBalance`, `read` runs a read-only `eth_call` against a
+// contract. None of these touch HTLC state — for that flow use
+// the top-level `pay` / `invoice` commands.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rootstock")]
+async fn cmd_rootstock_send(
+    network: &str,
+    to: String,
+    amount_msat: u64,
+    data: Option<String>,
+    args: Option<String>,
+) -> Result<(), String> {
+    let (spec, adapter) = load_rootstock_adapter(network).await?;
+    // Contract-call mode: both --data and --args must be set.
+    // Plain-transfer mode otherwise.
+    match (data, args) {
+        (Some(entry), Some(args)) => {
+            let calldata = cassis_rootstock::encode_call(&entry, &args)
+                .map_err(|e| format!("encode call: {e}"))?;
+            info!(
+                target: "cassis_cli",
+                "rootstock send(call): calldata_len={} value_msat={amount_msat} to={to}",
+                calldata.len(),
+            );
+            let (tx_hash, gas_used, ok) = adapter
+                .send_call(&to, &calldata, amount_msat)
+                .await
+                .map_err(|e| format!("rootstock send call: {e}"))?;
+            println!("status:       ok");
+            println!("network:      {}", spec.network_id());
+            println!("from:         {}", adapter.address());
+            println!("to:           {to}");
+            println!("value_msat:   {amount_msat}");
+            println!("tx_hash:      {tx_hash}");
+            println!("deployed:     waiting for receipt");
+            println!(
+                "status:       mined ({})",
+                if ok { "success" } else { "revert" }
+            );
+            println!("gas_used:     {gas_used}");
+            Ok(())
+        }
+        (None, None) => {
+            if amount_msat == 0 {
+                return Err(
+                    "amount-msat must be > 0 for a plain transfer (use --data/--args for a call)"
+                        .to_string(),
+                );
+            }
+            info!(
+                target: "cassis_cli",
+                "rootstock send(transfer): {amount_msat} msat from {} to {to}",
+                adapter.address(),
+            );
+            let tx_hash = adapter
+                .transfer(&to, amount_msat)
+                .await
+                .map_err(|e| format!("rootstock send: {e}"))?;
+            println!("status:       ok");
+            println!("network:      {}", spec.network_id());
+            println!("from:         {}", adapter.address());
+            println!("to:           {to}");
+            println!("amount_msat:  {amount_msat}");
+            println!("tx_hash:      {tx_hash}");
+            Ok(())
+        }
+        (Some(_), None) => Err("--data requires --args".to_string()),
+        (None, Some(_)) => Err("--args requires --data".to_string()),
+    }
+}
+
+#[cfg(feature = "rootstock")]
+async fn cmd_rootstock_info(network: &str) -> Result<(), String> {
+    let (spec, adapter) = load_rootstock_adapter(network).await?;
+    let balance_msat = adapter
+        .balance_msat()
+        .await
+        .map_err(|e| format!("rootstock balance: {e}"))?;
+    let rbtc_whole = balance_msat / 100_000_000_000u64;
+    let rbtc_frac = balance_msat % 100_000_000_000u64;
+    println!("network:      {}", spec.network_id());
+    println!("address:      {}", adapter.address());
+    println!("balance_msat: {balance_msat}");
+    println!("balance_rbtc: {rbtc_whole}.{:011}", rbtc_frac);
+    Ok(())
+}
+
+#[cfg(feature = "rootstock")]
+async fn cmd_rootstock_read(
+    network: &str,
+    to: String,
+    data: String,
+    args: String,
+) -> Result<(), String> {
+    let (_spec, adapter) = load_rootstock_adapter(network).await?;
+    let calldata =
+        cassis_rootstock::encode_call(&data, &args).map_err(|e| format!("encode call: {e}"))?;
+    info!(
+        target: "cassis_cli",
+        "rootstock read: to={to} calldata_len={}",
+        calldata.len(),
+    );
+    let out = adapter
+        .eth_call(&to, &calldata)
+        .await
+        .map_err(|e| format!("rootstock read: {e}"))?;
+    println!("to:        {to}");
+    println!("calldata:  0x{}", lowercase_hex::encode(&calldata));
+    println!("return:    0x{}", lowercase_hex::encode(out.as_ref()));
     Ok(())
 }
 

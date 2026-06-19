@@ -1,6 +1,7 @@
+use alloy::dyn_abi::{DynSolType, DynSolValue, JsonAbiExt};
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::{Ethereum, EthereumWallet};
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
@@ -211,6 +212,16 @@ impl RootstockAdapter {
             .map_err(|e| Error::Rpc(e.to_string()))
     }
 
+    /// Current legacy gas price (wei) via `eth_gasPrice`. RSK has
+    /// no EIP-1559, so `eth_maxPriorityFeePerGas` is unsupported;
+    /// we always build legacy transactions with this price.
+    async fn gas_price_wei(&self) -> Result<u128, Error> {
+        self.provider
+            .get_gas_price()
+            .await
+            .map_err(|e| Error::Rpc(format!("get_gas_price: {e}")))
+    }
+
     fn unix_now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -234,6 +245,110 @@ impl RootstockAdapter {
         let timelock_be = U256::from(timelock).to_be_bytes::<32>();
         buf[128..160].copy_from_slice(&timelock_be);
         keccak256(buf)
+    }
+
+    /// Cached EVM address derived from `config.sk` in `new()`.
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    /// On-chain RBTC balance of the local EVM address, in msat.
+    /// No HTLC state is consulted; this is a plain
+    /// `eth_getBalance` against the configured RPC.
+    pub async fn balance_msat(&self) -> Result<u64, Error> {
+        let wei = self
+            .provider
+            .get_balance(self.address)
+            .await
+            .map_err(|e| Error::Rpc(e.to_string()))?;
+        let ratio = U256::from(WEI_PER_RBTC / MSAT_PER_RBTC);
+        let msat = wei.checked_div(ratio).unwrap_or(U256::ZERO);
+        let msat: u128 = msat
+            .try_into()
+            .map_err(|_| Error::InvalidParams("balance overflows u128".into()))?;
+        Ok(u64::try_from(msat)
+            .map_err(|_| Error::InvalidParams("balance exceeds u64::MAX msat".into()))?)
+    }
+
+    /// Send `amount_msat` worth of RBTC to `to` as a plain
+    /// value transfer (no HTLC, no contract call). `to` is a
+    /// hex-encoded EVM address (`0x`-prefixed or bare).
+    /// Returns the transaction hash; the caller can poll the
+    /// RPC for the receipt if they want to confirm inclusion.
+    pub async fn transfer(&self, to: &str, amount_msat: u64) -> Result<B256, Error> {
+        if amount_msat == 0 {
+            return Err(Error::InvalidParams("amount must be > 0".into()));
+        }
+        let to_addr = parse_address(to)?;
+        let wei = Self::msat_to_wei(amount_msat);
+        // RSK does not support EIP-1559 (`eth_maxPriorityFeePerGas`
+        // → -32601 method not found). Force a legacy tx by setting
+        // the gas price explicitly so alloy's gas filler takes the
+        // legacy path via `eth_gasPrice`.
+        let gas_price = self.gas_price_wei().await?;
+        let request = TransactionRequest::default()
+            .to(to_addr)
+            .value(wei)
+            .gas_price(gas_price);
+        let pending = self
+            .provider
+            .send_transaction(request)
+            .await
+            .map_err(|e| Error::Rpc(format!("transfer send: {e}")))?;
+        Ok(*pending.tx_hash())
+    }
+
+    /// Raw read-only `eth_call`. `to` is a hex-encoded EVM
+    /// address; `calldata` is the already-encoded ABI
+    /// calldata bytes (selector + args). Returns the raw
+    /// returndata bytes; the caller decodes. Used by the CLI's
+    /// `read` subcommand.
+    pub async fn eth_call(&self, to: &str, calldata: &[u8]) -> Result<Bytes, Error> {
+        let to_addr = parse_address(to)?;
+        let request = TransactionRequest::default()
+            .to(to_addr)
+            .input(Bytes::copy_from_slice(calldata).into());
+        let out = self
+            .provider
+            .call(request)
+            .await
+            .map_err(|e| Error::Rpc(format!("eth_call: {e}")))?;
+        Ok(out)
+    }
+
+    /// Broadcast an arbitrary contract call as a signed tx.
+    /// `to` is a hex-encoded EVM address; `calldata` is the
+    /// already-encoded ABI calldata bytes; `value_msat` is the
+    /// RBTC value to attach (may be 0). Returns the tx hash
+    /// immediately, then waits for the receipt and returns its
+    /// status boolean and gas used.
+    pub async fn send_call(
+        &self,
+        to: &str,
+        calldata: &[u8],
+        value_msat: u64,
+    ) -> Result<(B256, u64, bool), Error> {
+        let to_addr = parse_address(to)?;
+        let value_wei = Self::msat_to_wei(value_msat);
+        // Force legacy gas pricing (see `transfer`).
+        let gas_price = self.gas_price_wei().await?;
+        let request = TransactionRequest::default()
+            .to(to_addr)
+            .input(Bytes::copy_from_slice(calldata).into())
+            .value(value_wei)
+            .gas_price(gas_price);
+        let pending = self
+            .provider
+            .send_transaction(request)
+            .await
+            .map_err(|e| Error::Rpc(format!("send_call send: {e}")))?;
+        let tx_hash = *pending.tx_hash();
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| Error::Rpc(format!("send_call receipt: {e}")))?;
+        let gas_used = receipt.gas_used;
+        Ok((tx_hash, gas_used, receipt.status()))
     }
 }
 
@@ -308,9 +423,14 @@ impl NetworkRouterAdapter for RootstockAdapter {
         let timelock = latest.saturating_add(blocks_ahead);
 
         let preimage_hash = B256::from_slice(payment_hash.as_ref());
+        let gas_price = self
+            .gas_price_wei()
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
         let request = TransactionRequest::default()
             .to(self.contract)
             .value(amount_wei)
+            .gas_price(gas_price)
             .input(
                 IEtherSwap::lockCall {
                     preimageHash: preimage_hash,
@@ -375,16 +495,23 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 "incoming HTLC has no amount (descriptor not yet accepted)".into(),
             ));
         }
-        let request = TransactionRequest::default().to(slot.contract).input(
-            IEtherSwap::claimCall {
-                preimage: B256::from_slice(preimage.as_ref()),
-                amount: slot.amount_wei,
-                refundAddress: slot.refund_address,
-                timelock: U256::from(slot.timelock),
-            }
-            .abi_encode()
-            .into(),
-        );
+        let gas_price = self
+            .gas_price_wei()
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        let request = TransactionRequest::default()
+            .to(slot.contract)
+            .gas_price(gas_price)
+            .input(
+                IEtherSwap::claimCall {
+                    preimage: B256::from_slice(preimage.as_ref()),
+                    amount: slot.amount_wei,
+                    refundAddress: slot.refund_address,
+                    timelock: U256::from(slot.timelock),
+                }
+                .abi_encode()
+                .into(),
+            );
         let pending = self
             .provider
             .send_transaction(request)
@@ -420,16 +547,23 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 slot.timelock
             )));
         }
-        let request = TransactionRequest::default().to(slot.contract).input(
-            IEtherSwap::refundCall {
-                preimageHash: B256::from_slice(payment_hash.as_ref()),
-                amount: slot.amount_wei,
-                claimAddress: self.address,
-                timelock: U256::from(slot.timelock),
-            }
-            .abi_encode()
-            .into(),
-        );
+        let gas_price = self
+            .gas_price_wei()
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        let request = TransactionRequest::default()
+            .to(slot.contract)
+            .gas_price(gas_price)
+            .input(
+                IEtherSwap::refundCall {
+                    preimageHash: B256::from_slice(payment_hash.as_ref()),
+                    amount: slot.amount_wei,
+                    claimAddress: self.address,
+                    timelock: U256::from(slot.timelock),
+                }
+                .abi_encode()
+                .into(),
+            );
         let pending = self
             .provider
             .send_transaction(request)
@@ -671,6 +805,281 @@ pub fn default_config(network_id: NetworkId, sk: [u8; 32]) -> RootstockConfig {
     }
 }
 
+/// Derive the EVM address for a 32-byte secret key without
+/// touching the network. Used by the CLI's `info` subcommand
+/// so showing the local address doesn't need an RPC
+/// connection.
+pub fn address_from_sk(sk: [u8; 32]) -> Result<Address, Error> {
+    let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&sk))
+        .map_err(|e| Error::InvalidParams(format!("invalid secret key: {e}")))?;
+    Ok(signer.address())
+}
+
+/// Parse a hex-encoded `0x`-prefixed (or bare) EVM address.
+pub fn parse_address(s: &str) -> Result<Address, Error> {
+    Address::from_str(s.trim()).map_err(|e| Error::InvalidAddress(format!("'{s}': {e}")))
+}
+
+/// Parse hex calldata (`0x`-prefixed or bare) into bytes. Odd
+/// length or non-hex characters produce `Error::InvalidParams`.
+pub fn parse_hex(s: &str) -> Result<Vec<u8>, Error> {
+    let trimmed = s.trim();
+    let stripped = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if stripped.len() % 2 != 0 {
+        return Err(Error::InvalidParams(format!(
+            "hex string has odd length ({} chars)",
+            stripped.len()
+        )));
+    }
+    let bytes = stripped.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i]).ok_or_else(|| {
+            Error::InvalidParams(format!("invalid hex char '{}'", bytes[i] as char))
+        })?;
+        let lo = hex_nibble(bytes[i + 1]).ok_or_else(|| {
+            Error::InvalidParams(format!("invalid hex char '{}'", bytes[i + 1] as char))
+        })?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// ABI-encode a function call from a JSON ABI entry and a JSON
+/// array of args. `abi_entry_json` is a function ABI entry:
+///
+/// ```json
+/// {"name":"transfer","inputs":[{"name":"to","type":"address"},
+///                              {"name":"amount","type":"uint256"}],
+///  "outputs":[]}
+/// ```
+///
+/// `args_json` is a JSON array of values, one per input, in
+/// order. Returns the encoded calldata (4-byte selector +
+/// ABI-encoded args).
+pub fn encode_call(abi_entry_json: &str, args_json: &str) -> Result<Vec<u8>, Error> {
+    use alloy::json_abi::Function;
+    let function: Function = serde_json::from_str(abi_entry_json)
+        .map_err(|e| Error::InvalidParams(format!("invalid ABI entry: {e}")))?;
+    let args: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|e| Error::InvalidParams(format!("invalid args JSON: {e}")))?;
+    let args = args
+        .as_array()
+        .ok_or_else(|| Error::InvalidParams("--args must be a JSON array".into()))?;
+    if args.len() != function.inputs.len() {
+        return Err(Error::InvalidParams(format!(
+            "arg count mismatch: ABI has {} input(s), got {} arg(s)",
+            function.inputs.len(),
+            args.len()
+        )));
+    }
+    let mut values = Vec::with_capacity(args.len());
+    for (input, arg) in function.inputs.iter().zip(args.iter()) {
+        let ty = DynSolType::parse(&input.ty)
+            .map_err(|e| Error::InvalidParams(format!("invalid type '{}': {e}", input.ty)))?;
+        values.push(json_to_dyn(&ty, arg)?);
+    }
+    function
+        .abi_encode_input(&values)
+        .map_err(|e| Error::InvalidParams(format!("ABI encode: {e}")))
+}
+
+/// Convert a JSON value to a [`DynSolValue`] matching `ty`.
+/// Supports the common Solidity types: bool, signed/unsigned
+/// ints, addresses, bytes, strings, and nested arrays/tuples.
+fn json_to_dyn(ty: &DynSolType, v: &serde_json::Value) -> Result<DynSolValue, Error> {
+    use serde_json::Value;
+    match ty {
+        DynSolType::Bool => match v {
+            Value::Bool(b) => Ok(DynSolValue::Bool(*b)),
+            _ => Err(Error::InvalidParams("expected JSON bool".into())),
+        },
+        DynSolType::Int(bits) => {
+            let i = json_i256(v)?;
+            Ok(DynSolValue::Int(i, *bits))
+        }
+        DynSolType::Uint(bits) => {
+            let u = json_u256(v)?;
+            Ok(DynSolValue::Uint(u, *bits))
+        }
+        DynSolType::FixedBytes(len) => {
+            let b = json_bytes(v)?;
+            if b.len() != *len {
+                return Err(Error::InvalidParams(format!(
+                    "bytes{} expected, got {} byte(s)",
+                    len,
+                    b.len()
+                )));
+            }
+            let mut word = [0u8; 32];
+            word[..b.len()].copy_from_slice(&b);
+            Ok(DynSolValue::FixedBytes(B256::from(word), *len))
+        }
+        DynSolType::Address => {
+            let s = json_scalar_string(v)?;
+            let a = parse_address(&s)?;
+            Ok(DynSolValue::Address(a))
+        }
+        DynSolType::Function => Err(Error::InvalidParams(
+            "ABI 'function' type is not supported".into(),
+        )),
+        DynSolType::Bytes => Ok(DynSolValue::Bytes(json_bytes(v)?)),
+        DynSolType::String => {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            Ok(DynSolValue::String(s))
+        }
+        DynSolType::Array(inner) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| Error::InvalidParams("expected JSON array".into()))?;
+            let mut out = Vec::with_capacity(arr.len());
+            for el in arr {
+                out.push(json_to_dyn(inner, el)?);
+            }
+            Ok(DynSolValue::Array(out))
+        }
+        DynSolType::FixedArray(inner, n) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| Error::InvalidParams("expected JSON array".into()))?;
+            if arr.len() != *n {
+                return Err(Error::InvalidParams(format!(
+                    "expected array of {n}, got {} element(s)",
+                    arr.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for el in arr {
+                out.push(json_to_dyn(inner, el)?);
+            }
+            Ok(DynSolValue::FixedArray(out))
+        }
+        DynSolType::Tuple(inners) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| Error::InvalidParams("expected JSON array".into()))?;
+            if arr.len() != inners.len() {
+                return Err(Error::InvalidParams(format!(
+                    "tuple expects {} element(s), got {}",
+                    inners.len(),
+                    arr.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for (inner, el) in inners.iter().zip(arr.iter()) {
+                out.push(json_to_dyn(inner, el)?);
+            }
+            Ok(DynSolValue::Tuple(out))
+        }
+        #[allow(unreachable_patterns)]
+        other => Err(Error::InvalidParams(format!(
+            "type '{}' not supported",
+            other
+        ))),
+    }
+}
+
+/// Extract a JSON number (decimal or `0x`-hex) or hex string as
+/// a [`U256`].
+fn json_u256(v: &serde_json::Value) -> Result<U256, Error> {
+    match v {
+        serde_json::Value::Number(n) => {
+            let s = n.to_string();
+            U256::from_str_radix(&s, 10)
+                .map_err(|e| Error::InvalidParams(format!("invalid uint '{s}': {e}")))
+        }
+        serde_json::Value::String(s) => number_from_hex_or_dec(s),
+        other => Err(Error::InvalidParams(format!("expected uint, got {other}"))),
+    }
+}
+
+fn json_i256(v: &serde_json::Value) -> Result<I256, Error> {
+    match v {
+        serde_json::Value::Number(n) => {
+            let s = n.to_string();
+            I256::from_dec_str(&s)
+                .map_err(|e| Error::InvalidParams(format!("invalid int '{s}': {e}")))
+        }
+        serde_json::Value::String(s) => int_from_hex_or_dec(s),
+        other => Err(Error::InvalidParams(format!("expected int, got {other}"))),
+    }
+}
+
+fn number_from_hex_or_dec(s: &str) -> Result<U256, Error> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        U256::from_str_radix(hex, 16)
+            .map_err(|e| Error::InvalidParams(format!("invalid hex number '{t}': {e}")))
+    } else {
+        U256::from_str_radix(t, 10)
+            .map_err(|e| Error::InvalidParams(format!("invalid number '{t}': {e}")))
+    }
+}
+
+fn int_from_hex_or_dec(s: &str) -> Result<I256, Error> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        I256::from_hex_str(hex)
+            .map_err(|e| Error::InvalidParams(format!("invalid hex int '{t}': {e}")))
+    } else {
+        I256::from_dec_str(t).map_err(|e| Error::InvalidParams(format!("invalid int '{t}': {e}")))
+    }
+}
+
+fn json_bytes(v: &serde_json::Value) -> Result<Vec<u8>, Error> {
+    match v {
+        serde_json::Value::String(s) => parse_hex(s),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    serde_json::Value::Number(n) => {
+                        let byte = n
+                            .as_u64()
+                            .ok_or_else(|| Error::InvalidParams(format!("invalid byte '{n}'")))?;
+                        out.push(u8::try_from(byte).map_err(|_| {
+                            Error::InvalidParams(format!("byte out of range '{n}'"))
+                        })?);
+                    }
+                    other => {
+                        return Err(Error::InvalidParams(format!("expected byte, got {other}")))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        other => Err(Error::InvalidParams(format!(
+            "expected hex string or byte array, got {other}"
+        ))),
+    }
+}
+
+fn json_scalar_string(v: &serde_json::Value) -> Result<String, Error> {
+    match v {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        other => Err(Error::InvalidParams(format!(
+            "expected string value, got {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +1127,49 @@ mod tests {
         assert_eq!(cfg.rpc_url, ROOTSTOCK_TESTNET_RPC);
         assert_eq!(cfg.chain_id, 31);
         assert_eq!(cfg.contract.as_deref(), Some(ROOTSTOCK_TESTNET_CONTRACT));
+    }
+
+    #[test]
+    fn encode_call_transfer_selectors_and_args() {
+        let calldata = encode_call(
+            r#"{"name":"transfer","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[]}"#,
+            r#"["0x1111111111111111111111111111111111111111", 5]"#,
+        )
+        .unwrap();
+        // transfer(address,uint256) -> 0xa9059cbb
+        assert_eq!(calldata[0..4], [0xa9, 0x05, 0x9c, 0xbb]);
+        assert_eq!(calldata.len(), 4 + 32 + 32);
+    }
+
+    #[test]
+    fn encode_call_rejects_arg_count_mismatch() {
+        let result = encode_call(
+            r#"{"name":"transfer","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[]}"#,
+            r#"["0x1111111111111111111111111111111111111111"]"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_call_supports_string_and_bool() {
+        let calldata = encode_call(
+            r#"{"name":"set","inputs":[{"name":"msg","type":"string"},{"name":"flag","type":"bool"}],"outputs":[]}"#,
+            r#"["hello world", true]"#,
+        )
+        .unwrap();
+        // selector + offset + bool + string len + padded "hello world" (32)
+        assert_eq!(calldata.len(), 4 + 32 + 32 + 32 + 32);
+    }
+
+    #[test]
+    fn encode_call_supports_hex_uint_and_bytes() {
+        let calldata = encode_call(
+            r#"{"name":"f","inputs":[{"name":"a","type":"uint256"},{"name":"b","type":"bytes"}],"outputs":[]}"#,
+            r#"["0xff", "0xabcd"]"#,
+        )
+        .unwrap();
+        assert_eq!(calldata[4 + 32 - 1], 0xff);
+        assert!(calldata.contains(&0xab));
+        assert!(calldata.contains(&0xcd));
     }
 }
