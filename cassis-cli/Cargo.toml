@@ -9,7 +9,7 @@ cashu = ["dep:cassis-cashu", "dep:cdk", "cassis-router/cashu", "cassis-core/cash
 fedimint = ["dep:cassis-fedimint"]
 ark = ["dep:cassis-arkade"]
 liquid = ["dep:cassis-liquid"]
-rootstock = ["dep:cassis-rootstock"]
+rootstock = ["dep:cassis-rootstock", "cassis-router/rootstock", "cassis-core/rootstock"]
 
 [dependencies]
 cassis-client = { path = "../cassis-client" }
