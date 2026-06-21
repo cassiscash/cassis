@@ -12,6 +12,7 @@ members = [
   "cassis-router",
   "cassis-client",
   "cassis-cli",
+  "cassis-gui",
 ]
 resolver = "2"
 
