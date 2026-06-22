@@ -1,11 +1,13 @@
 use cassis_core::{Bytes32, NetworkId};
 use minisqlite::{Connection, Error as SqlError, Value};
+
+/// Re-export of `minisqlite::Value` so callers can pattern-match SQL
+/// rows without depending on `minisqlite` directly.
+pub use minisqlite::Value as SqlValue;
 use std::path::Path;
-#[cfg(feature = "cashu")]
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "cashu")]
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS invoices (
     payment_hash TEXT PRIMARY KEY,
@@ -29,23 +31,6 @@ CREATE TABLE IF NOT EXISTS cashu_proofs (
     created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS cashu_proofs_mint_idx ON cashu_proofs(mint_url);
-";
-
-#[cfg(not(feature = "cashu"))]
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS invoices (
-    payment_hash TEXT PRIMARY KEY,
-    preimage     BLOB NOT NULL,
-    amount_msat  INTEGER NOT NULL,
-    network_id   TEXT NOT NULL,
-    payee        TEXT,
-    description  TEXT,
-    expires_at   INTEGER NOT NULL,
-    status       TEXT NOT NULL,
-    created_at   INTEGER NOT NULL,
-    claimed_at   INTEGER
-);
-CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices(status);
 ";
 
 /// Lifecycle of an invoice row.
@@ -335,7 +320,6 @@ fn unix_now() -> u64 {
 // wallet to mark specific rows as spent.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cashu")]
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct CashuProofRow {
@@ -347,7 +331,6 @@ pub struct CashuProofRow {
     pub created_at: u64,
 }
 
-#[cfg(feature = "cashu")]
 impl Store {
     /// Append a batch of proofs to the wallet for `mint_url`.
     /// Each proof is its own row so the wallet can delete
@@ -435,20 +418,17 @@ impl Store {
 /// short-lived [`Store`] (same pattern the COMMIT handler uses).
 /// This keeps the adapter (which must be `Send + Sync`) free to
 /// share the store across threads.
-#[cfg(feature = "cashu")]
 #[derive(Clone)]
 pub struct CashuProofDb {
     path: PathBuf,
 }
 
-#[cfg(feature = "cashu")]
 impl CashuProofDb {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
 }
 
-#[cfg(feature = "cashu")]
 impl cassis_cashu::CashuProofStore for CashuProofDb {
     fn insert_proofs(
         &self,
@@ -493,14 +473,12 @@ impl cassis_cashu::CashuProofStore for CashuProofDb {
     }
 }
 
-#[cfg(feature = "cashu")]
 impl From<StoreError> for cassis_cashu::Error {
     fn from(e: StoreError) -> Self {
         cassis_cashu::Error::Store(e.to_string())
     }
 }
 
-#[cfg(feature = "cashu")]
 fn cashu_proof_row_from_values(row: &[Value]) -> Result<CashuProofRow, StoreError> {
     let id = int_at(row, 0, "id")?;
     let mint_url = text_at(row, 1, "mint_url")?;
@@ -516,7 +494,6 @@ fn cashu_proof_row_from_values(row: &[Value]) -> Result<CashuProofRow, StoreErro
     })
 }
 
-#[cfg(feature = "cashu")]
 fn blob_at_var(row: &[Value], idx: usize, field: &str) -> Result<Vec<u8>, StoreError> {
     match row.get(idx) {
         Some(Value::Blob(b)) => Ok(b.clone()),
