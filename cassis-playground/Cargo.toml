@@ -5,17 +5,17 @@ edition.workspace = true
 
 [dependencies]
 cassis-client = { path = "../cassis-client", features = ["cashu", "rootstock"] }
+cassis-routing = { path = "../cassis-routing" }
 cassis-core = { path = "../cassis-core", features = ["cashu", "rootstock"] }
 cassis-keys = { path = "../cassis-keys" }
 cassis-router = { path = "../cassis-router", features = ["cashu", "rootstock"] }
 cassis-cashu = { path = "../networks/cassis-cashu" }
 cassis-rootstock = { path = "../networks/cassis-rootstock" }
+ritualistic = "0.1.1"
 cdk = { version = "0.17.3", features = ["wallet"] }
 log = "0.4.33"
 lowercase-hex = "0.1.1"
 minisqlite = { git = "https://github.com/cursor/minisqlite" }
-ratatui = "0.29"
-crossterm = "0.28"
-tui-input = "0.11"
+rustyline = "17"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "time", "io-util"] }
