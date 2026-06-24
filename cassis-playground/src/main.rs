@@ -88,7 +88,14 @@ impl Log for LogSink {
         metadata.level() != Level::Trace && !metadata.target().starts_with("iroh")
     }
     fn log(&self, record: &Record<'_>) {
-        let line = format!("[{}] {}", record.level(), record.args());
+        let message = record.args().to_string();
+        // Drop bare span names leaked from the tracing bridge ("QADv4;",
+        // "tx;", "upnp;", ...): a single token terminated by ';'.
+        let trimmed = message.trim_end();
+        if trimmed.ends_with(';') && !trimmed[..trimmed.len() - 1].contains(char::is_whitespace) {
+            return;
+        }
+        let line = format!("[{}] {}", record.level(), message);
         if let Ok(mut printer) = self.printer.lock() {
             if let Some(printer) = printer.as_mut() {
                 let _ = printer.print(line.clone());
@@ -239,7 +246,7 @@ impl Playground {
         let balances = self.balances.lock().await;
         let mut sorted_nodes: Vec<&NodeState> = nodes.values().collect();
         sorted_nodes.sort_by(|left, right| left.id.cmp(&right.id));
-        for node in sorted_nodes {
+        for node in &sorted_nodes {
             output.push_str(&format!(
                 "{}: {}\n",
                 colored_node_name(&node.id),
@@ -251,6 +258,36 @@ impl Playground {
                     .map(String::as_str)
                     .unwrap_or("(not refreshed)");
                 output.push_str(&format!("  {network_id}: {balance}\n"));
+            }
+        }
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let mut network_ids: Vec<String> = nodes
+            .values()
+            .flat_map(|node| node.memberships.iter().cloned())
+            .collect();
+        network_ids.sort();
+        network_ids.dedup();
+        for network_id in network_ids {
+            let mut lines: Vec<String> = Vec::new();
+            for node in &sorted_nodes {
+                if !node.memberships.iter().any(|m| m == &network_id) {
+                    continue;
+                }
+                let balance = balances.get(&(node.id.clone(), network_id.clone()));
+                if !matches!(node.status, Status::Idle) || balance_is_positive(balance) {
+                    lines.push(format!(
+                        "  {}: {}",
+                        colored_node_name(&node.id),
+                        status_word(&node.status)
+                    ));
+                }
+            }
+            if !lines.is_empty() {
+                output.push_str(&format!("{network_id}:\n"));
+                output.push_str(&lines.join("\n"));
+                output.push('\n');
             }
         }
         output
@@ -319,6 +356,22 @@ fn status_text(status: &Status, memberships: &[String]) -> String {
         Status::Paying => "paying".to_string(),
         Status::Receiving => "receiving".to_string(),
     }
+}
+
+fn status_word(status: &Status) -> &'static str {
+    match status {
+        Status::Idle => "idle",
+        Status::Routing => "routing",
+        Status::Paying => "paying",
+        Status::Receiving => "listening",
+    }
+}
+
+fn balance_is_positive(balance: Option<&String>) -> bool {
+    balance
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|amount| amount.parse::<u64>().ok())
+        .is_some_and(|amount| amount > 0)
 }
 
 fn node_color(name: &str) -> &'static str {
@@ -611,7 +664,7 @@ impl Completer for CommandHelper {
         let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
         let word = &line[start..pos];
         let candidates = [
-            "fund", "router", "pay", "route", "balance", "balances", "help", "quit", "exit",
+            "fund", "router", "pay", "route", "summary", "help", "quit", "exit",
         ]
         .into_iter()
         .chain(NODE_NAMES.iter().copied())
@@ -749,7 +802,8 @@ async fn command_route(
 async fn execute_line(playground: Arc<Playground>, line: String) {
     info!("{line}");
     let mut parts = line.split_whitespace();
-    match parts.next() {
+    let verb = parts.next();
+    match verb {
         Some("fund") => match (parts.next(), parts.next()) {
             (Some(node), Some(network)) => {
                 if let Err(e) = command_fund(&playground, node, network).await {
@@ -779,7 +833,7 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             }
             _ => info!("usage: pay <node_id_sender> <node_id_target> <amount_msat>"),
         },
-        Some("balances") | Some("balance") => {}
+        Some("summary") => {}
         Some("route") => match (
             parts.next(),
             parts.next(),
@@ -793,14 +847,19 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             _ => info!("usage: route <sender> <target> <amount_msat>"),
         },
         Some("help") => info!(
-            "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | balances | route <sender> <target> <amount_msat> | quit"
+            "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
         ),
         Some("quit") | Some("exit") => info!("use Ctrl-C to exit"),
         Some(other) => info!("unknown command '{other}'; try help"),
         None => {}
     }
-    playground.refresh_balances().await;
-    info!("summary:\n{}", playground.summary().await);
+    if matches!(
+        verb,
+        Some("fund") | Some("router") | Some("pay") | Some("summary")
+    ) {
+        playground.refresh_balances().await;
+        info!("summary:\n{}", playground.summary().await);
+    }
 }
 
 #[tokio::main]
@@ -830,7 +889,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     info!(
-        "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | balances | route <sender> <target> <amount_msat> | quit"
+        "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
     );
 
     loop {
