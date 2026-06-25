@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, WatchError,
+    Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
+    WatchError,
 };
 
 #[derive(Clone, Debug)]
@@ -34,7 +35,7 @@ impl NetworkRouterAdapter for ArkAdapter {
         _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
-        _recipient: &str,
+        _recipient: PubKey,
     ) -> Result<OutgoingHtlc, HtlcError> {
         Err(HtlcError::Unimplemented)
     }

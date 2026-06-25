@@ -343,7 +343,7 @@ impl CassisClient {
                 outgoing_network: hop.outgoing.clone(),
                 incoming_deadline: expiries.get(i).copied().unwrap_or(now),
                 outgoing_expiry: expiries.get(i + 1).copied().unwrap_or(now),
-                recipient: hop.node.node_pubkey.to_string(),
+                recipient: hop.node.node_pubkey.to_hex(),
                 incoming_descriptor: descriptor,
             };
             let peer = hop.node.node_pubkey;

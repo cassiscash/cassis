@@ -537,7 +537,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: &str,
+        recipient: cassis_core::PubKey,
     ) -> Result<OutgoingHtlc, HtlcError> {
         if amount_msat == 0 {
             return Err(HtlcError::InvalidParams("amount must be > 0".into()));
@@ -678,7 +678,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                         .map_err(|e| HtlcError::InvalidParams(e.to_string()))?,
                     keyset_id,
                     proofs: Mutex::new(proofs.to_vec()),
-                    recipient: recipient.to_string(),
+                    recipient: recipient.to_hex(),
                 },
             );
         }
@@ -704,7 +704,7 @@ impl NetworkRouterAdapter for CashuAdapter {
             payment_hash,
             amount_msat,
             expiry,
-            recipient: recipient.to_string(),
+            recipient: recipient.to_hex(),
             network: self.network_id.clone(),
         })
     }
