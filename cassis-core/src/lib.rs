@@ -907,7 +907,10 @@ where
             amount_msat,
             expiry,
             destination_pubkey.parse().map_err(|e| {
-                SendError::InvalidParams(format!("invalid destination pubkey: {e}"))
+                SendError::InvalidParams(format!(
+                    "invalid destination pubkey '{}': {e}",
+                    destination_pubkey
+                ))
             })?,
         )
         .await
