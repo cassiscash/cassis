@@ -37,8 +37,8 @@
 //! | `claim_incoming`             | `await_final_receive_operation_state` → `Claimed`. The     |
 //! |                              | LNv2 claim is driven by the claim-keypair the module set    |
 //! |                              | up on our behalf; the `preimage` arg is informational only. |
-//! | `pay_invoice`                | `LightningClientModule::send(Bolt11Invoice)` — fund an      |
-//! |                              | `OutgoingContract` for the counter-party's `IncomingContract`.|
+//! | `pay_invoice`                | Fund an `OutgoingContract` directly, using the destination    |
+//! |                              | pubkey as `claim_pk`.                                        |
 //! | `watch_payment`              | Subscribe to send-op updates; capture `Success(preimage)`.  |
 //! | `refund_payment`             | Poll `await_final_send_operation_state` to terminal         |
 //! |                              | `Refunded` (LNv2 SM auto-refunds on timeout; no synchronous |
@@ -61,10 +61,8 @@
 //!   internally; the secret is not the input here. The argument is
 //!   asserted against the payment hash where possible and otherwise
 //!   ignored.
-//! * `destination_pubkey` passed to `pay_invoice` is the
-//!   counter-party's Bolt11 invoice string — i.e. the
-//!   `Bolt11Invoice` produced by the *downstream* node's
-//!   `create_invoice`.
+//! * `destination_pubkey` passed to `pay_invoice` becomes the outgoing
+//!   contract's `claim_pk`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -73,25 +71,28 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
 use fedimint_connectors::ConnectorRegistry;
-use fedimint_core::core::OperationId;
+use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
-use fedimint_core::module::registry::ModuleRegistry;
-use fedimint_core::Amount;
+use fedimint_core::module::{registry::ModuleRegistry, Amounts, ApiRequestErased};
+use fedimint_core::{secp256k1, Amount};
 use fedimint_derive_secret::DerivableSecret;
+use fedimint_lnv2_client::common::contracts::{OutgoingContract, PaymentImage};
 use fedimint_lnv2_client::common::Bolt11InvoiceDescription;
-use fedimint_lnv2_client::{LightningClientModule, SendOperationState};
+use fedimint_lnv2_client::common::{LightningOutput, LightningOutputV0};
+use fedimint_lnv2_client::LightningClientModule;
 use fedimint_mint_client::MintClientInit;
 use futures::StreamExt;
-use lightning_invoice::Bolt11Invoice;
 use std::str::FromStr;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use fedimint_api_client::api::FederationApiExt;
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
+use fedimint_client_module::transaction::{ClientOutput, ClientOutputBundle, TransactionBuilder};
 
 use cassis_core::{
-    Bytes32, NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment,
+    Bytes32, NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment, PubKey,
     ReceiveError, SendError,
 };
 
@@ -152,12 +153,10 @@ struct IncomingOp {
 #[derive(Clone)]
 #[allow(dead_code)]
 struct OutgoingOp {
-    operation_id: OperationId,
+    outpoint: fedimint_core::OutPoint,
     amount_msat: u64,
-    expiry: u64,
+    contract_expiration: u64,
     recipient: String,
-    /// Bolt11 invoice we are paying.
-    invoice: Bolt11Invoice,
 }
 
 impl FedimintAdapter {
@@ -520,16 +519,12 @@ impl NetworkSenderAdapter for FedimintAdapter {
         self.network_id.clone()
     }
 
-    /// Initiate an outgoing payment. The `destination_pubkey` is the
-    /// counter-party's Bolt11 invoice string, exactly as the
-    /// downstream node's `create_invoice` recorded it in
-    /// `Invoice.payee`. We validate the amount matches the invoice
-    /// and then submit the send to the LNv2 module.
+    /// Initiate an outgoing payment by funding an LNv2 contract directly.
     async fn pay_invoice(
         &self,
         payment_hash: Bytes32,
         amount_msat: u64,
-        destination_pubkey: &str,
+        destination_pubkey: PubKey,
         destination_network: &NetworkId,
         expiry: u64,
     ) -> Result<OutgoingPayment, SendError> {
@@ -540,54 +535,93 @@ impl NetworkSenderAdapter for FedimintAdapter {
                 self.network_id
             )));
         }
-
-        let invoice: Bolt11Invoice = destination_pubkey.parse().map_err(|e| {
-            SendError::InvalidParams(format!("destination_pubkey is not a Bolt11 invoice: {e}"))
-        })?;
-
-        let invoice_amount_msat = invoice
-            .amount_milli_satoshis()
-            .ok_or_else(|| SendError::InvalidParams("invoice has no amount".into()))?;
-        if invoice_amount_msat != amount_msat {
-            return Err(SendError::InvalidParams(format!(
-                "invoice amount {invoice_amount_msat} msat does not match requested {amount_msat}"
-            )));
+        if amount_msat == 0 {
+            return Err(SendError::InvalidParams("amount must be > 0".into()));
         }
-        let invoice_payment_hash = Bytes32(invoice.payment_hash().to_byte_array());
-        if invoice_payment_hash != payment_hash {
-            return Err(SendError::InvalidParams(format!(
-                "invoice payment hash {:?} does not match expected {:?}",
-                invoice_payment_hash, payment_hash
-            )));
+        if expiry
+            <= std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0)
+        {
+            return Err(SendError::InvalidParams("expiry in the past".into()));
         }
 
-        let ln = Self::ln_module(&self.client)
+        let module = self
+            .client
+            .get_first_module::<LightningClientModule>()
             .map_err(|e| SendError::Network(format!("LNv2 module not available: {e}")))?;
-        let operation_id = ln
-            .send(invoice.clone(), None, serde_json::Value::Null)
+        let consensus_block_count: u64 = module
+            .api
+            .request_current_consensus(
+                "consensus_block_count".to_string(),
+                ApiRequestErased::default(),
+            )
             .await
-            .map_err(|e| SendError::Network(format!("send failed: {e:?}")))?;
+            .map_err(|e| SendError::Network(format!("block count request failed: {e}")))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let expiration =
+            consensus_block_count.saturating_add(expiry.saturating_sub(now).div_ceil(10));
+        let mut claim_pk_bytes = [0u8; 33];
+        claim_pk_bytes[0] = 2;
+        claim_pk_bytes[1..].copy_from_slice(destination_pubkey.as_bytes());
+        let claim_pk = secp256k1::PublicKey::from_slice(&claim_pk_bytes)
+            .map_err(|e| SendError::InvalidParams(format!("invalid destination pubkey: {e}")))?;
+        let refund_keypair = secp256k1::SecretKey::new(&mut secp256k1::rand::thread_rng())
+            .keypair(&secp256k1::SECP256K1);
+        let ephemeral_keypair = secp256k1::SecretKey::new(&mut secp256k1::rand::thread_rng())
+            .keypair(&secp256k1::SECP256K1);
+        let contract = OutgoingContract {
+            payment_image: PaymentImage::Hash(sha256::Hash::from_byte_array(payment_hash.0)),
+            amount: Amount::from_msats(amount_msat),
+            expiration,
+            claim_pk,
+            refund_pk: refund_keypair.public_key(),
+            ephemeral_pk: ephemeral_keypair.public_key(),
+        };
+        let operation_id = OperationId::from_encodable(&(payment_hash.0, destination_pubkey.0));
+        let output = ClientOutput {
+            output: LightningOutput::V0(LightningOutputV0::Outgoing(contract)),
+            amounts: Amounts::new_bitcoin(Amount::from_msats(amount_msat)),
+        };
+        let outputs = ClientOutputBundle::new_no_sm(vec![output]).into_dyn(module.id);
+        let outpoints = self
+            .client
+            .finalize_and_submit_transaction(
+                operation_id,
+                "lnv2-cassis",
+                |_| serde_json::Value::Null,
+                TransactionBuilder::new().with_outputs(outputs),
+            )
+            .await
+            .map_err(|e| SendError::Network(format!("failed to fund contract: {e}")))?;
+        let outpoint = outpoints
+            .into_iter()
+            .next()
+            .ok_or_else(|| SendError::Network("funding returned no outpoint".into()))?;
 
         self.outgoing_ops.lock().await.insert(
-            invoice_payment_hash,
+            payment_hash,
             OutgoingOp {
-                operation_id,
+                outpoint,
                 amount_msat,
-                expiry,
-                recipient: destination_pubkey.to_string(),
-                invoice,
+                contract_expiration: expiration,
+                recipient: destination_pubkey.to_hex(),
             },
         );
 
         debug!(
-            ?invoice_payment_hash,
+            ?payment_hash,
             amount_msat, "fedimint outgoing payment initiated"
         );
 
         Ok(OutgoingPayment {
-            payment_hash: invoice_payment_hash,
+            payment_hash,
             amount_msat,
-            destination_pubkey: destination_pubkey.to_string(),
+            destination_pubkey: destination_pubkey.to_hex(),
             destination_network: destination_network.clone(),
             expiry,
         })
@@ -604,12 +638,10 @@ impl NetworkSenderAdapter for FedimintAdapter {
         payment: OutgoingPayment,
         deadline: u64,
     ) -> Result<Bytes32, SendError> {
-        let ln = Self::ln_module(&self.client)
-            .map_err(|e| SendError::Network(format!("LNv2 module not available: {e}")))?;
-        let op_id = {
+        let (outpoint, contract_expiration) = {
             let ops = self.outgoing_ops.lock().await;
             ops.get(&payment.payment_hash)
-                .map(|o| o.operation_id)
+                .map(|o| (o.outpoint, o.contract_expiration))
                 .ok_or_else(|| {
                     SendError::NotFound(format!(
                         "no outgoing operation known for payment hash {:?}",
@@ -618,46 +650,21 @@ impl NetworkSenderAdapter for FedimintAdapter {
                 })?
         };
 
-        let stream = ln
-            .subscribe_send_operation_state_updates(op_id)
-            .await
-            .map_err(|e| SendError::Network(format!("subscribe_send failed: {e}")))?
-            .into_stream();
-
-        let preimage_fut = async {
-            let mut s = stream;
-            while let Some(state) = s.next().await {
-                match state {
-                    SendOperationState::Success(p) => return Ok(Bytes32(p)),
-                    SendOperationState::Refunded => {
-                        return Err(SendError::Network(
-                            "outgoing payment refunded (counter-party forfeited or expired)".into(),
-                        ));
-                    }
-                    SendOperationState::Failure => {
-                        return Err(SendError::Network("outgoing send failed".into()));
-                    }
-                    SendOperationState::Refunding => {
-                        return Err(SendError::Network(
-                            "outgoing payment is refunding (counter-party forfeited or expired)"
-                                .into(),
-                        ));
-                    }
-                    SendOperationState::Funding | SendOperationState::Funded => {}
-                }
-            }
-            Err(SendError::Network(
-                "send state stream ended without preimage".into(),
-            ))
-        };
-
-        tokio::time::timeout(Self::deadline_to_timeout(deadline), preimage_fut)
-            .await
-            .map_err(|_| SendError::DeadlineExceeded)?
-            .map_err(|e| match e {
-                SendError::Network(msg) => SendError::Network(format!("await: {msg}")),
-                other => other,
-            })
+        let module = self
+            .client
+            .get_first_module::<LightningClientModule>()
+            .map_err(|e| SendError::Network(format!("LNv2 module not available: {e}")))?;
+        let preimage = tokio::time::timeout(
+            Self::deadline_to_timeout(deadline),
+            module.api.request_current_consensus::<[u8; 32]>(
+                "await_preimage".to_string(),
+                ApiRequestErased::new((outpoint, contract_expiration)),
+            ),
+        )
+        .await
+        .map_err(|_| SendError::DeadlineExceeded)?
+        .map_err(|e| SendError::Network(format!("await preimage failed: {e}")))?;
+        Ok(Bytes32(preimage))
     }
 
     /// Refund/cancel an outgoing payment. In LNv2 the send state
@@ -668,51 +675,9 @@ impl NetworkSenderAdapter for FedimintAdapter {
     /// path this is normally NOT called — the preimage reveals and
     /// we move on.
     async fn refund_payment(&self, payment: OutgoingPayment) -> Result<(), SendError> {
-        let ln = Self::ln_module(&self.client)
-            .map_err(|e| SendError::Network(format!("LNv2 module not available: {e}")))?;
-        let op_id = {
-            let ops = self.outgoing_ops.lock().await;
-            ops.get(&payment.payment_hash)
-                .map(|o| o.operation_id)
-                .ok_or_else(|| {
-                    SendError::NotFound(format!(
-                        "no outgoing operation known for payment hash {:?}",
-                        payment.payment_hash
-                    ))
-                })?
-        };
-
-        // LNv2 only reaches `Refunded` once the outgoing contract's
-        // block-height expiry has passed. For long-expiry contracts
-        // this can be hours, so we cap the wait here and return early
-        // if the SM hasn't refunded yet — the cassis routing layer
-        // may re-invoke later when the deadline approaches. We prefer
-        // a generous cap (one day) so most realistic refund cases
-        // resolve in one call.
-        let final_state = tokio::time::timeout(
-            std::time::Duration::from_secs(86_400),
-            ln.await_final_send_operation_state(op_id),
-        )
-        .await
-        .map_err(|_| SendError::Network("timed out waiting for send state".into()))?
-        .map_err(|e| SendError::Network(format!("await_send failed: {e}")))?;
-
-        match final_state {
-            fedimint_lnv2_client::FinalSendOperationState::Refunded => {
-                debug!(
-                    ?payment.payment_hash,
-                    "fedimint outgoing payment refunded"
-                );
-                self.outgoing_ops.lock().await.remove(&payment.payment_hash);
-                Ok(())
-            }
-            fedimint_lnv2_client::FinalSendOperationState::Success => Err(SendError::Network(
-                "outgoing payment was already claimed with a preimage (not refundable)".into(),
-            )),
-            fedimint_lnv2_client::FinalSendOperationState::Failure => {
-                self.outgoing_ops.lock().await.remove(&payment.payment_hash);
-                Err(SendError::Network("outgoing send failed".into()))
-            }
-        }
+        let _ = payment;
+        Err(SendError::Network(
+            "raw outgoing contract refund is not supported".into(),
+        ))
     }
 }

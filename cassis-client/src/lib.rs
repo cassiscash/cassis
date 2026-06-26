@@ -317,7 +317,7 @@ impl CassisClient {
             .pay_invoice(
                 invoice.payment_hash,
                 invoice.amount_msat,
-                &first_hop.node.node_pubkey.to_string(),
+                first_hop.node.node_pubkey,
                 &first_hop.outgoing,
                 first_outgoing_expiry,
             )

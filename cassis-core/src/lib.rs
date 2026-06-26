@@ -747,7 +747,7 @@ pub trait NetworkSenderAdapter: Send + Sync {
         &self,
         payment_hash: Bytes32,
         amount_msat: u64,
-        destination_pubkey: &str,
+        destination_pubkey: PubKey,
         destination_network: &NetworkId,
         expiry: u64,
     ) -> Result<OutgoingPayment, SendError>;
@@ -897,7 +897,7 @@ where
         &self,
         payment_hash: Bytes32,
         amount_msat: u64,
-        destination_pubkey: &str,
+        destination_pubkey: PubKey,
         destination_network: &NetworkId,
         expiry: u64,
     ) -> Result<OutgoingPayment, SendError> {
@@ -906,12 +906,7 @@ where
             payment_hash,
             amount_msat,
             expiry,
-            destination_pubkey.parse().map_err(|e| {
-                SendError::InvalidParams(format!(
-                    "invalid destination pubkey '{}': {e}",
-                    destination_pubkey
-                ))
-            })?,
+            destination_pubkey,
         )
         .await
         .map_err(|e| match e {
@@ -921,7 +916,7 @@ where
         Ok(OutgoingPayment {
             payment_hash: htlc.payment_hash,
             amount_msat,
-            destination_pubkey: destination_pubkey.to_string(),
+            destination_pubkey: destination_pubkey.to_hex(),
             destination_network: destination_network.clone(),
             expiry,
         })
