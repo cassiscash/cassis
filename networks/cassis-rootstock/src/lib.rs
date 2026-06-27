@@ -27,7 +27,6 @@ sol! {
             bytes32 indexed preimageHash,
             uint256 amount,
             address indexed claimAddress,
-            address indexed refundAddress,
             uint256 timelock
         );
 
@@ -43,7 +42,6 @@ sol! {
         function lock(
             bytes32 preimageHash,
             address claimAddress,
-            address refundAddress,
             uint256 timelock
         ) payable;
 
@@ -346,8 +344,13 @@ impl RootstockAdapter {
         let receipt = pending
             .get_receipt()
             .await
-            .map_err(|e| Error::Rpc(format!("send_call receipt: {e}")))?;
+            .map_err(|e| Error::Rpc(format!("send_call receipt (tx {tx_hash}): {e}")))?;
         let gas_used = receipt.gas_used;
+        if !receipt.status() {
+            return Err(Error::Rpc(format!(
+                "send_call transaction {tx_hash} reverted"
+            )));
+        }
         Ok((tx_hash, gas_used, receipt.status()))
     }
 }
@@ -434,7 +437,6 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 IEtherSwap::lockCall {
                     preimageHash: preimage_hash,
                     claimAddress: claim_address,
-                    refundAddress: self.address,
                     timelock: U256::from(timelock),
                 }
                 .abi_encode()
@@ -446,6 +448,15 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .await
             .map_err(|e| HtlcError::Network(format!("lock send: {e}")))?;
         let tx_hash = *pending.tx_hash();
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| HtlcError::Network(format!("lock receipt (tx {tx_hash}): {e}")))?;
+        if !receipt.status() {
+            return Err(HtlcError::Network(format!(
+                "lock transaction {tx_hash} reverted"
+            )));
+        }
         debug!(
             target: "cassis_rootstock",
             "lock tx sent: payment_hash={} claim={} amount_wei={} timelock={} tx={tx_hash}",
@@ -516,12 +527,15 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .send_transaction(request)
             .await
             .map_err(|e| HtlcError::Network(format!("claim send: {e}")))?;
+        let tx_hash = *pending.tx_hash();
         let receipt = pending
             .get_receipt()
             .await
-            .map_err(|e| HtlcError::Network(format!("claim receipt: {e}")))?;
+            .map_err(|e| HtlcError::Network(format!("claim receipt (tx {tx_hash}): {e}")))?;
         if !receipt.status() {
-            return Err(HtlcError::Network("claim tx reverted".into()));
+            return Err(HtlcError::Network(format!(
+                "claim transaction {tx_hash} reverted"
+            )));
         }
         let mut incoming = self.incoming.lock().await;
         incoming.remove(&payment_hash);
@@ -568,12 +582,15 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .send_transaction(request)
             .await
             .map_err(|e| HtlcError::Network(format!("refund send: {e}")))?;
+        let tx_hash = *pending.tx_hash();
         let receipt = pending
             .get_receipt()
             .await
-            .map_err(|e| HtlcError::Network(format!("refund receipt: {e}")))?;
+            .map_err(|e| HtlcError::Network(format!("refund receipt (tx {tx_hash}): {e}")))?;
         if !receipt.status() {
-            return Err(HtlcError::Network("refund tx reverted".into()));
+            return Err(HtlcError::Network(format!(
+                "refund transaction {tx_hash} reverted"
+            )));
         }
         let mut outgoing = self.outgoing.lock().await;
         outgoing.remove(&payment_hash);
