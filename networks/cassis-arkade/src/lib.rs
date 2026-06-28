@@ -7,16 +7,24 @@ use cassis_core::{
 #[derive(Clone, Debug)]
 pub struct ArkAdapter {
     network_id: NetworkId,
+    invoice_pubkey: PubKey,
 }
 
 impl ArkAdapter {
-    pub fn new(network_id: NetworkId) -> Self {
-        Self { network_id }
+    pub fn new(network_id: NetworkId, invoice_pubkey: PubKey) -> Self {
+        Self {
+            network_id,
+            invoice_pubkey,
+        }
     }
 }
 
 #[async_trait]
 impl NetworkRouterAdapter for ArkAdapter {
+    fn invoice_pubkey(&self) -> PubKey {
+        self.invoice_pubkey
+    }
+
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }

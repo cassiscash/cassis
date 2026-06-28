@@ -13,7 +13,7 @@ use cassis_core::{
     Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
     OutgoingHtlc, PubKey, WatchError,
 };
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -130,6 +130,7 @@ pub struct RootstockConfig {
     /// claims / refunds HTLCs. Derived from
     /// `cassis/network/<network_id>`.
     pub sk: [u8; 32],
+    pub invoice_pubkey: PubKey,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +147,7 @@ struct PendingIncoming {
 struct PendingOutgoing {
     contract: Address,
     amount_wei: U256,
+    claim_address: Address,
     refund_address: Address,
     timelock: u64,
 }
@@ -357,6 +359,10 @@ impl RootstockAdapter {
 
 #[async_trait]
 impl NetworkRouterAdapter for RootstockAdapter {
+    fn invoice_pubkey(&self) -> PubKey {
+        self.config.invoice_pubkey
+    }
+
     fn network_id(&self) -> NetworkId {
         self.config.network_id.clone()
     }
@@ -416,6 +422,13 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 .0[12..],
         );
         let amount_wei = Self::msat_to_wei(amount_msat);
+        info!(
+            target: "cassis_rootstock",
+            "preparing htlc amount={} to={} hash={}",
+            amount_msat,
+            claim_address,
+            payment_hash.short(),
+        );
         let latest = self
             .block_number()
             .await
@@ -457,6 +470,10 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 "lock transaction {tx_hash} reverted"
             )));
         }
+        info!(
+            target: "cassis_rootstock",
+            "htlc prepared tx={tx_hash}",
+        );
         debug!(
             target: "cassis_rootstock",
             "lock tx sent: payment_hash={} claim={} amount_wei={} timelock={} tx={tx_hash}",
@@ -471,6 +488,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
             PendingOutgoing {
                 contract: self.contract,
                 amount_wei,
+                claim_address,
                 refund_address: self.address,
                 timelock,
             },
@@ -660,10 +678,11 @@ impl NetworkRouterAdapter for RootstockAdapter {
         descriptor: &HtlcDescriptor,
         payment_hash: Bytes32,
     ) -> Result<(), HtlcError> {
-        let (contract_addr, amount_wei, refund_addr, timelock) = match descriptor {
+        let (contract_addr, amount_wei, claim_addr, refund_addr, timelock) = match descriptor {
             HtlcDescriptor::Rootstock {
                 contract,
                 amount_wei,
+                claim_address,
                 refund_address,
                 timelock,
             } => {
@@ -673,9 +692,12 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 let refund_addr = Address::from_str(refund_address).map_err(|e| {
                     HtlcError::InvalidParams(format!("invalid refund address: {e}"))
                 })?;
+                let claim_addr = Address::from_str(claim_address)
+                    .map_err(|e| HtlcError::InvalidParams(format!("invalid claim address: {e}")))?;
                 (
                     contract_addr,
                     U256::from(*amount_wei),
+                    claim_addr,
                     refund_addr,
                     *timelock,
                 )
@@ -689,9 +711,16 @@ impl NetworkRouterAdapter for RootstockAdapter {
         let hash = Self::compute_swap_hash(
             B256::from_slice(payment_hash.as_ref()),
             amount_wei,
-            self.address,
+            claim_addr,
             refund_addr,
             timelock,
+        );
+        info!(
+            target: "cassis_rootstock",
+            "checking htlc target={} amount={} hash={}",
+            claim_addr,
+            amount_wei,
+            payment_hash.short(),
         );
         let call = IEtherSwap::swapsCall(hash);
         let request = TransactionRequest::default()
@@ -728,6 +757,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
             HtlcDescriptor::Rootstock {
                 contract,
                 amount_wei,
+                claim_address: _,
                 refund_address,
                 timelock,
             } => (
@@ -791,6 +821,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         Ok(HtlcDescriptor::Rootstock {
             contract: format!("{:#x}", slot.contract),
             amount_wei,
+            claim_address: format!("{:#x}", slot.claim_address),
             refund_address: format!("{:#x}", slot.refund_address),
             timelock: slot.timelock,
         })
@@ -802,7 +833,11 @@ impl NetworkRouterAdapter for RootstockAdapter {
 /// contract for mainnet (`rootstock`) or testnet
 /// (`rootstock::testnet`). Callers can override `contract` on the
 /// returned config before constructing the adapter.
-pub fn default_config(network_id: NetworkId, sk: [u8; 32]) -> RootstockConfig {
+pub fn default_config(
+    network_id: NetworkId,
+    sk: [u8; 32],
+    invoice_pubkey: PubKey,
+) -> RootstockConfig {
     match network_id.0.as_str() {
         "rootstock::testnet" => RootstockConfig {
             network_id,
@@ -810,6 +845,7 @@ pub fn default_config(network_id: NetworkId, sk: [u8; 32]) -> RootstockConfig {
             contract: Some(ROOTSTOCK_TESTNET_CONTRACT.to_string()),
             chain_id: ROOTSTOCK_TESTNET_CHAIN_ID,
             sk,
+            invoice_pubkey,
         },
         _ => RootstockConfig {
             network_id,
@@ -817,6 +853,7 @@ pub fn default_config(network_id: NetworkId, sk: [u8; 32]) -> RootstockConfig {
             contract: Some(ROOTSTOCK_MAINNET_CONTRACT.to_string()),
             chain_id: ROOTSTOCK_MAINNET_CHAIN_ID,
             sk,
+            invoice_pubkey,
         },
     }
 }
@@ -1131,7 +1168,13 @@ mod tests {
 
     #[test]
     fn default_config_mainnet_has_contract_and_rpc() {
-        let cfg = default_config(NetworkId("rootstock".to_string()), [7u8; 32]);
+        let cfg = default_config(
+            NetworkId("rootstock".to_string()),
+            [7u8; 32],
+            "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
+                .parse()
+                .unwrap(),
+        );
         assert_eq!(cfg.rpc_url, ROOTSTOCK_MAINNET_RPC);
         assert_eq!(cfg.chain_id, 30);
         assert_eq!(cfg.contract.as_deref(), Some(ROOTSTOCK_MAINNET_CONTRACT));
@@ -1139,7 +1182,13 @@ mod tests {
 
     #[test]
     fn default_config_testnet_has_contract_and_rpc() {
-        let cfg = default_config(NetworkId("rootstock::testnet".to_string()), [7u8; 32]);
+        let cfg = default_config(
+            NetworkId("rootstock::testnet".to_string()),
+            [7u8; 32],
+            "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
+                .parse()
+                .unwrap(),
+        );
         assert_eq!(cfg.rpc_url, ROOTSTOCK_TESTNET_RPC);
         assert_eq!(cfg.chain_id, 31);
         assert_eq!(cfg.contract.as_deref(), Some(ROOTSTOCK_TESTNET_CONTRACT));

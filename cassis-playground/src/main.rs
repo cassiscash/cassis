@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -38,6 +39,31 @@ struct NetworkDef {
     id: &'static str,
     spec: &'static str,
     mint_url: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BalanceMsat(u64);
+
+impl fmt::Display for BalanceMsat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let digits = self.0.to_string();
+        let grouped = digits
+            .chars()
+            .rev()
+            .enumerate()
+            .flat_map(|(index, digit)| {
+                if index > 0 && index % 3 == 0 {
+                    Some(['_', digit])
+                } else {
+                    Some(['\0', digit])
+                }
+            })
+            .flat_map(|pair| pair.into_iter())
+            .filter(|digit| *digit != '\0')
+            .collect::<String>();
+        let grouped = grouped.chars().rev().collect::<String>();
+        write!(f, "{grouped}msat")
+    }
 }
 
 const NETWORKS: &[NetworkDef] = &[
@@ -98,6 +124,11 @@ impl Log for LogSink {
     }
     fn log(&self, record: &Record<'_>) {
         let message = record.args().to_string();
+        if message.starts_with("request; method_names=")
+            || message == "connection handled successfully"
+        {
+            return;
+        }
         // Drop bare span names leaked from the tracing bridge ("QADv4;",
         // "tx;", "upnp;", ...): a single token terminated by ';'.
         let trimmed = message.trim_end();
@@ -161,7 +192,7 @@ struct Playground {
     nodes: Mutex<HashMap<String, NodeState>>,
     children: Mutex<Vec<Child>>,
     relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    balances: Mutex<HashMap<(String, String), String>>,
+    balances: Mutex<HashMap<(String, String), BalanceMsat>>,
 }
 
 impl Playground {
@@ -285,22 +316,11 @@ impl Playground {
         sorted_nodes.sort_by(|left, right| left.id.cmp(&right.id));
         for node in &sorted_nodes {
             output.push_str(&format!(
-                "{} [pub:{} iroh:{}]: {}\n",
+                "{} [pub:…{} iroh:…{}]\n",
                 colored_node_name(&node.id),
                 identity_suffix(&node.nostr_pubkey),
                 identity_suffix(&node.iroh_id),
-                status_text(&node.status, &node.memberships)
             ));
-            for network_id in &node.memberships {
-                let balance = balances
-                    .get(&(node.id.clone(), network_id.clone()))
-                    .map(String::as_str)
-                    .unwrap_or("(not refreshed)");
-                output.push_str(&format!(
-                    "  {}: {balance}\n",
-                    colored_network_name(network_id)
-                ));
-            }
         }
         if !output.is_empty() {
             output.push('\n');
@@ -317,13 +337,20 @@ impl Playground {
                 if !node.memberships.iter().any(|m| m == &network_id) {
                     continue;
                 }
-                let balance = balances.get(&(node.id.clone(), network_id.clone()));
-                if !matches!(node.status, Status::Idle) || balance_is_positive(balance) {
-                    lines.push(format!(
-                        "  {}: {}",
-                        colored_node_name(&node.id),
-                        status_word(&node.status)
-                    ));
+                if let Some(balance) = balances.get(&(node.id.clone(), network_id.clone())) {
+                    if !matches!(node.status, Status::Idle) || balance.0 > 0 {
+                        lines.push(format!(
+                            "  {}: {} ({})",
+                            colored_node_name(&node.id),
+                            balance,
+                            match &node.status {
+                                Status::Idle => "idle",
+                                Status::Routing => "routing",
+                                Status::Paying => "paying",
+                                Status::Receiving => "listening",
+                            }
+                        ));
+                    }
                 }
             }
             if !lines.is_empty() {
@@ -350,12 +377,15 @@ impl Playground {
                 })
                 .collect()
         };
-        let mut refreshed = Vec::with_capacity(entries.len());
+        let mut refreshed: Vec<((String, String), BalanceMsat)> = Vec::with_capacity(entries.len());
         for (node_id, network_id) in entries {
-            let value = self
-                .node_balance(&node_id, &network_id)
-                .await
-                .unwrap_or_else(|e| format!("error: {e}"));
+            let value = match self.node_balance(&node_id, &network_id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!("balance refresh failed for {node_id} on {network_id}: {error}");
+                    BalanceMsat::default()
+                }
+            };
             refreshed.push(((node_id, network_id), value));
         }
         let mut balances = self.balances.lock().await;
@@ -364,7 +394,7 @@ impl Playground {
         }
     }
 
-    async fn node_balance(&self, node_id: &str, network_id: &str) -> Result<String, String> {
+    async fn node_balance(&self, node_id: &str, network_id: &str) -> Result<BalanceMsat, String> {
         let network = network(network_id)?;
         let home = node_home(node_id);
         let spec = NetSpec::parse(network.spec)?;
@@ -378,48 +408,17 @@ impl Playground {
                     .await
                     .iter()
                     .map(|p| u64::from(p.amount))
-                    .sum()
+                    .sum::<u64>()
+                    .saturating_mul(1000)
             }
             None => {
                 let adapter =
                     cassis_client::adapters::build_rootstock_adapter(&spec, &derived).await?;
-                adapter.balance_msat().await.map_err(|e| e.to_string())? / 1000
+                adapter.balance_msat().await.map_err(|e| e.to_string())?
             }
         };
-        Ok(format!("{total} sat"))
+        Ok(BalanceMsat(total))
     }
-}
-
-fn status_text(status: &Status, memberships: &[String]) -> String {
-    match status {
-        Status::Idle => "idle".to_string(),
-        Status::Routing => format!(
-            "routing ({})",
-            memberships
-                .iter()
-                .map(|network| colored_network_name(network))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Status::Paying => "paying".to_string(),
-        Status::Receiving => "receiving".to_string(),
-    }
-}
-
-fn status_word(status: &Status) -> &'static str {
-    match status {
-        Status::Idle => "idle",
-        Status::Routing => "routing",
-        Status::Paying => "paying",
-        Status::Receiving => "listening",
-    }
-}
-
-fn balance_is_positive(balance: Option<&String>) -> bool {
-    balance
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|amount| amount.parse::<u64>().ok())
-        .is_some_and(|amount| amount > 0)
 }
 
 fn node_color(name: &str) -> &'static str {

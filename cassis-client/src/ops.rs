@@ -119,7 +119,7 @@ pub async fn create_invoice_for(
     let invoice = Invoice {
         payment_hash: Bytes32(payment_hash),
         amount_msat,
-        payee: network_id.0.clone(),
+        payee: derived.invoice.pubkey(),
         expires_at: invoice_expiry,
         networks: vec![network_id],
         description: None,

@@ -25,12 +25,6 @@ use cdk::Amount;
 
 use crate::errors::{CashuError, CashuResult};
 
-/// SHA-256 of the preimage in hex, exactly the form NUT-14 stores in
-/// the secret's `data` field.
-pub fn payment_hash_hex(payment_hash: &[u8; 32]) -> String {
-    lowercase_hex::encode(payment_hash)
-}
-
 /// Build the NUT-14 spending conditions for an HTLC whose preimage
 /// hash is `payment_hash` and whose sender-refund path becomes
 /// available at `locktime` (unix seconds). `locktime` is required to
@@ -39,7 +33,7 @@ pub fn payment_hash_hex(payment_hash: &[u8; 32]) -> String {
 pub fn htlc_conditions(payment_hash: &[u8; 32], locktime: u64) -> CashuResult<SpendingConditions> {
     let conditions = Conditions::new(Some(locktime), None, None, None, None, None)
         .map_err(|e| CashuError::Nuts(format!("invalid NUT-10 conditions: {e}")))?;
-    SpendingConditions::new_htlc_hash(&payment_hash_hex(payment_hash), Some(conditions))
+    SpendingConditions::new_htlc_hash(&lowercase_hex::encode(payment_hash), Some(conditions))
         .map_err(|e| CashuError::Nuts(format!("invalid NUT-14 spending conditions: {e}")))
 }
 
@@ -154,7 +148,7 @@ pub fn verify_proofs_htlc(proofs: &[Proof]) -> CashuResult<()> {
 /// runs at DISPATCH time, when the proofs are freshly locked and no
 /// witness is available yet.
 pub fn verify_proofs_htlc_locked(proofs: &[Proof], payment_hash: &[u8; 32]) -> CashuResult<()> {
-    let expected = payment_hash_hex(payment_hash);
+    let expected = lowercase_hex::encode(payment_hash);
     for proof in proofs {
         let nut10: Nut10Secret = serde_json::from_str(&proof.secret.to_string())
             .map_err(|e| CashuError::Nuts(format!("decode proof secret: {e}")))?;
@@ -236,7 +230,7 @@ mod tests {
         let hash = random_payment_hash();
         let locktime = unix_time() + 60;
         let cond = htlc_conditions(&hash, locktime).expect("valid");
-        let hex = payment_hash_hex(&hash);
+        let hex = lowercase_hex::encode(hash);
         match cond {
             SpendingConditions::HTLCConditions { data, conditions } => {
                 assert_eq!(data.to_string(), hex);
@@ -361,9 +355,9 @@ mod tests {
     }
 
     #[test]
-    fn payment_hash_hex_is_lowercase_and_padded() {
+    fn payment_hash_encoding_is_lowercase_and_padded() {
         let hash = [0u8; 32];
-        let s = payment_hash_hex(&hash);
+        let s = lowercase_hex::encode(hash);
         assert_eq!(s.len(), 64);
         assert!(s
             .chars()
