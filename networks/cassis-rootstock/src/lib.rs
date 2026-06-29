@@ -229,24 +229,6 @@ impl RootstockAdapter {
             .unwrap_or(0)
     }
 
-    fn compute_swap_hash(
-        preimage_hash: B256,
-        amount: U256,
-        claim: Address,
-        refund: Address,
-        timelock: u64,
-    ) -> B256 {
-        use alloy::primitives::keccak256;
-        let mut buf = [0u8; 160];
-        buf[0..32].copy_from_slice(preimage_hash.as_slice());
-        buf[32..64].copy_from_slice(&amount.to_be_bytes::<32>());
-        buf[64..84].copy_from_slice(claim.as_slice());
-        buf[84..104].copy_from_slice(refund.as_slice());
-        let timelock_be = U256::from(timelock).to_be_bytes::<32>();
-        buf[128..160].copy_from_slice(&timelock_be);
-        keccak256(buf)
-    }
-
     /// Cached EVM address derived from `config.sk` in `new()`.
     pub fn address(&self) -> Address {
         self.address
@@ -493,6 +475,17 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 timelock,
             },
         );
+        drop(outgoing);
+        let descriptor = HtlcDescriptor::Rootstock {
+            contract: format!("{:#x}", self.contract),
+            amount_wei: amount_wei
+                .try_into()
+                .map_err(|_| HtlcError::Network("amount_wei overflows descriptor field".into()))?,
+            claim_address: format!("{:#x}", claim_address),
+            refund_address: format!("{:#x}", self.address),
+            timelock,
+        };
+        self.verify_incoming_htlc(&descriptor, payment_hash).await?;
         Ok(OutgoingHtlc {
             payment_hash,
             amount_msat,
@@ -708,13 +701,6 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 )));
             }
         };
-        let hash = Self::compute_swap_hash(
-            B256::from_slice(payment_hash.as_ref()),
-            amount_wei,
-            claim_addr,
-            refund_addr,
-            timelock,
-        );
         info!(
             target: "cassis_rootstock",
             "checking htlc target={} amount={} hash={}",
@@ -722,7 +708,29 @@ impl NetworkRouterAdapter for RootstockAdapter {
             amount_wei,
             payment_hash.short(),
         );
-        let call = IEtherSwap::swapsCall(hash);
+        let hash_values_call = IEtherSwap::hashValuesCall {
+            preimageHash: B256::from_slice(payment_hash.as_ref()),
+            amount: amount_wei,
+            claimAddress: claim_addr,
+            refundAddress: refund_addr,
+            timelock: U256::from(timelock),
+        };
+        let hash_values_request = TransactionRequest::default()
+            .to(contract_addr)
+            .input(hash_values_call.abi_encode().into());
+        let hash_values = self
+            .provider
+            .call(hash_values_request)
+            .await
+            .map_err(|e| HtlcError::Network(format!("hashValues() failed: {e}")))?;
+        if hash_values.len() < 32 {
+            return Err(HtlcError::Network(format!(
+                "hashValues() returned {} bytes, expected 32",
+                hash_values.len()
+            )));
+        }
+        let swap_hash = B256::from_slice(&hash_values[..32]);
+        let call = IEtherSwap::swapsCall(swap_hash);
         let request = TransactionRequest::default()
             .to(contract_addr)
             .input(call.abi_encode().into());
