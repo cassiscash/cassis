@@ -12,7 +12,6 @@ use cassis_client::ops::{
 use cassis_client::store::CashuProofDb;
 use cassis_client::CassisClient;
 use cdk::nuts::Token;
-use log::{info, warn, Level, LevelFilter, Log, Metadata, Record};
 use ritualistic::server::{CustomRelay, RelayInternals};
 use ritualistic::{Event as NostrEvent, Filter as NostrFilter};
 use rustyline::completion::{Completer, Pair};
@@ -23,16 +22,18 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Editor, ExternalPrinter, Helper};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tracing::Instrument;
+use tracing::{info, info_span, warn, Event, Span, Subscriber};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Context as SubscriberContext, Layer};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
 
 const ROOT: &str = "/tmp/cassis-playground";
 const COMMAND_HISTORY: &str = "commands.history";
 const RELAY: &str = "ws://localhost:10000";
 const RSK_SEED: &str = "tmp/rsk-seed";
 const DEFAULT_FUND_AMOUNT: u64 = 1000;
-
-tokio::task_local! {
-    static NODE_LOG_CONTEXT: String;
-}
 
 #[derive(Clone)]
 struct NetworkDef {
@@ -104,6 +105,7 @@ enum Status {
 
 struct NodeState {
     id: String,
+    span: Span,
     nostr_pubkey: String,
     iroh_id: String,
     memberships: Vec<String>,
@@ -113,38 +115,56 @@ struct NodeState {
     router_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-struct LogSink {
+struct PlaygroundLogLayer {
     lines: Arc<StdMutex<VecDeque<String>>>,
     printer: Arc<StdMutex<Option<Box<dyn ExternalPrinter + Send>>>>,
 }
 
-impl Log for LogSink {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() != Level::Trace && !metadata.target().starts_with("iroh")
+struct NodeSpanName(String);
+
+impl<S> Layer<S> for PlaygroundLogLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::Id,
+        ctx: SubscriberContext<'_, S>,
+    ) {
+        let mut visitor = NodeSpanVisitor(None);
+        attrs.record(&mut visitor);
+        if let Some(name) = visitor.0 {
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(NodeSpanName(name));
+            }
+        }
     }
-    fn log(&self, record: &Record<'_>) {
-        let message = record.args().to_string();
+
+    fn on_event(&self, event: &Event<'_>, _ctx: SubscriberContext<'_, S>) {
+        let metadata = event.metadata();
+        if *metadata.level() > tracing::Level::INFO || metadata.target().starts_with("iroh") {
+            return;
+        }
+        let mut message = String::new();
+        event.record(&mut PlaygroundMessageVisitor(&mut message));
         if message.starts_with("request; method_names=")
             || message == "connection handled successfully"
         {
             return;
         }
-        // Drop bare span names leaked from the tracing bridge ("QADv4;",
-        // "tx;", "upnp;", ...): a single token terminated by ';'.
         let trimmed = message.trim_end();
         if trimmed.ends_with(';') && !trimmed[..trimmed.len() - 1].contains(char::is_whitespace) {
             return;
         }
-        let line = NODE_LOG_CONTEXT
-            .try_with(|node| {
-                format!(
-                    "[{}] {}: {}",
-                    record.level(),
-                    colored_node_name(node),
-                    message
-                )
-            })
-            .unwrap_or_else(|_| format!("[{}] {}", record.level(), message));
+        let node = _ctx.event_span(event).and_then(|span| {
+            span.extensions()
+                .get::<NodeSpanName>()
+                .map(|name| colored_node_name(&name.0))
+        });
+        let line = node
+            .map(|node| format!("[{}] {}: {}", metadata.level(), node, message))
+            .unwrap_or_else(|| format!("[{}] {}", metadata.level(), message));
         if let Ok(mut printer) = self.printer.lock() {
             if let Some(printer) = printer.as_mut() {
                 let _ = printer.print(line.clone());
@@ -158,7 +178,39 @@ impl Log for LogSink {
             }
         }
     }
-    fn flush(&self) {}
+}
+
+struct NodeSpanVisitor(Option<String>);
+
+impl tracing::field::Visit for NodeSpanVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "node" {
+            self.0 = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        if field.name() == "node" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+struct PlaygroundMessageVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for PlaygroundMessageVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0.push_str(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{value:?}");
+        }
+    }
 }
 
 #[derive(Default)]
@@ -228,6 +280,7 @@ impl Playground {
                 (*id).to_string(),
                 NodeState {
                     id: (*id).to_string(),
+                    span: info_span!("node", node = *id),
                     nostr_pubkey,
                     iroh_id,
                     memberships: Vec::new(),
@@ -259,7 +312,7 @@ impl Playground {
             )
             .await
             {
-                log::error!("relay stopped: {error}");
+                tracing::error!("relay stopped: {error}");
             }
         });
         *self.relay_task.lock().await = Some(task);
@@ -418,6 +471,15 @@ impl Playground {
             }
         };
         Ok(BalanceMsat(total))
+    }
+
+    async fn node_span(&self, node_id: &str) -> Span {
+        self.nodes
+            .lock()
+            .await
+            .get(node_id)
+            .map(|node| node.span.clone())
+            .unwrap_or_else(Span::none)
     }
 }
 
@@ -628,7 +690,7 @@ async fn command_router(
         .collect();
     let cashu_store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path));
-    let router_node_id = node_id.to_string();
+    let router_span = playground.node_span(node_id).await;
     let jh = tokio::spawn(async move {
         let config = cassis_router::RouterConfig {
             network_specs,
@@ -636,13 +698,13 @@ async fn command_router(
             derived_keys: derived,
             cashu_store,
         };
-        NODE_LOG_CONTEXT
-            .scope(router_node_id, async move {
-                if let Err(e) = cassis_router::run_router(config).await {
-                    warn!("router failed: {e}");
-                }
-            })
-            .await;
+        async move {
+            if let Err(e) = cassis_router::run_router(config).await {
+                warn!("router failed: {e}");
+            }
+        }
+        .instrument(router_span)
+        .await;
     });
     let mut nodes = playground.nodes.lock().await;
     let node = nodes.get_mut(node_id).unwrap();
@@ -898,12 +960,12 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
                     },
                     None => DEFAULT_FUND_AMOUNT,
                 };
-                NODE_LOG_CONTEXT
-                    .scope(node.to_string(), async {
+                async {
                         if let Err(e) = command_fund(&playground, node, network, amount).await {
                             warn!("fund failed: {e}");
                         }
-                    })
+                    }
+                    .instrument(playground.node_span(node).await)
                     .await;
             }
             _ => info!("usage: fund <node_id> <network_id> [amount]"),
@@ -911,12 +973,12 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
         Some("router") => match parts.next() {
             Some(node) => {
                 let networks = parts.map(str::to_string).collect();
-                NODE_LOG_CONTEXT
-                    .scope(node.to_string(), async {
+                async {
                         if let Err(e) = command_router(&playground, node, networks).await {
                             warn!("router failed: {e}");
                         }
-                    })
+                    }
+                    .instrument(playground.node_span(node).await)
                     .await;
             }
             None => info!("usage: router <node_id> [<network_id> ...]"),
@@ -927,12 +989,12 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             parts.next().and_then(|s| s.parse::<u64>().ok()),
         ) {
             (Some(sender), Some(target), Some(amount)) => {
-                NODE_LOG_CONTEXT
-                    .scope(sender.to_string(), async {
+                async {
                         if let Err(e) = command_pay(&playground, sender, target, amount).await {
                             warn!("pay failed: {e}");
                         }
-                    })
+                    }
+                    .instrument(playground.node_span(sender).await)
                     .await;
             }
             _ => info!("usage: pay <node_id_sender> <node_id_target> <amount_msat>"),
@@ -944,12 +1006,12 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             parts.next().and_then(|s| s.parse::<u64>().ok()),
         ) {
             (Some(sender), Some(target), Some(amount)) => {
-                NODE_LOG_CONTEXT
-                    .scope(sender.to_string(), async {
+                async {
                         if let Err(e) = command_route(&playground, sender, target, amount).await {
                             warn!("route failed: {e}");
                         }
-                    })
+                    }
+                    .instrument(playground.node_span(sender).await)
                     .await;
             }
             _ => info!("usage: route <sender> <target> <amount_msat>"),
@@ -974,11 +1036,12 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs = Arc::new(StdMutex::new(VecDeque::new()));
     let printer = Arc::new(StdMutex::new(None));
-    log::set_boxed_logger(Box::new(LogSink {
-        lines: logs.clone(),
-        printer: printer.clone(),
-    }))?;
-    log::set_max_level(LevelFilter::Info);
+    tracing_subscriber::registry()
+        .with(PlaygroundLogLayer {
+            lines: logs.clone(),
+            printer: printer.clone(),
+        })
+        .init();
     let playground = Playground::new().await?;
 
     let mut editor = Editor::<CommandHelper, rustyline::history::DefaultHistory>::new()?;

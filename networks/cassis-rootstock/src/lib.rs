@@ -13,12 +13,12 @@ use cassis_core::{
     Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
     OutgoingHtlc, PubKey, WatchError,
 };
-use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
+use tracing::{debug, info, warn};
 
 sol! {
     #[derive(Debug)]

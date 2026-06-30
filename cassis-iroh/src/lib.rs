@@ -5,13 +5,13 @@ use cassis_core::{
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl, SecretKey};
-use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 pub const ALPN_PROTOCOL: &[u8] = b"cassis-hop/1";
 
@@ -99,13 +99,13 @@ impl IrohClient {
 
     /// Build a new client endpoint with the same defaults as the server.
     pub async fn bind() -> Result<Self, IrohError> {
-        info!(target: "iroh_client", "binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
+        debug!(target: "iroh_client", "binding endpoint with ALPN {:?}", ALPN_PROTOCOL);
         let endpoint = Endpoint::builder(presets::N0)
             .alpns(vec![ALPN_PROTOCOL.to_vec()])
             .bind()
             .await
             .map_err(|e| IrohError::Io(e.to_string()))?;
-        info!(target: "iroh_client", "bound peer_id={}", endpoint.id());
+        debug!(target: "iroh_client", "bound peer_id={}", endpoint.id());
         Ok(Self::new(endpoint))
     }
 
@@ -315,7 +315,7 @@ impl IrohServer {
                 + Sync,
         >,
     ) -> Result<(), IrohError> {
-        info!(target: "iroh_server", "entering accept loop");
+        debug!(target: "iroh_server", "entering accept loop");
         loop {
             debug!(target: "iroh_server", "waiting for incoming connection...");
             let incoming = match self.endpoint.accept().await {
@@ -328,7 +328,7 @@ impl IrohServer {
             debug!(target: "iroh_server", "got incoming, awaiting handshake...");
             let conn = match incoming.await {
                 Ok(c) => {
-                    info!(
+                    debug!(
                         target: "iroh_server",
                         "handshake complete from remote={:?}",
                         c.remote_id()
@@ -347,7 +347,7 @@ impl IrohServer {
                 if let Err(e) = handle_conn(conn, handler).await {
                     error!(target: "iroh_server", "handle error: {e}");
                 } else {
-                    info!(target: "iroh_server", "connection handled successfully");
+                    debug!(target: "iroh_server", "connection handled successfully");
                 }
             });
         }

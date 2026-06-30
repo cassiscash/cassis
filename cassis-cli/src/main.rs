@@ -17,7 +17,7 @@ use cassis_client::CassisClient;
 use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter};
 use cassis_keys as keys;
 use clap::Parser;
-use log::{error, info};
+use tracing::{error, info};
 
 mod cli;
 use cli::{CashuCommands, Cli, Commands, RootstockCommands};

@@ -237,7 +237,7 @@ pub async fn start_receive(
         });
         tokio::spawn(async move {
             if let Err(e) = iroh_server.run(handler).await {
-                log::error!(target: "cassis_client", "iroh server error: {e}");
+                tracing::error!(target: "cassis_client", "iroh server error: {e}");
             }
         });
     }
@@ -277,7 +277,7 @@ pub async fn start_receive(
         // Hold the task alive forever; dropping this handle cancels it.
         std::future::pending::<()>().await;
     });
-    log::info!(
+    tracing::info!(
         target: "cassis_client",
         "receive: listening for COMMIT on iroh peer_id={iroh_peer_id} relay={iroh_relay}"
     );

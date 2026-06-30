@@ -18,9 +18,9 @@ use cassis_routing::{
 use futures::future::try_join_all;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
-use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 #[derive(thiserror::Error, Debug)]
 pub enum PayError {
