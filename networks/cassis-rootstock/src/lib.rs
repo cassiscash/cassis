@@ -1,18 +1,20 @@
+use alloy::consensus::Transaction;
 use alloy::dyn_abi::{DynSolType, DynSolValue, JsonAbiExt};
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::eth::{Filter, TransactionRequest};
+use alloy::rpc::types::eth::{BlockTransactions, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use alloy::sol_types::{SolCall, SolEvent};
+use alloy::sol_types::SolCall;
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
 use cassis_core::{
     Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
     OutgoingHtlc, PubKey, WatchError,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -339,6 +341,48 @@ impl RootstockAdapter {
     }
 }
 
+impl RootstockAdapter {
+    async fn find_claim_preimage_in_block(
+        &self,
+        block_number: u64,
+        payment_hash: Bytes32,
+    ) -> Result<Option<Bytes32>, Error> {
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .full()
+            .await
+            .map_err(|e| Error::Rpc(format!("get_block_by_number({block_number}): {e}")))?;
+
+        let Some(block) = block else {
+            return Ok(None);
+        };
+        let BlockTransactions::Full(transactions) = &block.transactions else {
+            return Ok(None);
+        };
+
+        for transaction in transactions {
+            if transaction.to() != Some(self.contract) {
+                continue;
+            }
+            let input = transaction.input();
+            if input.len() < 4 {
+                continue;
+            }
+            let Ok(decoded) = IEtherSwap::claimCall::abi_decode(input) else {
+                continue;
+            };
+            let digest = Sha256::digest(decoded.preimage.as_slice());
+            if digest.as_slice() == payment_hash.as_ref() {
+                let mut preimage = [0u8; 32];
+                preimage.copy_from_slice(decoded.preimage.as_slice());
+                return Ok(Some(Bytes32(preimage)));
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[async_trait]
 impl NetworkRouterAdapter for RootstockAdapter {
     fn invoice_pubkey(&self) -> PubKey {
@@ -613,40 +657,35 @@ impl NetworkRouterAdapter for RootstockAdapter {
         payment_hash: Bytes32,
         deadline: u64,
     ) -> Result<Bytes32, WatchError> {
-        let topic = B256::from_slice(payment_hash.as_ref());
         let interval = Duration::from_secs(POLL_INTERVAL_SECS);
+        let mut last_scanned: Option<u64> = None;
         loop {
             if Self::unix_now() >= deadline {
                 return Err(WatchError::DeadlineExceeded);
             }
-            let filter = Filter::new()
-                .address(self.contract)
-                .event_signature(IEtherSwap::Claim::SIGNATURE_HASH)
-                .topic1(topic)
-                .from_block(BlockNumberOrTag::Latest);
-            match self.provider.get_logs(&filter).await {
-                Ok(logs) => {
-                    for log in logs {
-                        if log.topics().len() < 2 {
-                            continue;
-                        }
-                        let decoded = match log.log_decode::<IEtherSwap::Claim>() {
-                            Ok(d) => d,
-                            Err(_) => continue,
-                        };
-                        let args = &decoded.inner.data;
-                        let mut out = [0u8; 32];
-                        out.copy_from_slice(args.preimage.as_slice());
-                        return Ok(Bytes32(out));
-                    }
-                }
+            let latest = match self.block_number().await {
+                Ok(n) => n,
                 Err(e) => {
-                    warn!(
+                    warn!(target: "cassis_rootstock", "watch_preimage block_number failed: {e}");
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            };
+            let from = last_scanned.map(|n| n + 1).unwrap_or(latest);
+            for block_number in from..=latest {
+                match self
+                    .find_claim_preimage_in_block(block_number, payment_hash)
+                    .await
+                {
+                    Ok(Some(preimage)) => return Ok(preimage),
+                    Ok(None) => {}
+                    Err(e) => warn!(
                         target: "cassis_rootstock",
-                        "watch_preimage get_logs failed: {e}"
-                    );
+                        "watch_preimage block scan failed at {block_number}: {e}"
+                    ),
                 }
             }
+            last_scanned = Some(latest);
             tokio::time::sleep(interval).await;
         }
     }
