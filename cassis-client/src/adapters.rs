@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use cassis_core::{NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter};
 use cassis_keys::DerivedKeys;
+use tracing::Span;
 
 use crate::netspec::NetSpec;
 use crate::store::CashuProofDb;
@@ -18,10 +19,11 @@ pub async fn build_receivers(
     specs: &[NetSpec],
     derived: &DerivedKeys,
     store_path: &Path,
+    span: Span,
 ) -> Result<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>, String> {
     let mut out: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>> = HashMap::new();
     for spec in specs {
-        let entry = build_pair(spec, derived, store_path).await?;
+        let entry = build_pair(spec, derived, store_path, span.clone()).await?;
         out.insert(entry.network_id.clone(), entry.receiver);
     }
     Ok(out)
@@ -31,10 +33,11 @@ pub async fn build_senders(
     specs: &[NetSpec],
     derived: &DerivedKeys,
     store_path: &Path,
+    span: Span,
 ) -> Result<HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>, String> {
     let mut out: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>> = HashMap::new();
     for spec in specs {
-        let entry = build_pair(spec, derived, store_path).await?;
+        let entry = build_pair(spec, derived, store_path, span.clone()).await?;
         out.insert(entry.network_id.clone(), entry.sender);
     }
     Ok(out)
@@ -52,6 +55,7 @@ async fn build_pair(
     spec: &NetSpec,
     derived: &DerivedKeys,
     store_path: &Path,
+    span: Span,
 ) -> Result<AdapterPair, String> {
     let network_id = spec.network_id();
     let sk = derived
@@ -70,6 +74,7 @@ async fn build_pair(
                     sk,
                     derived.invoice.pubkey(),
                     store,
+                    span.clone(),
                 )
                 .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
@@ -80,8 +85,12 @@ async fn build_pair(
             })
         }
         NetSpec::Rootstock { .. } => {
-            let cfg =
-                cassis_rootstock::default_config(network_id.clone(), sk, derived.invoice.pubkey());
+            let cfg = cassis_rootstock::default_config(
+                network_id.clone(),
+                sk,
+                derived.invoice.pubkey(),
+                span.clone(),
+            );
             let adapter = cassis_rootstock::RootstockAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
@@ -122,6 +131,7 @@ pub async fn build_cashu_adapter(
     spec: &NetSpec,
     derived: &DerivedKeys,
     store_path: &Path,
+    span: Span,
 ) -> Result<Arc<cassis_cashu::CashuAdapter>, String> {
     let NetSpec::Cashu { mint_url, host: _ } = spec else {
         return Err(format!("expected a cashu spec, got {}", spec.kind_name()));
@@ -140,6 +150,7 @@ pub async fn build_cashu_adapter(
         sk,
         derived.invoice.pubkey(),
         store,
+        span,
     )
     .map(|a| Arc::new(a))
     .map_err(|e| format!("cashu adapter init failed: {e}"))
@@ -150,6 +161,7 @@ pub async fn build_cashu_adapter(
 pub async fn build_rootstock_adapter(
     spec: &NetSpec,
     derived: &DerivedKeys,
+    span: Span,
 ) -> Result<Arc<cassis_rootstock::RootstockAdapter>, String> {
     let NetSpec::Rootstock { .. } = spec else {
         return Err(format!(
@@ -163,7 +175,7 @@ pub async fn build_rootstock_adapter(
         .get(&network_id)
         .map(|k| *k.as_bytes())
         .unwrap_or([0u8; 32]);
-    let cfg = cassis_rootstock::default_config(network_id, sk, derived.invoice.pubkey());
+    let cfg = cassis_rootstock::default_config(network_id, sk, derived.invoice.pubkey(), span);
     cassis_rootstock::RootstockAdapter::new(cfg)
         .await
         .map_err(|e| format!("rootstock adapter init failed: {e}"))
@@ -176,6 +188,7 @@ pub async fn build_cashu_adapter_from_url(
     mint_url: &str,
     derived: &DerivedKeys,
     store_path: &Path,
+    span: Span,
 ) -> Result<(NetSpec, Arc<cassis_cashu::CashuAdapter>), String> {
     let host = mint_url_to_host(mint_url)?;
     let network_id = cassis_core::cashu_network_id(&host);
@@ -192,6 +205,7 @@ pub async fn build_cashu_adapter_from_url(
         sk,
         derived.invoice.pubkey(),
         store,
+        span,
     )
     .map_err(|e| format!("cashu adapter init failed: {e}"))?;
     let canonical = cassis_core::cashu_mint_url(&network_id)

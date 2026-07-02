@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument, Span};
 
 const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 
@@ -52,6 +52,8 @@ pub struct RouterConfig {
     /// endpoint and `derived.networks` for per-network
     /// adapter signing.
     pub derived_keys: keys::DerivedKeys,
+    /// Span identifying node that owns router and its adapter calls.
+    pub span: Span,
     /// Persistence backend for cashu wallet proofs. The cashu
     /// adapter reads and writes every held proof through this,
     /// so balances survive router restarts. Required only when
@@ -97,6 +99,7 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
         match build_adapter(
             spec,
             &config.derived_keys,
+            config.span.clone(),
             #[cfg(feature = "cashu")]
             &config.cashu_store,
         )
@@ -129,7 +132,7 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
         config.nostr_relays.clone()
     };
 
-    let router = Arc::new(CassisRouter::new(adapters));
+    let router = Arc::new(CassisRouter::new(adapters, config.span));
     let handler_router = router.clone();
     let poll_router = router.clone();
 
@@ -197,6 +200,7 @@ pub struct NetworkEntry {
 async fn build_adapter(
     spec: &str,
     derived: &keys::DerivedKeys,
+    span: Span,
     #[cfg(feature = "cashu")] cashu_store: &Arc<dyn cassis_cashu::CashuProofStore>,
 ) -> Result<NetworkEntry, String> {
     let (kind, param) = cassis_core::split_spec(spec);
@@ -224,6 +228,7 @@ async fn build_adapter(
                     sk,
                     derived.invoice.pubkey(),
                     cashu_store.clone(),
+                    span.clone(),
                 )
                 .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
@@ -256,7 +261,8 @@ async fn build_adapter(
             let adapter: Arc<dyn NetworkRouterAdapter> =
                 Arc::new(cassis_liquid::LiquidAdapter::new(
                     network_id.clone(),
-                    config.derived_keys.invoice.pubkey(),
+                    derived.invoice.pubkey(),
+                    span.clone(),
                 ));
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
@@ -281,7 +287,8 @@ async fn build_adapter(
             let adapter: Arc<dyn NetworkRouterAdapter> =
                 Arc::new(cassis_arkade::ArkAdapter::new(
                     network_id.clone(),
-                    config.derived_keys.invoice.pubkey(),
+                    derived.invoice.pubkey(),
+                    span.clone(),
                 ));
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
@@ -317,6 +324,7 @@ async fn build_adapter(
                 network_id.clone(),
                 sk,
                 derived.invoice.pubkey(),
+                span.clone(),
             );
             let adapter: Arc<dyn NetworkRouterAdapter> = cassis_rootstock::RootstockAdapter::new(cfg)
                 .await
@@ -354,14 +362,16 @@ struct DispatchedHop {
 
 pub struct CassisRouter {
     pub adapters: HashMap<NetworkId, NetworkEntry>,
+    span: Span,
     prepared: PreparedMap,
     dispatched: Arc<Mutex<HashMap<Bytes32, DispatchedHop>>>,
 }
 
 impl CassisRouter {
-    pub fn new(adapters: HashMap<NetworkId, NetworkEntry>) -> Self {
+    pub fn new(adapters: HashMap<NetworkId, NetworkEntry>, span: Span) -> Self {
         Self {
             adapters,
+            span,
             prepared: Arc::new(Mutex::new(HashMap::new())),
             dispatched: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -373,6 +383,12 @@ impl CassisRouter {
     /// Committed flow directly from sender to receiver
     /// (payee's `cassis-cli`) without crossing a router hop.
     pub async fn handle_frame(&self, frame: Frame) -> Result<Frame, IrohError> {
+        self.handle_frame_inner(frame)
+            .instrument(self.span.clone())
+            .await
+    }
+
+    async fn handle_frame_inner(&self, frame: Frame) -> Result<Frame, IrohError> {
         match &frame {
             Frame::Prepare(p) => {
                 info!(
@@ -727,7 +743,7 @@ impl CassisRouter {
                 Ok(preimage) => {
                     info!(
                         target: "cassis_router",
-                        "  preimage revealed for {} on {}, claiming incoming",
+                        "  preimage revealed for {} on {}, preparing incoming claim",
                         payment_hash.short(),
                         prepare.outgoing_network,
                     );
@@ -764,6 +780,12 @@ impl CassisRouter {
                 return;
             }
         };
+        info!(
+            target: "cassis_router",
+            "  claiming incoming HTLC for {} on {}",
+            payment_hash.short(),
+            prepare.incoming_network,
+        );
         match incoming_entry
             .adapter
             .claim_incoming(payment_hash, preimage)

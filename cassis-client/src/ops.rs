@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{info, Instrument, Span};
 
 pub use crate::netspec::NetSpec;
 pub use crate::seed_store::{read_mnemonic, seed_path, write_mnemonic};
@@ -169,6 +170,19 @@ pub async fn handle_commit_frame(
     let receiver = receivers.get(&commit.network).ok_or_else(|| {
         cassis_iroh::IrohError::Protocol(format!("no receiver for {}", commit.network))
     })?;
+    info!(
+        target: "cassis_client",
+        "received COMMIT for payment_hash={} amount_msat={} network={}",
+        commit.payment_hash.short(),
+        commit.amount_msat,
+        commit.network,
+    );
+    info!(
+        target: "cassis_client",
+        "claiming incoming HTLC for payment_hash={} on {}",
+        commit.payment_hash.short(),
+        commit.network,
+    );
     receiver
         .accept_incoming_via_descriptor(
             commit.payment_hash,
@@ -181,6 +195,12 @@ pub async fn handle_commit_frame(
         .claim_incoming(commit.payment_hash, Bytes32(preimage))
         .await
         .map_err(|e| cassis_iroh::IrohError::Protocol(format!("claim: {e}")))?;
+    info!(
+        target: "cassis_client",
+        "incoming HTLC claimed for payment_hash={} on {}",
+        commit.payment_hash.short(),
+        commit.network,
+    );
     let mut store = Store::open(&store_path)
         .map_err(|e| cassis_iroh::IrohError::Protocol(format!("store reopen: {e}")))?;
     store
@@ -204,10 +224,12 @@ pub struct ReceiverHandle {
 pub async fn start_receive(
     home: &Path,
     networks: &[NetSpec],
+    span: Span,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let ids: Vec<NetworkId> = networks.iter().map(|s| s.network_id()).collect();
     let derived = load_and_derive(home, ids)?;
-    let receivers = build_receivers(networks, &derived, &node_store_path(home)).await?;
+    let receivers =
+        build_receivers(networks, &derived, &node_store_path(home), span.clone()).await?;
     let receivers: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>> = Arc::new(receivers);
 
     let (iroh_server, iroh_secret) = IrohServer::new(derived.iroh.clone())
@@ -224,10 +246,14 @@ pub async fn start_receive(
     {
         let receivers = receivers.clone();
         let store_path = store_path.clone();
+        let handler_span = span.clone();
         let handler = Arc::new(move |frame: Frame| {
             let receivers = receivers.clone();
             let store_path = store_path.clone();
-            Box::pin(async move { handle_commit_frame(frame, receivers, store_path).await })
+            Box::pin(
+                async move { handle_commit_frame(frame, receivers, store_path).await }
+                    .instrument(handler_span.clone()),
+            )
                 as std::pin::Pin<
                     Box<
                         dyn std::future::Future<Output = Result<Frame, cassis_iroh::IrohError>>
@@ -254,29 +280,32 @@ pub async fn start_receive(
             .filter(|r| networks.iter().any(|s| s.network_id() == r.network_id))
             .collect()
     };
-    let jh = tokio::spawn(async move {
-        for row in pending {
-            let r = receivers.get(&row.network_id);
-            if let Some(rv) = r {
-                let deadline = row.expires_at.min(unix_now().saturating_add(3600));
-                // Block until the upstream hop funds the invoice (or the
-                // deadline passes), then claim with the revealed preimage.
-                let fund = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    rv.watch_incoming(row.payment_hash, deadline),
-                )
-                .await;
-                if let Ok(Ok(preimage)) = fund {
-                    let _ = rv.claim_incoming(row.payment_hash, preimage).await;
-                    if let Ok(mut st) = Store::open(&store_path) {
-                        let _ = st.mark_status(&row.payment_hash, InvoiceStatus::Claimed);
+    let jh = tokio::spawn(
+        async move {
+            for row in pending {
+                let r = receivers.get(&row.network_id);
+                if let Some(rv) = r {
+                    let deadline = row.expires_at.min(unix_now().saturating_add(3600));
+                    // Block until the upstream hop funds the invoice (or the
+                    // deadline passes), then claim with the revealed preimage.
+                    let fund = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        rv.watch_incoming(row.payment_hash, deadline),
+                    )
+                    .await;
+                    if let Ok(Ok(preimage)) = fund {
+                        let _ = rv.claim_incoming(row.payment_hash, preimage).await;
+                        if let Ok(mut st) = Store::open(&store_path) {
+                            let _ = st.mark_status(&row.payment_hash, InvoiceStatus::Claimed);
+                        }
                     }
                 }
             }
+            // Hold the task alive forever; dropping this handle cancels it.
+            std::future::pending::<()>().await;
         }
-        // Hold the task alive forever; dropping this handle cancels it.
-        std::future::pending::<()>().await;
-    });
+        .instrument(span),
+    );
     tracing::info!(
         target: "cassis_client",
         "receive: listening for COMMIT on iroh peer_id={iroh_peer_id} relay={iroh_relay}"

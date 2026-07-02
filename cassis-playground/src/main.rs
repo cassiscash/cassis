@@ -453,9 +453,12 @@ impl Playground {
         let spec = NetSpec::parse(network.spec)?;
         let ids = vec![spec.network_id()];
         let derived = load_and_derive(&home, ids)?;
+        let span = self.node_span(node_id).await;
         let total = match network.mint_url {
             Some(_) => {
-                let adapter = build_cashu_adapter(&spec, &derived, &node_store_path(&home)).await?;
+                let adapter =
+                    build_cashu_adapter(&spec, &derived, &node_store_path(&home), span.clone())
+                        .await?;
                 adapter
                     .balance()
                     .await
@@ -466,7 +469,7 @@ impl Playground {
             }
             None => {
                 let adapter =
-                    cassis_client::adapters::build_rootstock_adapter(&spec, &derived).await?;
+                    cassis_client::adapters::build_rootstock_adapter(&spec, &derived, span).await?;
                 adapter.balance_msat().await.map_err(|e| e.to_string())?
             }
         };
@@ -552,9 +555,10 @@ async fn command_fund(
     }
     let net = network(network_id)?.clone();
     ensure_membership(playground, node_id, network_id).await?;
+    let span = playground.node_span(node_id).await;
     match net.mint_url {
-        Some(mint_url) => fund_cashu(node_id, network_id, mint_url, amount).await,
-        None => fund_rootstock(node_id, amount * 1000).await,
+        Some(mint_url) => fund_cashu(node_id, network_id, mint_url, amount, span).await,
+        None => fund_rootstock(node_id, amount * 1000, span).await,
     }
 }
 
@@ -578,6 +582,7 @@ async fn fund_cashu(
     network_id: &str,
     mint_url: &str,
     amount_sat: u64,
+    span: Span,
 ) -> Result<(), String> {
     let cdk = cdk_dir(network_id);
     std::fs::create_dir_all(&cdk).map_err(|e| e.to_string())?;
@@ -619,7 +624,7 @@ async fn fund_cashu(
     let spec = NetSpec::parse(&format!("cashu::{host}"))?;
     let home = node_home(node_id);
     let derived = load_and_derive(&home, vec![spec.network_id()])?;
-    let adapter = build_cashu_adapter(&spec, &derived, &node_store_path(&home)).await?;
+    let adapter = build_cashu_adapter(&spec, &derived, &node_store_path(&home), span).await?;
     let keysets = adapter.keysets().await.map_err(|e| e.to_string())?;
     let incoming = parsed.proofs(&keysets).map_err(|e| e.to_string())?;
     let received = adapter
@@ -634,18 +639,19 @@ async fn fund_cashu(
     Ok(())
 }
 
-async fn fund_rootstock(node_id: &str, amount_msat: u64) -> Result<(), String> {
+async fn fund_rootstock(node_id: &str, amount_msat: u64, span: Span) -> Result<(), String> {
     let source_mnemonic =
         std::fs::read_to_string(RSK_SEED).map_err(|e| format!("read {RSK_SEED}: {e}"))?;
     let source_spec = NetSpec::parse("rootstock::testnet")?;
     let source_keys = cassis_keys::derive_keys(&source_mnemonic, vec![source_spec.network_id()])
         .map_err(|e| e.to_string())?;
     let source =
-        cassis_client::adapters::build_rootstock_adapter(&source_spec, &source_keys).await?;
+        cassis_client::adapters::build_rootstock_adapter(&source_spec, &source_keys, span.clone())
+            .await?;
     let target_home = node_home(node_id);
     let target_keys = load_and_derive(&target_home, vec![source_spec.network_id()])?;
     let target =
-        cassis_client::adapters::build_rootstock_adapter(&source_spec, &target_keys).await?;
+        cassis_client::adapters::build_rootstock_adapter(&source_spec, &target_keys, span).await?;
     let tx = source
         .transfer(&target.address().to_string(), amount_msat)
         .await
@@ -696,6 +702,7 @@ async fn command_router(
             network_specs,
             nostr_relays: vec![RELAY.to_string()],
             derived_keys: derived,
+            span: router_span.clone(),
             cashu_store,
         };
         async move {
@@ -751,6 +758,7 @@ async fn command_pay(
             .iter()
             .map(|id| NetSpec::parse(network(id).unwrap().spec))
             .collect::<Result<Vec<_>, _>>()?,
+        playground.node_span(target).await,
     )
     .await?;
     playground
@@ -771,6 +779,7 @@ async fn command_pay(
         &sender_specs_parsed,
         &derived,
         &node_store_path(&sender_home),
+        playground.node_span(sender).await,
     )
     .await?;
     let client = CassisClient::new(senders, vec![RELAY.to_string()]).await;

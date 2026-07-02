@@ -20,7 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Span};
 
 sol! {
     #[derive(Debug)]
@@ -133,6 +133,7 @@ pub struct RootstockConfig {
     /// `cassis/network/<network_id>`.
     pub sk: [u8; 32],
     pub invoice_pubkey: PubKey,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -448,13 +449,15 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 .0[12..],
         );
         let amount_wei = Self::msat_to_wei(amount_msat);
-        info!(
-            target: "cassis_rootstock",
-            "preparing htlc amount={} to={} hash={}",
-            amount_msat,
-            claim_address,
-            payment_hash.short(),
-        );
+        self.config.span.in_scope(|| {
+            info!(
+                target: "cassis_rootstock",
+                "preparing htlc amount={} to={} hash={}",
+                amount_msat,
+                claim_address,
+                payment_hash.short(),
+            );
+        });
         let latest = self
             .block_number()
             .await
@@ -496,18 +499,17 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 "lock transaction {tx_hash} reverted"
             )));
         }
-        info!(
-            target: "cassis_rootstock",
-            "htlc prepared tx={tx_hash}",
-        );
-        debug!(
-            target: "cassis_rootstock",
-            "lock tx sent: payment_hash={} claim={} amount_wei={} timelock={} tx={tx_hash}",
-            payment_hash,
-            claim_address,
-            amount_wei,
-            timelock,
-        );
+        self.config.span.in_scope(|| {
+            info!(target: "cassis_rootstock", "htlc prepared tx={tx_hash}");
+            debug!(
+                target: "cassis_rootstock",
+                "lock tx sent: payment_hash={} claim={} amount_wei={} timelock={} tx={tx_hash}",
+                payment_hash,
+                claim_address,
+                amount_wei,
+                timelock,
+            );
+        });
         let mut outgoing = self.outgoing.lock().await;
         outgoing.insert(
             payment_hash,
@@ -666,7 +668,9 @@ impl NetworkRouterAdapter for RootstockAdapter {
             let latest = match self.block_number().await {
                 Ok(n) => n,
                 Err(e) => {
-                    warn!(target: "cassis_rootstock", "watch_preimage block_number failed: {e}");
+                    self.config.span.in_scope(|| {
+                        warn!(target: "cassis_rootstock", "watch_preimage block_number failed: {e}");
+                    });
                     tokio::time::sleep(interval).await;
                     continue;
                 }
@@ -679,10 +683,12 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 {
                     Ok(Some(preimage)) => return Ok(preimage),
                     Ok(None) => {}
-                    Err(e) => warn!(
-                        target: "cassis_rootstock",
-                        "watch_preimage block scan failed at {block_number}: {e}"
-                    ),
+                    Err(e) => self.config.span.in_scope(|| {
+                        warn!(
+                            target: "cassis_rootstock",
+                            "watch_preimage block scan failed at {block_number}: {e}"
+                        );
+                    }),
                 }
             }
             last_scanned = Some(latest);
@@ -740,13 +746,15 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 )));
             }
         };
-        info!(
-            target: "cassis_rootstock",
-            "checking htlc target={} amount={} hash={}",
-            claim_addr,
-            amount_wei,
-            payment_hash.short(),
-        );
+        self.config.span.in_scope(|| {
+            info!(
+                target: "cassis_rootstock",
+                "checking htlc target={} amount={} hash={}",
+                claim_addr,
+                amount_wei,
+                payment_hash.short(),
+            );
+        });
         let hash_values_call = IEtherSwap::hashValuesCall {
             preimageHash: B256::from_slice(payment_hash.as_ref()),
             amount: amount_wei,
@@ -884,6 +892,7 @@ pub fn default_config(
     network_id: NetworkId,
     sk: [u8; 32],
     invoice_pubkey: PubKey,
+    span: Span,
 ) -> RootstockConfig {
     match network_id.0.as_str() {
         "rootstock::testnet" => RootstockConfig {
@@ -893,6 +902,7 @@ pub fn default_config(
             chain_id: ROOTSTOCK_TESTNET_CHAIN_ID,
             sk,
             invoice_pubkey,
+            span: span.clone(),
         },
         _ => RootstockConfig {
             network_id,
@@ -901,6 +911,7 @@ pub fn default_config(
             chain_id: ROOTSTOCK_MAINNET_CHAIN_ID,
             sk,
             invoice_pubkey,
+            span,
         },
     }
 }
@@ -1221,6 +1232,7 @@ mod tests {
             "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
                 .parse()
                 .unwrap(),
+            Span::none(),
         );
         assert_eq!(cfg.rpc_url, ROOTSTOCK_MAINNET_RPC);
         assert_eq!(cfg.chain_id, 30);
@@ -1235,6 +1247,7 @@ mod tests {
             "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
                 .parse()
                 .unwrap(),
+            Span::none(),
         );
         assert_eq!(cfg.rpc_url, ROOTSTOCK_TESTNET_RPC);
         assert_eq!(cfg.chain_id, 31);
