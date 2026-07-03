@@ -3,6 +3,7 @@ use cassis_core::{
     Bytes32, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
     WatchError,
 };
+use tracing::Span;
 
 #[derive(Clone, Debug)]
 pub struct LiquidAdapter {
@@ -11,7 +12,7 @@ pub struct LiquidAdapter {
 }
 
 impl LiquidAdapter {
-    pub fn new(network_id: NetworkId, invoice_pubkey: PubKey) -> Self {
+    pub fn new(network_id: NetworkId, invoice_pubkey: PubKey, span: Span) -> Self {
         Self {
             network_id,
             invoice_pubkey,

@@ -571,19 +571,23 @@ impl NetworkRouterAdapter for CashuAdapter {
             .find(|k| k.id == keyset_id)
             .ok_or_else(|| HtlcError::Network("active keyset disappeared".into()))?
             .clone();
-        let conditions = htlc_conditions(&payment_hash.0, expiry)
+        let receiver_pubkey = htlc::pubkey_from_cassis(&recipient)
             .map_err(|e| HtlcError::InvalidParams(e.to_string()))?;
-        let _ = conditions; // included in the swap's blinded-message secrets by build_htlc_outputs
 
         // Build the HTLC-locked outputs. The mint signs them
         // under the spending conditions embedded in each
         // blinded-message secret.
-        let outputs = build_htlc_outputs(amount_sat, keyset_id, &payment_hash.0, expiry).map_err(
-            |e| match e {
-                CashuError::HtlcExpired => HtlcError::InvalidParams("expiry in past".into()),
-                other => HtlcError::Network(other.to_string()),
-            },
-        )?;
+        let outputs = build_htlc_outputs(
+            amount_sat,
+            keyset_id,
+            &payment_hash.0,
+            expiry,
+            &receiver_pubkey,
+        )
+        .map_err(|e| match e {
+            CashuError::HtlcExpired => HtlcError::InvalidParams("expiry in past".into()),
+            other => HtlcError::Network(other.to_string()),
+        })?;
         let n_output = outputs.premints.len();
 
         // Pull unrestricted input proofs from the local
@@ -686,7 +690,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                 PendingOutgoing {
                     amount_sat,
                     locktime: expiry,
-                    conditions: htlc_conditions(&payment_hash.0, expiry)
+                    conditions: htlc_conditions(&payment_hash.0, expiry, &receiver_pubkey)
                         .map_err(|e| HtlcError::InvalidParams(e.to_string()))?,
                     keyset_id,
                     proofs: Mutex::new(proofs.to_vec()),
@@ -776,7 +780,10 @@ impl NetworkRouterAdapter for CashuAdapter {
         // path of NUT-14 and is what makes the swap at the
         // mint valid.
         let mut proofs = locked;
-        add_preimage_to_proofs(&mut proofs, &preimage.0);
+        let signing_key = cdk::nuts::nut01::SecretKey::from_slice(&self.secret_key)
+            .map_err(|e| HtlcError::Network(format!("invalid Cashu signing key: {e}")))?;
+        add_preimage_to_proofs(&mut proofs, &preimage.0, &signing_key)
+            .map_err(|e| HtlcError::InvalidParams(e.to_string()))?;
         verify_proofs_htlc(&proofs).map_err(|e| HtlcError::InvalidParams(e.to_string()))?;
 
         // Build the swap-to-self: outputs use unrestricted

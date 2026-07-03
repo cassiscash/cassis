@@ -17,6 +17,7 @@
 #[allow(unused_imports)]
 use cdk::dhke::{blind_message, construct_proofs as dhke_construct_proofs};
 use cdk::nuts::nut00::{BlindedMessage, PreMint, Proof, Proofs};
+use cdk::nuts::nut01::{PublicKey, SecretKey as P2pkSecretKey};
 use cdk::nuts::nut10::{Secret as Nut10Secret, SpendingConditions};
 use cdk::nuts::{Conditions, Id as KeysetId, Witness};
 use cdk::secret::Secret;
@@ -25,14 +26,31 @@ use cdk::Amount;
 
 use crate::errors::{CashuError, CashuResult};
 
+pub fn pubkey_from_cassis(pubkey: &cassis_core::PubKey) -> CashuResult<PublicKey> {
+    PublicKey::from_slice(&pubkey.to_ecdsa_key().serialize())
+        .map_err(|e| CashuError::Nuts(format!("invalid receiver pubkey: {e}")))
+}
+
 /// Build the NUT-14 spending conditions for an HTLC whose preimage
 /// hash is `payment_hash` and whose sender-refund path becomes
 /// available at `locktime` (unix seconds). `locktime` is required to
 /// be in the future; the resulting [`SpendingConditions`] embed it
 /// as a tag so the mint will accept the swap.
-pub fn htlc_conditions(payment_hash: &[u8; 32], locktime: u64) -> CashuResult<SpendingConditions> {
-    let conditions = Conditions::new(Some(locktime), None, None, None, None, None)
-        .map_err(|e| CashuError::Nuts(format!("invalid NUT-10 conditions: {e}")))?;
+pub fn htlc_conditions(
+    payment_hash: &[u8; 32],
+    locktime: u64,
+    receiver_pubkey: &PublicKey,
+) -> CashuResult<SpendingConditions> {
+    let conditions = Conditions::new(
+        Some(locktime),
+        Some(vec![*receiver_pubkey]),
+        None,
+        Some(1),
+        None,
+        None,
+    )
+    .map_err(|e| CashuError::Nuts(format!("invalid NUT-10 conditions: {e}")))?;
+
     SpendingConditions::new_htlc_hash(&lowercase_hex::encode(payment_hash), Some(conditions))
         .map_err(|e| CashuError::Nuts(format!("invalid NUT-14 spending conditions: {e}")))
 }
@@ -58,8 +76,9 @@ pub fn build_htlc_outputs(
     keyset_id: KeysetId,
     payment_hash: &[u8; 32],
     locktime: u64,
+    receiver_pubkey: &PublicKey,
 ) -> CashuResult<HtlcOutputs> {
-    let conditions = htlc_conditions(payment_hash, locktime)?;
+    let conditions = htlc_conditions(payment_hash, locktime, receiver_pubkey)?;
     let amount = Amount::from(amount_sat);
     let fee_and_amounts = default_fee_and_amounts();
     let split = amount
@@ -99,11 +118,19 @@ pub fn default_fee_and_amounts() -> cdk::amount::FeeAndAmounts {
 /// them in a subsequent NUT-03 swap (i.e. so the receiver can
 /// claim). `preimage` is the 32-byte raw preimage (not its hex
 /// encoding).
-pub fn add_preimage_to_proofs(proofs: &mut [Proof], preimage: &[u8; 32]) {
+pub fn add_preimage_to_proofs(
+    proofs: &mut [Proof],
+    preimage: &[u8; 32],
+    signing_key: &P2pkSecretKey,
+) -> CashuResult<()> {
     let preimage_hex = lowercase_hex::encode(preimage);
     for proof in proofs.iter_mut() {
         proof.add_preimage(preimage_hex.clone());
+        proof
+            .sign_p2pk(signing_key.clone())
+            .map_err(|e| CashuError::Nuts(format!("sign HTLC witness: {e}")))?;
     }
+    Ok(())
 }
 
 /// Construct NUT-00 [`Proof`]s from a swap response and the pre-mint
@@ -229,7 +256,11 @@ mod tests {
     fn htlc_conditions_embeds_hash_and_locktime() {
         let hash = random_payment_hash();
         let locktime = unix_time() + 60;
-        let cond = htlc_conditions(&hash, locktime).expect("valid");
+        let pubkey = PublicKey::from_str(
+            "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        let cond = htlc_conditions(&hash, locktime, &pubkey).expect("valid");
         let hex = lowercase_hex::encode(hash);
         match cond {
             SpendingConditions::HTLCConditions { data, conditions } => {
@@ -245,7 +276,11 @@ mod tests {
     fn htlc_conditions_rejects_past_locktime() {
         let hash = random_payment_hash();
         let past = unix_time().saturating_sub(10);
-        assert!(htlc_conditions(&hash, past).is_err());
+        let pubkey = PublicKey::from_str(
+            "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        assert!(htlc_conditions(&hash, past, &pubkey).is_err());
     }
 
     #[test]
@@ -253,7 +288,11 @@ mod tests {
         let hash = random_payment_hash();
         let locktime = unix_time() + 120;
         let keyset_id = KeysetId::from_str("009a1f293253e41e").unwrap();
-        let out = build_htlc_outputs(11, keyset_id, &hash, locktime).expect("valid");
+        let pubkey = PublicKey::from_str(
+            "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        let out = build_htlc_outputs(11, keyset_id, &hash, locktime, &pubkey).expect("valid");
         // 11 = 8 + 2 + 1
         let amounts: Vec<u64> = out.premints.iter().map(|p| u64::from(p.amount)).collect();
         assert_eq!(amounts.iter().sum::<u64>(), 11);
@@ -265,7 +304,11 @@ mod tests {
         let hash = random_payment_hash();
         let locktime = unix_time() + 60;
         let keyset_id = KeysetId::from_str("009a1f293253e41e").unwrap();
-        let out = build_htlc_outputs(4, keyset_id, &hash, locktime).expect("valid");
+        let pubkey = PublicKey::from_str(
+            "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        let out = build_htlc_outputs(4, keyset_id, &hash, locktime, &pubkey).expect("valid");
         let (preimage, _blinded_message, r, amount) = {
             let pm = &out.premints[0];
             (
@@ -292,7 +335,16 @@ mod tests {
             p2pk_e: None,
         };
         let preimage_bytes = [0xabu8; 32];
-        add_preimage_to_proofs(std::slice::from_mut(&mut proof), &preimage_bytes);
+        let signing_key = P2pkSecretKey::from_hex(
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        )
+        .unwrap();
+        add_preimage_to_proofs(
+            std::slice::from_mut(&mut proof),
+            &preimage_bytes,
+            &signing_key,
+        )
+        .unwrap();
         let extracted = extract_preimage(&[proof]).expect("preimage present");
         assert_eq!(extracted, preimage_bytes);
         let _ = r; // silence
@@ -303,7 +355,11 @@ mod tests {
         let hash = random_payment_hash();
         let locktime = unix_time() + 60;
         let keyset_id = KeysetId::from_str("009a1f293253e41e").unwrap();
-        let out = build_htlc_outputs(4, keyset_id, &hash, locktime).expect("valid");
+        let pubkey = PublicKey::from_str(
+            "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        let out = build_htlc_outputs(4, keyset_id, &hash, locktime, &pubkey).expect("valid");
         // Hand-rolled proofs carrying the real HTLC secret (the
         // C value is irrelevant to the structural check).
         let proofs: Proofs = out
@@ -333,7 +389,11 @@ mod tests {
         let hash = random_payment_hash();
         let locktime = unix_time() + 60;
         let keyset_id = KeysetId::from_str("009a1f293253e41e").unwrap();
-        let out = build_htlc_outputs(4, keyset_id, &hash, locktime).expect("valid");
+        let pubkey = PublicKey::from_str(
+            "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        let out = build_htlc_outputs(4, keyset_id, &hash, locktime, &pubkey).expect("valid");
         let proofs: Proofs = out
             .premints
             .into_iter()

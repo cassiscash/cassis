@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::error;
 use tracing::{info, Instrument, Span};
 
 pub use crate::netspec::NetSpec;
@@ -191,10 +192,18 @@ pub async fn handle_commit_frame(
         )
         .await
         .map_err(|e| cassis_iroh::IrohError::Protocol(format!("accept_incoming: {e}")))?;
-    receiver
+    if let Err(e) = receiver
         .claim_incoming(commit.payment_hash, Bytes32(preimage))
         .await
-        .map_err(|e| cassis_iroh::IrohError::Protocol(format!("claim: {e}")))?;
+    {
+        error!(
+            target: "cassis_client",
+            "incoming HTLC claim failed for payment_hash={} on {}: {e}",
+            commit.payment_hash.short(),
+            commit.network,
+        );
+        return Err(cassis_iroh::IrohError::Protocol(format!("claim: {e}")));
+    }
     info!(
         target: "cassis_client",
         "incoming HTLC claimed for payment_hash={} on {}",

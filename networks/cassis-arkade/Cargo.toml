@@ -9,3 +9,4 @@ default = []
 [dependencies]
 async-trait = "0.1.91"
 cassis-core = { path = "../../cassis-core" }
+tracing = "0.1.44"

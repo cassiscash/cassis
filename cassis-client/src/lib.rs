@@ -232,7 +232,7 @@ impl CassisClient {
                         outgoing_network: hop.outgoing.clone(),
                         incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
                         outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
-                        recipient: hop.node.node_pubkey.to_hex(),
+                        recipient: hop.node.node_pubkey,
                     },
                 )
             })

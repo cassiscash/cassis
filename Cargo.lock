@@ -1942,6 +1942,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cassis-core",
+ "tracing",
 ]
 
 [[package]]
@@ -2089,6 +2090,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cassis-core",
+ "tracing",
 ]
 
 [[package]]
