@@ -71,7 +71,7 @@ async fn build_pair(
                 cassis_cashu::CashuAdapter::new(
                     network_id.clone(),
                     mint_url.clone(),
-                    sk,
+                    *derived.invoice.as_bytes(),
                     derived.invoice.pubkey(),
                     store,
                     span.clone(),

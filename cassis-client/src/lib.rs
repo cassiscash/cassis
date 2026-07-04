@@ -232,7 +232,13 @@ impl CassisClient {
                         outgoing_network: hop.outgoing.clone(),
                         incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
                         outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
-                        recipient: hop.node.node_pubkey,
+                        // Final HTLC must use invoice key: payee signs the
+                        // Cashu witness with matching invoice secret.
+                        recipient: if idx + 1 == route.len() {
+                            invoice.payee
+                        } else {
+                            hop.node.node_pubkey
+                        },
                     },
                 )
             })
@@ -338,12 +344,6 @@ impl CassisClient {
         for (i, hop) in route.iter().enumerate() {
             let dispatch = HopDispatch {
                 payment_hash: invoice.payment_hash,
-                amount_msat: invoice.amount_msat,
-                incoming_network: hop.incoming.clone(),
-                outgoing_network: hop.outgoing.clone(),
-                incoming_deadline: expiries.get(i).copied().unwrap_or(now),
-                outgoing_expiry: expiries.get(i + 1).copied().unwrap_or(now),
-                recipient: hop.node.node_pubkey.to_hex(),
                 incoming_descriptor: descriptor,
             };
             let peer = hop.node.node_pubkey;
@@ -355,12 +355,12 @@ impl CassisClient {
                  payment_hash={} incoming_descriptor={:?}",
                 i+1,
                 route.len(),
-                dispatch.incoming_network,
-                dispatch.outgoing_network,
-                dispatch.amount_msat,
-                dispatch.incoming_deadline,
-                dispatch.outgoing_expiry,
-                dispatch.recipient,
+                hop.incoming,
+                hop.outgoing,
+                invoice.amount_msat,
+                expiries[i],
+                expiries[i + 1],
+                hop.node.node_pubkey,
                 dispatch.payment_hash,
                 dispatch.incoming_descriptor,
             );

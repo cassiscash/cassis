@@ -322,7 +322,7 @@ async fn build_adapter(
                 .unwrap_or([0u8; 32]);
             let cfg = cassis_rootstock::default_config(
                 network_id.clone(),
-                sk,
+                *derived.invoice.as_bytes(),
                 derived.invoice.pubkey(),
                 span.clone(),
             );
@@ -407,15 +407,9 @@ impl CassisRouter {
             Frame::Dispatch(d) => {
                 info!(
                     target: "cassis_router",
-                    "received DISPATCH: payment_hash={} amount_msat={} {} -> {} via {} \
-                     incoming_deadline={} outgoing_expiry={}",
+                    "received DISPATCH: payment_hash={} incoming_descriptor={:?}",
                     d.payment_hash.short(),
-                    d.amount_msat,
-                    d.incoming_network,
-                    d.outgoing_network,
-                    d.recipient,
-                    d.incoming_deadline,
-                    d.outgoing_expiry,
+                    d.incoming_descriptor,
                 );
             }
             Frame::Commit(c) => {
@@ -547,38 +541,18 @@ impl CassisRouter {
                 ))?;
             prepared.remove(index).prepare
         };
-        if prepare.incoming_network != dispatch.incoming_network
-            || prepare.outgoing_network != dispatch.outgoing_network
-            || prepare.amount_msat != dispatch.amount_msat
-            || prepare.recipient.to_hex() != dispatch.recipient
-        {
-            return Err(format!(
-                "DISPATCH specs do not match PREPARE: \
-                 prepare(in={}, out={}, amt={}, to={}) vs \
-                 dispatch(in={}, out={}, amt={}, to={})",
-                prepare.incoming_network,
-                prepare.outgoing_network,
-                prepare.amount_msat,
-                prepare.recipient,
-                dispatch.incoming_network,
-                dispatch.outgoing_network,
-                dispatch.amount_msat,
-                dispatch.recipient,
-            ));
-        }
-
         let incoming_entry = self
             .adapters
-            .get(&dispatch.incoming_network)
+            .get(&prepare.incoming_network)
             .ok_or_else(|| "incoming network unsupported".to_string())?;
         let outgoing_entry = self
             .adapters
-            .get(&dispatch.outgoing_network)
+            .get(&prepare.outgoing_network)
             .ok_or_else(|| "outgoing network unsupported".to_string())?;
 
         if let Err(e) = incoming_entry
             .adapter
-            .verify_incoming_htlc(&dispatch.incoming_descriptor, dispatch.payment_hash)
+            .verify_incoming_htlc(&dispatch.incoming_descriptor, prepare.payment_hash)
             .await
         {
             return Err(format!("incoming HTLC not claimable: {e}"));
@@ -590,9 +564,9 @@ impl CassisRouter {
         if let Err(e) = incoming_entry
             .adapter
             .accept_incoming_htlc(
-                dispatch.payment_hash,
+                prepare.payment_hash,
                 &dispatch.incoming_descriptor,
-                dispatch.incoming_deadline,
+                prepare.incoming_deadline,
             )
             .await
         {
@@ -604,9 +578,9 @@ impl CassisRouter {
         match outgoing_entry
             .adapter
             .create_outgoing_htlc(
-                dispatch.payment_hash,
-                dispatch.amount_msat,
-                dispatch.outgoing_expiry,
+                prepare.payment_hash,
+                prepare.amount_msat,
+                prepare.outgoing_expiry,
                 recipient,
             )
             .await
@@ -621,14 +595,14 @@ impl CassisRouter {
             Err(err) => {
                 return Err(format!(
                     "create_outgoing_htlc failed on {}: {err}",
-                    dispatch.outgoing_network
+                    prepare.outgoing_network
                 ));
             }
         };
 
         let outgoing_descriptor: HtlcDescriptor = match outgoing_entry
             .adapter
-            .outgoing_htlc_descriptor(dispatch.payment_hash)
+            .outgoing_htlc_descriptor(prepare.payment_hash)
             .await
         {
             Ok(d) => d,
@@ -643,8 +617,8 @@ impl CassisRouter {
             dispatched.insert(
                 dispatch.payment_hash,
                 DispatchedHop {
-                    prepare: dispatch.clone().into_prepare(),
-                    outgoing_deadline: dispatch.outgoing_expiry,
+                    prepare: prepare.clone(),
+                    outgoing_deadline: prepare.outgoing_expiry,
                 },
             );
         }
@@ -652,11 +626,11 @@ impl CassisRouter {
             target: "cassis_router",
             "DISPATCH done: payment_hash={} amount_msat={} {} -> {} via {} \
              outgoing_descriptor={:?}",
-            dispatch.payment_hash.short(),
-            dispatch.amount_msat,
-            dispatch.incoming_network,
-            dispatch.outgoing_network,
-            dispatch.recipient,
+            prepare.payment_hash.short(),
+            prepare.amount_msat,
+            prepare.incoming_network,
+            prepare.outgoing_network,
+            prepare.recipient,
             outgoing_descriptor,
         );
         Ok(HopDispatched {
@@ -886,27 +860,6 @@ struct PreparedEntry {
 /// layer and the local log carries the hash.
 fn internal<E: std::fmt::Display>(e: E) -> IrohError {
     IrohError::Protocol(e.to_string())
-}
-
-trait HopDispatchExt {
-    fn into_prepare(self) -> HopPrepare;
-}
-
-impl HopDispatchExt for HopDispatch {
-    fn into_prepare(self) -> HopPrepare {
-        HopPrepare {
-            payment_hash: self.payment_hash,
-            amount_msat: self.amount_msat,
-            incoming_network: self.incoming_network,
-            outgoing_network: self.outgoing_network,
-            incoming_deadline: self.incoming_deadline,
-            outgoing_expiry: self.outgoing_expiry,
-            recipient: self
-                .recipient
-                .parse()
-                .expect("DISPATCH recipient must be a valid pubkey"),
-        }
-    }
 }
 
 fn unix_now() -> u64 {

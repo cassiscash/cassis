@@ -374,12 +374,6 @@ pub struct HopPrepared {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopDispatch {
     pub payment_hash: Bytes32,
-    pub amount_msat: u64,
-    pub incoming_network: NetworkId,
-    pub outgoing_network: NetworkId,
-    pub incoming_deadline: u64,
-    pub outgoing_expiry: u64,
-    pub recipient: String,
     /// Network-specific handle to the deployed incoming HTLC.
     pub incoming_descriptor: HtlcDescriptor,
 }
