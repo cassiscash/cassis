@@ -298,6 +298,26 @@ pub struct Invoice {
     pub expires_at: u64,
     pub networks: Vec<NetworkId>,
     pub description: Option<String>,
+    /// Per-network identity the payee will actually claim the final
+    /// HTLC with, one entry per element of `networks`.
+    ///
+    /// `payee` is the payee's *invoice* key and is the right identity
+    /// for networks whose claim signature is over the invoice key
+    /// (cashu). Networks that hold a separate per-network key — e.g.
+    /// rootstock, where the claim is an on-chain transaction signed by
+    /// a dedicated EVM account — must advertise that key here instead,
+    /// otherwise the last hop locks the HTLC to an identity the payee
+    /// cannot claim with.
+    ///
+    /// This is deliberately carried in the invoice (point-to-point)
+    /// rather than published in a Nostr route announcement: the payee
+    /// is not a router and announces nothing. The payer forwards the
+    /// matching entry to the last hop in its DISPATCH.
+    ///
+    /// Absent or missing entries fall back to `payee`, which keeps old
+    /// invoices working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_pubkeys: Vec<(NetworkId, PubKey)>,
     /// Iroh peer id of the payee's `cassis-cli` endpoint, used by
     /// the payer to send the final COMMIT message directly. `None`
     /// for invoices not produced by a cassis receiver (e.g. raw
@@ -309,6 +329,22 @@ pub struct Invoice {
     /// aren't known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay: Option<String>,
+}
+
+impl Invoice {
+    /// Identity the payee will claim the final HTLC with on `network`.
+    ///
+    /// Prefers the network-specific entry from
+    /// [`Invoice::claim_pubkeys`] and falls back to
+    /// [`Invoice::payee`] when the invoice does not carry one (older
+    /// invoices, or networks that claim with the invoice key).
+    pub fn claim_pubkey_for(&self, network: &NetworkId) -> PubKey {
+        self.claim_pubkeys
+            .iter()
+            .find(|(id, _)| id == network)
+            .map(|(_, pubkey)| *pubkey)
+            .unwrap_or(self.payee)
+    }
 }
 
 /// Handle to an in-flight outgoing payment initiated by
@@ -350,7 +386,6 @@ pub struct HopPrepare {
     pub outgoing_network: NetworkId,
     pub incoming_deadline: u64,
     pub outgoing_expiry: u64,
-    pub recipient: PubKey,
 }
 
 /// Reply to [`HopPrepare`]. `accepted=true` means the hop has
@@ -362,6 +397,22 @@ pub struct HopPrepared {
     pub payment_hash: Bytes32,
     pub accepted: bool,
     pub reason: Option<String>,
+    /// The identity this hop will claim its *incoming* HTLC with, as
+    /// reported by its incoming adapter
+    /// ([`NetworkRouterAdapter::claim_pubkey`]).
+    ///
+    /// The upstream party (the previous hop, or the payer for hop 0)
+    /// must lock its outgoing HTLC to this key. Having the hop
+    /// self-report it is what makes lock and claim agree by
+    /// construction: no other party has to guess which of the hop's
+    /// keys it actually signs claims with. `None` on a rejection,
+    /// where there is nothing to lock.
+    ///
+    /// Deliberately carries no `skip_serializing_if`: these frames go
+    /// over postcard, which is positional and non-self-describing, so
+    /// omitting a field desynchronizes the decoder rather than falling
+    /// back to a default. Always serialized, like `reason` above.
+    pub claim_pubkey: Option<PubKey>,
 }
 
 /// DISPATCH message (sender -> router): tells a hop that a real
@@ -376,6 +427,18 @@ pub struct HopDispatch {
     pub payment_hash: Bytes32,
     /// Network-specific handle to the deployed incoming HTLC.
     pub incoming_descriptor: HtlcDescriptor,
+    /// Identity the hop must lock its *outgoing* HTLC to: the
+    /// downstream party's `claim_pubkey` for that network (the next
+    /// hop's [`HopPrepared::claim_pubkey`], or the payee's entry from
+    /// [`Invoice::claim_pubkeys`] for the last hop).
+    ///
+    /// This travels in DISPATCH rather than PREPARE because the payer
+    /// PREPAREs every hop *concurrently*, so when hop `i`'s PREPARE is
+    /// built the reply from hop `i+1` — and therefore its claim
+    /// identity — is not known yet. DISPATCH is sequential and happens
+    /// strictly after every PREPARE has been answered, so by then the
+    /// downstream identity is always available.
+    pub recipient: PubKey,
 }
 
 /// Reply to [`HopDispatch`]. Carries the descriptor of the outgoing
@@ -577,6 +640,24 @@ pub trait NetworkRouterAdapter: Send + Sync {
 
     fn invoice_pubkey(&self) -> PubKey;
 
+    /// The identity this adapter can actually *claim* an incoming HTLC
+    /// with: the public key whose secret key the adapter holds and
+    /// signs claims with on this network.
+    ///
+    /// Counterparties must lock HTLCs destined for this adapter to this
+    /// key. Self-reporting it (rather than letting the counterparty
+    /// guess from an announced node key) is what keeps lock and claim
+    /// in agreement by construction.
+    ///
+    /// Defaults to [`NetworkRouterAdapter::invoice_pubkey`], which is
+    /// correct for networks whose claim signature is over the invoice
+    /// key (cashu). Networks holding a separate per-network key — e.g.
+    /// rootstock, whose claim is an on-chain transaction signed by a
+    /// dedicated EVM account — must override this.
+    fn claim_pubkey(&self) -> PubKey {
+        self.invoice_pubkey()
+    }
+
     fn incoming_delta_secs(&self) -> u64;
 
     async fn watch_incoming_htlc(
@@ -678,6 +759,17 @@ pub trait NetworkReceiverAdapter: Send + Sync {
     /// incoming HTLC and forwarding the outgoing one. Mirrors
     /// [`NetworkRouterAdapter::incoming_delta_secs`].
     fn incoming_delta_secs(&self) -> u64;
+
+    /// Identity this receiver claims incoming HTLCs with on this
+    /// network, advertised to payers via [`Invoice::claim_pubkeys`] so
+    /// the last hop locks the final HTLC to a key the payee can
+    /// actually spend. Mirrors [`NetworkRouterAdapter::claim_pubkey`].
+    ///
+    /// `None` means "no network-specific identity": the payer falls
+    /// back to [`Invoice::payee`].
+    fn claim_pubkey(&self) -> Option<PubKey> {
+        None
+    }
 
     /// Generate a fresh preimage, register a pending invoice on the
     /// underlying network, and return the corresponding
@@ -809,6 +901,10 @@ where
         NetworkRouterAdapter::incoming_delta_secs(self)
     }
 
+    fn claim_pubkey(&self) -> Option<PubKey> {
+        Some(NetworkRouterAdapter::claim_pubkey(self))
+    }
+
     /// Register an incoming contract with the router adapter. We pass
     /// a fresh random payment hash as a placeholder; "sells its own
     /// preimage" networks (e.g. cashu) substitute their own and
@@ -839,6 +935,7 @@ where
             amount_msat,
             payee: self.invoice_pubkey(),
             expires_at: expiry,
+            claim_pubkeys: vec![(network_id.clone(), NetworkRouterAdapter::claim_pubkey(self))],
             networks: vec![network_id],
             description,
             iroh_peer_id: None,

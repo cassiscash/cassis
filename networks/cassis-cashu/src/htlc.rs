@@ -31,6 +31,27 @@ pub fn pubkey_from_cassis(pubkey: &cassis_core::PubKey) -> CashuResult<PublicKey
         .map_err(|e| CashuError::Nuts(format!("invalid receiver pubkey: {e}")))
 }
 
+/// Inverse of [`pubkey_from_cassis`]: the cassis x-only identity of a
+/// 32-byte secret key, i.e. the identity a counterparty must lock
+/// HTLC proofs to for this key to be able to claim them.
+///
+/// Used by `CashuAdapter::claim_pubkey` to advertise the key it really
+/// signs witnesses with, instead of assuming that is the invoice key.
+pub fn claim_pubkey_from_secret(secret_key: &[u8; 32]) -> CashuResult<cassis_core::PubKey> {
+    let secret = P2pkSecretKey::from_slice(secret_key)
+        .map_err(|e| CashuError::Nuts(format!("invalid signing key: {e}")))?;
+    // Drop the compression prefix: cassis identities are x-only, and
+    // NUT-11/14 verification is BIP340 so parity is never checked.
+    // `to_bytes` is a fixed 33-byte compressed key, so this slice is
+    // always exactly the 32-byte X coordinate.
+    let compressed = secret.public_key().to_bytes();
+    let xonly: [u8; 32] = compressed[1..33]
+        .try_into()
+        .expect("compressed key is 33 bytes");
+    cassis_core::PubKey::from_bytes(xonly)
+        .map_err(|e| CashuError::Nuts(format!("invalid x-only pubkey: {e}")))
+}
+
 /// Build the NUT-14 spending conditions for an HTLC whose preimage
 /// hash is `payment_hash` and whose sender-refund path becomes
 /// available at `locktime` (unix seconds). `locktime` is required to

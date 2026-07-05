@@ -50,6 +50,23 @@ pub struct AdapterPair {
     pub sender: Arc<dyn NetworkSenderAdapter>,
 }
 
+/// Per-network signing key for `network_id`, or a descriptive error.
+///
+/// Previously this fell back to an all-zero key, which is not a valid
+/// secp256k1 scalar: the failure was merely deferred to the first
+/// signature (or, worse, produced an identity the node could not claim
+/// with). Naming the missing key here is far clearer than an "invalid
+/// secret key" surfacing from inside an adapter.
+fn network_sk(derived: &DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32], String> {
+    derived
+        .networks
+        .get(network_id)
+        .map(|k| *k.as_bytes())
+        .ok_or_else(|| {
+            format!("no signing key derived for network '{network_id}'; derive keys for it first")
+        })
+}
+
 #[allow(unused_variables)]
 async fn build_pair(
     spec: &NetSpec,
@@ -58,11 +75,6 @@ async fn build_pair(
     span: Span,
 ) -> Result<AdapterPair, String> {
     let network_id = spec.network_id();
-    let sk = derived
-        .networks
-        .get(&network_id)
-        .map(|k| *k.as_bytes())
-        .unwrap_or([0u8; 32]);
     match spec {
         NetSpec::Cashu { mint_url, host: _ } => {
             let store: Arc<dyn cassis_cashu::CashuProofStore> =
@@ -87,7 +99,7 @@ async fn build_pair(
         NetSpec::Rootstock { .. } => {
             let cfg = cassis_rootstock::default_config(
                 network_id.clone(),
-                sk,
+                network_sk(derived, &network_id)?,
                 derived.invoice.pubkey(),
                 span.clone(),
             );
@@ -137,11 +149,7 @@ pub async fn build_cashu_adapter(
         return Err(format!("expected a cashu spec, got {}", spec.kind_name()));
     };
     let network_id = spec.network_id();
-    let sk = derived
-        .networks
-        .get(&network_id)
-        .map(|k| *k.as_bytes())
-        .unwrap_or([0u8; 32]);
+    let sk = network_sk(derived, &network_id)?;
     let store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path.to_path_buf()));
     cassis_cashu::CashuAdapter::new(
@@ -170,11 +178,7 @@ pub async fn build_rootstock_adapter(
         ));
     };
     let network_id = spec.network_id();
-    let sk = derived
-        .networks
-        .get(&network_id)
-        .map(|k| *k.as_bytes())
-        .unwrap_or([0u8; 32]);
+    let sk = network_sk(derived, &network_id)?;
     let cfg = cassis_rootstock::default_config(network_id, sk, derived.invoice.pubkey(), span);
     cassis_rootstock::RootstockAdapter::new(cfg)
         .await
@@ -192,11 +196,16 @@ pub async fn build_cashu_adapter_from_url(
 ) -> Result<(NetSpec, Arc<cassis_cashu::CashuAdapter>), String> {
     let host = mint_url_to_host(mint_url)?;
     let network_id = cassis_core::cashu_network_id(&host);
+    // The mint here comes from the *token*, which may well be a mint
+    // the caller never derived a key for, so fall back to the invoice
+    // key rather than to an all-zero key. Redeeming a token only swaps
+    // unrestricted proofs and needs no HTLC signing key, but the
+    // adapter still requires a usable one to derive its claim identity.
     let sk = derived
         .networks
         .get(&network_id)
         .map(|k| *k.as_bytes())
-        .unwrap_or([0u8; 32]);
+        .unwrap_or(*derived.invoice.as_bytes());
     let store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path.to_path_buf()));
     let adapter = cassis_cashu::CashuAdapter::new(

@@ -9,6 +9,9 @@ default = []
 [dependencies]
 async-trait = "0.1.91"
 cassis-core = { path = "../../cassis-core" }
+# Needed to normalize a secret key to its even-Y form so the x-only
+# pubkey -> EVM address mapping is well defined (see `normalize_sk`).
+secp256k1 = { version = "0.31", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.40"
 sha2 = "0.10"

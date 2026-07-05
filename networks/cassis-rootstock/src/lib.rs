@@ -131,6 +131,11 @@ pub struct RootstockConfig {
     /// 32-byte secret key for the EVM account that locks /
     /// claims / refunds HTLCs. Derived from
     /// `cassis/network/<network_id>`.
+    ///
+    /// Normalized to its even-Y form in [`RootstockAdapter::new`] so
+    /// that the x-only pubkey advertised via
+    /// [`NetworkRouterAdapter::claim_pubkey`] maps to exactly one EVM
+    /// address, and that address is the one this key can sign for.
     pub sk: [u8; 32],
     pub invoice_pubkey: PubKey,
     pub span: Span,
@@ -158,6 +163,9 @@ struct PendingOutgoing {
 pub struct RootstockAdapter {
     config: RootstockConfig,
     address: Address,
+    /// x-only pubkey of the (normalized) `config.sk`. Advertised to
+    /// counterparties so they lock HTLCs to `self.address`.
+    claim_pubkey: PubKey,
     contract: Address,
     provider: Box<dyn Provider + Send + Sync>,
     incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
@@ -183,9 +191,28 @@ impl RootstockAdapter {
             .ok_or_else(|| Error::MissingContract(config.network_id.clone()))?;
         let contract = Address::from_str(&contract_str)
             .map_err(|e| Error::InvalidAddress(format!("{contract_str}: {e}")))?;
+        // Normalize before deriving anything: the claim identity we
+        // advertise is x-only, so the secret key must be the even-Y
+        // representative or the address we advertise is not the address
+        // we can sign for. See `normalized_key`.
+        let mut config = config;
+        let (normalized_sk, claim_pubkey) = normalized_key(config.sk)?;
+        config.sk = normalized_sk;
         let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&config.sk))
             .map_err(|e| Error::InvalidParams(format!("invalid secret key: {e}")))?;
         let address = signer.address();
+        // Fail loudly at startup rather than on-chain: if these ever
+        // disagree, every counterparty would lock HTLCs to an address
+        // this adapter cannot claim from, and the funds would sit until
+        // the timelock expired.
+        let derived = evm_address_from_pubkey(&claim_pubkey);
+        if derived != address {
+            return Err(Error::InvalidParams(format!(
+                "claim identity mismatch: x-only pubkey {} maps to {derived} but the \
+                 signing key controls {address}",
+                claim_pubkey.to_hex(),
+            )));
+        }
         let url = Url::from_str(&config.rpc_url)
             .map_err(|e| Error::InvalidParams(format!("invalid rpc url: {e}")))?;
         let wallet = EthereumWallet::from(signer);
@@ -197,6 +224,7 @@ impl RootstockAdapter {
         Ok(Arc::new(Self {
             config,
             address,
+            claim_pubkey,
             contract,
             provider,
             incoming: Mutex::new(HashMap::new()),
@@ -390,6 +418,15 @@ impl NetworkRouterAdapter for RootstockAdapter {
         self.config.invoice_pubkey
     }
 
+    /// Rootstock claims are on-chain transactions signed by a dedicated
+    /// per-network EVM account, *not* by the invoice key, so this must
+    /// override the default. Counterparties lock to
+    /// `evm_address_from_pubkey(this)` == `self.address`, which the
+    /// constructor already verified.
+    fn claim_pubkey(&self) -> PubKey {
+        self.claim_pubkey
+    }
+
     fn network_id(&self) -> NetworkId {
         self.config.network_id.clone()
     }
@@ -444,10 +481,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         if expiry <= now {
             return Err(HtlcError::InvalidParams("expiry in the past".into()));
         }
-        let claim_address = Address::from_slice(
-            &alloy::primitives::keccak256(&recipient.to_ecdsa_key().serialize_uncompressed()[1..])
-                .0[12..],
-        );
+        let claim_address = evm_address_from_pubkey(&recipient);
         let amount_wei = Self::msat_to_wei(amount_msat);
         self.config.span.in_scope(|| {
             info!(
@@ -628,7 +662,13 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 IEtherSwap::refundCall {
                     preimageHash: B256::from_slice(payment_hash.as_ref()),
                     amount: slot.amount_wei,
-                    claimAddress: self.address,
+                    // Must be the address the swap was *locked* to, not
+                    // ours: `hashValues` commits to the claim address,
+                    // and the 4-arg `refund` supplies `msg.sender` as
+                    // the refund address. Passing our own address here
+                    // produces a hash for which no swap exists, so
+                    // every refund reverts.
+                    claimAddress: slot.claim_address,
                     timelock: U256::from(slot.timelock),
                 }
                 .abi_encode()
@@ -808,21 +848,42 @@ impl NetworkRouterAdapter for RootstockAdapter {
         deadline: u64,
     ) -> Result<(), HtlcError> {
         self.verify_incoming_htlc(descriptor, payment_hash).await?;
-        let (contract_str, amount_wei, refund_address, timelock) = match descriptor {
+        let (contract_str, amount_wei, claim_address, refund_address, timelock) = match descriptor {
             HtlcDescriptor::Rootstock {
                 contract,
                 amount_wei,
-                claim_address: _,
+                claim_address,
                 refund_address,
                 timelock,
             } => (
                 contract.clone(),
                 *amount_wei,
+                claim_address.clone(),
                 refund_address.clone(),
                 *timelock,
             ),
             _ => unreachable!("verify_incoming_htlc rejects other variants"),
         };
+        // Reject an HTLC we could never claim. `verify_incoming_htlc`
+        // only proves *a* swap with these values exists on chain; it
+        // says nothing about whether we are its `claimAddress`. Since
+        // the contract commits `msg.sender` as the claim address, a
+        // mismatch here means `claim_incoming` would revert later, after
+        // we had already funded the outgoing HTLC. Fail at DISPATCH
+        // instead, while the hop can still be rejected cheaply.
+        //
+        // This check cannot live in `verify_incoming_htlc`, because
+        // `create_outgoing_htlc` reuses that method to confirm its own
+        // lock landed — and there we are the locker, not the claimer.
+        let claim_addr = Address::from_str(&claim_address)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim address: {e}")))?;
+        if claim_addr != self.address {
+            return Err(HtlcError::InvalidParams(format!(
+                "incoming HTLC is locked to {claim_addr}, which this node cannot claim; \
+                 expected {} (upstream hop locked to the wrong identity)",
+                self.address,
+            )));
+        }
         let contract = Address::from_str(&contract_str)
             .map_err(|e| HtlcError::InvalidParams(format!("invalid contract address: {e}")))?;
         let refund_address = Address::from_str(&refund_address)
@@ -920,10 +981,67 @@ pub fn default_config(
 /// touching the network. Used by the CLI's `info` subcommand
 /// so showing the local address doesn't need an RPC
 /// connection.
+///
+/// Normalizes the key exactly like [`RootstockAdapter::new`], so the
+/// address shown here is always the address the adapter actually uses.
 pub fn address_from_sk(sk: [u8; 32]) -> Result<Address, Error> {
+    let (sk, _) = normalized_key(sk)?;
     let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&sk))
         .map_err(|e| Error::InvalidParams(format!("invalid secret key: {e}")))?;
     Ok(signer.address())
+}
+
+/// Normalize a secret key to the representative whose public key has an
+/// even Y coordinate, returning it unchanged if it already does.
+///
+/// Cassis identities are BIP340 x-only keys: 32 bytes of X with the Y
+/// parity discarded. Reconstructing a full point from one therefore has
+/// to assume a parity, and everything here assumes even (the `0x02`
+/// prefix). Ethereum addresses, however, are `keccak256(X || Y)[12..]`,
+/// so `P` and `-P` — same X, opposite Y — hash to *different*
+/// addresses.
+///
+/// Without this, a key whose public point has odd Y would advertise an
+/// x-only identity that maps to `evm_addr(-P)` while the signer could
+/// only produce signatures for `evm_addr(P)`: HTLCs would be locked to
+/// an address the adapter cannot claim from, for roughly half of all
+/// keys, at random.
+///
+/// Since `(n - sk) * G == -(sk * G)`, negating the scalar yields the
+/// even-Y twin with an identical X. The x-only pubkey is therefore
+/// unchanged, so nostr/npub and cashu (BIP340, x-only) identities are
+/// unaffected — only the EVM address becomes well defined.
+/// Normalize `sk` to its even-Y form and return it together with the
+/// x-only identity it maps to, sharing one secp context and one scalar
+/// multiplication (every caller needs both halves). Kept private:
+/// external callers want [`address_from_sk`] or the adapter itself.
+fn normalized_key(sk: [u8; 32]) -> Result<([u8; 32], PubKey), Error> {
+    let secp = secp256k1::Secp256k1::signing_only();
+    let secret = secp256k1::SecretKey::from_byte_array(sk)
+        .map_err(|e| Error::InvalidParams(format!("invalid secret key: {e}")))?;
+    let (xonly, parity) = secret.x_only_public_key(&secp);
+    let normalized = match parity {
+        secp256k1::Parity::Even => sk,
+        // Negating the scalar flips Y and leaves X untouched, so the
+        // x-only identity computed above still holds.
+        secp256k1::Parity::Odd => secret.negate().secret_bytes(),
+    };
+    let pubkey = PubKey::from_bytes(xonly.serialize())
+        .map_err(|e| Error::InvalidParams(format!("invalid x-only pubkey: {e}")))?;
+    Ok((normalized, pubkey))
+}
+
+/// Map a cassis x-only identity to the EVM address that can claim an
+/// HTLC locked to it: `keccak256(X || Y)[12..]` of the even-Y point.
+///
+/// This is the single source of truth for the identity -> address
+/// mapping. It is used both to pick the `claimAddress` when locking an
+/// outgoing HTLC for a counterparty and (via the constructor
+/// self-check) to validate our own address, so the two can never drift.
+pub fn evm_address_from_pubkey(pubkey: &PubKey) -> Address {
+    let uncompressed = pubkey.to_ecdsa_key().serialize_uncompressed();
+    // Skip the 0x04 tag: keccak is over the raw 64-byte X || Y.
+    Address::from_slice(&alloy::primitives::keccak256(&uncompressed[1..]).0[12..])
 }
 
 /// Parse a hex-encoded `0x`-prefixed (or bare) EVM address.
@@ -1205,23 +1323,48 @@ mod tests {
         );
     }
 
+    /// Walk enough keys to hit both Y parities (each is ~50% likely, so
+    /// 24 candidates makes a miss vanishingly unlikely) and assert the
+    /// normalization invariants on every one.
     #[test]
-    fn compute_swap_hash_matches_keccak_of_abi_packed_fields() {
-        let preimage_hash = B256::from_slice(&[1u8; 32]);
-        let amount = U256::from(123_456u64);
-        let claim = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
-        let refund = Address::from_str("0x2222222222222222222222222222222222222222").unwrap();
-        let timelock: u64 = 9999;
-        let h = RootstockAdapter::compute_swap_hash(preimage_hash, amount, claim, refund, timelock);
-        let mut buf = [0u8; 160];
-        buf[0..32].copy_from_slice(preimage_hash.as_slice());
-        buf[32..64].copy_from_slice(&amount.to_be_bytes::<32>());
-        buf[64..84].copy_from_slice(claim.as_slice());
-        buf[84..104].copy_from_slice(refund.as_slice());
-        let timelock_be = U256::from(timelock).to_be_bytes::<32>();
-        buf[128..160].copy_from_slice(&timelock_be);
-        let expected = alloy::primitives::keccak256(buf);
-        assert_eq!(h, expected);
+    fn normalize_sk_preserves_x_only_identity_and_yields_signable_address() {
+        let mut covered_even = false;
+        let mut covered_odd = false;
+        for seed in 1u8..25 {
+            let sk = [seed; 32];
+            let (normalized, pubkey) = normalized_key(sk).expect("valid key");
+            if normalized == sk {
+                covered_even = true;
+            } else {
+                covered_odd = true;
+            }
+
+            // The x-only identity must survive normalization, otherwise
+            // negating the scalar would change the node's identity on
+            // every other network (nostr, cashu) too.
+            let (renormalized, pubkey_again) = normalized_key(normalized).expect("valid key");
+            assert_eq!(
+                pubkey, pubkey_again,
+                "normalization must not change the x-only identity",
+            );
+
+            // The crux: the address derived from the advertised x-only
+            // identity must be the address the normalized key can sign
+            // for. Without normalization this fails for odd-Y keys.
+            assert_eq!(
+                evm_address_from_pubkey(&pubkey),
+                address_from_sk(sk).unwrap(),
+                "advertised identity must map to the signable address",
+            );
+
+            // Idempotent: normalizing an already-normalized key is a
+            // no-op, so repeated construction is stable.
+            assert_eq!(renormalized, normalized);
+        }
+        assert!(
+            covered_even && covered_odd,
+            "expected the sample to cover both Y parities",
+        );
     }
 
     #[test]

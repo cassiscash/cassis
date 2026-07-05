@@ -384,6 +384,10 @@ impl NetworkReceiverAdapter for FedimintAdapter {
             amount_msat,
             payee: self.invoice_pubkey,
             expires_at: expiry,
+            // Fedimint sells its own preimage: the federation settles
+            // the contract, so there is no local key that signs a
+            // claim and nothing to advertise here.
+            claim_pubkeys: Vec::new(),
             networks: vec![self.network_id.clone()],
             description: Some(DEFAULT_INVOICE_DESCRIPTION.to_string()),
             iroh_peer_id: None,

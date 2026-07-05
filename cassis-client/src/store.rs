@@ -516,10 +516,9 @@ mod hex {
 #[cfg(all(test, feature = "cashu"))]
 mod cashu_tests {
     use super::*;
-    use cashu::nuts::nut01::PublicKey;
-    use cashu::nuts::nut02::Id as KeysetId;
-    use cashu::Amount;
-    use cassis_cashu::Proof;
+    // Via cassis-cashu's re-exports: this crate has no direct cashu/cdk
+    // dependency of its own.
+    use cassis_cashu::{Amount, KeysetId, Proof, PublicKey, Secret};
     use std::str::FromStr;
 
     fn fake_proof(amount_sat: u64, secret_seed: &str) -> Proof {
@@ -529,7 +528,7 @@ mod cashu_tests {
         Proof {
             amount: Amount::from(amount_sat),
             keyset_id: KeysetId::from_str("009a1f293253e41e").unwrap(),
-            secret: cashu::secret::Secret::new(secret_seed),
+            secret: Secret::new(secret_seed),
             c: PublicKey::from_str(
                 "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
             )
