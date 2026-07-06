@@ -446,12 +446,18 @@ impl CassisClient {
             invoice.payment_hash.short(),
         );
         let committed = self.iroh_client.send_commit(payee_addr, commit).await?;
+        let preimage = committed.preimage;
+        // The payee's COMMIT reply is where the preimage enters this
+        // process: from here on the payer can claim its own outgoing
+        // HTLC, and so can every hop in between.
         info!(
             target: "cassis_client",
-            "payee accepted COMMIT for payment_hash={}",
+            "payee accepted COMMIT for payment_hash={} on {}: preimage={} \
+             (received from payee)",
             invoice.payment_hash.short(),
+            dest_network,
+            preimage,
         );
-        let preimage = committed.preimage;
         if preimage.0 == [0u8; 32] {
             return Err(PayError::Commit(
                 "payee returned zero preimage (misroute or commit handler missing)".to_string(),

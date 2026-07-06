@@ -197,9 +197,15 @@ pub async fn handle_commit_frame(
         commit.amount_msat,
         commit.network,
     );
+    // The payee is the origin of the preimage: claiming publishes it,
+    // which is what lets every upstream hop claim in turn. Logged
+    // immediately before it leaves this process, so the reveal has a
+    // definite point in the timeline to compare the hops against.
+    let preimage = Bytes32(preimage);
     info!(
         target: "cassis_client",
-        "claiming incoming HTLC for payment_hash={} on {}",
+        "revealing preimage and claiming incoming HTLC for payment_hash={} on {}: \
+         preimage={preimage}",
         commit.payment_hash.short(),
         commit.network,
     );
@@ -211,10 +217,7 @@ pub async fn handle_commit_frame(
         )
         .await
         .map_err(|e| cassis_iroh::IrohError::Protocol(format!("accept_incoming: {e}")))?;
-    if let Err(e) = receiver
-        .claim_incoming(commit.payment_hash, Bytes32(preimage))
-        .await
-    {
+    if let Err(e) = receiver.claim_incoming(commit.payment_hash, preimage).await {
         error!(
             target: "cassis_client",
             "incoming HTLC claim failed for payment_hash={} on {}: {e}",
@@ -236,7 +239,7 @@ pub async fn handle_commit_frame(
         .map_err(|e| cassis_iroh::IrohError::Protocol(format!("mark claimed: {e}")))?;
     Ok(Frame::Committed(cassis_core::HopCommitted {
         payment_hash: commit.payment_hash,
-        preimage: Bytes32(preimage),
+        preimage,
     }))
 }
 

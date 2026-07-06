@@ -83,6 +83,11 @@ const ROOTSTOCK_TESTNET_CHAIN_ID: u64 = 31;
 const ROOTSTOCK_MAINNET_CONTRACT: &str = "0x3612e393cA2fbB8874854B88fFCf04307a518239";
 const ROOTSTOCK_TESTNET_CONTRACT: &str = "0x165f8e654b3fe310a854805323718d51977ad95f";
 
+/// Upper bound on the gas an `EtherSwap.lock()` or `.claim()` consumes,
+/// used to reserve a transaction's worth of gas before committing to a
+/// route. Both calls are well below this.
+const HTLC_TX_GAS_LIMIT: u64 = 200_000;
+
 const RSK_BLOCK_TIME_SECS: u64 = 30;
 const POLL_INTERVAL_SECS: u64 = 5;
 const WEI_PER_RBTC: u128 = 1_000_000_000_000_000_000;
@@ -162,6 +167,12 @@ struct PendingOutgoing {
 
 pub struct RootstockAdapter {
     config: RootstockConfig,
+    /// `config.span` with this adapter's `network` field attached, so
+    /// every log below carries both the owning node and the network.
+    /// Built once in [`RootstockAdapter::new`]: the adapter's methods
+    /// are driven from unrelated tasks (the router's poll loop, an iroh
+    /// request handler), so the ambient span at call time is no help.
+    span: Span,
     address: Address,
     /// x-only pubkey of the (normalized) `config.sk`. Advertised to
     /// counterparties so they lock HTLCs to `self.address`.
@@ -221,8 +232,21 @@ impl RootstockAdapter {
                 .wallet(wallet)
                 .connect_http(url),
         );
+        let span = cassis_core::network_span(&config.span, &config.network_id);
+        // `debug!`, not `info!`: adapters are rebuilt for every balance
+        // query, so this would otherwise fire on each poll.
+        span.in_scope(|| {
+            debug!(
+                target: "cassis_rootstock",
+                "adapter ready: address={address} contract={contract} \
+                 claim_pubkey={} rpc={}",
+                claim_pubkey.to_hex(),
+                config.rpc_url,
+            );
+        });
         Ok(Arc::new(Self {
             config,
+            span,
             address,
             claim_pubkey,
             contract,
@@ -251,6 +275,24 @@ impl RootstockAdapter {
             .get_gas_price()
             .await
             .map_err(|e| Error::Rpc(format!("get_gas_price: {e}")))
+    }
+
+    /// Reject a balance that cannot cover the gas for an HTLC claim.
+    ///
+    /// Shared by the PREPARE-time [`NetworkRouterAdapter::can_claim`]
+    /// and the claim itself, so both agree on what "affordable" means.
+    /// The lock side lives in [`NetworkRouterAdapter::can_route`], which
+    /// reserves the same gas on top of the HTLC value.
+    fn ensure_claim_gas(&self, balance: U256, gas_price: u128) -> Result<(), HtlcError> {
+        let reserve = gas_reserve(gas_price);
+        if balance < reserve {
+            return Err(HtlcError::InvalidParams(format!(
+                "account {} cannot afford claim gas on {}: \
+                 need ~{reserve} wei at {gas_price} wei/gas, have {balance} wei",
+                self.address, self.config.network_id,
+            )));
+        }
+        Ok(())
     }
 
     fn unix_now() -> u64 {
@@ -483,7 +525,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         }
         let claim_address = evm_address_from_pubkey(&recipient);
         let amount_wei = Self::msat_to_wei(amount_msat);
-        self.config.span.in_scope(|| {
+        self.span.in_scope(|| {
             info!(
                 target: "cassis_rootstock",
                 "preparing htlc amount={} to={} hash={}",
@@ -533,7 +575,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 "lock transaction {tx_hash} reverted"
             )));
         }
-        self.config.span.in_scope(|| {
+        self.span.in_scope(|| {
             info!(target: "cassis_rootstock", "htlc prepared tx={tx_hash}");
             debug!(
                 target: "cassis_rootstock",
@@ -600,6 +642,34 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .gas_price_wei()
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
+        // Log the funding state of the claiming account up front: an
+        // unfunded account is rejected by RSK with "the sender account
+        // doesn't exist" (-32010), which says nothing about *which*
+        // account, so surface it here.
+        let balance = self
+            .provider
+            .get_balance(self.address)
+            .await
+            .map_err(|e| HtlcError::Network(format!("get_balance: {e}")))?;
+        self.span.in_scope(|| {
+            info!(
+                target: "cassis_rootstock",
+                "claiming htlc {} with preimage={} from={} balance={} wei \
+                 amount={} wei gas_price={} wei",
+                payment_hash.short(),
+                preimage,
+                self.address,
+                balance,
+                slot.amount_wei,
+                gas_price,
+            );
+        });
+        // Same check PREPARE ran, re-run here because PREPARE may have
+        // been minutes ago and the account can have been drained by
+        // another claim since. Reuses the balance and gas price already
+        // fetched above rather than calling `can_claim`, which would
+        // repeat both RPC round-trips on the hot claim path.
+        self.ensure_claim_gas(balance, gas_price)?;
         let request = TransactionRequest::default()
             .to(slot.contract)
             .gas_price(gas_price)
@@ -628,6 +698,13 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 "claim transaction {tx_hash} reverted"
             )));
         }
+        self.span.in_scope(|| {
+            info!(
+                target: "cassis_rootstock",
+                "htlc claimed for {}: tx={tx_hash}",
+                payment_hash.short(),
+            );
+        });
         let mut incoming = self.incoming.lock().await;
         incoming.remove(&payment_hash);
         Ok(())
@@ -708,7 +785,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
             let latest = match self.block_number().await {
                 Ok(n) => n,
                 Err(e) => {
-                    self.config.span.in_scope(|| {
+                    self.span.in_scope(|| {
                         warn!(target: "cassis_rootstock", "watch_preimage block_number failed: {e}");
                     });
                     tokio::time::sleep(interval).await;
@@ -721,9 +798,19 @@ impl NetworkRouterAdapter for RootstockAdapter {
                     .find_claim_preimage_in_block(block_number, payment_hash)
                     .await
                 {
-                    Ok(Some(preimage)) => return Ok(preimage),
+                    Ok(Some(preimage)) => {
+                        self.span.in_scope(|| {
+                            info!(
+                                target: "cassis_rootstock",
+                                "preimage observed on chain in block {block_number} for {}: \
+                                 preimage={preimage}",
+                                payment_hash.short(),
+                            );
+                        });
+                        return Ok(preimage);
+                    }
                     Ok(None) => {}
-                    Err(e) => self.config.span.in_scope(|| {
+                    Err(e) => self.span.in_scope(|| {
                         warn!(
                             target: "cassis_rootstock",
                             "watch_preimage block scan failed at {block_number}: {e}"
@@ -742,13 +829,46 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .get_balance(self.address)
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let needed = Self::msat_to_wei(amount_msat);
+        // The lock is itself a transaction, so the value alone is not
+        // enough — without gas headroom `can_route` passes and the lock
+        // then fails for want of gas, which is the same trap `can_claim`
+        // closes on the incoming side.
+        let gas_price = self
+            .gas_price_wei()
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        let gas = gas_reserve(gas_price);
+        let needed = Self::msat_to_wei(amount_msat).saturating_add(gas);
         if balance < needed {
             return Err(HtlcError::InvalidParams(format!(
-                "insufficient rootstock balance: need {needed} wei, have {balance} wei"
+                "insufficient rootstock balance on {}: need {needed} wei \
+                 (including ~{gas} wei gas), have {balance} wei",
+                self.address,
             )));
         }
         Ok(())
+    }
+
+    /// Claiming on rootstock is an on-chain transaction, so it needs gas
+    /// even though the claimed value flows *in*. An unfunded account is
+    /// rejected outright by RSK ("the sender account doesn't exist",
+    /// -32010) because it has no state-trie entry at all.
+    ///
+    /// Checked at PREPARE time so the hop is rejected before it locks
+    /// anything downstream, instead of stranding an outgoing HTLC it
+    /// cannot recoup. `amount_msat` is deliberately unused: the claimed
+    /// value arrives, so only the gas matters.
+    async fn can_claim(&self, _amount_msat: u64) -> Result<(), HtlcError> {
+        let balance = self
+            .provider
+            .get_balance(self.address)
+            .await
+            .map_err(|e| HtlcError::Network(format!("get_balance: {e}")))?;
+        let gas_price = self
+            .gas_price_wei()
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        self.ensure_claim_gas(balance, gas_price)
     }
 
     async fn verify_incoming_htlc(
@@ -786,7 +906,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
                 )));
             }
         };
-        self.config.span.in_scope(|| {
+        self.span.in_scope(|| {
             info!(
                 target: "cassis_rootstock",
                 "checking htlc target={} amount={} hash={}",
@@ -1042,6 +1162,11 @@ pub fn evm_address_from_pubkey(pubkey: &PubKey) -> Address {
     let uncompressed = pubkey.to_ecdsa_key().serialize_uncompressed();
     // Skip the 0x04 tag: keccak is over the raw 64-byte X || Y.
     Address::from_slice(&alloy::primitives::keccak256(&uncompressed[1..]).0[12..])
+}
+
+/// Wei to reserve for one HTLC transaction at `gas_price`.
+fn gas_reserve(gas_price: u128) -> U256 {
+    U256::from(gas_price).saturating_mul(U256::from(HTLC_TX_GAS_LIMIT))
 }
 
 /// Parse a hex-encoded `0x`-prefixed (or bare) EVM address.

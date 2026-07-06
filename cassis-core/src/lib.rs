@@ -4,6 +4,7 @@ use async_trait::async_trait;
 pub use ritualistic::PubKey;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use tracing::Span;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Bytes32(pub [u8; 32]);
@@ -12,6 +13,24 @@ impl Bytes32 {
     pub fn short(&self) -> String {
         format!("…{}", self)[60..].to_string()
     }
+}
+
+/// Build the per-network child span an adapter should hold and enter
+/// around every log it emits.
+///
+/// `parent` is the caller's node span (the one carrying the `node`
+/// field). The returned span adds a `network` field, so a log emitted
+/// inside it has *both* in its scope and a subscriber walking
+/// `event_scope()` can render `[alice/rootstock::testnet]`.
+///
+/// The parent is passed explicitly rather than relying on the ambient
+/// `Span::current()`: adapters are constructed on whichever task
+/// happened to run the builder, but their methods are later driven from
+/// unrelated tasks (the router poll loop, an iroh request handler), so
+/// the contextual parent at construction time is the only reliable
+/// link back to the owning node.
+pub fn network_span(parent: &Span, network_id: &NetworkId) -> Span {
+    tracing::info_span!(parent: parent, "network", network = %network_id)
 }
 
 impl fmt::Debug for Bytes32 {
@@ -696,6 +715,24 @@ pub trait NetworkRouterAdapter: Send + Sync {
     /// implementation accepts unconditionally so stub adapters don't
     /// have to implement it.
     async fn can_route(&self, _amount_msat: u64) -> Result<(), HtlcError> {
+        Ok(())
+    }
+
+    /// PREPARE-time check on the hop's *incoming* adapter: can this
+    /// adapter afford to eventually *claim* what it is owed?
+    ///
+    /// [`NetworkRouterAdapter::can_route`] only proves the outgoing side
+    /// can be funded. On networks where claiming costs something of its
+    /// own — rootstock, where the claim is an on-chain transaction the
+    /// router pays gas for — that leaves a gap: the hop accepts the
+    /// route, locks its outgoing HTLC, and only then discovers it cannot
+    /// claim upstream. Funds are committed downstream and unclaimable
+    /// upstream until the timelock expires.
+    ///
+    /// Checking here means the PREPARE is rejected before anything is
+    /// locked. Defaults to accepting: on networks where a claim is just
+    /// a signed message (cashu), there is nothing to afford.
+    async fn can_claim(&self, _amount_msat: u64) -> Result<(), HtlcError> {
         Ok(())
     }
 

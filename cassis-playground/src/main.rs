@@ -11,6 +11,7 @@ use cassis_client::ops::{
 };
 use cassis_client::store::CashuProofDb;
 use cassis_client::CassisClient;
+use cassis_core::logging::ScopeFields;
 use cdk::nuts::Token;
 use ritualistic::server::{CustomRelay, RelayInternals};
 use ritualistic::{Event as NostrEvent, Filter as NostrFilter};
@@ -120,27 +121,10 @@ struct PlaygroundLogLayer {
     printer: Arc<StdMutex<Option<Box<dyn ExternalPrinter + Send>>>>,
 }
 
-struct NodeSpanName(String);
-
 impl<S> Layer<S> for PlaygroundLogLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        id: &tracing::Id,
-        ctx: SubscriberContext<'_, S>,
-    ) {
-        let mut visitor = NodeSpanVisitor(None);
-        attrs.record(&mut visitor);
-        if let Some(name) = visitor.0 {
-            if let Some(span) = ctx.span(id) {
-                span.extensions_mut().insert(NodeSpanName(name));
-            }
-        }
-    }
-
     fn on_event(&self, event: &Event<'_>, _ctx: SubscriberContext<'_, S>) {
         let metadata = event.metadata();
         if *metadata.level() > tracing::Level::INFO || metadata.target().starts_with("iroh") {
@@ -157,13 +141,26 @@ where
         if trimmed.ends_with(';') && !trimmed[..trimmed.len() - 1].contains(char::is_whitespace) {
             return;
         }
-        let node = _ctx.event_span(event).and_then(|span| {
-            span.extensions()
-                .get::<NodeSpanName>()
-                .map(|name| colored_node_name(&name.0))
-        });
-        let line = node
-            .map(|node| format!("[{}] {}: {}", metadata.level(), node, message))
+        // Walk the whole scope, not just the innermost span: an adapter
+        // log is emitted inside a per-network span that is a *child* of
+        // the node span, so the innermost span carries `network` while
+        // only its parent carries `node`.
+        let scope = _ctx
+            .event_scope(event)
+            .map(ScopeFields::from_scope)
+            .unwrap_or_default();
+        let prefix = match (&scope.node, &scope.network) {
+            (Some(node), Some(network)) => Some(format!(
+                "{}/{}",
+                colored_node_name(node),
+                colored_network_name(network),
+            )),
+            (Some(node), None) => Some(colored_node_name(node)),
+            (None, Some(network)) => Some(colored_network_name(network)),
+            (None, None) => None,
+        };
+        let line = prefix
+            .map(|prefix| format!("[{}] {}: {}", metadata.level(), prefix, message))
             .unwrap_or_else(|| format!("[{}] {}", metadata.level(), message));
         if let Ok(mut printer) = self.printer.lock() {
             if let Some(printer) = printer.as_mut() {
@@ -176,22 +173,6 @@ where
             while lines.len() > 100 {
                 lines.pop_front();
             }
-        }
-    }
-}
-
-struct NodeSpanVisitor(Option<String>);
-
-impl tracing::field::Visit for NodeSpanVisitor {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "node" {
-            self.0 = Some(value.to_string());
-        }
-    }
-
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-        if field.name() == "node" {
-            self.0 = Some(format!("{value:?}"));
         }
     }
 }
@@ -515,7 +496,9 @@ fn colored_network_name(name: &str) -> String {
         "cashu_1" => 97,
         "cashu_2" => 93,
         "cashu_3" => 96,
-        "rootstock_testnet" => 97,
+        // Both the playground's own id and the wire `NetworkId`, since
+        // adapter spans carry the latter.
+        "rootstock_testnet" | "rootstock::testnet" => 97,
         _ => 37,
     };
     format!("\x1b[{background};{foreground}m{name}\x1b[0m")
@@ -1046,6 +1029,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs = Arc::new(StdMutex::new(VecDeque::new()));
     let printer = Arc::new(StdMutex::new(None));
     tracing_subscriber::registry()
+        // Captures `node` / `network` off each span so the layer below
+        // can resolve them when formatting an event.
+        .with(cassis_core::logging::ScopeLayer)
         .with(PlaygroundLogLayer {
             lines: logs.clone(),
             printer: printer.clone(),
