@@ -469,6 +469,42 @@ pub struct HopDispatched {
     pub outgoing_descriptor: HtlcDescriptor,
 }
 
+/// DISCARD message (sender -> router): abandon a reservation made by an
+/// earlier [`HopPrepare`] that will never be followed by a DISPATCH.
+///
+/// The payer sends this to every hop still holding a reservation as
+/// soon as it knows the payment cannot proceed — a hop rejected its
+/// PREPARE, the payer could not fund the first HTLC, or a DISPATCH
+/// failed part-way down the route. Without it a failed attempt leaves
+/// capacity pinned on every hop that *did* accept until the
+/// reservation ages out, so a payer retrying over an overlapping route
+/// competes against its own abandoned attempts.
+///
+/// This can only ever free a reservation, never affect money: a hop
+/// drops its [`HopPrepare`] record the moment it acts on the matching
+/// DISPATCH, so by the time any HTLC exists there is nothing here left
+/// to match. A DISCARD that arrives after DISPATCH finds no record and
+/// is reported as `released: false` rather than unwinding anything;
+/// funded HTLCs are left to the normal preimage-or-timelock path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopDiscard {
+    pub payment_hash: Bytes32,
+}
+
+/// Reply to [`HopDiscard`]. `released` is true when a matching
+/// reservation was found and dropped.
+///
+/// `released: false` is a normal, non-error outcome: the reservation
+/// may have already aged out, the PREPARE may have been rejected (in
+/// which case nothing was ever reserved), or a DISPATCH may have
+/// already consumed it. The payer sends DISCARD as a best-effort
+/// cleanup and does not fail a payment over the answer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopDiscarded {
+    pub payment_hash: Bytes32,
+    pub released: bool,
+}
+
 /// COMMIT message (sender -> final receiver): sent directly from the
 /// payer to the payee (not through routers) to claim the final
 /// incoming HTLC. The receiver verifies the HTLC matches the local

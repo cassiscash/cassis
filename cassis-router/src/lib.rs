@@ -15,11 +15,11 @@
 #[cfg(feature = "cashu")]
 use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
-    network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDispatch,
-    HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, NetworkId, NetworkRouterAdapter,
-    WatchError,
+    network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDiscard,
+    HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, NetworkId,
+    NetworkRouterAdapter, WatchError,
 };
-use cassis_iroh::{Frame, IrohError, IrohServer};
+use cassis_iroh::{Frame, IrohError, IrohServer, PublicKey};
 use cassis_keys as keys;
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
@@ -153,11 +153,13 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
     tokio::spawn(
         async move {
             let handler = Arc::new(
-                move |frame: Frame| -> std::pin::Pin<
+                move |frame: Frame,
+                      remote: PublicKey|
+                      -> std::pin::Pin<
                     Box<dyn std::future::Future<Output = Result<Frame, IrohError>> + Send>,
                 > {
                     let router = handler_router.clone();
-                    Box::pin(async move { router.handle_frame(frame).await })
+                    Box::pin(async move { router.handle_frame(frame, remote).await })
                 },
             );
             if let Err(e) = iroh_server.run(handler).await {
@@ -410,21 +412,30 @@ impl CassisRouter {
 
     /// Top-level dispatcher: turn a [`Frame`] into the
     /// matching reply [`Frame`]. The router only handles
-    /// Prepare / Prepared / Dispatch / Dispatched; Commit /
-    /// Committed flow directly from sender to receiver
-    /// (payee's `cassis-cli`) without crossing a router hop.
-    pub async fn handle_frame(&self, frame: Frame) -> Result<Frame, IrohError> {
-        self.handle_frame_inner(frame)
+    /// Prepare / Prepared / Dispatch / Dispatched / Discard /
+    /// Discarded; Commit / Committed flow directly from sender to
+    /// receiver (payee's `cassis-cli`) without crossing a router hop.
+    ///
+    /// `remote` is the authenticated iroh identity of the requesting
+    /// peer. It scopes state the router keeps on a caller's behalf:
+    /// PREPARE reservations belong to whoever created them, and only
+    /// that peer may release one via DISCARD.
+    pub async fn handle_frame(&self, frame: Frame, remote: PublicKey) -> Result<Frame, IrohError> {
+        self.handle_frame_inner(frame, remote)
             .instrument(self.span.clone())
             .await
     }
 
-    async fn handle_frame_inner(&self, frame: Frame) -> Result<Frame, IrohError> {
+    async fn handle_frame_inner(
+        &self,
+        frame: Frame,
+        remote: PublicKey,
+    ) -> Result<Frame, IrohError> {
         match &frame {
             Frame::Prepare(p) => {
                 info!(
                     target: "cassis_router",
-                    "received PREPARE: payment_hash={} amount_msat={} {} -> {} \
+                    "received PREPARE from peer={remote}: payment_hash={} amount_msat={} {} -> {} \
                      incoming_deadline={} outgoing_expiry={}",
                     p.payment_hash.short(),
                     p.amount_msat,
@@ -441,6 +452,13 @@ impl CassisRouter {
                     d.payment_hash.short(),
                     d.recipient,
                     d.incoming_descriptor,
+                );
+            }
+            Frame::Discard(d) => {
+                info!(
+                    target: "cassis_router",
+                    "received DISCARD from peer={remote}: payment_hash={}",
+                    d.payment_hash.short(),
                 );
             }
             Frame::Commit(c) => {
@@ -461,7 +479,7 @@ impl CassisRouter {
         }
         match frame {
             Frame::Prepare(p) => self
-                .handle_prepare(p)
+                .handle_prepare(p, remote)
                 .await
                 .map(Frame::Prepared)
                 .map_err(internal),
@@ -469,6 +487,11 @@ impl CassisRouter {
                 .handle_dispatch(d)
                 .await
                 .map(Frame::Dispatched)
+                .map_err(internal),
+            Frame::Discard(d) => self
+                .handle_discard(d, remote)
+                .await
+                .map(Frame::Discarded)
                 .map_err(internal),
             Frame::Commit(c) => self
                 .handle_commit(c)
@@ -485,7 +508,18 @@ impl CassisRouter {
     /// PREPARE handler: validate the request, check funds on
     /// the outgoing side, store the spec. Do NOT create any
     /// HTLCs.
-    async fn handle_prepare(&self, mut prepare: HopPrepare) -> Result<HopPrepared, String> {
+    ///
+    /// The reservation is bound to `remote`: the iroh peer that sent
+    /// the PREPARE is the only peer allowed to release it later with
+    /// a DISCARD. This closes the cheap DoS where anyone who learns a
+    /// payment_hash could otherwise free someone else's reservation
+    /// and strand their DISPATCH with "no matching PREPARE". No funds
+    /// are ever at risk — a reservation is bookkeeping, not money.
+    async fn handle_prepare(
+        &self,
+        mut prepare: HopPrepare,
+        remote: PublicKey,
+    ) -> Result<HopPrepared, String> {
         let incoming_raw = prepare.incoming_network.clone();
         let outgoing_raw = prepare.outgoing_network.clone();
         prepare.incoming_network = normalize_network_id(&prepare.incoming_network);
@@ -566,6 +600,7 @@ impl CassisRouter {
         prepared.push(PreparedEntry {
             prepare: prepare.clone(),
             expires_at: now.saturating_add(600),
+            owner: remote,
         });
         info!(
             target: "cassis_router",
@@ -706,6 +741,58 @@ impl CassisRouter {
         Ok(HopDispatched {
             payment_hash: dispatch.payment_hash,
             outgoing_descriptor,
+        })
+    }
+
+    /// DISCARD handler: release a PREPARE reservation that will never
+    /// be followed by a DISPATCH.
+    ///
+    /// Only the peer that created the reservation may release it, and
+    /// only while it still exists: `handle_dispatch` removes the entry
+    /// before creating any HTLC, so a DISCARD can never unwind funded
+    /// money — it either frees pure bookkeeping or finds nothing. Both
+    /// "already consumed" and "never existed" report `released: false`
+    /// as normal outcomes; the payer treats this whole exchange as
+    /// best-effort cleanup.
+    async fn handle_discard(
+        &self,
+        discard: HopDiscard,
+        remote: PublicKey,
+    ) -> Result<HopDiscarded, String> {
+        let released = {
+            let mut prepared = self.prepared.lock().await;
+            let now = unix_now();
+            prepared.retain(|entry| entry.expires_at > now);
+            match prepared
+                .iter()
+                .position(|entry| entry.prepare.payment_hash == discard.payment_hash)
+            {
+                None => false,
+                Some(index) => {
+                    if prepared[index].owner != remote {
+                        warn!(
+                            target: "cassis_router",
+                            "DISCARD denied: payment_hash={} reserved by {} \
+                             but request came from {remote}",
+                            discard.payment_hash.short(),
+                            prepared[index].owner,
+                        );
+                        false
+                    } else {
+                        prepared.remove(index);
+                        true
+                    }
+                }
+            }
+        };
+        info!(
+            target: "cassis_router",
+            "DISCARD processed: payment_hash={} peer={remote} released={released}",
+            discard.payment_hash.short(),
+        );
+        Ok(HopDiscarded {
+            payment_hash: discard.payment_hash,
+            released,
         })
     }
 
@@ -925,6 +1012,11 @@ impl CassisRouter {
 struct PreparedEntry {
     prepare: HopPrepare,
     expires_at: u64,
+    /// Authenticated iroh identity of the peer that sent the PREPARE.
+    /// Only this peer may free the reservation via DISCARD; a DISCARD
+    /// from anyone else is refused (logged, reported as
+    /// `released: false`).
+    owner: PublicKey,
 }
 
 /// Tiny shim: lift a string rejection into an iroh-level

@@ -3,7 +3,7 @@
 //! duplicated orchestration logic.
 
 use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter};
-use cassis_iroh::{Frame, IrohServer};
+use cassis_iroh::{Frame, IrohServer, PublicKey};
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -278,7 +278,7 @@ pub async fn start_receive(
         let receivers = receivers.clone();
         let store_path = store_path.clone();
         let handler_span = span.clone();
-        let handler = Arc::new(move |frame: Frame| {
+        let handler = Arc::new(move |frame: Frame, _remote: PublicKey| {
             let receivers = receivers.clone();
             let store_path = store_path.clone();
             Box::pin(
