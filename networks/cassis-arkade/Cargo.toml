@@ -10,3 +10,18 @@ default = []
 async-trait = "0.1.91"
 cassis-core = { path = "../../cassis-core" }
 tracing = "0.1.44"
+thiserror = "1.0.69"
+tokio = { version = "1.46.1", features = ["sync", "time", "rt"] }
+futures = "0.3.33"
+
+# Arkade Rust SDK (`ark-rs`). `ark-client` is the high-level wallet
+# (coin selection, offchain send/claim flows, VTXO listings); it
+# re-exports the gRPC transport used to talk to the operator.
+ark-client = { version = "0.10", default-features = false, features = ["tls-webpki-roots"] }
+ark-core = "0.10"
+# bdk-backed onchain wallet required by the ark-client type bounds.
+ark-bdk-wallet = "0.10"
+esplora-client = { version = "0.10", features = ["async-https"] }
+
+bitcoin = "0.32"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

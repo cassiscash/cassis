@@ -1,10 +1,12 @@
 use cassis_core::{cashu_mint_url, cashu_network_id, NetworkId};
 
 /// A parsed `--network` spec, mirroring the router/CLI format:
-/// `cashu::host`, `rootstock`, or `rootstock::testnet`.
+/// `cashu::host`, `arkade`, `arkade::testnet`, `rootstock`, or
+/// `rootstock::testnet`.
 #[derive(Clone, Debug)]
 pub enum NetSpec {
     Cashu { mint_url: String, host: String },
+    Arkade { testnet: bool },
     Rootstock { testnet: bool },
 }
 
@@ -36,6 +38,13 @@ impl NetSpec {
                     "network 'rootstock' only accepts no parameter or 'testnet', got '{other}'"
                 )),
             },
+            "arkade" => match param {
+                None => Ok(NetSpec::Arkade { testnet: false }),
+                Some("testnet") => Ok(NetSpec::Arkade { testnet: true }),
+                Some(other) => Err(format!(
+                    "network 'arkade' only accepts no parameter or 'testnet', got '{other}'"
+                )),
+            },
             other => Err(format!(
                 "unsupported network kind '{other}' (compile cassis-client with the matching feature)"
             )),
@@ -45,6 +54,7 @@ impl NetSpec {
     pub fn kind_name(&self) -> &'static str {
         match self {
             NetSpec::Cashu { .. } => "cashu",
+            NetSpec::Arkade { .. } => "arkade",
             NetSpec::Rootstock { .. } => "rootstock",
         }
     }
@@ -52,6 +62,11 @@ impl NetSpec {
     pub fn network_id(&self) -> NetworkId {
         match self {
             NetSpec::Cashu { host, .. } => cashu_network_id(host),
+            NetSpec::Arkade { testnet } => NetworkId(if *testnet {
+                "arkade::testnet".to_string()
+            } else {
+                "arkade".to_string()
+            }),
             NetSpec::Rootstock { testnet } => NetworkId(if *testnet {
                 "rootstock::testnet".to_string()
             } else {
@@ -109,5 +124,15 @@ mod tests {
             NetSpec::parse("rootstock::testnet").unwrap(),
             NetSpec::Rootstock { testnet: true }
         ));
+    }
+
+    #[test]
+    fn parse_arkade_default_and_testnet() {
+        let s = NetSpec::parse("arkade").unwrap();
+        assert_eq!(s.network_id().0, "arkade");
+        assert_eq!(s.kind_name(), "arkade");
+        let s = NetSpec::parse("arkade::testnet").unwrap();
+        assert_eq!(s.network_id().0, "arkade::testnet");
+        assert!(matches!(NetSpec::parse("arkade::foo"), Err(_)));
     }
 }

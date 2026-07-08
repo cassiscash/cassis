@@ -5,7 +5,7 @@ use cassis_core::NetworkId;
 ///
 /// Values mirror the `incoming_delta_secs()` declared on each network
 /// adapter (`cassisd` and the per-network crates):
-///   - ark: 10
+///   - arkade: 60 (`arkade` and `arkade::testnet`)
 ///   - fedimint: 30
 ///   - cashu: 30
 ///   - liquid: 300
@@ -15,7 +15,7 @@ use cassis_core::NetworkId;
 /// any network not in the table.
 pub fn fallback_incoming_delta(network: &NetworkId) -> u64 {
     match network.0.as_str() {
-        "ark" => 10,
+        "arkade" | "arkade::testnet" => 60,
         "fedimint" => 30,
         "cashu" => 30,
         "liquid" => 300,
@@ -42,7 +42,11 @@ mod tests {
 
     #[test]
     fn known_networks_return_documented_values() {
-        assert_eq!(fallback_incoming_delta(&NetworkId("ark".into())), 10);
+        assert_eq!(fallback_incoming_delta(&NetworkId("arkade".into())), 60);
+        assert_eq!(
+            fallback_incoming_delta(&NetworkId("arkade::testnet".into())),
+            60
+        );
         assert_eq!(fallback_incoming_delta(&NetworkId("fedimint".into())), 30);
         assert_eq!(fallback_incoming_delta(&NetworkId("cashu".into())), 30);
         assert_eq!(fallback_incoming_delta(&NetworkId("liquid".into())), 300);
@@ -61,7 +65,6 @@ mod tests {
 
     #[test]
     fn fallback_transit_slack_is_60_for_known_and_unknown_networks() {
-        assert_eq!(fallback_transit_slack(&NetworkId("ark".into())), 60);
         assert_eq!(fallback_transit_slack(&NetworkId("liquid".into())), 60);
         assert_eq!(fallback_transit_slack(&NetworkId("rootstock".into())), 60);
         assert_eq!(fallback_transit_slack(&NetworkId("mystery".into())), 60);

@@ -17,7 +17,7 @@
 //! model selected for cassis: at the Fedimint leg the contract is
 //! preimage-gated via TPE rather than via an external Lightning reveal.
 //!
-//! Unlike the cashu / ark / rootstock / liquid adapters, fedimint
+//! Unlike the cashu / arkade / rootstock / liquid adapters, fedimint
 //! does **not** implement the lower-level
 //! [`cassis_core::NetworkRouterAdapter`] trait. LNv2's "sells its own
 //! preimage" semantics don't map cleanly onto a router that has to

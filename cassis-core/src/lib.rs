@@ -111,7 +111,7 @@ pub fn fedimint_network_id(invite_code: &str) -> NetworkId {
 }
 
 /// Build the canonical `NetworkId` for a kind without a parameter
-/// (liquid, ark, rootstock).
+/// (liquid, arkade, arkade::testnet, rootstock).
 pub fn simple_network_id(kind: &str) -> NetworkId {
     NetworkId(kind.to_string())
 }
@@ -119,7 +119,8 @@ pub fn simple_network_id(kind: &str) -> NetworkId {
 /// Pass-through used by the router to canonicalize `HopInstruction`
 /// network ids before adapter lookup. Only the canonical on-the-wire
 /// form (`cashu::<host>`, `fedimint::<invite>`, or the simple kinds
-/// `liquid` / `ark` / `rootstock` / `rootstock::testnet`) round-trips;
+/// `liquid` / `arkade` / `arkade::testnet` / `rootstock` /
+/// `rootstock::testnet`) round-trips;
 /// anything else is returned unchanged so the adapter lookup rejects it.
 pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
     if let Some(rest) = id.0.strip_prefix(CASHU_NETWORK_ID_PREFIX) {
@@ -132,7 +133,12 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
             return id.clone();
         }
     }
-    if id.0 == "liquid" || id.0 == "ark" || id.0 == "rootstock" || id.0 == "rootstock::testnet" {
+    if id.0 == "liquid"
+        || id.0 == "arkade"
+        || id.0 == "arkade::testnet"
+        || id.0 == "rootstock"
+        || id.0 == "rootstock::testnet"
+    {
         return id.clone();
     }
     id.clone()
@@ -212,16 +218,17 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
                 .to_string(),
         ),
 
-        #[cfg(feature = "ark")]
-        "ark" => {
-            if param.is_some() {
-                return Err("network 'ark' does not take a parameter".into());
-            }
-            Ok(NetworkId("ark".to_string()))
-        }
-        #[cfg(not(feature = "ark"))]
-        "ark" => Err(
-            "network 'ark' requested but cassis-core was not compiled with the 'ark' feature"
+        #[cfg(feature = "arkade")]
+        "arkade" => match param {
+            None => Ok(NetworkId("arkade".to_string())),
+            Some("testnet") => Ok(NetworkId("arkade::testnet".to_string())),
+            Some(other) => Err(format!(
+                "network 'arkade' only accepts no parameter or 'testnet', got '{other}'"
+            )),
+        },
+        #[cfg(not(feature = "arkade"))]
+        "arkade" => Err(
+            "network 'arkade' requested but cassis-core was not compiled with the 'arkade' feature"
                 .to_string(),
         ),
 
@@ -560,8 +567,36 @@ pub enum HtlcDescriptor {
     Cashu { proofs_b64: Vec<String> },
     /// Stub for liquid: no on-wire shape yet.
     Liquid {},
-    /// Stub for ark: no on-wire shape yet.
-    Ark {},
+    /// Arkade VHTLC. Carries every [`ark_core::vhtlc::VhtlcOptions`]
+    /// field the receiver needs to rebuild the VHTLC taproot script,
+    /// find the locked VTXO at its address, and claim it:
+    ///
+    /// * `sender` is the x-only key of the party that locked the funds
+    ///   (the upstream hop) and controls the refund paths.
+    /// * `receiver` is the x-only key that can claim with the
+    ///   preimage — always `claim_pubkeys[arkade]` of this hop, so
+    ///   receiving a descriptor whose `receiver` does not match is an
+    ///   identity error worth rejecting.
+    /// * `server` is the operator's signer key: the script's second
+    ///   claim-path signer and co-signer on any spend submitted to
+    ///   that operator. The descriptor only round-trips inside one
+    ///   operator.
+    /// * `preimage_hash` is hex RIPEMD160(SHA256(preimage)) ==
+    ///   RIPEMD160(payment_hash), the 20-byte value burned into the
+    ///   script (`OP_HASH160 ... OP_EQUALVERIFY`).
+    /// * `refund_locktime` (absolute block height) plus the three
+    ///   unilateral CSV delays are consensus `u32` values passed
+    ///   straight through to the script builder.
+    Arkade {
+        sender: String,
+        receiver: String,
+        server: String,
+        preimage_hash: String,
+        refund_locktime: u32,
+        unilateral_claim_delay: u32,
+        unilateral_refund_delay: u32,
+        unilateral_refund_without_receiver_delay: u32,
+    },
     /// On-chain EtherSwap HTLC on Rootstock. Carries the
     /// fields the receiver needs to claim:
     /// `preimageHash` is the route's payment hash (the
@@ -1233,25 +1268,27 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "ark")]
+    #[cfg(feature = "arkade")]
     #[test]
-    fn network_id_for_ark_spec_uses_canonical_form() {
-        let id = network_id_for_spec("ark").unwrap();
-        assert_eq!(id.0, "ark");
+    fn network_id_for_arkade_spec_uses_canonical_form() {
+        let id = network_id_for_spec("arkade").unwrap();
+        assert_eq!(id.0, "arkade");
+        let id = network_id_for_spec("arkade::testnet").unwrap();
+        assert_eq!(id.0, "arkade::testnet");
     }
 
-    #[cfg(feature = "ark")]
+    #[cfg(feature = "arkade")]
     #[test]
-    fn network_id_for_ark_spec_rejects_parameter() {
-        assert!(network_id_for_spec("ark::foo").is_err());
+    fn network_id_for_arkade_spec_rejects_unknown_parameter() {
+        assert!(network_id_for_spec("arkade::foo").is_err());
     }
 
-    #[cfg(not(feature = "ark"))]
+    #[cfg(not(feature = "arkade"))]
     #[test]
-    fn network_id_for_ark_spec_reports_missing_feature() {
-        let err = network_id_for_spec("ark").unwrap_err();
+    fn network_id_for_arkade_spec_reports_missing_feature() {
+        let err = network_id_for_spec("arkade").unwrap_err();
         assert!(
-            err.contains("'ark' feature"),
+            err.contains("'arkade' feature"),
             "expected feature-related error, got: {err}"
         );
     }
@@ -1383,8 +1420,12 @@ mod tests {
             "liquid"
         );
         assert_eq!(
-            canonicalize_network_id(&NetworkId("ark".to_string())).0,
-            "ark"
+            canonicalize_network_id(&NetworkId("arkade".to_string())).0,
+            "arkade"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("arkade::testnet".to_string())).0,
+            "arkade::testnet"
         );
         assert_eq!(
             canonicalize_network_id(&NetworkId("rootstock".to_string())).0,
@@ -1434,7 +1475,6 @@ mod tests {
             normalize_network_id(&NetworkId("liquid".to_string())).0,
             "liquid"
         );
-        assert_eq!(normalize_network_id(&NetworkId("ark".to_string())).0, "ark");
         assert_eq!(
             normalize_network_id(&NetworkId("rootstock".to_string())).0,
             "rootstock"
