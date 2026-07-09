@@ -89,6 +89,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: ArkadeCommands,
     },
+    /// Manage a node's Liquid (LWK) funds.
+    Liquid {
+        /// Network spec, `liquid` (default) or `liquid::testnet`.
+        #[arg(long, default_value = "liquid")]
+        network: String,
+        #[command(subcommand)]
+        command: LiquidCommands,
+    },
     /// Register a network to participate in. The argument format
     /// mirrors `cassis-router`: `cashu::host`, `rootstock`,
     /// `rootstock::testnet`.
@@ -132,9 +140,27 @@ pub enum CashuCommands {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum LiquidCommands {
+    /// Show the node's L-BTC balance.
+    Balance,
+    /// Print the confidential deposit address.
+    Deposit,
+    /// Send L-BTC to another confidential address.
+    Send {
+        /// Destination Liquid address.
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount_msat: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ArkadeCommands {
     /// Show the node's offchain Arkade balance.
     Balance,
+    /// Submit confirmed boarding outputs to the next batch swap.
+    Onboard,
     /// Print deposit addresses (boarding / on-chain / arkade).
     Deposit,
     /// Send VTXOs to another Arkade address.

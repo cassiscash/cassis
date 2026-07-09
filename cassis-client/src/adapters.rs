@@ -96,6 +96,23 @@ async fn build_pair(
                 sender: adapter,
             })
         }
+        #[cfg(feature = "liquid")]
+        NetSpec::Liquid { .. } => {
+            let cfg = cassis_liquid::default_config(
+                network_id.clone(),
+                network_sk(derived, &network_id)?,
+                derived.invoice.pubkey(),
+                span.clone(),
+            );
+            let adapter = cassis_liquid::LiquidAdapter::new(cfg)
+                .await
+                .map_err(|e| format!("liquid adapter init failed: {e}"))?;
+            Ok(AdapterPair {
+                network_id,
+                receiver: adapter.clone(),
+                sender: adapter,
+            })
+        }
         NetSpec::Rootstock { .. } => {
             let cfg = cassis_rootstock::default_config(
                 network_id.clone(),
@@ -179,6 +196,26 @@ pub async fn build_cashu_adapter(
     )
     .map(|a| Arc::new(a))
     .map_err(|e| format!("cashu adapter init failed: {e}"))
+}
+
+/// Build a concrete `cassis_liquid::LiquidAdapter` for a liquid
+/// spec (for the wallet/CLI `balance` / `deposit` / `send`
+/// subcommands).
+#[cfg(feature = "liquid")]
+pub async fn build_liquid_adapter(
+    spec: &NetSpec,
+    derived: &DerivedKeys,
+    span: Span,
+) -> Result<Arc<cassis_liquid::LiquidAdapter>, String> {
+    let NetSpec::Liquid { .. } = spec else {
+        return Err(format!("expected a liquid spec, got {}", spec.kind_name()));
+    };
+    let network_id = spec.network_id();
+    let sk = network_sk(derived, &network_id)?;
+    let cfg = cassis_liquid::default_config(network_id, sk, derived.invoice.pubkey(), span);
+    cassis_liquid::LiquidAdapter::new(cfg)
+        .await
+        .map_err(|e| format!("liquid adapter init failed: {e}"))
 }
 
 /// Build a concrete `cassis_rootstock::RootstockAdapter` for a

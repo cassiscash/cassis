@@ -10,3 +10,18 @@ default = []
 async-trait = "0.1.91"
 cassis-core = { path = "../../cassis-core" }
 tracing = "0.1.44"
+thiserror = "1.0.69"
+tokio = { version = "1.46.1", features = ["sync", "time", "rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lwk_common = "0.19"
+
+# Liquid Wallet Kit (LWK): watch-only wallet over CT descriptors +
+# esplora client, plus the software PSET signer. `lwk_wollet`
+# re-exports the `elements` crate used for script/tx construction.
+lwk_wollet = { version = "0.19", default-features = false, features = ["esplora"] }
+lwk_signer = "0.19"
+
+hmac = "0.12"
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

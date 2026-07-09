@@ -8,7 +8,7 @@ use cassis_core::NetworkId;
 ///   - arkade: 60 (`arkade` and `arkade::testnet`)
 ///   - fedimint: 30
 ///   - cashu: 30
-///   - liquid: 300
+///   - liquid: 300 (`liquid` and `liquid::testnet`)
 ///   - rootstock: 600 (both mainnet and `rootstock::testnet`)
 ///
 /// The default (30 s) matches the most common adapter and is used for
@@ -18,7 +18,7 @@ pub fn fallback_incoming_delta(network: &NetworkId) -> u64 {
         "arkade" | "arkade::testnet" => 60,
         "fedimint" => 30,
         "cashu" => 30,
-        "liquid" => 300,
+        "liquid" | "liquid::testnet" => 300,
         "rootstock" | "rootstock::testnet" => 600,
         _ => 30,
     }
@@ -50,6 +50,10 @@ mod tests {
         assert_eq!(fallback_incoming_delta(&NetworkId("fedimint".into())), 30);
         assert_eq!(fallback_incoming_delta(&NetworkId("cashu".into())), 30);
         assert_eq!(fallback_incoming_delta(&NetworkId("liquid".into())), 300);
+        assert_eq!(
+            fallback_incoming_delta(&NetworkId("liquid::testnet".into())),
+            300
+        );
         assert_eq!(fallback_incoming_delta(&NetworkId("rootstock".into())), 600);
         assert_eq!(
             fallback_incoming_delta(&NetworkId("rootstock::testnet".into())),

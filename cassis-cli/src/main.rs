@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "arkade")]
 use cassis_client::adapters::build_arkade_adapter;
+#[cfg(feature = "liquid")]
+use cassis_client::adapters::build_liquid_adapter;
 use cassis_client::adapters::{build_receivers, build_rootstock_adapter, build_senders};
 use cassis_client::netspec::NetSpec;
 use cassis_client::ops::{create_invoice_for, node_store_path, start_receive, unix_now};
@@ -24,6 +26,8 @@ use tracing::{error, info, info_span};
 mod cli;
 #[cfg(feature = "arkade")]
 use cli::ArkadeCommands;
+#[cfg(feature = "liquid")]
+use cli::LiquidCommands;
 use cli::{CashuCommands, Cli, Commands, RootstockCommands};
 
 #[tokio::main]
@@ -92,6 +96,7 @@ async fn main() {
         #[cfg(feature = "arkade")]
         Commands::Arkade { command, network } => match command {
             ArkadeCommands::Balance {} => cmd_arkade_balance(network).await,
+            ArkadeCommands::Onboard {} => cmd_arkade_onboard(network).await,
             ArkadeCommands::Deposit {} => cmd_arkade_deposit(network).await,
             ArkadeCommands::Send { to, amount_msat } => {
                 cmd_arkade_send(network, to, amount_msat).await
@@ -100,6 +105,18 @@ async fn main() {
         #[cfg(not(feature = "arkade"))]
         Commands::Arkade { .. } => {
             Err("'cassis-cli arkade' requires building with the 'arkade' feature".to_string())
+        }
+        #[cfg(feature = "liquid")]
+        Commands::Liquid { command, network } => match command {
+            LiquidCommands::Balance {} => cmd_liquid_balance(network).await,
+            LiquidCommands::Deposit {} => cmd_liquid_deposit(network).await,
+            LiquidCommands::Send { to, amount_msat } => {
+                cmd_liquid_send(network, to, amount_msat).await
+            }
+        },
+        #[cfg(not(feature = "liquid"))]
+        Commands::Liquid { .. } => {
+            Err("'cassis-cli liquid' requires building with the 'liquid' feature".to_string())
         }
         Commands::Register { network } => cmd_register(network),
         Commands::Rootstock { network, command } => match command {
@@ -577,6 +594,19 @@ async fn cmd_arkade_balance(network: String) -> Result<(), String> {
 }
 
 #[cfg(feature = "arkade")]
+async fn cmd_arkade_onboard(network: String) -> Result<(), String> {
+    let (spec, adapter) = build_cli_arkade_adapter(&network).await?;
+    let commitment_txid = adapter.onboard().await.map_err(|e| e.to_string())?;
+    println!("status:      ok");
+    println!("network:     {}", spec.network_id());
+    match commitment_txid {
+        Some(txid) => println!("commitment_txid: {txid}"),
+        None => println!("message:     no boarding outputs ready"),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arkade")]
 async fn cmd_arkade_deposit(network: String) -> Result<(), String> {
     let (spec, adapter) = build_cli_arkade_adapter(&network).await?;
     let (boarding, onchain, arkade) = adapter
@@ -598,6 +628,64 @@ async fn cmd_arkade_send(network: String, to: String, amount_msat: u64) -> Resul
         .transfer_to_ark_address(&to, amount_msat)
         .await
         .map_err(|e| format!("arkade send: {e}"))?;
+    println!("status:      ok");
+    println!("network:     {}", spec.network_id());
+    println!("to:          {to}");
+    println!("amount_msat: {amount_msat}");
+    println!("txid:        {txid}");
+    Ok(())
+}
+
+#[cfg(feature = "liquid")]
+// ============================================================================
+// liquid
+// ============================================================================
+#[cfg(feature = "liquid")]
+async fn build_cli_liquid_adapter(
+    network: &str,
+) -> Result<(NetSpec, std::sync::Arc<cassis_liquid::LiquidAdapter>), String> {
+    let testnet = network == "liquid::testnet";
+    if !testnet && network != "liquid" {
+        return Err(format!(
+            "network 'liquid' only accepts no parameter or 'testnet', got '{network}'"
+        ));
+    }
+    let spec = NetSpec::Liquid { testnet };
+    let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
+    let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
+    let adapter = build_liquid_adapter(&spec, &derived, info_span!("node", node = "cassis-cli"))
+        .await
+        .map_err(|e| format!("liquid adapter init failed: {e}"))?;
+    Ok((spec, adapter))
+}
+
+#[cfg(feature = "liquid")]
+async fn cmd_liquid_balance(network: String) -> Result<(), String> {
+    let (spec, adapter) = build_cli_liquid_adapter(&network).await?;
+    let balance_msat = adapter.balance_msat().await.map_err(|e| e.to_string())?;
+    println!("status:      ok");
+    println!("network:     {}", spec.network_id());
+    println!("balance_msat:{balance_msat:>13}");
+    Ok(())
+}
+
+#[cfg(feature = "liquid")]
+async fn cmd_liquid_deposit(network: String) -> Result<(), String> {
+    let (spec, adapter) = build_cli_liquid_adapter(&network).await?;
+    let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
+    println!("status:      ok");
+    println!("network:     {}", spec.network_id());
+    println!("address:     {address}");
+    Ok(())
+}
+
+#[cfg(feature = "liquid")]
+async fn cmd_liquid_send(network: String, to: String, amount_msat: u64) -> Result<(), String> {
+    let (spec, adapter) = build_cli_liquid_adapter(&network).await?;
+    let txid = adapter
+        .transfer_to_address(&to, amount_msat)
+        .await
+        .map_err(|e| format!("liquid send: {e}"))?;
     println!("status:      ok");
     println!("network:     {}", spec.network_id());
     println!("to:          {to}");

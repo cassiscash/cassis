@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cassis-client = { path = "../cassis-client", features = ["cashu", "arkade", "rootstock"] }
+cassis-client = { path = "../cassis-client", features = ["cashu", "arkade", "liquid", "rootstock"] }
 cassis-routing = { path = "../cassis-routing" }
-cassis-core = { path = "../cassis-core", features = ["cashu", "arkade", "rootstock"] }
+cassis-core = { path = "../cassis-core", features = ["cashu", "arkade", "liquid", "rootstock"] }
 cassis-keys = { path = "../cassis-keys" }
-cassis-router = { path = "../cassis-router", features = ["cashu", "arkade", "rootstock"] }
+cassis-router = { path = "../cassis-router", features = ["cashu", "arkade", "liquid", "rootstock"] }
 cassis-cashu = { path = "../networks/cassis-cashu" }
 cassis-rootstock = { path = "../networks/cassis-rootstock" }
 ritualistic = "0.1.1"

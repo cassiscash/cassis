@@ -7,6 +7,7 @@ edition.workspace = true
 default = []
 cashu = ["cassis-core/cashu"]
 arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
+liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["cassis-core/rootstock"]
 
 [dependencies]
@@ -18,6 +19,7 @@ cassis-router = { path = "../cassis-router" }
 cassis-cashu = { path = "../networks/cassis-cashu" }
 cassis-rootstock = { path = "../networks/cassis-rootstock" }
 cassis-arkade = { path = "../networks/cassis-arkade", optional = true }
+cassis-liquid = { path = "../networks/cassis-liquid", optional = true }
 clap = { version = "4.6.6", features = ["derive"] }
 futures = "0.3.33"
 iroh = "1.0.3"

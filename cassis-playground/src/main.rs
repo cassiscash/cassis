@@ -94,6 +94,11 @@ const NETWORKS: &[NetworkDef] = &[
         spec: "arkade::testnet",
         mint_url: None,
     },
+    NetworkDef {
+        id: "liquid_testnet",
+        spec: "liquid::testnet",
+        mint_url: None,
+    },
 ];
 
 const NODE_NAMES: &[&str] = &[
@@ -458,6 +463,11 @@ impl Playground {
                     cassis_client::adapters::build_arkade_adapter(&spec, &derived, span).await?;
                 adapter.balance_msat().await.map_err(|e| e.to_string())?
             }
+            _ if network.spec == "liquid::testnet" => {
+                let adapter =
+                    cassis_client::adapters::build_liquid_adapter(&spec, &derived, span).await?;
+                adapter.balance_msat().await.map_err(|e| e.to_string())?
+            }
             _ => {
                 let adapter =
                     cassis_client::adapters::build_rootstock_adapter(&spec, &derived, span).await?;
@@ -510,6 +520,7 @@ fn colored_network_name(name: &str) -> String {
         // adapter spans carry the latter.
         "rootstock_testnet" | "rootstock::testnet" => 97,
         "arkade_testnet" | "arkade::testnet" => 94,
+        "liquid_testnet" | "liquid::testnet" => 92,
         _ => 37,
     };
     format!("\x1b[{background};{foreground}m{name}\x1b[0m")
@@ -556,7 +567,27 @@ async fn command_fund(
     if net.spec == "arkade::testnet" {
         return fund_arkade(node_id, span).await;
     }
+    if net.spec == "liquid::testnet" {
+        return fund_liquid(node_id, span).await;
+    }
     fund_rootstock(node_id, amount * 1000, span).await
+}
+
+/// Liquid testnet L-BTC has a web faucet; print the node's
+/// confidential address for a manual top-up (e.g. via
+/// https://liquidtestnet.com), then check `balance` once the tx
+/// confirms and the wallet rescans.
+async fn fund_liquid(node_id: &str, span: Span) -> Result<(), String> {
+    let spec = NetSpec::parse("liquid::testnet")?;
+    let home = node_home(node_id);
+    let derived = load_and_derive(&home, vec![spec.network_id()])?;
+    let adapter = cassis_client::adapters::build_liquid_adapter(&spec, &derived, span).await?;
+    let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
+    info!(
+        "fund {node_id} on {}: send test L-BTC to {address}, then check `balance`",
+        colored_network_name("liquid_testnet"),
+    );
+    Ok(())
 }
 
 /// Arkade has no API faucet on public operators, so funding prints the
@@ -712,6 +743,8 @@ async fn command_router(
             NetSpec::Cashu { host, .. } => format!("cashu::{host}"),
             NetSpec::Arkade { testnet: true } => "arkade::testnet".into(),
             NetSpec::Arkade { testnet: false } => "arkade".into(),
+            NetSpec::Liquid { testnet: true } => "liquid::testnet".into(),
+            NetSpec::Liquid { testnet: false } => "liquid".into(),
             NetSpec::Rootstock { testnet: true } => "rootstock::testnet".into(),
             NetSpec::Rootstock { testnet: false } => "rootstock".into(),
         })

@@ -1,12 +1,13 @@
 use cassis_core::{cashu_mint_url, cashu_network_id, NetworkId};
 
 /// A parsed `--network` spec, mirroring the router/CLI format:
-/// `cashu::host`, `arkade`, `arkade::testnet`, `rootstock`, or
-/// `rootstock::testnet`.
+/// `cashu::host`, `arkade`, `arkade::testnet`, `liquid`,
+/// `liquid::testnet`, `rootstock`, or `rootstock::testnet`.
 #[derive(Clone, Debug)]
 pub enum NetSpec {
     Cashu { mint_url: String, host: String },
     Arkade { testnet: bool },
+    Liquid { testnet: bool },
     Rootstock { testnet: bool },
 }
 
@@ -45,6 +46,13 @@ impl NetSpec {
                     "network 'arkade' only accepts no parameter or 'testnet', got '{other}'"
                 )),
             },
+            "liquid" => match param {
+                None => Ok(NetSpec::Liquid { testnet: false }),
+                Some("testnet") => Ok(NetSpec::Liquid { testnet: true }),
+                Some(other) => Err(format!(
+                    "network 'liquid' only accepts no parameter or 'testnet', got '{other}'"
+                )),
+            },
             other => Err(format!(
                 "unsupported network kind '{other}' (compile cassis-client with the matching feature)"
             )),
@@ -55,6 +63,7 @@ impl NetSpec {
         match self {
             NetSpec::Cashu { .. } => "cashu",
             NetSpec::Arkade { .. } => "arkade",
+            NetSpec::Liquid { .. } => "liquid",
             NetSpec::Rootstock { .. } => "rootstock",
         }
     }
@@ -66,6 +75,11 @@ impl NetSpec {
                 "arkade::testnet".to_string()
             } else {
                 "arkade".to_string()
+            }),
+            NetSpec::Liquid { testnet } => NetworkId(if *testnet {
+                "liquid::testnet".to_string()
+            } else {
+                "liquid".to_string()
             }),
             NetSpec::Rootstock { testnet } => NetworkId(if *testnet {
                 "rootstock::testnet".to_string()
@@ -124,6 +138,16 @@ mod tests {
             NetSpec::parse("rootstock::testnet").unwrap(),
             NetSpec::Rootstock { testnet: true }
         ));
+    }
+
+    #[test]
+    fn parse_liquid_default_and_testnet() {
+        let s = NetSpec::parse("liquid").unwrap();
+        assert_eq!(s.network_id().0, "liquid");
+        assert_eq!(s.kind_name(), "liquid");
+        let s = NetSpec::parse("liquid::testnet").unwrap();
+        assert_eq!(s.network_id().0, "liquid::testnet");
+        assert!(matches!(NetSpec::parse("liquid::foo"), Err(_)));
     }
 
     #[test]
