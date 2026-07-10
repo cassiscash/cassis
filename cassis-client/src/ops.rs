@@ -30,7 +30,7 @@ pub fn default_nostr_relays() -> Vec<String> {
 }
 
 /// Force-create a fresh 12-word BIP39 mnemonic under `<home>/seed` if
-/// one isn't there. Matches `cassis-cli seed init --force`.
+/// one isn't there. Mirrors the CLI's on-first-use auto-init.
 pub fn init_node_home(home: &Path) -> Result<(), String> {
     std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
     let p = seed_path(home);
