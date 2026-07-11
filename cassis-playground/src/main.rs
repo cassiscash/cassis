@@ -464,8 +464,13 @@ impl Playground {
                 adapter.balance_msat().await.map_err(|e| e.to_string())?
             }
             _ if network.spec == "liquid::testnet" => {
-                let adapter =
-                    cassis_client::adapters::build_liquid_adapter(&spec, &derived, span).await?;
+                let adapter = cassis_client::adapters::build_liquid_adapter(
+                    &spec,
+                    &derived,
+                    &node_store_path(&home),
+                    span,
+                )
+                .await?;
                 adapter.balance_msat().await.map_err(|e| e.to_string())?
             }
             _ => {
@@ -581,7 +586,13 @@ async fn fund_liquid(node_id: &str, span: Span) -> Result<(), String> {
     let spec = NetSpec::parse("liquid::testnet")?;
     let home = node_home(node_id);
     let derived = load_and_derive(&home, vec![spec.network_id()])?;
-    let adapter = cassis_client::adapters::build_liquid_adapter(&spec, &derived, span).await?;
+    let adapter = cassis_client::adapters::build_liquid_adapter(
+        &spec,
+        &derived,
+        &node_store_path(&home),
+        span,
+    )
+    .await?;
     let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
     info!(
         "fund {node_id} on {}: send test L-BTC to {address}, then check `balance`",
@@ -751,6 +762,7 @@ async fn command_router(
         .collect();
     let cashu_store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path));
+    let liquid_store_dir = node_home(node_id).join("liquid");
     let router_span = playground.node_span(node_id).await;
     let jh = tokio::spawn(async move {
         let config = cassis_router::RouterConfig {
@@ -759,6 +771,7 @@ async fn command_router(
             derived_keys: derived,
             span: router_span.clone(),
             cashu_store,
+            liquid_store_dir: Some(liquid_store_dir),
         };
         async move {
             if let Err(e) = cassis_router::run_router(config).await {

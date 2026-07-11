@@ -64,6 +64,8 @@ use lwk_wollet::elements::{
 use lwk_wollet::{Network, Wollet, WolletBuilder, WolletDescriptor};
 use sha2::Sha512;
 use std::collections::HashMap;
+use std::fs::File;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,6 +134,9 @@ fn error_from_lwk(e: impl std::fmt::Display) -> HtlcError {
 pub struct LiquidConfig {
     pub network_id: NetworkId,
     pub esplora_url: String,
+    /// Directory used for LWK wallet state. `None` keeps wallet state
+    /// in memory, useful for tests.
+    pub persist_dir: Option<PathBuf>,
     /// 32-byte secret key derived from `cassis/network/<network_id>`.
     pub sk: [u8; 32],
     pub invoice_pubkey: PubKey,
@@ -150,6 +155,7 @@ pub fn default_config(
         "liquid::testnet" => LiquidConfig {
             network_id,
             esplora_url: TESTNET_ESPLORA_URL.to_string(),
+            persist_dir: None,
             sk,
             invoice_pubkey,
             span: span.clone(),
@@ -157,6 +163,7 @@ pub fn default_config(
         _ => LiquidConfig {
             network_id,
             esplora_url: MAINNET_ESPLORA_URL.to_string(),
+            persist_dir: None,
             sk,
             invoice_pubkey,
             span,
@@ -336,6 +343,8 @@ pub struct LiquidAdapter {
     http: reqwest::Client,
     esplora_url: String,
     network: Network,
+    /// Exclusive lock for `persist_dir`; held while adapter is open.
+    _persist_lock: Option<File>,
     incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
     outgoing: Mutex<HashMap<Bytes32, PendingOutgoing>>,
 }
@@ -407,8 +416,34 @@ impl LiquidAdapter {
         let descriptor: WolletDescriptor = descriptor_str
             .parse()
             .map_err(|e| Error::InvalidParams(format!("wollet descriptor: {e}")))?;
+        let mut wollet_builder = WolletBuilder::new(network, descriptor);
+        let persist_lock = if let Some(persist_dir) = &config.persist_dir {
+            std::fs::create_dir_all(persist_dir)
+                .map_err(|e| Error::Client(format!("create Liquid wallet directory: {e}")))?;
+            let lock_path = persist_dir.join(".lock");
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| Error::Client(format!("open Liquid wallet lock: {e}")))?;
+            fs2::FileExt::try_lock_exclusive(&lock).map_err(|e| {
+                Error::Client(format!(
+                    "Liquid wallet already open at {}; close other process first: {e}",
+                    persist_dir.display()
+                ))
+            })?;
+            let file_store = lwk_wollet::FileStore::new(persist_dir.clone())
+                .map_err(|e| Error::Client(format!("create Liquid wallet store: {e}")))?;
+            wollet_builder = wollet_builder
+                .with_stores(Arc::new(file_store))
+                .map_err(|e| Error::Client(format!("configure Liquid wallet store: {e}")))?;
+            Some(lock)
+        } else {
+            None
+        };
         let wollet = Arc::new(Mutex::new(
-            WolletBuilder::new(network, descriptor)
+            wollet_builder
                 .build()
                 .map_err(|e| Error::Client(format!("wollet build: {e}")))?,
         ));
@@ -442,6 +477,7 @@ impl LiquidAdapter {
             http,
             esplora_url: config.esplora_url.clone(),
             network,
+            _persist_lock: persist_lock,
             incoming: Mutex::new(HashMap::new()),
             outgoing: Mutex::new(HashMap::new()),
         }))

@@ -654,9 +654,14 @@ async fn build_cli_liquid_adapter(
     let spec = NetSpec::Liquid { testnet };
     let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let adapter = build_liquid_adapter(&spec, &derived, info_span!("node", node = "cassis-cli"))
-        .await
-        .map_err(|e| format!("liquid adapter init failed: {e}"))?;
+    let adapter = build_liquid_adapter(
+        &spec,
+        &derived,
+        &node_store_path(&node_home()),
+        info_span!("node", node = "cassis-cli"),
+    )
+    .await
+    .map_err(|e| format!("liquid adapter init failed: {e}"))?;
     Ok((spec, adapter))
 }
 
