@@ -12,50 +12,49 @@ liquid = ["dep:cassis-liquid", "cassis-client/liquid", "cassis-router/liquid", "
 rootstock = ["dep:cassis-rootstock", "cassis-router/rootstock", "cassis-core/rootstock"]
 
 [dependencies]
-cassis-client = { path = "../cassis-client" }
-cassis-core = { path = "../cassis-core" }
-cassis-iroh = { path = "../cassis-iroh" }
-cassis-keys = { path = "../cassis-keys" }
-cassis-router = { path = "../cassis-router" }
-cassis-routing = { path = "../cassis-routing" }
-clap = { version = "4.6.6", features = ["derive"] }
-rand = "0.8.7"
-sha2 = "0.10.9"
-futures = "0.3.33"
-iroh = "1.0.3"
-lowercase-hex = "0.1.1"
-minisqlite = { git = "https://github.com/cursor/minisqlite" }
-rustls = "0.23.43"
-serde_json = "1.0.151"
-thiserror = "1.0.69"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
-base64 = "0.22.1"
-tracing = "0.1.44"
+cassis-client = { workspace = true }
+cassis-core = { workspace = true }
+cassis-iroh = { workspace = true }
+cassis-keys = { workspace = true }
+cassis-router = { workspace = true }
+cassis-routing = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+futures = { workspace = true }
+iroh = { workspace = true }
+lowercase-hex = { workspace = true }
+minisqlite = { workspace = true }
+rustls = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+base64 = { workspace = true }
+tracing = { workspace = true }
 
 [dependencies.cassis-cashu]
-path = "../networks/cassis-cashu"
+workspace = true
 optional = true
 
 # Used by the cashu wallet subcommands to encode / decode
 # NUT-00 tokens via `cdk::nuts::Token`. Same version
 # `cassis-cashu` pulls in transitively.
 [dependencies.cdk]
-version = "0.17.3"
-features = ["wallet"]
+workspace = true
 optional = true
 
 [dependencies.cassis-fedimint]
-path = "../networks/cassis-fedimint"
+workspace = true
 optional = true
 
 [dependencies.cassis-arkade]
-path = "../networks/cassis-arkade"
+workspace = true
 optional = true
 
 [dependencies.cassis-liquid]
-path = "../networks/cassis-liquid"
+workspace = true
 optional = true
 
 [dependencies.cassis-rootstock]
-path = "../networks/cassis-rootstock"
+workspace = true
 optional = true

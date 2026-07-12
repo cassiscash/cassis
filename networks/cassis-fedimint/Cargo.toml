@@ -7,29 +7,29 @@ edition.workspace = true
 default = []
 
 [dependencies]
-async-trait = "0.1.91"
-cassis-core = { path = "../../cassis-core" }
+async-trait = { workspace = true }
+cassis-core = { workspace = true }
 
 # Fedimint client stack (LNv2 line). Pin to the same release; adjust the tag
 # to match the federation you talk to. `fedimint-connectors` (the iroh
 # transport) and the consolidated `gatewayd` land in v0.11; LNv2 itself
 # was stabilized earlier (v0.6). Use a single tag across all fedimint
 # crates — they share a workspace version.
-fedimint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-api-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-client-module = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-core = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-connectors = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-derive-secret = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+fedimint-client = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-connectors = { workspace = true }
+fedimint-derive-secret = { workspace = true }
+fedimint-mint-client = { workspace = true }
+fedimint-lnv2-client = { workspace = true }
+fedimint-rocksdb = { workspace = true }
 
-anyhow = "1.0.104"
-bitcoin = "0.32.102"
-futures = "0.3.33"
-lightning-invoice = { version = "0.33.3", features = ["std"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros"] }
-tracing = "0.1.44"
+anyhow = { workspace = true }
+bitcoin = { workspace = true }
+futures = { workspace = true }
+lightning-invoice = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing = { workspace = true }

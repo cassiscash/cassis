@@ -11,23 +11,23 @@ liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["cassis-core/rootstock"]
 
 [dependencies]
-cassis-core = { path = "../cassis-core", features = ["cashu", "rootstock"] }
-cassis-keys = { path = "../cassis-keys" }
-cassis-routing = { path = "../cassis-routing" }
-cassis-iroh = { path = "../cassis-iroh" }
-cassis-router = { path = "../cassis-router" }
-cassis-cashu = { path = "../networks/cassis-cashu" }
-cassis-rootstock = { path = "../networks/cassis-rootstock" }
-cassis-arkade = { path = "../networks/cassis-arkade", optional = true }
-cassis-liquid = { path = "../networks/cassis-liquid", optional = true }
-clap = { version = "4.6.6", features = ["derive"] }
-futures = "0.3.33"
-iroh = "1.0.3"
-rand = "0.8.7"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10.9"
-thiserror = "1.0.69"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "time", "fs", "io-util", "net"] }
-minisqlite = { git = "https://github.com/cursor/minisqlite" }
-tracing = "0.1.44"
+cassis-core = { workspace = true, features = ["cashu", "rootstock"] }
+cassis-keys = { workspace = true }
+cassis-routing = { workspace = true }
+cassis-iroh = { workspace = true }
+cassis-router = { workspace = true }
+cassis-cashu = { workspace = true }
+cassis-rootstock = { workspace = true }
+cassis-arkade = { workspace = true, optional = true }
+cassis-liquid = { workspace = true, optional = true }
+clap = { workspace = true }
+futures = { workspace = true }
+iroh = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "process", "time", "fs", "io-util", "net"] }
+minisqlite = { workspace = true }
+tracing = { workspace = true }

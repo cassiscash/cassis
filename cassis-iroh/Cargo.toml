@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cassis-core = { path = "../cassis-core" }
-lowercase-hex = "0.1.1"
-iroh = "1.0.3"
-postcard = { version = "1.1.3", features = ["alloc"] }
-serde = { version = "1.0.229", features = ["derive"] }
-thiserror = "1.0.69"
-tokio = { version = "1.53.1", features = ["io-util", "sync"] }
-tracing = "0.1.44"
+cassis-core = { workspace = true }
+lowercase-hex = { workspace = true }
+iroh = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "sync"] }
+tracing = { workspace = true }
