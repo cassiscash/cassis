@@ -23,6 +23,7 @@ use cassis_iroh::{Frame, IrohError, IrohServer, PublicKey};
 use cassis_keys as keys;
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
+#[cfg(feature = "liquid")]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
