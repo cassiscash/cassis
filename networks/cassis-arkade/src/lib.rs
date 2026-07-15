@@ -761,7 +761,9 @@ impl ArkadeAdapter {
     /// Returns the commitment transaction ID, or `None` when no
     /// boarding output or recoverable VTXO is ready to settle.
     pub async fn onboard(&self) -> Result<Option<bitcoin::Txid>, HtlcError> {
-        let mut rng = rand::thread_rng();
+        // OsRng (not `thread_rng`) so the returned future stays Send
+        // and can be awaited from spawned tasks.
+        let mut rng = rand::rngs::OsRng;
         self.client
             .settle(&mut rng)
             .await

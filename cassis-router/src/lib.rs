@@ -66,6 +66,12 @@ pub struct RouterConfig {
     /// the router is built with the `cashu` feature.
     #[cfg(feature = "cashu")]
     pub cashu_store: Arc<dyn cassis_cashu::CashuProofStore>,
+    /// Adapter instances the caller already opened (e.g. a
+    /// long-running wallet process holding exclusive Liquid
+    /// wallet state). When an entry's [`NetworkId`] matches a
+    /// spec below it is used instead of building a fresh
+    /// adapter for that network.
+    pub prebuilt_adapters: Vec<Arc<dyn NetworkRouterAdapter>>,
 }
 
 /// Run the router daemon. Blocks until Ctrl-C. The caller
@@ -102,24 +108,38 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
 
     let mut adapters: HashMap<NetworkId, NetworkEntry> = HashMap::new();
     for spec in &config.network_specs {
-        match build_adapter(
-            spec,
-            &config.derived_keys,
-            config.span.clone(),
-            #[cfg(feature = "cashu")]
-            &config.cashu_store,
-            #[cfg(feature = "liquid")]
-            config.liquid_store_dir.as_deref(),
-        )
-        .await
+        let network_id = network_id_for_spec(spec).map_err(|e| e.to_string())?;
+        let entry = match config
+            .prebuilt_adapters
+            .iter()
+            .find(|adapter| adapter.network_id() == network_id)
         {
-            Ok(entry) => {
-                adapters.insert(entry.network_id.clone(), entry);
+            Some(adapter) => {
+                let incoming_delta_secs = adapter.incoming_delta_secs();
+                NetworkEntry {
+                    network_id,
+                    adapter: adapter.clone(),
+                    incoming_delta_secs,
+                }
             }
-            Err(err) => {
-                return Err(err);
-            }
-        }
+            None => match build_adapter(
+                spec,
+                &config.derived_keys,
+                config.span.clone(),
+                #[cfg(feature = "cashu")]
+                &config.cashu_store,
+                #[cfg(feature = "liquid")]
+                config.liquid_store_dir.as_deref(),
+            )
+            .await
+            {
+                Ok(entry) => entry,
+                Err(err) => {
+                    return Err(err);
+                }
+            },
+        };
+        adapters.insert(entry.network_id.clone(), entry);
     }
 
     if adapters.len() < 2 {

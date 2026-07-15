@@ -1,17 +1,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::ops::Div;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use cassis_client::adapters::{build_cashu_adapter, build_senders};
 use cassis_client::netspec::NetSpec;
 use cassis_client::ops::{
-    create_invoice_for, init_node_home, load_and_derive, node_store_path, start_receive,
+    create_invoice_with_claim_pubkeys, init_node_home, load_and_derive, node_store_path,
+    start_receive_with,
 };
 use cassis_client::store::CashuProofDb;
 use cassis_client::CassisClient;
 use cassis_core::logging::ScopeFields;
+use cassis_core::{NetworkId, NetworkReceiverAdapter, NetworkRouterAdapter, NetworkSenderAdapter};
 use cdk::nuts::Token;
 use ritualistic::server::{CustomRelay, RelayInternals};
 use ritualistic::{Event as NostrEvent, Filter as NostrFilter};
@@ -21,16 +23,17 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, ExternalPrinter, Helper};
+use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::Instrument;
-use tracing::{info, info_span, warn, Event, Span, Subscriber};
+use tracing::{error, info, info_span, warn, Event, Span, Subscriber};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::layer::{Context as SubscriberContext, Layer};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
-const ROOT: &str = "/tmp/cassis-playground";
+const ROOT: &str = "tmp/playground";
 const COMMAND_HISTORY: &str = "commands.history";
 const RELAY: &str = "ws://localhost:10000";
 const DEFAULT_PREFUND_SEED: &str =
@@ -115,6 +118,63 @@ enum Status {
     Receiving,
 }
 
+/// One open network wallet for a node. Built once at playground
+/// startup and shared by balance refresh, funding, paying, receiving
+/// and routing: some networks (Liquid) hold an exclusive lock on
+/// their wallet state, so reopening is not even possible while a
+/// router runs.
+#[derive(Clone)]
+enum NodeWallet {
+    Cashu(Arc<cassis_cashu::CashuAdapter>),
+    Arkade(Arc<cassis_arkade::ArkadeAdapter>),
+    Liquid(Arc<cassis_liquid::LiquidAdapter>),
+    Rootstock(Arc<cassis_rootstock::RootstockAdapter>),
+}
+
+impl NodeWallet {
+    fn router(&self) -> Arc<dyn NetworkRouterAdapter> {
+        match self {
+            NodeWallet::Cashu(a) => a.clone(),
+            NodeWallet::Arkade(a) => a.clone(),
+            NodeWallet::Liquid(a) => a.clone(),
+            NodeWallet::Rootstock(a) => a.clone(),
+        }
+    }
+
+    fn receiver(&self) -> Arc<dyn NetworkReceiverAdapter> {
+        match self {
+            NodeWallet::Cashu(a) => a.clone(),
+            NodeWallet::Arkade(a) => a.clone(),
+            NodeWallet::Liquid(a) => a.clone(),
+            NodeWallet::Rootstock(a) => a.clone(),
+        }
+    }
+
+    fn sender(&self) -> Arc<dyn NetworkSenderAdapter> {
+        match self {
+            NodeWallet::Cashu(a) => a.clone(),
+            NodeWallet::Arkade(a) => a.clone(),
+            NodeWallet::Liquid(a) => a.clone(),
+            NodeWallet::Rootstock(a) => a.clone(),
+        }
+    }
+
+    async fn balance_msat(&self) -> Result<u64, String> {
+        match self {
+            NodeWallet::Cashu(a) => Ok(a
+                .balance()
+                .await
+                .iter()
+                .map(|p| u64::from(p.amount))
+                .sum::<u64>()
+                .saturating_mul(1000)),
+            NodeWallet::Arkade(a) => a.balance_msat().await.map_err(|e| e.to_string()),
+            NodeWallet::Liquid(a) => a.balance_msat().await.map_err(|e| e.to_string()),
+            NodeWallet::Rootstock(a) => a.balance_msat().await.map_err(|e| e.to_string()),
+        }
+    }
+}
+
 struct NodeState {
     id: String,
     span: Span,
@@ -122,6 +182,8 @@ struct NodeState {
     iroh_id: String,
     memberships: Vec<String>,
     status: Status,
+    /// Open network wallets, keyed by wire `NetworkId`.
+    wallets: HashMap<NetworkId, NodeWallet>,
     #[allow(dead_code)]
     receive_tasks: Vec<tokio::task::JoinHandle<()>>,
     router_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -138,7 +200,11 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: SubscriberContext<'_, S>) {
         let metadata = event.metadata();
-        if *metadata.level() > tracing::Level::INFO || metadata.target().starts_with("iroh") {
+        if !matches!(
+            *metadata.level(),
+            tracing::Level::INFO | tracing::Level::WARN | tracing::Level::ERROR
+        ) || metadata.target().starts_with("iroh")
+        {
             return;
         }
         let mut message = String::new();
@@ -175,7 +241,7 @@ where
             .unwrap_or_else(|| format!("[{}] {}", metadata.level(), message));
         if let Ok(mut printer) = self.printer.lock() {
             if let Some(printer) = printer.as_mut() {
-                let _ = printer.print(line.clone());
+                let _ = printer.print(format!("{line}\n"));
                 return;
             }
         }
@@ -238,19 +304,59 @@ struct Playground {
     relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     balances: Mutex<HashMap<(String, String), BalanceMsat>>,
     prefund_seed: String,
+    prefund_liquid: Arc<cassis_liquid::LiquidAdapter>,
+    prefund_arkade: Arc<cassis_arkade::ArkadeAdapter>,
+    prefund_rootstock: Arc<cassis_rootstock::RootstockAdapter>,
 }
 
 impl Playground {
     async fn new(prefund_seed: String) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(Path::new(ROOT)).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(prefund_store_path().parent().unwrap_or(Path::new(ROOT)))
+        std::fs::create_dir_all(
+            prefund_store_path(&prefund_seed)
+                .parent()
+                .unwrap_or(Path::new(ROOT)),
+        )
+        .map_err(|e| e.to_string())?;
+        let prefund_span = info_span!("prefund");
+        let liquid_spec = NetSpec::parse("liquid::testnet")?;
+        let liquid_keys = cassis_keys::derive_keys(&prefund_seed, vec![liquid_spec.network_id()])
             .map_err(|e| e.to_string())?;
+        let prefund_liquid = cassis_client::adapters::build_liquid_adapter(
+            &liquid_spec,
+            &liquid_keys,
+            &prefund_store_path(&prefund_seed),
+            prefund_span.clone(),
+        )
+        .await?;
+        let arkade_spec = NetSpec::parse("arkade::testnet")?;
+        let arkade_keys = cassis_keys::derive_keys(&prefund_seed, vec![arkade_spec.network_id()])
+            .map_err(|e| e.to_string())?;
+        let prefund_arkade = cassis_client::adapters::build_arkade_adapter(
+            &arkade_spec,
+            &arkade_keys,
+            prefund_span.clone(),
+        )
+        .await?;
+        let rootstock_spec = NetSpec::parse("rootstock::testnet")?;
+        let rootstock_keys =
+            cassis_keys::derive_keys(&prefund_seed, vec![rootstock_spec.network_id()])
+                .map_err(|e| e.to_string())?;
+        let prefund_rootstock = cassis_client::adapters::build_rootstock_adapter(
+            &rootstock_spec,
+            &rootstock_keys,
+            prefund_span,
+        )
+        .await?;
         let playground = Arc::new(Self {
             nodes: Mutex::new(HashMap::new()),
             children: Mutex::new(Vec::new()),
             relay_task: Mutex::new(None),
             balances: Mutex::new(HashMap::new()),
             prefund_seed,
+            prefund_liquid,
+            prefund_arkade,
+            prefund_rootstock,
         });
         let network_ids = NETWORKS
             .iter()
@@ -272,15 +378,18 @@ impl Playground {
                     "duplicate nostr identity for node {id}: {nostr_pubkey}"
                 ));
             }
+            let span = info_span!("node", node = *id);
             playground.nodes.lock().await.insert(
                 (*id).to_string(),
                 NodeState {
                     id: (*id).to_string(),
-                    span: info_span!("node", node = *id),
+                    span: span.clone(),
                     nostr_pubkey,
                     iroh_id,
                     memberships: Vec::new(),
                     status: Status::Idle,
+                    // Wallets open lazily on `open`, `fund` or `router`.
+                    wallets: HashMap::new(),
                     receive_tasks: Vec::new(),
                     router_tasks: Vec::new(),
                 },
@@ -374,6 +483,21 @@ impl Playground {
         if !output.is_empty() {
             output.push('\n');
         }
+        // The shared prefund wallet: always shown, it is where manual
+        // test-coin deposits land before `fund` distributes them.
+        output.push_str(&format!("{}:\n", colored_node_name("prefund")));
+        for network_id in ["arkade_testnet", "liquid_testnet", "rootstock_testnet"] {
+            let balance = balances
+                .get(&("prefund".to_string(), network_id.to_string()))
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            output.push_str(&format!(
+                "  {}: {}\n",
+                colored_network_name(network_id),
+                balance
+            ));
+        }
+        output.push('\n');
         let mut network_ids: Vec<String> = nodes
             .values()
             .flat_map(|node| node.memberships.iter().cloned())
@@ -387,19 +511,17 @@ impl Playground {
                     continue;
                 }
                 if let Some(balance) = balances.get(&(node.id.clone(), network_id.clone())) {
-                    if !matches!(node.status, Status::Idle) || balance.0 > 0 {
-                        lines.push(format!(
-                            "  {}: {} ({})",
-                            colored_node_name(&node.id),
-                            balance,
-                            match &node.status {
-                                Status::Idle => "idle",
-                                Status::Routing => "routing",
-                                Status::Paying => "paying",
-                                Status::Receiving => "listening",
-                            }
-                        ));
-                    }
+                    lines.push(format!(
+                        "  {}: {} ({})",
+                        colored_node_name(&node.id),
+                        balance,
+                        match &node.status {
+                            Status::Idle => "idle",
+                            Status::Routing => "routing",
+                            Status::Paying => "paying",
+                            Status::Receiving => "listening",
+                        }
+                    ));
                 }
             }
             if !lines.is_empty() {
@@ -412,8 +534,10 @@ impl Playground {
     }
 
     /// Recompute every displayed balance. Called once after a command
-    /// completes, never from the render loop.
-    async fn refresh_balances(&self) {
+    /// completes, never from the render loop. Balances are fetched
+    /// concurrently: each one is a network sync (esplora full scan,
+    /// ark server, RPC), so serialising them multiplies latency.
+    async fn refresh_balances(self: &Arc<Self>) {
         let entries: Vec<(String, String)> = {
             let nodes = self.nodes.lock().await;
             nodes
@@ -426,65 +550,188 @@ impl Playground {
                 })
                 .collect()
         };
-        let mut refreshed: Vec<((String, String), BalanceMsat)> = Vec::with_capacity(entries.len());
+        let mut handles = Vec::with_capacity(entries.len());
         for (node_id, network_id) in entries {
-            let value = match self.node_balance(&node_id, &network_id).await {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!("balance refresh failed for {node_id} on {network_id}: {error}");
-                    BalanceMsat::default()
-                }
-            };
-            refreshed.push(((node_id, network_id), value));
+            let playground = self.clone();
+            handles.push(tokio::spawn(async move {
+                let value = match playground.node_balance(&node_id, &network_id).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!("balance refresh failed for {node_id} on {network_id}: {error}");
+                        BalanceMsat::default()
+                    }
+                };
+                ((node_id, network_id), value)
+            }));
+        }
+        // The prefund wallet rides along so `summary` always shows how
+        // much test coin is available for distribution.
+        {
+            let playground = self.clone();
+            handles.push(tokio::spawn(async move {
+                let value = match playground.prefund_arkade.balance_msat().await {
+                    Ok(value) => BalanceMsat(value),
+                    Err(error) => {
+                        warn!("prefund balance refresh failed on arkade_testnet: {error}");
+                        BalanceMsat::default()
+                    }
+                };
+                (("prefund".to_string(), "arkade_testnet".to_string()), value)
+            }));
+        }
+        {
+            let playground = self.clone();
+            handles.push(tokio::spawn(async move {
+                let value = match playground.prefund_liquid.balance_msat().await {
+                    Ok(value) => BalanceMsat(value),
+                    Err(error) => {
+                        warn!("prefund balance refresh failed on liquid_testnet: {error}");
+                        BalanceMsat::default()
+                    }
+                };
+                (("prefund".to_string(), "liquid_testnet".to_string()), value)
+            }));
+        }
+        {
+            let playground = self.clone();
+            handles.push(tokio::spawn(async move {
+                let value = match playground.prefund_rootstock.balance_msat().await {
+                    Ok(value) => BalanceMsat(value),
+                    Err(error) => {
+                        warn!("prefund balance refresh failed on rootstock_testnet: {error}");
+                        BalanceMsat::default()
+                    }
+                };
+                (
+                    ("prefund".to_string(), "rootstock_testnet".to_string()),
+                    value,
+                )
+            }));
         }
         let mut balances = self.balances.lock().await;
-        for (key, value) in refreshed {
-            balances.insert(key, value);
+        for handle in handles {
+            if let Ok((key, value)) = handle.await {
+                balances.insert(key, value);
+            }
         }
     }
 
-    async fn node_balance(&self, node_id: &str, network_id: &str) -> Result<BalanceMsat, String> {
-        let network = network(network_id)?;
+    /// Best-effort onboarding of the prefund arkade wallet: joins the
+    /// next batch swap when confirmed boarding outputs (or recoverable
+    /// VTXOs) exist, so `fund ... arkade_testnet` can spend them.
+    async fn auto_onboard_prefund(&self) {
+        match self.prefund_arkade.onboard().await {
+            Ok(Some(txid)) => info!(
+                "prefund: boarding outputs onboarded (commitment {txid}); \
+                 coins are spendable after the batch swap confirms"
+            ),
+            Ok(None) => {}
+            Err(error) => warn!("prefund: onboard check failed: {error}"),
+        }
+    }
+
+    /// The node's open wallet for `network_id`, opening it on first
+    /// use. Idempotent: concurrent callers racing on the same network
+    /// share whichever adapter landed in the map first.
+    async fn ensure_wallet(
+        &self,
+        node_id: &str,
+        network_id: &NetworkId,
+    ) -> Result<NodeWallet, String> {
+        {
+            let nodes = self.nodes.lock().await;
+            if let Some(wallet) = nodes
+                .get(node_id)
+                .ok_or_else(|| format!("unknown node '{node_id}'"))?
+                .wallets
+                .get(network_id)
+            {
+                return Ok(wallet.clone());
+            }
+        }
+        let spec = NETWORKS
+            .iter()
+            .find(|n| NetSpec::parse(n.spec).map(|s| s.network_id()) == Ok(network_id.clone()))
+            .map(|n| NetSpec::parse(n.spec))
+            .transpose()?
+            .ok_or_else(|| format!("unknown network '{network_id}'"))?;
+        let wallet = self.open_wallet(node_id, &spec).await?;
+        let mut nodes = self.nodes.lock().await;
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| format!("unknown node '{node_id}'"))?;
+        match node.wallets.get(network_id) {
+            Some(existing) => Ok(existing.clone()),
+            None => {
+                node.wallets.insert(network_id.clone(), wallet.clone());
+                Ok(wallet)
+            }
+        }
+    }
+
+    /// Build a fresh adapter for `node_id`/`spec` from the node's
+    /// derived keys. Does not register it; callers use
+    /// [`Playground::ensure_wallet`].
+    async fn open_wallet(&self, node_id: &str, spec: &NetSpec) -> Result<NodeWallet, String> {
         let home = node_home(node_id);
-        let spec = NetSpec::parse(network.spec)?;
-        let ids = vec![spec.network_id()];
-        let derived = load_and_derive(&home, ids)?;
+        let derived = load_and_derive(&home, vec![spec.network_id()])?;
         let span = self.node_span(node_id).await;
-        let total = match network.mint_url {
-            Some(_) => {
-                let adapter =
-                    build_cashu_adapter(&spec, &derived, &node_store_path(&home), span.clone())
-                        .await?;
-                adapter
-                    .balance()
-                    .await
-                    .iter()
-                    .map(|p| u64::from(p.amount))
-                    .sum::<u64>()
-                    .saturating_mul(1000)
+        let network_id = spec.network_id();
+        let wallet = match spec {
+            NetSpec::Cashu { mint_url, .. } => {
+                let sk = derived
+                    .networks
+                    .get(&network_id)
+                    .map(|k| *k.as_bytes())
+                    .ok_or_else(|| format!("no key derived for {network_id}"))?;
+                let store: Arc<dyn cassis_cashu::CashuProofStore> =
+                    Arc::new(CashuProofDb::new(node_store_path(&home)));
+                NodeWallet::Cashu(Arc::new(
+                    cassis_cashu::CashuAdapter::new(
+                        network_id.clone(),
+                        mint_url.clone(),
+                        sk,
+                        derived.invoice.pubkey(),
+                        store,
+                        span,
+                    )
+                    .map_err(|e| format!("cashu adapter init failed: {e}"))?,
+                ))
             }
-            _ if network.spec == "arkade::testnet" => {
-                let adapter =
-                    cassis_client::adapters::build_arkade_adapter(&spec, &derived, span).await?;
-                adapter.balance_msat().await.map_err(|e| e.to_string())?
-            }
-            _ if network.spec == "liquid::testnet" => {
-                let adapter = cassis_client::adapters::build_liquid_adapter(
-                    &spec,
+            NetSpec::Arkade { .. } => NodeWallet::Arkade(
+                cassis_client::adapters::build_arkade_adapter(spec, &derived, span).await?,
+            ),
+            NetSpec::Liquid { .. } => NodeWallet::Liquid(
+                cassis_client::adapters::build_liquid_adapter(
+                    spec,
                     &derived,
                     &node_store_path(&home),
                     span,
                 )
-                .await?;
-                adapter.balance_msat().await.map_err(|e| e.to_string())?
-            }
-            _ => {
-                let adapter =
-                    cassis_client::adapters::build_rootstock_adapter(&spec, &derived, span).await?;
-                adapter.balance_msat().await.map_err(|e| e.to_string())?
-            }
+                .await?,
+            ),
+            NetSpec::Rootstock { .. } => NodeWallet::Rootstock(
+                cassis_client::adapters::build_rootstock_adapter(spec, &derived, span).await?,
+            ),
         };
-        Ok(BalanceMsat(total))
+        Ok(wallet)
+    }
+
+    async fn node_balance(&self, node_id: &str, network_id: &str) -> Result<BalanceMsat, String> {
+        let spec = NetSpec::parse(network(network_id)?.spec)?;
+        // Read-only: balance refresh must not open wallets, otherwise
+        // `summary` would connect to every chain for every node.
+        let wallet = {
+            let nodes = self.nodes.lock().await;
+            nodes
+                .get(node_id)
+                .ok_or_else(|| format!("unknown node '{node_id}'"))?
+                .wallets
+                .get(&spec.network_id())
+                .cloned()
+                .ok_or_else(|| format!("node {node_id} has no open wallet for {network_id}"))?
+        };
+        Ok(BalanceMsat(wallet.balance_msat().await?))
     }
 
     async fn node_span(&self, node_id: &str) -> Span {
@@ -559,8 +806,12 @@ fn cdk_dir(id: &str) -> PathBuf {
     PathBuf::from(ROOT).join("cdk").join(id)
 }
 
-fn prefund_store_path() -> PathBuf {
-    PathBuf::from(ROOT).join("prefund").join("store.db")
+fn prefund_store_path(seed: &str) -> PathBuf {
+    let digest = Sha256::digest(seed.as_bytes());
+    PathBuf::from(ROOT)
+        .join("prefund/liquid")
+        .join(format!("{:x}", digest))
+        .join("store.db")
 }
 
 async fn command_fund(
@@ -573,81 +824,65 @@ async fn command_fund(
         return Err(format!("unknown node '{node_id}'"));
     }
     let net = network(network_id)?.clone();
+    let spec = NetSpec::parse(net.spec)?;
+    // Open before joining: membership implies an open wallet, which
+    // is what balance refresh assumes.
+    let wallet = playground
+        .ensure_wallet(node_id, &spec.network_id())
+        .await?;
     ensure_membership(playground, node_id, network_id).await?;
-    let span = playground.node_span(node_id).await;
-    if net.mint_url.is_some() {
-        return fund_cashu(node_id, network_id, net.mint_url.unwrap(), amount, span).await;
+    if let Some(mint_url) = net.mint_url {
+        return fund_cashu(node_id, network_id, wallet, mint_url, amount).await;
     }
     if net.spec == "arkade::testnet" {
-        return fund_arkade(&playground.prefund_seed, node_id, amount, span).await;
+        return fund_arkade(&playground.prefund_arkade, node_id, &wallet, amount).await;
     }
     if net.spec == "liquid::testnet" {
-        return fund_liquid(&playground.prefund_seed, node_id, amount, span).await;
+        return fund_liquid(&playground.prefund_liquid, node_id, &wallet, amount).await;
     }
-    fund_rootstock(&playground.prefund_seed, node_id, amount * 1000, span).await
+    fund_rootstock(&playground.prefund_rootstock, node_id, &wallet, amount).await
 }
 
 async fn fund_liquid(
-    prefund_seed: &str,
+    source: &cassis_liquid::LiquidAdapter,
     node_id: &str,
-    amount_sat: u64,
-    span: Span,
+    target: &NodeWallet,
+    amount_msat: u64,
 ) -> Result<(), String> {
-    let spec = NetSpec::parse("liquid::testnet")?;
-    let source_keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
-        .map_err(|e| e.to_string())?;
-    let source = cassis_client::adapters::build_liquid_adapter(
-        &spec,
-        &source_keys,
-        &prefund_store_path(),
-        span.clone(),
-    )
-    .await?;
-    let home = node_home(node_id);
-    let derived = load_and_derive(&home, vec![spec.network_id()])?;
-    let adapter = cassis_client::adapters::build_liquid_adapter(
-        &spec,
-        &derived,
-        &node_store_path(&home),
-        span,
-    )
-    .await?;
+    let NodeWallet::Liquid(adapter) = target else {
+        return Err("target wallet is not liquid".into());
+    };
     let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
     let txid = source
-        .transfer_to_address(&address, amount_sat.saturating_mul(1000))
+        .transfer_to_address(&address, amount_msat)
         .await
         .map_err(|e| e.to_string())?;
     info!(
-        "funded {node_id} on {}: {amount_sat} sat, tx {txid}",
+        "funded {node_id} on {}: {amount_msat} sat, tx {txid}",
         colored_network_name("liquid_testnet"),
     );
     Ok(())
 }
 
 async fn fund_arkade(
-    prefund_seed: &str,
+    source: &cassis_arkade::ArkadeAdapter,
     node_id: &str,
-    amount_sat: u64,
-    span: Span,
+    target: &NodeWallet,
+    amount_msat: u64,
 ) -> Result<(), String> {
-    let spec = NetSpec::parse("arkade::testnet")?;
-    let source_keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
-        .map_err(|e| e.to_string())?;
-    let source =
-        cassis_client::adapters::build_arkade_adapter(&spec, &source_keys, span.clone()).await?;
-    let home = node_home(node_id);
-    let derived = load_and_derive(&home, vec![spec.network_id()])?;
-    let adapter = cassis_client::adapters::build_arkade_adapter(&spec, &derived, span).await?;
+    let NodeWallet::Arkade(adapter) = target else {
+        return Err("target wallet is not arkade".into());
+    };
     let (_, _, arkade) = adapter
         .deposit_addresses()
         .await
         .map_err(|e| e.to_string())?;
     let txid = source
-        .transfer_to_ark_address(&arkade, amount_sat.saturating_mul(1000))
+        .transfer_to_ark_address(&arkade, amount_msat)
         .await
         .map_err(|e| e.to_string())?;
     info!(
-        "funded {node_id} on {}: {amount_sat} sat, tx {txid}",
+        "funded {node_id} on {}: {amount_msat} sat, tx {txid}",
         colored_network_name("arkade_testnet"),
     );
     Ok(())
@@ -671,9 +906,9 @@ async fn ensure_membership(
 async fn fund_cashu(
     node_id: &str,
     network_id: &str,
+    wallet: NodeWallet,
     mint_url: &str,
-    amount_sat: u64,
-    span: Span,
+    amount_msat: u64,
 ) -> Result<(), String> {
     let cdk = cdk_dir(network_id);
     std::fs::create_dir_all(&cdk).map_err(|e| e.to_string())?;
@@ -683,7 +918,7 @@ async fn fund_cashu(
         .arg("-n")
         .arg("mint")
         .arg(mint_url)
-        .arg(amount_sat.to_string())
+        .arg(amount_msat.div(1000).to_string())
         .output()
         .await
         .map_err(|e| e.to_string())?;
@@ -696,7 +931,7 @@ async fn fund_cashu(
         .arg("-n")
         .arg("send")
         .arg("-a")
-        .arg(amount_sat.to_string())
+        .arg(amount_msat.div(1000).to_string())
         .arg("--mint-url")
         .arg(mint_url)
         .output()
@@ -711,11 +946,9 @@ async fn fund_cashu(
         .ok_or("cdk-cli returned no cashu token")?
         .to_string();
     let parsed = token.parse::<Token>().map_err(|e| e.to_string())?;
-    let host = cassis_client::adapters::mint_url_to_host(mint_url)?;
-    let spec = NetSpec::parse(&format!("cashu::{host}"))?;
-    let home = node_home(node_id);
-    let derived = load_and_derive(&home, vec![spec.network_id()])?;
-    let adapter = build_cashu_adapter(&spec, &derived, &node_store_path(&home), span).await?;
+    let NodeWallet::Cashu(adapter) = &wallet else {
+        return Err("target wallet is not cashu".into());
+    };
     let keysets = adapter.keysets().await.map_err(|e| e.to_string())?;
     let incoming = parsed.proofs(&keysets).map_err(|e| e.to_string())?;
     let received = adapter
@@ -731,23 +964,16 @@ async fn fund_cashu(
 }
 
 async fn fund_rootstock(
-    prefund_seed: &str,
+    source: &cassis_rootstock::RootstockAdapter,
     node_id: &str,
+    target: &NodeWallet,
     amount_msat: u64,
-    span: Span,
 ) -> Result<(), String> {
-    let source_spec = NetSpec::parse("rootstock::testnet")?;
-    let source_keys = cassis_keys::derive_keys(prefund_seed, vec![source_spec.network_id()])
-        .map_err(|e| e.to_string())?;
-    let source =
-        cassis_client::adapters::build_rootstock_adapter(&source_spec, &source_keys, span.clone())
-            .await?;
-    let target_home = node_home(node_id);
-    let target_keys = load_and_derive(&target_home, vec![source_spec.network_id()])?;
-    let target =
-        cassis_client::adapters::build_rootstock_adapter(&source_spec, &target_keys, span).await?;
+    let NodeWallet::Rootstock(adapter) = target else {
+        return Err("target wallet is not rootstock".into());
+    };
     let tx = source
-        .transfer(&target.address().to_string(), amount_msat)
+        .transfer(&adapter.address().to_string(), amount_msat)
         .await
         .map_err(|e| e.to_string())?;
     info!(
@@ -759,52 +985,104 @@ async fn fund_rootstock(
 
 /// Show the prefund wallet addresses per network so test coins can be
 /// sent to them manually (faucets, another wallet, ...); the `fund`
-/// command then spends them from here into nodes.
-async fn command_prefund(prefund_seed: &str) -> Result<(), String> {
-    let span = info_span!("prefund");
+/// command then spends them from here into nodes. For arkade only the
+/// boarding address is shown: deposits there are settled into
+/// spendable VTXOs by the `onboard` command.
+async fn command_prefund(
+    prefund_seed: &str,
+    prefund_liquid: &cassis_liquid::LiquidAdapter,
+    prefund_rootstock: &cassis_rootstock::RootstockAdapter,
+    prefund_arkade: &cassis_arkade::ArkadeAdapter,
+) -> Result<(), String> {
     let mut output = format!("prefund seed: {prefund_seed}\n");
 
-    let spec = NetSpec::parse("rootstock::testnet")?;
-    let keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
-        .map_err(|e| e.to_string())?;
-    let adapter =
-        cassis_client::adapters::build_rootstock_adapter(&spec, &keys, span.clone()).await?;
     output.push_str(&format!(
         "{}: {}\n",
         colored_network_name("rootstock_testnet"),
-        adapter.address()
+        prefund_rootstock.address()
     ));
 
-    let spec = NetSpec::parse("liquid::testnet")?;
-    let keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
+    let address = prefund_liquid
+        .deposit_address()
+        .await
         .map_err(|e| e.to_string())?;
-    let adapter = cassis_client::adapters::build_liquid_adapter(
-        &spec,
-        &keys,
-        &prefund_store_path(),
-        span.clone(),
-    )
-    .await?;
-    let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
     output.push_str(&format!(
         "{}: {address}\n",
         colored_network_name("liquid_testnet"),
     ));
 
-    let spec = NetSpec::parse("arkade::testnet")?;
-    let keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
-        .map_err(|e| e.to_string())?;
-    let adapter = cassis_client::adapters::build_arkade_adapter(&spec, &keys, span).await?;
-    let (boarding, onchain, arkade) = adapter
+    let (boarding, _, _) = prefund_arkade
         .deposit_addresses()
         .await
         .map_err(|e| e.to_string())?;
     output.push_str(&format!(
-        "{}:\n  boarding: {boarding}\n  onchain: {onchain}\n  arkade: {arkade}\n",
+        "{}: {boarding}\n",
         colored_network_name("arkade_testnet"),
     ));
 
     info!("send test coins to:\n{output}");
+    Ok(())
+}
+
+/// Join the next arkade batch swap so confirmed boarding outputs (and
+/// recoverable VTXOs) settle into spendable offchain coins.
+async fn command_onboard(
+    adapter: &cassis_arkade::ArkadeAdapter,
+    label: &str,
+) -> Result<(), String> {
+    match adapter.onboard().await.map_err(|e| e.to_string())? {
+        Some(txid) => info!(
+            "{label}: onboard committed {txid}; coins are spendable after the batch swap confirms"
+        ),
+        None => info!(
+            "{label}: nothing to onboard (no confirmed boarding outputs or recoverable VTXOs)"
+        ),
+    }
+    Ok(())
+}
+
+async fn command_onboard_node(playground: &Playground, node_id: &str) -> Result<(), String> {
+    let spec = NetSpec::parse("arkade::testnet")?;
+    let wallet = playground
+        .ensure_wallet(node_id, &spec.network_id())
+        .await?;
+    match &wallet {
+        NodeWallet::Arkade(adapter) => command_onboard(adapter, node_id).await,
+        _ => Err(format!("node {node_id} has no arkade wallet")),
+    }
+}
+
+async fn command_open(
+    playground: &Playground,
+    node_id: &str,
+    network_id: &str,
+) -> Result<(), String> {
+    let spec = NetSpec::parse(network(network_id)?.spec)?;
+    let already_open = {
+        let nodes = playground.nodes.lock().await;
+        nodes
+            .get(node_id)
+            .ok_or_else(|| format!("unknown node '{node_id}'"))?
+            .wallets
+            .contains_key(&spec.network_id())
+    };
+    playground
+        .ensure_wallet(node_id, &spec.network_id())
+        .await?;
+    ensure_membership(playground, node_id, network_id).await?;
+    if already_open {
+        info!(
+            "{} wallet for {} already open",
+            colored_network_name(&spec.network_id().0),
+            colored_node_name(node_id),
+        );
+    } else {
+        info!(
+            "opened {} wallet for {}",
+            colored_network_name(&spec.network_id().0),
+            colored_node_name(node_id),
+        );
+    }
     Ok(())
 }
 
@@ -818,7 +1096,6 @@ async fn command_router(
     }
     for id in &network_ids {
         network(id)?;
-        ensure_membership(playground, node_id, id).await?;
     }
     if network_ids.len() < 2 {
         return Err("router needs at least two networks".into());
@@ -827,6 +1104,15 @@ async fn command_router(
         .iter()
         .map(|id| NetSpec::parse(network(id).unwrap().spec))
         .collect::<Result<_, _>>()?;
+    // Membership after wallet open, same invariant as `fund`.
+    for spec in &specs {
+        playground
+            .ensure_wallet(node_id, &spec.network_id())
+            .await?;
+    }
+    for id in &network_ids {
+        ensure_membership(playground, node_id, id).await?;
+    }
     let home = node_home(node_id);
     let ids = specs.iter().map(|s| s.network_id()).collect();
     let derived = load_and_derive(&home, ids)?;
@@ -845,8 +1131,16 @@ async fn command_router(
         .collect();
     let cashu_store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path));
-    let liquid_store_dir = node_home(node_id).join("liquid");
     let router_span = playground.node_span(node_id).await;
+    let mut prebuilt_adapters = Vec::new();
+    for spec in &specs {
+        prebuilt_adapters.push(
+            playground
+                .ensure_wallet(node_id, &spec.network_id())
+                .await?
+                .router(),
+        );
+    }
     let jh = tokio::spawn(async move {
         let config = cassis_router::RouterConfig {
             network_specs,
@@ -854,7 +1148,8 @@ async fn command_router(
             derived_keys: derived,
             span: router_span.clone(),
             cashu_store,
-            liquid_store_dir: Some(liquid_store_dir),
+            liquid_store_dir: None,
+            prebuilt_adapters,
         };
         async move {
             if let Err(e) = cassis_router::run_router(config).await {
@@ -899,16 +1194,43 @@ async fn command_pay(
     let target_spec = NetSpec::parse(network(target_id)?.spec)?;
     let sender_spec = NetSpec::parse(network(sender_id)?.spec)?;
     let target_home = node_home(target);
-    let sender_home = node_home(sender);
     let target_network = target_spec.network_id();
-    let (invoice, _, _) =
-        create_invoice_for(&target_home, target_network, target_spec.clone(), amount).await?;
-    let listener = start_receive(
+    // Resolve the claim identity from the target's already-open
+    // receiver instead of rebuilding one.
+    let target_receiver = playground
+        .ensure_wallet(target, &target_network)
+        .await?
+        .receiver();
+    let claim_pubkeys = target_receiver
+        .claim_pubkey()
+        .map(|pubkey| vec![(target_network.clone(), pubkey)])
+        .unwrap_or_default();
+    let (invoice, _, _) = create_invoice_with_claim_pubkeys(
         &target_home,
-        &target_specs
-            .iter()
-            .map(|id| NetSpec::parse(network(id).unwrap().spec))
-            .collect::<Result<Vec<_>, _>>()?,
+        target_network,
+        amount,
+        claim_pubkeys,
+        None,
+    )
+    .await?;
+    let target_specs_parsed: Vec<NetSpec> = target_specs
+        .iter()
+        .map(|id| NetSpec::parse(network(id).unwrap().spec))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut receivers = HashMap::new();
+    for spec in &target_specs_parsed {
+        receivers.insert(
+            spec.network_id(),
+            playground
+                .ensure_wallet(target, &spec.network_id())
+                .await?
+                .receiver(),
+        );
+    }
+    let listener = start_receive_with(
+        &target_home,
+        Arc::new(receivers),
+        &target_specs_parsed,
         playground.node_span(target).await,
     )
     .await?;
@@ -924,15 +1246,16 @@ async fn command_pay(
         .iter()
         .map(|id| NetSpec::parse(network(id).unwrap().spec))
         .collect::<Result<_, _>>()?;
-    let sender_ids = sender_specs_parsed.iter().map(|s| s.network_id()).collect();
-    let derived = load_and_derive(&sender_home, sender_ids)?;
-    let senders = build_senders(
-        &sender_specs_parsed,
-        &derived,
-        &node_store_path(&sender_home),
-        playground.node_span(sender).await,
-    )
-    .await?;
+    let mut senders = HashMap::new();
+    for spec in &sender_specs_parsed {
+        senders.insert(
+            spec.network_id(),
+            playground
+                .ensure_wallet(sender, &spec.network_id())
+                .await?
+                .sender(),
+        );
+    }
     let client = CassisClient::new(senders, vec![RELAY.to_string()]).await;
     set_status(playground, sender, Status::Paying).await;
     set_status(playground, target, Status::Receiving).await;
@@ -968,7 +1291,8 @@ impl Completer for CommandHelper {
         let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
         let word = &line[start..pos];
         let candidates = [
-            "fund", "router", "pay", "route", "summary", "prefund", "help", "quit", "exit",
+            "fund", "router", "pay", "route", "summary", "prefund", "onboard", "open", "help",
+            "quit", "exit",
         ]
         .into_iter()
         .chain(NODE_NAMES.iter().copied())
@@ -1122,7 +1446,7 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
                 };
                 async {
                         if let Err(e) = command_fund(&playground, node, network, amount).await {
-                            warn!("fund failed: {e}");
+                            error!("fund failed: {e}");
                         }
                     }
                     .instrument(playground.node_span(node).await)
@@ -1159,16 +1483,47 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             }
             _ => info!("usage: pay <node_id_sender> <node_id_target> <amount_msat>"),
         },
+        Some("open") => match (parts.next(), parts.next()) {
+            (Some(node), Some(network_id)) => {
+                async {
+                    if let Err(e) = command_open(&playground, node, network_id).await {
+                        warn!("open failed: {e}");
+                    }
+                }
+                .instrument(playground.node_span(node).await)
+                .await;
+            }
+            _ => info!("usage: open <node_id> <network_id>"),
+        },
         Some("prefund") => {
             let seed = playground.prefund_seed.clone();
+            let liquid = playground.prefund_liquid.clone();
+            let rootstock = playground.prefund_rootstock.clone();
+            let arkade = playground.prefund_arkade.clone();
             async {
-                if let Err(e) = command_prefund(&seed).await {
+                if let Err(e) = command_prefund(&seed, &liquid, &rootstock, &arkade).await {
                     warn!("prefund failed: {e}");
                 }
             }
             .instrument(info_span!("prefund"))
             .await;
         }
+        Some("onboard") => match parts.next() {
+            Some(node) => {
+                async {
+                    if let Err(e) = command_onboard_node(&playground, node).await {
+                        warn!("onboard failed: {e}");
+                    }
+                }
+                .instrument(playground.node_span(node).await)
+                .await;
+            }
+            None => {
+                if let Err(e) = command_onboard(&playground.prefund_arkade, "prefund").await {
+                    warn!("onboard failed: {e}");
+                }
+            }
+        },
         Some("summary") => {}
         Some("route") => match (
             parts.next(),
@@ -1187,7 +1542,7 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             _ => info!("usage: route <sender> <target> <amount_msat>"),
         },
         Some("help") => info!(
-            "fund <node> <network> [amount_sat] | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | prefund | quit"
+            "commands:\n  fund <node> <network> [amount_msat]\n  router <node> [network...]\n  pay <sender> <target> <amount_msat>\n  summary\n  route <sender> <target> <amount_msat>\n  prefund\n  onboard [node]\n  open <node> <network>\n  quit"
         ),
         Some("quit") | Some("exit") => info!("use Ctrl-C to exit"),
         Some(other) => info!("unknown command '{other}'; try help"),
@@ -1195,8 +1550,19 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
     }
     if matches!(
         verb,
-        Some("fund") | Some("router") | Some("pay") | Some("summary")
+        Some("fund")
+            | Some("router")
+            | Some("pay")
+            | Some("summary")
+            | Some("prefund")
+            | Some("onboard")
     ) {
+        // `summary` and `prefund` opportunistically settle any coins
+        // sitting in the prefund boarding address before showing
+        // balances.
+        if matches!(verb, Some("summary") | Some("prefund")) {
+            playground.auto_onboard_prefund().await;
+        }
         playground.refresh_balances().await;
         info!("summary:\n{}", playground.summary().await);
     }
@@ -1253,10 +1619,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    info!("summary:\n{}", playground.summary().await);
-    info!(
-        "fund <node> <network> [amount_sat] | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
-    );
 
     loop {
         match editor.readline("cassis ~> ") {

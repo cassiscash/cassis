@@ -40,6 +40,7 @@ use hmac::Mac;
 use lwk_common::Signer as LwkSigner;
 use lwk_signer::SwSigner;
 use lwk_wollet::clients::asyncr::EsploraClient;
+use lwk_wollet::clients::EsploraClientBuilder;
 use lwk_wollet::elements::bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv};
 use lwk_wollet::elements::bitcoin::hashes::ripemd160;
 use lwk_wollet::elements::bitcoin::hashes::sha256;
@@ -74,8 +75,10 @@ use tracing::{debug, info, warn, Span};
 
 /// Blockstream esplora for Liquid mainnet.
 pub const MAINNET_ESPLORA_URL: &str = "https://blockstream.info/liquid/api";
-/// Blockstream esplora for Liquid testnet.
-pub const TESTNET_ESPLORA_URL: &str = "https://blockstream.info/liquidtestnet/api";
+pub const MAINNET_WATERFALLS_URL: &str = "https://waterfalls.liquidwebwallet.org/liquid/api";
+/// Public Liquid testnet Esplora endpoint.
+pub const TESTNET_ESPLORA_URL: &str = "https://liquid.network/liquidtestnet/api";
+pub const TESTNET_WATERFALLS_URL: &str = "https://waterfalls.liquidwebwallet.org/liquidtestnet/api";
 
 /// Liquid blocks land about every minute.
 const BLOCK_TIME_SECS: u64 = 60;
@@ -99,7 +102,6 @@ const MIN_LOCK_SATS: u64 = 1_000;
 const CLAIM_KEY_PATH_PREFIX: &str = "m/1037'";
 /// SLIP-0077 domain-separation label for the master blinding key.
 const SLIP77_LABEL: &[u8] = b"SLIP-0077";
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("invalid parameters: {0}")]
@@ -134,6 +136,7 @@ fn error_from_lwk(e: impl std::fmt::Display) -> HtlcError {
 pub struct LiquidConfig {
     pub network_id: NetworkId,
     pub esplora_url: String,
+    pub waterfalls_url: String,
     /// Directory used for LWK wallet state. `None` keeps wallet state
     /// in memory, useful for tests.
     pub persist_dir: Option<PathBuf>,
@@ -155,6 +158,7 @@ pub fn default_config(
         "liquid::testnet" => LiquidConfig {
             network_id,
             esplora_url: TESTNET_ESPLORA_URL.to_string(),
+            waterfalls_url: TESTNET_WATERFALLS_URL.to_string(),
             persist_dir: None,
             sk,
             invoice_pubkey,
@@ -163,6 +167,7 @@ pub fn default_config(
         _ => LiquidConfig {
             network_id,
             esplora_url: MAINNET_ESPLORA_URL.to_string(),
+            waterfalls_url: MAINNET_WATERFALLS_URL.to_string(),
             persist_dir: None,
             sk,
             invoice_pubkey,
@@ -340,6 +345,7 @@ pub struct LiquidAdapter {
     claim_xonly: PubKey,
     wollet: Arc<Mutex<Wollet>>,
     esplora: Arc<Mutex<EsploraClient>>,
+    waterfalls: Arc<Mutex<EsploraClient>>,
     http: reqwest::Client,
     esplora_url: String,
     network: Network,
@@ -401,22 +407,25 @@ impl LiquidAdapter {
         let claim_xonly = PubKey::from_bytes(claim_bytes[1..33].try_into().expect("32 bytes"))
             .map_err(|e| Error::InvalidParams(format!("invalid claim pubkey: {e}")))?;
 
-        // SLIP-0077 master blinding key, keyed from the node key.
+        // Keep custom SLIP-0077 derivation because this signer may not expose
+        // deterministic SLIP-0077, but use account-level xpub and origin.
         let mut mac = <hmac::Hmac<Sha512> as hmac::Mac>::new_from_slice(SLIP77_LABEL)
             .expect("hmac key length is always valid");
         mac.update(&config.sk);
-        let mbk = mac.finalize().into_bytes()[..32].to_vec();
-        let mbk_hex = mbk.to_lower_hex_string();
-
+        let mbk_hex = mac.finalize().into_bytes()[..32].to_lower_hex_string();
+        let account_path = DerivationPath::from_str("m/84'/1'/0'")
+            .map_err(|e| Error::InvalidParams(format!("wallet account path: {e}")))?;
+        let account_xpub = signer
+            .derive_xpub(&account_path)
+            .map_err(|e| Error::InvalidParams(format!("wallet account xpub: {e}")))?;
         let descriptor_str = format!(
-            "ct(slip77({mbk_hex}),elwpkh([{}/84'/1'/0']{}/<0;1>/*))",
-            fingerprint,
-            signer.xpub()
+            "ct(slip77({mbk_hex}),elwpkh([{}/84'/1'/0']{account_xpub}/<0;1>/*))",
+            fingerprint
         );
         let descriptor: WolletDescriptor = descriptor_str
             .parse()
             .map_err(|e| Error::InvalidParams(format!("wollet descriptor: {e}")))?;
-        let mut wollet_builder = WolletBuilder::new(network, descriptor);
+        let mut wollet_builder = WolletBuilder::new(network, descriptor).utxo_only(true);
         let persist_lock = if let Some(persist_dir) = &config.persist_dir {
             std::fs::create_dir_all(persist_dir)
                 .map_err(|e| Error::Client(format!("create Liquid wallet directory: {e}")))?;
@@ -448,6 +457,14 @@ impl LiquidAdapter {
                 .map_err(|e| Error::Client(format!("wollet build: {e}")))?,
         ));
         let esplora = Arc::new(Mutex::new(EsploraClient::new(network, &config.esplora_url)));
+        #[allow(deprecated)]
+        let waterfalls = Arc::new(Mutex::new(
+            EsploraClientBuilder::new(&config.waterfalls_url, network)
+                .waterfalls(true)
+                .utxo_only(true)
+                .build()
+                .map_err(|e| Error::Client(format!("create Waterfalls client: {e}")))?,
+        ));
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -474,6 +491,7 @@ impl LiquidAdapter {
             claim_xonly,
             wollet,
             esplora,
+            waterfalls,
             http,
             esplora_url: config.esplora_url.clone(),
             network,
@@ -521,10 +539,13 @@ impl LiquidAdapter {
     /// Sync the wallet with esplora (best-effort: on failure the
     /// cached state is used).
     async fn sync_wallet(&self) -> Result<(), HtlcError> {
-        let mut esplora = self.esplora.lock().await;
+        let mut waterfalls = self.waterfalls.lock().await;
         let wollet = self.wollet.lock().await;
-        let update = esplora.full_scan(&wollet).await.map_err(error_from_lwk)?;
-        drop(esplora);
+        let update = waterfalls
+            .full_scan(&wollet)
+            .await
+            .map_err(error_from_lwk)?;
+        drop(waterfalls);
         drop(wollet);
         if let Some(update) = update {
             self.wollet
@@ -616,9 +637,91 @@ impl LiquidAdapter {
         Ok(out)
     }
 
+    /// Find an unconfirmed explicit L-BTC output paying `address`.
+    async fn mempool_address_utxo(
+        &self,
+        address: &Address,
+    ) -> Result<Option<(OutPoint, u64)>, HtlcError> {
+        #[derive(serde::Deserialize)]
+        struct MempoolOutput {
+            scriptpubkey: String,
+            #[serde(default)]
+            value: Option<u64>,
+            #[serde(default)]
+            asset: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct MempoolTransaction {
+            txid: String,
+            vout: Vec<MempoolOutput>,
+        }
+
+        let url = format!("{}/address/{}/txs/mempool", self.esplora_url, address);
+        let text = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(error_from_lwk)?
+            .error_for_status()
+            .map_err(error_from_lwk)?
+            .text()
+            .await
+            .map_err(error_from_lwk)?;
+        let transactions: Vec<MempoolTransaction> = serde_json::from_str(&text)
+            .map_err(|e| HtlcError::Network(format!("mempool transaction parse: {e}")))?;
+        let script_pubkey = address.script_pubkey();
+        let policy = *self.network.policy_asset();
+        for transaction in transactions {
+            for (vout, output) in transaction.vout.into_iter().enumerate() {
+                let Ok(script) = output.scriptpubkey.parse::<ElScript>() else {
+                    continue;
+                };
+                let Some(asset) = output
+                    .asset
+                    .as_deref()
+                    .and_then(|a| AssetId::from_str(a).ok())
+                else {
+                    continue;
+                };
+                if script != script_pubkey || asset != policy {
+                    continue;
+                }
+                let Some(value) = output.value else {
+                    continue;
+                };
+                let txid = Txid::from_str(&transaction.txid)
+                    .map_err(|e| HtlcError::Network(format!("mempool txid parse: {e}")))?;
+                return Ok(Some((OutPoint::new(txid, vout as u32), value)));
+            }
+        }
+        Ok(None)
+    }
+
     /// The single unspent HTLC output for `spec`.
     async fn htlc_utxo(&self, spec: &HtlcSpec) -> Result<(OutPoint, u64), HtlcError> {
         let address = spec.lockup_address(self.network.address_params())?;
+        if let Some((outpoint, value_sat)) = self.mempool_address_utxo(&address).await? {
+            let tx = self
+                .esplora
+                .lock()
+                .await
+                .get_transaction(outpoint.txid)
+                .await
+                .map_err(error_from_lwk)?;
+            if tx
+                .input
+                .iter()
+                .any(|input| input.sequence.to_consensus_u32() < 0xFFFF_FFFE)
+            {
+                return Err(HtlcError::Network(
+                    "HTLC transaction signals replace-by-fee".into(),
+                ));
+            }
+            // TODO: query Liquid 0-conf service and require sufficient
+            // functionary/operator coverage before accepting mempool HTLCs.
+            return Ok((outpoint, value_sat));
+        }
         let utxos = self.address_utxos(&address).await?;
         match utxos.len() {
             1 => Ok((utxos[0].0, utxos[0].1)),
@@ -708,12 +811,26 @@ impl LiquidAdapter {
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<Txid, HtlcError> {
-        self.esplora
+        let txid = self
+            .esplora
             .lock()
             .await
             .broadcast(tx)
             .await
-            .map_err(error_from_lwk)
+            .map_err(error_from_lwk)?;
+        // Feed our own spend back into wallet state: the next build
+        // must not re-select these inputs. Esplora's scripthash scan
+        // sees mempool txs, so an immediate resync registers the spend
+        // as unconfirmed; without it the wallet happily spends the
+        // same UTXO again and the node rejects the second broadcast
+        // with `txn-mempool-conflict`. Best-effort: a failed resync
+        // only delays UTXO awareness until the next sync.
+        if let Err(error) = self.sync_wallet().await {
+            self.span.in_scope(|| {
+                warn!(target: "cassis_liquid", "post-broadcast resync failed: {error}");
+            });
+        }
+        Ok(txid)
     }
 
     /// Fee-funded claim/refund of `outpoint` (value `value_sat`) via
