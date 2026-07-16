@@ -5,15 +5,25 @@
 //! derived from the node's per-network key, a software PSET signer,
 //! and an esplora backend for sync and broadcast.
 //!
-//! HTLCs are plain P2WSH outputs with two spending paths:
+//! HTLCs are plain P2WSH outputs whose single witness script has two
+//! spending paths (boltz-style):
 //!
-//! * **Claim** (receiver): `OP_HASH160 <preimage_hash> EQUALVERIFY
-//!   <claim_pubkey> CHECKSIG` — the receiver reveals the preimage and
-//!   signs with its per-network key. The lockup output is *unblinded*
+//! ```text
+//! OP_HASH160 <RIPEMD160(payment_hash)> OP_EQUAL
+//! OP_IF <claim_pubkey>
+//! OP_ELSE <refund_locktime> OP_CLTV OP_DROP <refund_pubkey>
+//! OP_ENDIF
+//! OP_CHECKSIG
+//! ```
+//!
+//! * **Claim** (receiver): witness `[sig, preimage, script]` — the
+//!   revealed preimage selects the IF branch and the receiver signs
+//!   with its per-network claim key. The lockup output is *unblinded*
 //!   (explicit), so no blinding keys ever cross the protocol.
-//! * **Refund** (sender): `<refund_locktime> OP_CLTV OP_DROP
-//!   <refund_pubkey> OP_CHECKSIG` — recoverable after an absolute
-//!   block height derived from the route expiry.
+//! * **Refund** (sender): witness `[sig, <empty>, script]` — the
+//!   empty push fails the hash check, selecting the CLTV branch;
+//!   recoverable after an absolute block height derived from the
+//!   route expiry.
 //!
 //! Claim and refund are built as single-input spends whose fee comes
 //! out of the HTLC value itself (LWK `drain_lbtc_to`), so neither
@@ -21,8 +31,12 @@
 //!
 //! Hash semantics match the arkade adapter: a cassis payment hash is
 //! SHA256(preimage), the script burns `OP_HASH160` =
-//! RIPEMD160(SHA256(x)), so the script's preimage hash is
-//! RIPEMD160(payment_hash).
+//! RIPEMD160(SHA256(x)), so the 20 bytes in the script are
+//! RIPEMD160(payment_hash). The claim side of the script is derived
+//! from the payment hash and the receiver's claim key, so the wire
+//! descriptor carries only the lockup outpoint plus the refund pubkey
+//! and locktime — the receiver rebuilds the script itself, which
+//! simultaneously verifies the hash binding and its own identity.
 //!
 //! Claim-key parity: cassis identities are x-only (32 bytes), but
 //! `OP_CHECKSIG` on Liquid needs the full 33-byte compressed pubkey.
@@ -30,6 +44,18 @@
 //! scanning paths until the child pubkey has an even Y coordinate, so
 //! `02 || x-only(claim key)` is always the real pubkey and
 //! counterparties locking to the x-only identity are safe.
+//!
+//! 0-conf: lockups are broadcast non-RBF, and the sender only reports
+//! an outgoing HTLC as deployed once Blockstream's 0-conf observation
+//! service (see the `zeroconf` module) shows at least 4/5 of the functionaries
+//! have the tx in their mempool. The descriptor sent in DISPATCH pins
+//! the lockup txid and output, so the receiver re-checks the same
+//! service with one REST call and verifies the pinned output via
+//! esplora before accepting. The service only observes mainnet, so on
+//! `liquid::testnet` both checks are skipped and the sender instead
+//! pauses briefly for mempool propagation.
+
+mod zeroconf;
 
 use async_trait::async_trait;
 use cassis_core::{
@@ -40,6 +66,7 @@ use hmac::Mac;
 use lwk_common::Signer as LwkSigner;
 use lwk_signer::SwSigner;
 use lwk_wollet::clients::asyncr::EsploraClient;
+use lwk_wollet::clients::EsploraClientBuilder;
 use lwk_wollet::elements::bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv};
 use lwk_wollet::elements::bitcoin::hashes::ripemd160;
 use lwk_wollet::elements::bitcoin::hashes::sha256;
@@ -53,12 +80,12 @@ use lwk_wollet::elements::confidential::{
 };
 use lwk_wollet::elements::encode::Decodable as _;
 use lwk_wollet::elements::opcodes::all::{
-    OP_CHECKSIG, OP_CLTV, OP_DROP, OP_EQUALVERIFY, OP_HASH160,
+    OP_CHECKSIG, OP_CLTV, OP_DROP, OP_ELSE, OP_ENDIF, OP_EQUAL, OP_HASH160, OP_IF,
 };
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 use lwk_wollet::elements::script::{Builder as ElScriptBuilder, Script as ElScript};
 use lwk_wollet::elements::{
-    Address, AddressParams, AssetId, LockTime, OutPoint, Sequence, Transaction, TxInWitness, TxOut,
+    Address, AddressParams, LockTime, OutPoint, Sequence, Transaction, TxInWitness, TxOut,
     TxOutSecrets, Txid,
 };
 use lwk_wollet::{Network, Wollet, WolletBuilder, WolletDescriptor};
@@ -74,8 +101,10 @@ use tracing::{debug, info, warn, Span};
 
 /// Blockstream esplora for Liquid mainnet.
 pub const MAINNET_ESPLORA_URL: &str = "https://blockstream.info/liquid/api";
-/// Blockstream esplora for Liquid testnet.
-pub const TESTNET_ESPLORA_URL: &str = "https://blockstream.info/liquidtestnet/api";
+pub const MAINNET_WATERFALLS_URL: &str = "https://waterfalls.liquidwebwallet.org/liquid/api";
+/// Public Liquid testnet Esplora endpoint.
+pub const TESTNET_ESPLORA_URL: &str = "https://liquid.network/liquidtestnet/api";
+pub const TESTNET_WATERFALLS_URL: &str = "https://waterfalls.liquidwebwallet.org/liquidtestnet/api";
 
 /// Liquid blocks land about every minute.
 const BLOCK_TIME_SECS: u64 = 60;
@@ -85,8 +114,13 @@ const REFUND_LOCKTIME_SLACK_BLOCKS: u64 = 6;
 /// (0.2 sat/vbyte — Liquid is cheap).
 const FEE_RATE_SATS_KVB: f32 = 200.0;
 /// Non-final nSequence so the tx's nLockTime (CLTV) is enforced.
+/// Also the BIP-125 boundary: any input sequence *below* this value
+/// signals replace-by-fee, which the 0-conf trust model forbids.
 const NON_FINAL_SEQUENCE: u32 = 0xFFFF_FFFE;
 const POLL_INTERVAL_SECS: u64 = 5;
+/// Propagation pause replacing the 0-conf coverage wait on testnet,
+/// which the 0-conf service does not observe.
+const TESTNET_PROPAGATION_WAIT_SECS: u64 = 5;
 /// Millisatoshi per satoshi.
 const MSAT_PER_SAT: u64 = 1000;
 /// Minimum lockable amount in sats: fees are carved out of the HTLC
@@ -99,7 +133,6 @@ const MIN_LOCK_SATS: u64 = 1_000;
 const CLAIM_KEY_PATH_PREFIX: &str = "m/1037'";
 /// SLIP-0077 domain-separation label for the master blinding key.
 const SLIP77_LABEL: &[u8] = b"SLIP-0077";
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("invalid parameters: {0}")]
@@ -134,6 +167,7 @@ fn error_from_lwk(e: impl std::fmt::Display) -> HtlcError {
 pub struct LiquidConfig {
     pub network_id: NetworkId,
     pub esplora_url: String,
+    pub waterfalls_url: String,
     /// Directory used for LWK wallet state. `None` keeps wallet state
     /// in memory, useful for tests.
     pub persist_dir: Option<PathBuf>,
@@ -155,6 +189,7 @@ pub fn default_config(
         "liquid::testnet" => LiquidConfig {
             network_id,
             esplora_url: TESTNET_ESPLORA_URL.to_string(),
+            waterfalls_url: TESTNET_WATERFALLS_URL.to_string(),
             persist_dir: None,
             sk,
             invoice_pubkey,
@@ -163,6 +198,7 @@ pub fn default_config(
         _ => LiquidConfig {
             network_id,
             esplora_url: MAINNET_ESPLORA_URL.to_string(),
+            waterfalls_url: MAINNET_WATERFALLS_URL.to_string(),
             persist_dir: None,
             sk,
             invoice_pubkey,
@@ -178,9 +214,11 @@ fn lwk_network(network_id: &NetworkId) -> Network {
     }
 }
 
-/// RIPEMD160(SHA256(preimage)) == RIPEMD160(payment_hash): the 20-byte
-/// value burned into the claim script.
-fn htlc_preimage_hash(payment_hash: &Bytes32) -> [u8; 20] {
+/// RIPEMD160 of the route's 32-byte payment hash: the 20-byte value
+/// burned into the claim script. Equals HASH160(preimage), since the
+/// payment hash is SHA256(preimage) and `OP_HASH160` checks
+/// RIPEMD160(SHA256(x)).
+fn payment_hash160(payment_hash: &Bytes32) -> [u8; 20] {
     *ripemd160::Hash::hash(payment_hash.as_ref()).as_byte_array()
 }
 
@@ -194,38 +232,45 @@ fn msat_to_sat(amount_msat: u64) -> Result<u64, HtlcError> {
     Ok(amount_msat / MSAT_PER_SAT)
 }
 
-/// Build the claim leaf: preimage revelation + receiver signature.
-fn claim_script(preimage_hash: &[u8; 20], claim_pubkey: &BtcPublicKey) -> ElScript {
+/// Build the HTLC witness script (see the crate docs): preimage
+/// revelation + receiver signature on the IF branch, CLTV-gated
+/// sender recovery on the ELSE branch.
+fn htlc_script(
+    payment_hash160: &[u8; 20],
+    claim_pubkey: &BtcPublicKey,
+    refund_pubkey: &BtcPublicKey,
+    refund_locktime: u32,
+) -> ElScript {
     ElScriptBuilder::new()
         .push_opcode(OP_HASH160)
-        .push_slice(preimage_hash)
-        .push_opcode(OP_EQUALVERIFY)
+        .push_slice(payment_hash160)
+        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_IF)
         .push_key(claim_pubkey)
-        .push_opcode(OP_CHECKSIG)
-        .into_script()
-}
-
-/// Build the refund leaf: CLTV-gated sender recovery.
-fn refund_script(refund_locktime: u32, refund_pubkey: &BtcPublicKey) -> ElScript {
-    ElScriptBuilder::new()
+        .push_opcode(OP_ELSE)
         .push_int(i64::from(refund_locktime))
         .push_opcode(OP_CLTV)
         .push_opcode(OP_DROP)
         .push_key(refund_pubkey)
+        .push_opcode(OP_ENDIF)
         .push_opcode(OP_CHECKSIG)
         .into_script()
 }
 
-/// Decoded [`HtlcDescriptor::Liquid`]: everything needed to watch,
-/// claim or refund one HTLC.
+/// One HTLC's witness script and the parameters it was built from.
+/// Never crosses the wire as-is: the descriptor pins the lockup
+/// outpoint and carries only the refund parameters (see
+/// [`HtlcSpec::to_descriptor`]); the receiver rebuilds the same spec
+/// with its own claim key.
 #[derive(Clone, Debug)]
 struct HtlcSpec {
-    preimage_hash: [u8; 20],
-    claim_pubkey: BtcPublicKey,
-    claim_script: ElScript,
-    refund_script: ElScript,
+    /// The route's 32-byte payment hash, SHA256(preimage). The
+    /// script burns its RIPEMD160 (see [`payment_hash160`]).
+    payment_hash: Bytes32,
+    refund_pubkey: BtcPublicKey,
     refund_locktime: u32,
-    /// `P2WSH(claim_script)` — the lockup output's script pubkey.
+    witness_script: ElScript,
+    /// `P2WSH(witness_script)` — the lockup output's script pubkey.
     lockup_script_pubkey: ElScript,
 }
 
@@ -236,16 +281,18 @@ impl HtlcSpec {
         refund_pubkey: BtcPublicKey,
         refund_locktime: u32,
     ) -> Self {
-        let preimage_hash = htlc_preimage_hash(payment_hash);
-        let claim_script = claim_script(&preimage_hash, &claim_pubkey);
-        let refund_script = refund_script(refund_locktime, &refund_pubkey);
-        let lockup_script_pubkey = claim_script.to_v0_p2wsh();
-        Self {
-            preimage_hash,
-            claim_pubkey,
-            claim_script,
-            refund_script,
+        let witness_script = htlc_script(
+            &payment_hash160(payment_hash),
+            &claim_pubkey,
+            &refund_pubkey,
             refund_locktime,
+        );
+        let lockup_script_pubkey = witness_script.to_v0_p2wsh();
+        Self {
+            payment_hash: *payment_hash,
+            refund_pubkey,
+            refund_locktime,
+            witness_script,
             lockup_script_pubkey,
         }
     }
@@ -255,58 +302,29 @@ impl HtlcSpec {
             .ok_or_else(|| HtlcError::InvalidParams("cannot derive lockup address".into()))
     }
 
-    fn from_descriptor(descriptor: &HtlcDescriptor) -> Result<Self, HtlcError> {
-        let HtlcDescriptor::Liquid {
-            claim_pubkey,
-            preimage_hash,
-            claim_script,
-            refund_script,
-            refund_locktime,
-        } = descriptor
-        else {
-            return Err(HtlcError::InvalidParams(format!(
-                "unsupported htlc descriptor for liquid network: {descriptor:?}"
-            )));
-        };
-        let claim_pubkey = BtcPublicKey::from_str(claim_pubkey)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim pubkey: {e}")))?;
-        let decode_hex = |hex: &String| -> Result<Vec<u8>, HtlcError> {
-            Vec::<u8>::from_hex(hex)
-                .map_err(|e| HtlcError::InvalidParams(format!("invalid script hex: {e}")))
-        };
-        let claim_script = ElScript::from(decode_hex(claim_script)?);
-        let refund_script = ElScript::from(decode_hex(refund_script)?);
-        let hash_bytes = decode_hex(preimage_hash)?;
-        let preimage_hash: [u8; 20] = hash_bytes.try_into().map_err(|bytes: Vec<u8>| {
-            HtlcError::InvalidParams(format!(
-                "preimage hash must be 20 bytes, got {}",
-                bytes.len()
-            ))
-        })?;
-        let lockup_script_pubkey = claim_script.to_v0_p2wsh();
-        Ok(Self {
-            preimage_hash,
-            claim_pubkey,
-            claim_script,
-            refund_script,
-            refund_locktime: *refund_locktime,
-            lockup_script_pubkey,
-        })
-    }
-
-    fn to_descriptor(&self) -> HtlcDescriptor {
-        HtlcDescriptor::Liquid {
-            claim_pubkey: self.claim_pubkey.to_bytes().to_lower_hex_string(),
-            preimage_hash: self.preimage_hash.to_lower_hex_string(),
-            claim_script: self.claim_script.as_bytes().to_lower_hex_string(),
-            refund_script: self.refund_script.as_bytes().to_lower_hex_string(),
+    /// Build the wire descriptor: the pinned lockup outpoint plus the
+    /// refund parameters the receiver cannot derive itself (the claim
+    /// side it rebuilds from its own claim key and the payment hash).
+    fn to_descriptor(&self, lockup: OutPoint) -> Result<HtlcDescriptor, HtlcError> {
+        Ok(HtlcDescriptor::Liquid {
+            lockup_txid: lockup.txid.to_string(),
+            lockup_vout: lockup.vout.try_into().map_err(|_| {
+                HtlcError::InvalidParams(format!(
+                    "lockup output index {} does not fit the descriptor's u8",
+                    lockup.vout
+                ))
+            })?,
+            refund_pubkey: self.refund_pubkey.to_bytes().to_lower_hex_string(),
             refund_locktime: self.refund_locktime,
-        }
+        })
     }
 }
 
 struct PendingIncoming {
-    spec: Option<HtlcSpec>,
+    /// Pinned lockup output, populated once the dispatched HTLC
+    /// passes 0-conf + on-chain verification; `None` while the slot
+    /// is only reserved by PREPARE.
+    accepted: Option<AcceptedHtlc>,
     expected_sat: u64,
     /// Kept for parity with the reserved-slot bookkeeping model of the
     /// other adapters (the PREPARE deadline); not polled directly.
@@ -314,12 +332,18 @@ struct PendingIncoming {
     deadline: u64,
 }
 
+/// Incoming HTLC that passed `verified_incoming`: claims spend this
+/// exact outpoint with this exact witness script instead of
+/// re-scanning the lockup address.
+#[derive(Clone)]
+struct AcceptedHtlc {
+    spec: HtlcSpec,
+    outpoint: OutPoint,
+    value_sat: u64,
+}
+
 struct PendingOutgoing {
     spec: HtlcSpec,
-    /// Txid of the lockup; kept for parity with arkade's
-    /// bookkeeping — spending is detected via the address history.
-    #[allow(dead_code)]
-    lockup_txid: Txid,
     /// Output of the lockup tx carrying the HTLC.
     outpoint: OutPoint,
     value_sat: u64,
@@ -340,6 +364,7 @@ pub struct LiquidAdapter {
     claim_xonly: PubKey,
     wollet: Arc<Mutex<Wollet>>,
     esplora: Arc<Mutex<EsploraClient>>,
+    waterfalls: Arc<Mutex<EsploraClient>>,
     http: reqwest::Client,
     esplora_url: String,
     network: Network,
@@ -401,22 +426,25 @@ impl LiquidAdapter {
         let claim_xonly = PubKey::from_bytes(claim_bytes[1..33].try_into().expect("32 bytes"))
             .map_err(|e| Error::InvalidParams(format!("invalid claim pubkey: {e}")))?;
 
-        // SLIP-0077 master blinding key, keyed from the node key.
+        // Keep custom SLIP-0077 derivation because this signer may not expose
+        // deterministic SLIP-0077, but use account-level xpub and origin.
         let mut mac = <hmac::Hmac<Sha512> as hmac::Mac>::new_from_slice(SLIP77_LABEL)
             .expect("hmac key length is always valid");
         mac.update(&config.sk);
-        let mbk = mac.finalize().into_bytes()[..32].to_vec();
-        let mbk_hex = mbk.to_lower_hex_string();
-
+        let mbk_hex = mac.finalize().into_bytes()[..32].to_lower_hex_string();
+        let account_path = DerivationPath::from_str("m/84'/1'/0'")
+            .map_err(|e| Error::InvalidParams(format!("wallet account path: {e}")))?;
+        let account_xpub = signer
+            .derive_xpub(&account_path)
+            .map_err(|e| Error::InvalidParams(format!("wallet account xpub: {e}")))?;
         let descriptor_str = format!(
-            "ct(slip77({mbk_hex}),elwpkh([{}/84'/1'/0']{}/<0;1>/*))",
-            fingerprint,
-            signer.xpub()
+            "ct(slip77({mbk_hex}),elwpkh([{}/84'/1'/0']{account_xpub}/<0;1>/*))",
+            fingerprint
         );
         let descriptor: WolletDescriptor = descriptor_str
             .parse()
             .map_err(|e| Error::InvalidParams(format!("wollet descriptor: {e}")))?;
-        let mut wollet_builder = WolletBuilder::new(network, descriptor);
+        let mut wollet_builder = WolletBuilder::new(network, descriptor).utxo_only(true);
         let persist_lock = if let Some(persist_dir) = &config.persist_dir {
             std::fs::create_dir_all(persist_dir)
                 .map_err(|e| Error::Client(format!("create Liquid wallet directory: {e}")))?;
@@ -448,6 +476,14 @@ impl LiquidAdapter {
                 .map_err(|e| Error::Client(format!("wollet build: {e}")))?,
         ));
         let esplora = Arc::new(Mutex::new(EsploraClient::new(network, &config.esplora_url)));
+        #[allow(deprecated)]
+        let waterfalls = Arc::new(Mutex::new(
+            EsploraClientBuilder::new(&config.waterfalls_url, network)
+                .waterfalls(true)
+                .utxo_only(true)
+                .build()
+                .map_err(|e| Error::Client(format!("create Waterfalls client: {e}")))?,
+        ));
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -474,6 +510,7 @@ impl LiquidAdapter {
             claim_xonly,
             wollet,
             esplora,
+            waterfalls,
             http,
             esplora_url: config.esplora_url.clone(),
             network,
@@ -521,10 +558,13 @@ impl LiquidAdapter {
     /// Sync the wallet with esplora (best-effort: on failure the
     /// cached state is used).
     async fn sync_wallet(&self) -> Result<(), HtlcError> {
-        let mut esplora = self.esplora.lock().await;
+        let mut waterfalls = self.waterfalls.lock().await;
         let wollet = self.wollet.lock().await;
-        let update = esplora.full_scan(&wollet).await.map_err(error_from_lwk)?;
-        drop(esplora);
+        let update = waterfalls
+            .full_scan(&wollet)
+            .await
+            .map_err(error_from_lwk)?;
+        drop(waterfalls);
         drop(wollet);
         if let Some(update) = update {
             self.wollet
@@ -568,22 +608,15 @@ impl LiquidAdapter {
             .map_err(|e| HtlcError::Network(format!("tip height parse '{text}': {e}")))
     }
 
-    /// Unspent (explicit-value) L-BTC outputs at `address`.
-    async fn address_utxos(
-        &self,
-        address: &Address,
-    ) -> Result<Vec<(OutPoint, u64, AssetId)>, HtlcError> {
+    /// Whether `txid` is already included in a block, via the esplora
+    /// tx-status endpoint.
+    async fn tx_confirmed(&self, txid: &Txid) -> Result<bool, HtlcError> {
         #[derive(serde::Deserialize)]
-        struct Utxo {
-            txid: String,
-            vout: u32,
-            #[serde(default)]
-            value: Option<u64>,
-            #[serde(default)]
-            asset: Option<String>,
+        struct Status {
+            confirmed: bool,
         }
-        let url = format!("{}/address/{}/utxo", self.esplora_url, address);
-        let text = self
+        let url = format!("{}/tx/{}/status", self.esplora_url, txid);
+        let status: Status = self
             .http
             .get(&url)
             .send()
@@ -591,53 +624,128 @@ impl LiquidAdapter {
             .map_err(error_from_lwk)?
             .error_for_status()
             .map_err(error_from_lwk)?
-            .text()
+            .json()
             .await
-            .map_err(error_from_lwk)?;
-        let utxos: Vec<Utxo> = serde_json::from_str(&text)
-            .map_err(|e| HtlcError::Network(format!("address utxo parse: {e}")))?;
-        let policy = *self.network.policy_asset();
-        let mut out = Vec::new();
-        for u in utxos {
-            let (Some(value), Some(asset)) = (u.value, u.asset) else {
-                continue;
-            };
-            let Ok(asset_id) = AssetId::from_str(&asset) else {
-                continue;
-            };
-            if asset_id != policy || value == 0 {
-                continue;
-            }
-            let Ok(txid) = Txid::from_str(&u.txid) else {
-                continue;
-            };
-            out.push((OutPoint::new(txid, u.vout), value, asset_id));
-        }
-        Ok(out)
+            .map_err(|e| HtlcError::Network(format!("tx {txid} status parse: {e}")))?;
+        Ok(status.confirmed)
     }
 
-    /// The single unspent HTLC output for `spec`.
-    async fn htlc_utxo(&self, spec: &HtlcSpec) -> Result<(OutPoint, u64), HtlcError> {
-        let address = spec.lockup_address(self.network.address_params())?;
-        let utxos = self.address_utxos(&address).await?;
-        match utxos.len() {
-            1 => Ok((utxos[0].0, utxos[0].1)),
-            0 => Err(HtlcError::Network(
-                "no unspent L-BTC found at the HTLC address".into(),
-            )),
-            n => Err(HtlcError::Network(format!(
-                "expected one L-BTC output at the HTLC address, found {n}"
-            ))),
+    /// Rebuild the spec a dispatched descriptor must match: the
+    /// refund parameters come from the wire, the claim side from this
+    /// node's own claim key and the route's payment hash.
+    fn incoming_spec(
+        &self,
+        payment_hash: &Bytes32,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<(HtlcSpec, OutPoint), HtlcError> {
+        let HtlcDescriptor::Liquid {
+            lockup_txid,
+            lockup_vout,
+            refund_pubkey,
+            refund_locktime,
+        } = descriptor
+        else {
+            return Err(HtlcError::InvalidParams(format!(
+                "unsupported htlc descriptor for liquid network: {descriptor:?}"
+            )));
+        };
+        let txid = Txid::from_str(lockup_txid)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid lockup txid: {e}")))?;
+        let refund_pubkey = BtcPublicKey::from_str(refund_pubkey)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid refund pubkey: {e}")))?;
+        let spec = HtlcSpec::build(
+            payment_hash,
+            self.claim_pk_full,
+            refund_pubkey,
+            *refund_locktime,
+        );
+        Ok((spec, OutPoint::new(txid, u32::from(*lockup_vout))))
+    }
+
+    /// Receiver-side verification of a dispatched HTLC, shared by
+    /// `verify_incoming_htlc` and `accept_incoming_htlc`:
+    ///
+    /// 1. on mainnet, unless the lockup already confirmed, a one-shot
+    ///    0-conf check on the pinned lockup txid, whose answer is
+    ///    final: the sender only dispatched after waiting for
+    ///    coverage itself, so a shortfall here rejects the HTLC (a
+    ///    confirmed lockup is past mempool policy and may already
+    ///    have been dropped from the 0-conf service's memory; the
+    ///    service does not observe testnet at all);
+    /// 2. the lockup tx fetched from esplora (mempool or chain): it
+    ///    must be non-RBF and the pinned output must pay P2WSH of
+    ///    the witness script this node rebuilds from the payment
+    ///    hash, its own claim key and the wire's refund parameters —
+    ///    which simultaneously checks the hash binding and the
+    ///    recipient identity — an explicit L-BTC amount, which is
+    ///    returned.
+    async fn verified_incoming(
+        &self,
+        descriptor: &HtlcDescriptor,
+        payment_hash: Bytes32,
+    ) -> Result<(HtlcSpec, OutPoint, u64), HtlcError> {
+        let (spec, outpoint) = self.incoming_spec(&payment_hash, descriptor)?;
+
+        if self.network.is_mainnet() && !self.tx_confirmed(&outpoint.txid).await? {
+            zeroconf::check_coverage(&self.http, &outpoint.txid.to_string())
+                .await
+                .map_err(HtlcError::Network)?;
         }
+
+        let tx = self
+            .esplora
+            .lock()
+            .await
+            .get_transaction(outpoint.txid)
+            .await
+            .map_err(|e| {
+                HtlcError::Network(format!(
+                    "fetching lockup tx {} from esplora: lwk: {e}",
+                    outpoint.txid
+                ))
+            })?;
+        ensure_non_rbf(&tx).map_err(|_| {
+            HtlcError::Network(format!(
+                "lockup tx {} signals replace-by-fee",
+                outpoint.txid
+            ))
+        })?;
+        let output = tx.output.get(outpoint.vout as usize).ok_or_else(|| {
+            HtlcError::InvalidParams(format!(
+                "lockup tx {} has no output {}",
+                outpoint.txid, outpoint.vout
+            ))
+        })?;
+        if output.script_pubkey != spec.lockup_script_pubkey {
+            return Err(HtlcError::InvalidParams(format!(
+                "lockup output {}:{} does not pay the witness script this node rebuilds from \
+                 the payment hash, its claim key and the descriptor's refund parameters \
+                 (wrong recipient identity, hash or refund terms)",
+                outpoint.txid, outpoint.vout
+            )));
+        }
+        if output.asset != Asset::Explicit(*self.network.policy_asset()) {
+            return Err(HtlcError::InvalidParams(format!(
+                "lockup output {}:{} is not explicit L-BTC",
+                outpoint.txid, outpoint.vout
+            )));
+        }
+        let Value::Explicit(value_sat) = output.value else {
+            return Err(HtlcError::InvalidParams(format!(
+                "lockup output {}:{} value is not explicit",
+                outpoint.txid, outpoint.vout
+            )));
+        };
+        Ok((spec, outpoint, value_sat))
     }
 
     /// Max witness weight (WU) for a P2WSH spend of `script`.
     fn max_weight_to_satisfy(script: &ElScript, with_preimage: bool) -> usize {
         let script_len = script.len();
         let mut witness_len = 1; // item count
-        if with_preimage {
-            witness_len += 1 + 32;
-        }
+                                 // Branch selector: the 32-byte preimage on claims, an empty
+                                 // push on refunds.
+        witness_len += if with_preimage { 1 + 32 } else { 1 };
         witness_len += 1 + 73; // der sig + sighash byte
         witness_len += varint_len(script_len) + script_len;
         witness_len * 4 + 64 // conservative overhead for the input shell
@@ -645,8 +753,9 @@ impl LiquidAdapter {
 
     /// Sign `pset` with the software signer and return the extracted
     /// transaction with every input's witness built by hand: the HTLC
-    /// input gets `[preimage?, sig, script]`, plain p2wpkh wallet
-    /// inputs get `[sig, pubkey]`.
+    /// input gets `[sig, preimage-or-empty, script]` (the middle item
+    /// selects the script branch), plain p2wpkh wallet inputs get
+    /// `[sig, pubkey]`.
     ///
     /// Manual witness assembly (instead of `Wollet::finalize`) is
     /// required for the claim path: the preimage is not representable
@@ -686,10 +795,12 @@ impl LiquidAdapter {
                         HtlcError::Network("claim signature missing after sign".into())
                     })?;
                 let (_, preimage, script) = htlc_input.as_ref().expect("matched above");
-                match preimage {
-                    Some(preimage) => vec![preimage.to_vec(), sig.clone(), script.to_bytes()],
-                    None => vec![sig.clone(), script.to_bytes()],
-                }
+                // Witness items are pushed in order, so the branch
+                // selector (preimage or empty vector) must sit *after*
+                // the signature to end up on top of the stack, where
+                // the script's leading OP_HASH160 consumes it.
+                let selector = preimage.map(|p| p.to_vec()).unwrap_or_default();
+                vec![sig.clone(), selector, script.to_bytes()]
             } else if !psbt_input.partial_sigs.is_empty() {
                 // P2WPKH wallet input: [sig, pubkey].
                 let (pk, sig) = psbt_input
@@ -708,22 +819,36 @@ impl LiquidAdapter {
     }
 
     async fn broadcast(&self, tx: &Transaction) -> Result<Txid, HtlcError> {
-        self.esplora
+        let txid = self
+            .esplora
             .lock()
             .await
             .broadcast(tx)
             .await
-            .map_err(error_from_lwk)
+            .map_err(error_from_lwk)?;
+        // Feed our own spend back into wallet state: the next build
+        // must not re-select these inputs. Esplora's scripthash scan
+        // sees mempool txs, so an immediate resync registers the spend
+        // as unconfirmed; without it the wallet happily spends the
+        // same UTXO again and the node rejects the second broadcast
+        // with `txn-mempool-conflict`. Best-effort: a failed resync
+        // only delays UTXO awareness until the next sync.
+        if let Err(error) = self.sync_wallet().await {
+            self.span.in_scope(|| {
+                warn!(target: "cassis_liquid", "post-broadcast resync failed: {error}");
+            });
+        }
+        Ok(txid)
     }
 
-    /// Fee-funded claim/refund of `outpoint` (value `value_sat`) via
-    /// the given leaf script, draining everything to our wallet.
+    /// Fee-funded claim (`preimage` set) or refund (`cltv` set) of
+    /// `outpoint` (value `value_sat`), draining everything to our
+    /// wallet.
     async fn spend_htlc_input(
         &self,
         spec: &HtlcSpec,
         outpoint: OutPoint,
         value_sat: u64,
-        leaf_script: &ElScript,
         preimage: Option<[u8; 32]>,
         cltv: Option<u32>,
     ) -> Result<Txid, HtlcError> {
@@ -745,7 +870,10 @@ impl LiquidAdapter {
                 value_sat,
                 ValueBlindingFactor::zero(),
             ),
-            max_weight_to_satisfy: Self::max_weight_to_satisfy(leaf_script, preimage.is_some()),
+            max_weight_to_satisfy: Self::max_weight_to_satisfy(
+                &spec.witness_script,
+                preimage.is_some(),
+            ),
         };
         let mut pset = {
             let wollet = self.wollet.lock().await;
@@ -760,7 +888,7 @@ impl LiquidAdapter {
                 .map_err(error_from_lwk)?
         };
 
-        // Point the signer at the HTLC leaf: witness script + key
+        // Point the signer at the HTLC input: witness script + key
         // source on the input it controls.
         let idx = pset
             .inputs()
@@ -774,7 +902,7 @@ impl LiquidAdapter {
             .ok_or_else(|| HtlcError::Network("HTLC input missing from pset".into()))?;
         {
             let input = &mut pset.inputs_mut()[idx];
-            input.witness_script = Some(leaf_script.clone());
+            input.witness_script = Some(spec.witness_script.clone());
             input.bip32_derivation.insert(
                 self.claim_pk_full,
                 (self.fingerprint, self.claim_path.clone()),
@@ -786,7 +914,7 @@ impl LiquidAdapter {
         }
 
         let tx = self
-            .sign_and_extract(pset, Some((outpoint, preimage, leaf_script)))
+            .sign_and_extract(pset, Some((outpoint, preimage, &spec.witness_script)))
             .await?;
         self.broadcast(&tx).await
     }
@@ -844,6 +972,24 @@ impl LiquidAdapter {
     }
 }
 
+/// BIP-125: a transaction signals replaceability iff any input's
+/// nSequence is below [`NON_FINAL_SEQUENCE`]. The 0-conf trust model
+/// only holds for non-RBF transactions (Elements nodes keep the
+/// first-seen spend of an input), so both ends refuse replaceable
+/// lockups.
+fn ensure_non_rbf(tx: &Transaction) -> Result<(), HtlcError> {
+    if tx
+        .input
+        .iter()
+        .any(|input| input.sequence.to_consensus_u32() < NON_FINAL_SEQUENCE)
+    {
+        return Err(HtlcError::Network(
+            "HTLC lockup transaction signals replace-by-fee".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn even_y_pubkey(xonly: &PubKey) -> Result<BtcPublicKey, HtlcError> {
     let mut bytes = [0u8; 33];
     bytes[0] = 0x02;
@@ -899,7 +1045,7 @@ impl NetworkRouterAdapter for LiquidAdapter {
             .await
             .entry(payment_hash)
             .or_insert(PendingIncoming {
-                spec: None,
+                accepted: None,
                 expected_sat: sats,
                 deadline,
             });
@@ -951,6 +1097,18 @@ impl NetworkRouterAdapter for LiquidAdapter {
                 .finish()
                 .map_err(error_from_lwk)?
         };
+        // 0-conf acceptance requires a non-replaceable lockup: raise
+        // any RBF-signaling nSequence to the non-RBF (but still
+        // locktime-enabled) value before signing, since signatures
+        // commit to sequences.
+        for input in pset.inputs_mut() {
+            if input
+                .sequence
+                .is_some_and(|s| s.to_consensus_u32() < NON_FINAL_SEQUENCE)
+            {
+                input.sequence = Some(Sequence::from_consensus(NON_FINAL_SEQUENCE));
+            }
+        }
         let added = self
             .signer
             .sign(&mut pset)
@@ -964,6 +1122,7 @@ impl NetworkRouterAdapter for LiquidAdapter {
             .await
             .finalize(&mut pset)
             .map_err(error_from_lwk)?;
+        ensure_non_rbf(&tx)?;
         let txid = self.broadcast(&tx).await?;
 
         // Locate the lockup output index in the broadcast tx.
@@ -979,15 +1138,37 @@ impl NetworkRouterAdapter for LiquidAdapter {
             debug!(target: "cassis_liquid", "htlc locked {}: txid={txid}", payment_hash.short());
         });
 
+        // Record the HTLC before waiting on propagation: if coverage
+        // never arrives the lockup still exists on-chain and must
+        // stay refundable through `refund_outgoing`.
         self.outgoing.lock().await.insert(
             payment_hash,
             PendingOutgoing {
                 spec: spec.clone(),
-                lockup_txid: txid,
                 outpoint,
                 value_sat: sats,
             },
         );
+
+        // Only report the HTLC as deployed once at least 4/5 of the
+        // functionaries have seen the lockup, so the receiver's
+        // one-shot 0-conf check on DISPATCH cannot race propagation.
+        // The 0-conf service only observes mainnet; on testnet a
+        // short pause gives esplora time to index the mempool tx
+        // before the receiver fetches it.
+        if self.network.is_mainnet() {
+            zeroconf::wait_for_coverage(&self.span, &txid.to_string())
+                .await
+                .map_err(HtlcError::Network)?;
+            self.span.in_scope(|| {
+                debug!(
+                    target: "cassis_liquid",
+                    "htlc lockup {txid} reached 0-conf functionary coverage",
+                );
+            });
+        } else {
+            tokio::time::sleep(Duration::from_secs(TESTNET_PROPAGATION_WAIT_SECS)).await;
+        }
 
         Ok(OutgoingHtlc {
             payment_hash,
@@ -1003,10 +1184,14 @@ impl NetworkRouterAdapter for LiquidAdapter {
         payment_hash: Bytes32,
         preimage: Bytes32,
     ) -> Result<(), HtlcError> {
-        let spec = {
+        let AcceptedHtlc {
+            spec,
+            outpoint,
+            value_sat,
+        } = {
             let incoming = self.incoming.lock().await;
-            match incoming.get(&payment_hash).and_then(|s| s.spec.clone()) {
-                Some(spec) => spec,
+            match incoming.get(&payment_hash).and_then(|s| s.accepted.clone()) {
+                Some(accepted) => accepted,
                 None => {
                     return Err(HtlcError::InvalidParams(format!(
                         "no incoming HTLC registered for {payment_hash:?}"
@@ -1014,18 +1199,15 @@ impl NetworkRouterAdapter for LiquidAdapter {
                 }
             }
         };
-        // Revealed preimage must satisfy both the script hash and the
-        // route hash; anything else means an inconsistent upstream.
+        // The claim script burns RIPEMD160(payment_hash), so checking
+        // the revealed preimage against the route's payment hash also
+        // proves it satisfies the script.
         let sha = sha256::Hash::hash(preimage.as_ref());
-        let preimage_hash = Bytes32(sha.to_byte_array());
-        if preimage_hash != payment_hash
-            || ripemd160::Hash::hash(preimage_hash.as_ref()).to_byte_array() != spec.preimage_hash
-        {
+        if Bytes32(sha.to_byte_array()) != payment_hash {
             return Err(HtlcError::InvalidParams(
-                "preimage does not match the HTLC's preimage hash".into(),
+                "preimage does not hash to the payment hash".into(),
             ));
         }
-        let (outpoint, value_sat) = self.htlc_utxo(&spec).await?;
 
         self.span.in_scope(|| {
             info!(
@@ -1038,14 +1220,7 @@ impl NetworkRouterAdapter for LiquidAdapter {
         });
 
         let txid = self
-            .spend_htlc_input(
-                &spec,
-                outpoint,
-                value_sat,
-                &spec.claim_script,
-                Some(preimage.0),
-                None,
-            )
+            .spend_htlc_input(&spec, outpoint, value_sat, Some(preimage.0), None)
             .await?;
 
         self.span.in_scope(|| {
@@ -1069,21 +1244,16 @@ impl NetworkRouterAdapter for LiquidAdapter {
         };
         let tip = self.tip_height().await?;
         if tip < u64::from(spec.refund_locktime) {
-            return Err(HtlcError::InvalidParams(format!(
+            // `Network` (not `InvalidParams`) so the router treats it
+            // as transient and keeps retrying until the CLTV opens.
+            return Err(HtlcError::Network(format!(
                 "timelock not reached: tip={tip} refund_locktime={}",
                 spec.refund_locktime
             )));
         }
 
         let txid = self
-            .spend_htlc_input(
-                &spec,
-                outpoint,
-                value_sat,
-                &spec.refund_script,
-                None,
-                Some(spec.refund_locktime),
-            )
+            .spend_htlc_input(&spec, outpoint, value_sat, None, Some(spec.refund_locktime))
             .await?;
 
         self.span.in_scope(|| {
@@ -1098,7 +1268,7 @@ impl NetworkRouterAdapter for LiquidAdapter {
         payment_hash: Bytes32,
         deadline: u64,
     ) -> Result<Bytes32, WatchError> {
-        let (spec, lockup_outpoint) = {
+        let (spec, lockup) = {
             let outgoing = self.outgoing.lock().await;
             match outgoing.get(&payment_hash) {
                 Some(slot) => (slot.spec.clone(), slot.outpoint),
@@ -1121,20 +1291,13 @@ impl NetworkRouterAdapter for LiquidAdapter {
             // Poll the address history for a spend of the lockup
             // outpoint, then decode the raw tx and pull the preimage
             // out of the claim witness.
-            match self.find_spending_tx(&address, lockup_outpoint).await {
+            match self.find_spending_tx(&address, lockup).await {
                 Ok(Some(spending_tx)) => {
-                    match Self::extract_preimage(&spending_tx, lockup_outpoint, &spec) {
+                    // `extract_preimage` already verified the witness
+                    // preimage hashes to `spec.payment_hash`, which is
+                    // the route hash this HTLC was built from.
+                    match Self::extract_preimage(&spending_tx, lockup, &spec) {
                         Ok(preimage) => {
-                            let sha = sha256::Hash::hash(&preimage);
-                            let preimage_hash = Bytes32(sha.to_byte_array());
-                            if preimage_hash != payment_hash
-                                || ripemd160::Hash::hash(preimage_hash.as_ref()).to_byte_array()
-                                    != spec.preimage_hash
-                            {
-                                return Err(WatchError::Network(
-                                    "revealed preimage does not hash to the expected hash".into(),
-                                ));
-                            }
                             self.span.in_scope(|| {
                                 info!(
                                     target: "cassis_liquid",
@@ -1169,22 +1332,9 @@ impl NetworkRouterAdapter for LiquidAdapter {
         descriptor: &HtlcDescriptor,
         payment_hash: Bytes32,
     ) -> Result<(), HtlcError> {
-        let spec = HtlcSpec::from_descriptor(descriptor)?;
-
-        if spec.preimage_hash != htlc_preimage_hash(&payment_hash) {
-            return Err(HtlcError::InvalidParams(
-                "descriptor preimage hash does not match the payment hash".into(),
-            ));
-        }
-
-        let address = spec.lockup_address(self.network.address_params())?;
-        let utxos = self.address_utxos(&address).await?;
-        if utxos.is_empty() {
-            return Err(HtlcError::Network(
-                "no L-BTC present at the HTLC lockup address".into(),
-            ));
-        }
-        Ok(())
+        self.verified_incoming(descriptor, payment_hash)
+            .await
+            .map(|_| ())
     }
 
     async fn accept_incoming_htlc(
@@ -1193,64 +1343,61 @@ impl NetworkRouterAdapter for LiquidAdapter {
         descriptor: &HtlcDescriptor,
         deadline: u64,
     ) -> Result<(), HtlcError> {
-        self.verify_incoming_htlc(descriptor, payment_hash).await?;
-        let spec = HtlcSpec::from_descriptor(descriptor)?;
-        if spec.claim_pubkey != self.claim_pk_full {
+        // `verified_incoming` rebuilds the expected witness script
+        // with this node's own claim key, so an HTLC locked to the
+        // wrong identity already failed there.
+        let (spec, outpoint, value_sat) = self.verified_incoming(descriptor, payment_hash).await?;
+
+        // The sender's CLTV refund path must not open before this
+        // hop's claim deadline, or the sender could race a refund
+        // against our claim. Map the unix deadline onto blocks.
+        let deadline_blocks = deadline.saturating_sub(Self::unix_now()) / BLOCK_TIME_SECS;
+        let tip = self.tip_height().await?;
+        if u64::from(spec.refund_locktime) < tip + deadline_blocks {
             return Err(HtlcError::InvalidParams(format!(
-                "incoming HTLC is locked to {}, which this node cannot claim; \
-                 expected {} (upstream hop locked to the wrong identity)",
-                spec.claim_pubkey, self.claim_pk_full
+                "refund locktime {} opens before the HTLC deadline (tip {tip}, \
+                 need at least {})",
+                spec.refund_locktime,
+                tip + deadline_blocks
             )));
         }
 
         // Preserve the amount reserved at PREPARE time, then check the
-        // locked total actually covers it.
+        // pinned lockup output actually covers it.
         let expected_sat = {
-            let mut incoming = self.incoming.lock().await;
-            match incoming.get_mut(&payment_hash) {
-                Some(slot) => slot.expected_sat,
-                None => {
-                    incoming.insert(
-                        payment_hash,
-                        PendingIncoming {
-                            spec: None,
-                            expected_sat: 0,
-                            deadline,
-                        },
-                    );
-                    0
-                }
-            }
+            let incoming = self.incoming.lock().await;
+            incoming
+                .get(&payment_hash)
+                .map(|slot| slot.expected_sat)
+                .unwrap_or(0)
         };
-        if expected_sat > 0 {
-            let address = spec.lockup_address(self.network.address_params())?;
-            let total: u64 = self
-                .address_utxos(&address)
-                .await?
-                .iter()
-                .map(|(_, v, _)| *v)
-                .sum();
-            if total < expected_sat {
-                return Err(HtlcError::Network(format!(
-                    "locked amount {total} sats is below the reserved {expected_sat} sats"
-                )));
-            }
+        if value_sat < expected_sat {
+            return Err(HtlcError::Network(format!(
+                "locked amount {value_sat} sats is below the reserved {expected_sat} sats"
+            )));
         }
 
         self.span.in_scope(|| {
             debug!(
                 target: "cassis_liquid",
-                "accepted incoming htlc {} deadline={deadline}",
+                "accepted incoming htlc {} at {}:{} deadline={deadline}",
                 payment_hash.short(),
+                outpoint.txid,
+                outpoint.vout,
             );
         });
+        let accepted = AcceptedHtlc {
+            spec,
+            outpoint,
+            value_sat,
+        };
         self.incoming
             .lock()
             .await
             .entry(payment_hash)
-            .and_modify(|slot| slot.spec = Some(spec.clone()))
+            .and_modify(|slot| slot.accepted = Some(accepted.clone()))
             .or_insert(PendingIncoming {
-                spec: Some(spec),
+                accepted: Some(accepted),
                 expected_sat: 0,
                 deadline,
             });
@@ -1261,14 +1408,11 @@ impl NetworkRouterAdapter for LiquidAdapter {
         &self,
         payment_hash: Bytes32,
     ) -> Result<HtlcDescriptor, HtlcError> {
-        let spec = {
-            let outgoing = self.outgoing.lock().await;
-            outgoing.get(&payment_hash).map(|slot| slot.spec.clone())
-        };
-        spec.ok_or_else(|| {
+        let outgoing = self.outgoing.lock().await;
+        let slot = outgoing.get(&payment_hash).ok_or_else(|| {
             HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
-        })
-        .map(|spec| spec.to_descriptor())
+        })?;
+        slot.spec.to_descriptor(slot.outpoint)
     }
 
     /// L-BTC wallet balance must cover the routed amount. Claim/refund
@@ -1352,7 +1496,9 @@ impl LiquidAdapter {
     }
 
     /// Pull the preimage from the claim witness of the tx spending
-    /// `outpoint`. Claim witness layout: `[preimage, sig, script]`.
+    /// `outpoint`. Spend witness layout: `[sig, selector, script]`,
+    /// where the selector is the preimage on claims and an empty push
+    /// on refunds.
     fn extract_preimage(
         tx: &Transaction,
         outpoint: OutPoint,
@@ -1364,14 +1510,14 @@ impl LiquidAdapter {
             .position(|i| i.previous_output == outpoint)
             .ok_or("spending tx does not spend the lockup outpoint")?;
         let stack = &tx.input[vin_index].witness.script_witness;
-        let preimage_bytes = stack.first().ok_or("claim witness is empty")?;
+        let preimage_bytes = stack.get(1).ok_or("spend witness has no branch selector")?;
         let preimage: [u8; 32] = preimage_bytes
             .as_slice()
             .try_into()
             .map_err(|_| format!("preimage has unexpected length {}", preimage_bytes.len()))?;
         let sha = sha256::Hash::hash(&preimage);
-        if ripemd160::Hash::hash(sha.as_byte_array()).to_byte_array() != spec.preimage_hash {
-            return Err("witness preimage does not hash to the HTLC's preimage hash".into());
+        if Bytes32(sha.to_byte_array()) != spec.payment_hash {
+            return Err("witness preimage does not hash to the HTLC's payment hash".into());
         }
         Ok(preimage)
     }
@@ -1421,31 +1567,76 @@ mod tests {
         );
     }
 
-    /// Claim/refund script shapes: claim commits to the preimage hash
-    /// and the receiver key; refund commits to the locktime and the
-    /// sender key.
+    /// The witness script commits to the payment hash's RIPEMD160,
+    /// both keys and the refund locktime, and both parties derive the
+    /// same lockup script pubkey from the same parameters.
     #[test]
-    fn htlc_scripts_commit_to_expected_values() {
+    fn htlc_script_commits_to_expected_values() {
         let payment_hash = Bytes32([42u8; 32]);
         let claimer = xonly_test_pubkey(0xaa);
         let refunder = xonly_test_pubkey(0xbb);
 
         let spec = HtlcSpec::build(&payment_hash, claimer, refunder, 1234);
 
-        // preimage hash == RIPEMD160(payment_hash).
+        // The spec keeps the route's 32-byte payment hash; the script
+        // burns its RIPEMD160.
+        assert_eq!(spec.payment_hash, payment_hash);
         assert_eq!(
-            spec.preimage_hash.to_vec(),
+            payment_hash160(&payment_hash).to_vec(),
             ripemd160::Hash::hash(payment_hash.as_ref())
                 .as_byte_array()
                 .to_vec()
         );
 
-        // Claim script contains the hash.
-        let claim_hex = spec.claim_script.as_bytes().to_lower_hex_string();
-        let hash_hex = spec.preimage_hash.to_lower_hex_string();
-        assert!(claim_hex.contains(&hash_hex), "claim script: {claim_hex}");
+        let script_hex = spec.witness_script.as_bytes().to_lower_hex_string();
+        let hash_hex = payment_hash160(&payment_hash).to_lower_hex_string();
+        assert!(script_hex.contains(&hash_hex), "script: {script_hex}");
+        assert!(script_hex.contains(&claimer.to_bytes().to_lower_hex_string()));
+        assert!(script_hex.contains(&refunder.to_bytes().to_lower_hex_string()));
 
         // P2WSH lockup script is 34 bytes (0x0020{32}).
         assert_eq!(spec.lockup_script_pubkey.len(), 34);
+
+        // The receiver rebuilds the identical script from the same
+        // parameters (its own claim key + the wire's refund params).
+        let rebuilt = HtlcSpec::build(&payment_hash, claimer, refunder, 1234);
+        assert_eq!(rebuilt.lockup_script_pubkey, spec.lockup_script_pubkey);
+    }
+
+    /// The wire descriptor carries the lockup outpoint plus the
+    /// refund parameters, and nothing the receiver can derive itself.
+    #[test]
+    fn descriptor_round_trips_lockup_outpoint() {
+        let payment_hash = Bytes32([42u8; 32]);
+        let spec = HtlcSpec::build(
+            &payment_hash,
+            xonly_test_pubkey(0xaa),
+            xonly_test_pubkey(0xbb),
+            1234,
+        );
+        let txid = Txid::from_str(&"1f".repeat(32)).unwrap();
+        let outpoint = OutPoint::new(txid, 3);
+
+        let descriptor = spec.to_descriptor(outpoint).unwrap();
+        let HtlcDescriptor::Liquid {
+            lockup_txid,
+            lockup_vout,
+            refund_pubkey,
+            refund_locktime,
+        } = &descriptor
+        else {
+            panic!("expected liquid descriptor");
+        };
+        assert_eq!(lockup_txid, &txid.to_string());
+        assert_eq!(*lockup_vout, 3);
+        assert_eq!(
+            refund_pubkey,
+            &spec.refund_pubkey.to_bytes().to_lower_hex_string()
+        );
+        assert_eq!(*refund_locktime, 1234);
+
+        // Output indexes beyond the descriptor's u8 are rejected
+        // rather than truncated.
+        assert!(spec.to_descriptor(OutPoint::new(txid, 300)).is_err());
     }
 }

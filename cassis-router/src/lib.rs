@@ -16,8 +16,8 @@
 use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
     network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDiscard,
-    HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, NetworkId,
-    NetworkRouterAdapter, WatchError,
+    HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, HtlcError,
+    NetworkId, NetworkRouterAdapter, WatchError,
 };
 use cassis_iroh::{Frame, IrohError, IrohServer, PublicKey};
 use cassis_keys as keys;
@@ -66,6 +66,12 @@ pub struct RouterConfig {
     /// the router is built with the `cashu` feature.
     #[cfg(feature = "cashu")]
     pub cashu_store: Arc<dyn cassis_cashu::CashuProofStore>,
+    /// Adapter instances the caller already opened (e.g. a
+    /// long-running wallet process holding exclusive Liquid
+    /// wallet state). When an entry's [`NetworkId`] matches a
+    /// spec below it is used instead of building a fresh
+    /// adapter for that network.
+    pub prebuilt_adapters: Vec<Arc<dyn NetworkRouterAdapter>>,
 }
 
 /// Run the router daemon. Blocks until Ctrl-C. The caller
@@ -102,24 +108,38 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
 
     let mut adapters: HashMap<NetworkId, NetworkEntry> = HashMap::new();
     for spec in &config.network_specs {
-        match build_adapter(
-            spec,
-            &config.derived_keys,
-            config.span.clone(),
-            #[cfg(feature = "cashu")]
-            &config.cashu_store,
-            #[cfg(feature = "liquid")]
-            config.liquid_store_dir.as_deref(),
-        )
-        .await
+        let network_id = network_id_for_spec(spec).map_err(|e| e.to_string())?;
+        let entry = match config
+            .prebuilt_adapters
+            .iter()
+            .find(|adapter| adapter.network_id() == network_id)
         {
-            Ok(entry) => {
-                adapters.insert(entry.network_id.clone(), entry);
+            Some(adapter) => {
+                let incoming_delta_secs = adapter.incoming_delta_secs();
+                NetworkEntry {
+                    network_id,
+                    adapter: adapter.clone(),
+                    incoming_delta_secs,
+                }
             }
-            Err(err) => {
-                return Err(err);
-            }
-        }
+            None => match build_adapter(
+                spec,
+                &config.derived_keys,
+                config.span.clone(),
+                #[cfg(feature = "cashu")]
+                &config.cashu_store,
+                #[cfg(feature = "liquid")]
+                config.liquid_store_dir.as_deref(),
+            )
+            .await
+            {
+                Ok(entry) => entry,
+                Err(err) => {
+                    return Err(err);
+                }
+            },
+        };
+        adapters.insert(entry.network_id.clone(), entry);
     }
 
     if adapters.len() < 2 {
@@ -995,6 +1015,11 @@ impl CassisRouter {
         self.drop_dispatched(payment_hash).await;
     }
 
+    /// Refund the outgoing HTLC of an expired dispatch. Transient
+    /// (network) failures keep the dispatch row so the next poll tick
+    /// retries — e.g. on Liquid the CLTV refund path only opens a few
+    /// blocks after the route deadline, so the first attempts
+    /// legitimately fail — while permanent errors drop the row.
     async fn refund_dispatched(&self, payment_hash: Bytes32, prepare: &HopPrepare) {
         if let Some(entry) = self.adapters.get(&prepare.outgoing_network) {
             if let Err(e) = entry.adapter.refund_outgoing(payment_hash).await {
@@ -1002,6 +1027,9 @@ impl CassisRouter {
                     target: "cassis_router",
                     "  refund_outgoing failed for {payment_hash}: {e}"
                 );
+                if matches!(e, HtlcError::Network(_)) {
+                    return; // keep the dispatch row; retried next tick
+                }
             }
         }
         self.drop_dispatched(payment_hash).await;

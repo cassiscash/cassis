@@ -182,9 +182,10 @@ fn bitcoin_network(network_id: &NetworkId) -> bitcoin::Network {
     }
 }
 
-/// RIPEMD160(SHA256(preimage)) == RIPEMD160(payment_hash): the
-/// 20-byte value burned into the VHTLC script.
-fn vhtlc_preimage_hash(payment_hash: &Bytes32) -> ripemd160::Hash {
+/// RIPEMD160 of the route's 32-byte payment hash: the 20-byte value
+/// burned into the VHTLC script. Equals HASH160(preimage), since the
+/// payment hash is SHA256(preimage).
+fn vhtlc_payment_hash160(payment_hash: &Bytes32) -> ripemd160::Hash {
     ripemd160::Hash::hash(payment_hash.as_ref())
 }
 
@@ -344,7 +345,7 @@ impl ArkadeAdapter {
             sender,
             receiver,
             server,
-            preimage_hash,
+            payment_hash160,
             refund_locktime,
             unilateral_claim_delay,
             unilateral_refund_delay,
@@ -362,13 +363,13 @@ impl ArkadeAdapter {
         };
         let parse_hash = |hex: &String| -> Result<ripemd160::Hash, HtlcError> {
             let bytes = lowercase_hex_decode(hex).ok_or_else(|| {
-                HtlcError::InvalidParams(format!("invalid preimage hash '{hex}'"))
+                HtlcError::InvalidParams(format!("invalid payment hash160 '{hex}'"))
             })?;
             let arr: [u8; 20] = match bytes.try_into() {
                 Ok(arr) => arr,
                 Err(moved) => {
                     return Err(HtlcError::InvalidParams(format!(
-                        "preimage hash must be 20 bytes, got {}",
+                        "payment hash160 must be 20 bytes, got {}",
                         moved.len()
                     )));
                 }
@@ -384,7 +385,7 @@ impl ArkadeAdapter {
             sender: parse_xonly(sender)?,
             receiver: parse_xonly(receiver)?,
             server: parse_xonly(server)?,
-            preimage_hash: parse_hash(preimage_hash)?,
+            preimage_hash: parse_hash(payment_hash160)?,
             refund_locktime: *refund_locktime,
             unilateral_claim_delay: parse_sequence(*unilateral_claim_delay)?,
             unilateral_refund_delay: parse_sequence(*unilateral_refund_delay)?,
@@ -399,7 +400,7 @@ impl ArkadeAdapter {
             sender: options.sender.to_string(),
             receiver: options.receiver.to_string(),
             server: options.server.to_string(),
-            preimage_hash: lowercase_hex_encode(options.preimage_hash.as_byte_array()),
+            payment_hash160: lowercase_hex_encode(options.preimage_hash.as_byte_array()),
             refund_locktime: options.refund_locktime,
             unilateral_claim_delay: options.unilateral_claim_delay.to_consensus_u32(),
             unilateral_refund_delay: options.unilateral_refund_delay.to_consensus_u32(),
@@ -432,7 +433,7 @@ impl ArkadeAdapter {
             sender: self.claim_xonly,
             receiver: recipient_xonly,
             server: self.server_pk_xonly,
-            preimage_hash: vhtlc_preimage_hash(payment_hash),
+            preimage_hash: vhtlc_payment_hash160(payment_hash),
             refund_locktime: refund_locktime as u32,
             unilateral_claim_delay: Sequence::from_height(UNILATERAL_CLAIM_DELAY_BLOCKS),
             unilateral_refund_delay: Sequence::from_height(UNILATERAL_REFUND_DELAY_BLOCKS),
@@ -626,12 +627,12 @@ impl ArkadeAdapter {
         // Revealed preimage must satisfy both the script hash and the
         // route hash; anything else means an inconsistent upstream.
         let sha = sha256::Hash::hash(preimage.as_ref());
-        let preimage_hash: Bytes32 = Bytes32(sha.to_byte_array());
-        if preimage_hash != payment_hash
-            || ripemd160::Hash::hash(preimage_hash.as_ref()) != options.preimage_hash
+        let computed_payment_hash = Bytes32(sha.to_byte_array());
+        if computed_payment_hash != payment_hash
+            || ripemd160::Hash::hash(computed_payment_hash.as_ref()) != options.preimage_hash
         {
             return Err(HtlcError::InvalidParams(
-                "preimage does not match the HTLC's preimage hash".into(),
+                "preimage does not hash to the HTLC's payment hash".into(),
             ));
         }
 
@@ -761,7 +762,9 @@ impl ArkadeAdapter {
     /// Returns the commitment transaction ID, or `None` when no
     /// boarding output or recoverable VTXO is ready to settle.
     pub async fn onboard(&self) -> Result<Option<bitcoin::Txid>, HtlcError> {
-        let mut rng = rand::thread_rng();
+        // OsRng (not `thread_rng`) so the returned future stays Send
+        // and can be awaited from spawned tasks.
+        let mut rng = rand::rngs::OsRng;
         self.client
             .settle(&mut rng)
             .await
@@ -1075,9 +1078,9 @@ impl NetworkRouterAdapter for ArkadeAdapter {
         let options = Self::parse_vhtlc_options(descriptor)?;
 
         // Descriptor hash must commit to this very route hash.
-        if options.preimage_hash != vhtlc_preimage_hash(&payment_hash) {
+        if options.preimage_hash != vhtlc_payment_hash160(&payment_hash) {
             return Err(HtlcError::InvalidParams(
-                "descriptor preimage hash does not match the payment hash".into(),
+                "descriptor hash160 does not match the payment hash".into(),
             ));
         }
         if options.server != self.server_pk_xonly {

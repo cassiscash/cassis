@@ -2525,6 +2525,7 @@ dependencies = [
  "async-trait",
  "cassis-core",
  "fs2",
+ "futures",
  "hmac",
  "lwk_common",
  "lwk_signer",
@@ -2535,6 +2536,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tracing",
 ]
 
@@ -2542,10 +2544,12 @@ dependencies = [
 name = "cassis-playground"
 version = "0.1.0"
 dependencies = [
+ "cassis-arkade",
  "cassis-cashu",
  "cassis-client",
  "cassis-core",
  "cassis-keys",
+ "cassis-liquid",
  "cassis-rootstock",
  "cassis-router",
  "cassis-routing",
@@ -2555,6 +2559,7 @@ dependencies = [
  "ritualistic",
  "rustyline",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
