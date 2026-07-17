@@ -568,28 +568,36 @@ pub enum HtlcDescriptor {
     /// NUT-00 [`Proof`] per element.
     Cashu { proofs_b64: Vec<String> },
     /// Liquid HTLC: a P2WSH output on the Liquid sidechain whose
-    /// witness script is the claim leaf
-    /// `OP_HASH160 <preimage_hash> OP_EQUALVERIFY <claim_pubkey> OP_CHECKSIG`,
-    /// claimable by revealing the preimage and signing with the
-    /// receiver's per-network key; the refund leaf
-    /// `<refund_locktime> OP_CLTV OP_DROP <refund_pubkey> OP_CHECKSIG`
-    /// lets the sender recover the funds after the absolute block
-    /// height. The lockup output is unblinded (explicit), so the
-    /// receiver can see the amount without any blinding key and the
-    /// claim spend needs no blinders either.
+    /// single witness script has two paths — a claim path
+    /// (`OP_HASH160 <RIPEMD160(payment_hash)> OP_EQUAL OP_IF
+    /// <claim_pubkey>`) spendable by revealing the preimage and
+    /// signing with the receiver's per-network claim key, and a
+    /// CLTV refund path (`OP_ELSE <refund_locktime> OP_CLTV OP_DROP
+    /// <refund_pubkey> OP_ENDIF OP_CHECKSIG`) letting the sender
+    /// recover the funds after an absolute block height. The lockup
+    /// output is unblinded (explicit), so the receiver can see the
+    /// amount without any blinding key and the claim spend needs no
+    /// blinders either.
+    ///
+    /// The descriptor pins the lockup transaction and carries only
+    /// what the receiver cannot derive itself — the refund pubkey and
+    /// locktime; the claim side it rebuilds from its own claim pubkey
+    /// and the route's payment hash. The sender broadcasts the lockup
+    /// non-RBF and
+    /// only dispatches after Blockstream's 0-conf observation service
+    /// reports enough functionary coverage; the receiver re-checks
+    /// the same service and fetches the tx from esplora by this txid
+    /// instead of scanning the lockup address.
     Liquid {
-        /// Hex-encoded 33-byte compressed pubkey the receiver claims
-        /// with (even-Y representative of its x-only claim identity).
-        claim_pubkey: String,
-        /// Hex RIPEMD160(SHA256(preimage)) == RIPEMD160(payment_hash),
-        /// the 20-byte value burned into the claim script.
-        preimage_hash: String,
-        /// Hex witness script of the claim path; its P2WSH hash is the
-        /// lockup address the sender funds.
-        claim_script: String,
-        /// Hex witness script of the CLTV-gated refund path.
-        refund_script: String,
-        /// Absolute Liquid block height enabling the refund path.
+        /// Hex txid (display order) of the broadcast lockup
+        /// transaction.
+        lockup_txid: String,
+        /// Index of the HTLC output within the lockup transaction.
+        lockup_vout: u8,
+        /// Hex 33-byte compressed pubkey of the sender's refund key
+        /// (the witness script's ELSE branch).
+        refund_pubkey: String,
+        /// Absolute Liquid block height opening the refund path.
         refund_locktime: u32,
     },
     /// Arkade VHTLC. Carries every [`ark_core::vhtlc::VhtlcOptions`]
@@ -606,8 +614,8 @@ pub enum HtlcDescriptor {
     ///   claim-path signer and co-signer on any spend submitted to
     ///   that operator. The descriptor only round-trips inside one
     ///   operator.
-    /// * `preimage_hash` is hex RIPEMD160(SHA256(preimage)) ==
-    ///   RIPEMD160(payment_hash), the 20-byte value burned into the
+    /// * `payment_hash160` is hex RIPEMD160(payment_hash) ==
+    ///   HASH160(preimage), the 20-byte value burned into the
     ///   script (`OP_HASH160 ... OP_EQUALVERIFY`).
     /// * `refund_locktime` (absolute block height) plus the three
     ///   unilateral CSV delays are consensus `u32` values passed
@@ -616,7 +624,7 @@ pub enum HtlcDescriptor {
         sender: String,
         receiver: String,
         server: String,
-        preimage_hash: String,
+        payment_hash160: String,
         refund_locktime: u32,
         unilateral_claim_delay: u32,
         unilateral_refund_delay: u32,

@@ -16,8 +16,8 @@
 use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
     network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDiscard,
-    HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, NetworkId,
-    NetworkRouterAdapter, WatchError,
+    HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, HtlcError,
+    NetworkId, NetworkRouterAdapter, WatchError,
 };
 use cassis_iroh::{Frame, IrohError, IrohServer, PublicKey};
 use cassis_keys as keys;
@@ -1015,6 +1015,11 @@ impl CassisRouter {
         self.drop_dispatched(payment_hash).await;
     }
 
+    /// Refund the outgoing HTLC of an expired dispatch. Transient
+    /// (network) failures keep the dispatch row so the next poll tick
+    /// retries — e.g. on Liquid the CLTV refund path only opens a few
+    /// blocks after the route deadline, so the first attempts
+    /// legitimately fail — while permanent errors drop the row.
     async fn refund_dispatched(&self, payment_hash: Bytes32, prepare: &HopPrepare) {
         if let Some(entry) = self.adapters.get(&prepare.outgoing_network) {
             if let Err(e) = entry.adapter.refund_outgoing(payment_hash).await {
@@ -1022,6 +1027,9 @@ impl CassisRouter {
                     target: "cassis_router",
                     "  refund_outgoing failed for {payment_hash}: {e}"
                 );
+                if matches!(e, HtlcError::Network(_)) {
+                    return; // keep the dispatch row; retried next tick
+                }
             }
         }
         self.drop_dispatched(payment_hash).await;
