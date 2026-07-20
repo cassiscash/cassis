@@ -617,9 +617,13 @@ pub enum HtlcDescriptor {
     /// * `payment_hash160` is hex RIPEMD160(payment_hash) ==
     ///   HASH160(preimage), the 20-byte value burned into the
     ///   script (`OP_HASH160 ... OP_EQUALVERIFY`).
-    /// * `refund_locktime` (absolute block height) plus the three
-    ///   unilateral CSV delays are consensus `u32` values passed
-    ///   straight through to the script builder.
+    /// * `refund_locktime` is an absolute unix-timestamp locktime
+    ///   (the operator rejects height-based CLTVs on its scripts) and
+    ///   the three unilateral CSV delays are seconds-type consensus
+    ///   `u32` sequence numbers; all four pass straight through to
+    ///   the script builder. The sender-alone refund delay must
+    ///   exceed the claim delay, so the receiver wins any
+    ///   operator-less race.
     Arkade {
         sender: String,
         receiver: String,
