@@ -9,6 +9,7 @@ pub enum NetSpec {
     Arkade { testnet: bool },
     Liquid { testnet: bool },
     Rootstock { testnet: bool },
+    Lightning,
 }
 
 impl NetSpec {
@@ -39,6 +40,12 @@ impl NetSpec {
                     "network 'rootstock' only accepts no parameter or 'testnet', got '{other}'"
                 )),
             },
+            "lightning" => match param {
+                None => Ok(NetSpec::Lightning),
+                Some(other) => Err(format!(
+                    "network 'lightning' does not accept a parameter, got '{other}'"
+                )),
+            },
             "arkade" => match param {
                 None => Ok(NetSpec::Arkade { testnet: false }),
                 Some("testnet") => Ok(NetSpec::Arkade { testnet: true }),
@@ -65,6 +72,7 @@ impl NetSpec {
             NetSpec::Arkade { .. } => "arkade",
             NetSpec::Liquid { .. } => "liquid",
             NetSpec::Rootstock { .. } => "rootstock",
+            NetSpec::Lightning => "lightning",
         }
     }
 
@@ -86,6 +94,7 @@ impl NetSpec {
             } else {
                 "rootstock".to_string()
             }),
+            NetSpec::Lightning => NetworkId("lightning".to_string()),
         }
     }
 }
@@ -148,6 +157,14 @@ mod tests {
         let s = NetSpec::parse("liquid::testnet").unwrap();
         assert_eq!(s.network_id().0, "liquid::testnet");
         assert!(matches!(NetSpec::parse("liquid::foo"), Err(_)));
+    }
+
+    #[test]
+    fn parse_lightning_has_no_parameter() {
+        let s = NetSpec::parse("lightning").unwrap();
+        assert_eq!(s.network_id().0, "lightning");
+        assert_eq!(s.kind_name(), "lightning");
+        assert!(matches!(NetSpec::parse("lightning::testnet"), Err(_)));
     }
 
     #[test]

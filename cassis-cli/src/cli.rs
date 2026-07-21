@@ -15,6 +15,16 @@ pub struct Cli {
     /// `$CASSIS_HOME` if set, otherwise `$HOME/.cassis`.
     #[arg(long, global = true, value_name = "DIR")]
     pub home: Option<String>,
+    /// LND REST base URL for the `lightning` network
+    /// (e.g. `https://127.0.0.1:8080`).
+    #[arg(long, global = true, value_name = "URL")]
+    pub lnd_rest_url: Option<String>,
+    /// Path to LND's `tls.cert` for REST authentication.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub lnd_tls_cert: Option<String>,
+    /// Path to the LND macaroon for REST authentication.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub lnd_macaroon: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,

@@ -377,8 +377,12 @@ impl CassisClient {
         // its announced node key: those are different keys whenever the
         // network claims with a dedicated per-network key (rootstock).
         let first_recipient = recipients[0];
+        // The first hop may have registered a funding handle (LND hold
+        // invoice) during PREPARE. Pass it through so an LND sender pays
+        // the exact invoice instead of attempting a hash-only send.
+        let first_target = acks.first().and_then(|ack| ack.incoming_descriptor.clone());
         let first_payment: OutgoingPayment = match sender
-            .pay_invoice(
+            .pay_invoice_with_descriptor(
                 invoice.payment_hash,
                 invoice.amount_msat,
                 first_recipient,
@@ -387,6 +391,7 @@ impl CassisClient {
                 // incoming network.
                 &sender_network,
                 first_outgoing_expiry,
+                first_target.as_ref(),
             )
             .await
         {
@@ -417,15 +422,29 @@ impl CassisClient {
 
         // Step 3: walk the route. `descriptor` carries the
         // HTLC info for the *incoming* side of the next hop.
+        // `outgoing_target` carries the downstream funding handle the hop's
+        // outgoing adapter must pay (the next hop's LND hold invoice, or the
+        // payee's for the last hop). Hops without a native invoice target
+        // receive `None` and use their legacy hash-locked path.
+        let payee_target = invoice
+            .payment_request
+            .clone()
+            .map(|payment_request| HtlcDescriptor::Lightning { payment_request });
         let mut descriptor = first_descriptor;
         for (i, hop) in route.iter().enumerate() {
             // `recipients[i + 1]` is the party downstream of hop `i`:
             // the next hop's claim identity, or the payee's for the last
             // hop.
             let recipient = recipients[i + 1];
+            let outgoing_target = if i + 1 < acks.len() {
+                acks[i + 1].incoming_descriptor.clone()
+            } else {
+                payee_target.clone()
+            };
             let dispatch = HopDispatch {
                 payment_hash: invoice.payment_hash,
                 incoming_descriptor: descriptor,
+                outgoing_target,
                 recipient,
             };
             let peer = hop.node.node_pubkey;

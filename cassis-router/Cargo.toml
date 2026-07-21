@@ -34,8 +34,13 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.cassis-lightning]
+workspace = true
+optional = true
+
 [features]
 arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
 cashu = ["dep:cassis-cashu", "cassis-core/cashu"]
 liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["dep:cassis-rootstock", "cassis-core/rootstock"]
+lightning = ["dep:cassis-lightning", "cassis-core/lightning"]

@@ -9,6 +9,7 @@ cashu = ["cassis-core/cashu"]
 arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
 liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["cassis-core/rootstock"]
+lightning = ["dep:cassis-lightning", "cassis-core/lightning"]
 
 [dependencies]
 cassis-core = { workspace = true, features = ["cashu", "rootstock"] }
@@ -20,6 +21,7 @@ cassis-cashu = { workspace = true }
 cassis-rootstock = { workspace = true }
 cassis-arkade = { workspace = true, optional = true }
 cassis-liquid = { workspace = true, optional = true }
+cassis-lightning = { workspace = true, optional = true }
 clap = { workspace = true }
 futures = { workspace = true }
 iroh = { workspace = true }

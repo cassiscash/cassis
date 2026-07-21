@@ -17,7 +17,7 @@ use tracing::{info, Instrument, Span};
 pub use crate::netspec::NetSpec;
 pub use crate::seed_store::{read_mnemonic, seed_path, write_mnemonic};
 
-use crate::adapters::build_receivers;
+use crate::adapters::{build_receivers_with_config, AdapterConfig};
 use crate::store::{InvoiceRow, InvoiceStatus, Store};
 use cassis_keys as keys;
 
@@ -89,7 +89,32 @@ pub async fn create_invoice_for(
     spec: NetSpec,
     amount_msat: u64,
 ) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
-    create_invoice_with_claim_pubkeys(home, network_id, amount_msat, Vec::new(), Some(spec)).await
+    create_invoice_for_with_config(
+        home,
+        network_id,
+        spec,
+        amount_msat,
+        &AdapterConfig::default(),
+    )
+    .await
+}
+
+pub async fn create_invoice_for_with_config(
+    home: &Path,
+    network_id: NetworkId,
+    spec: NetSpec,
+    amount_msat: u64,
+    config: &AdapterConfig,
+) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
+    create_invoice_with_claim_pubkeys_and_config(
+        home,
+        network_id,
+        amount_msat,
+        Vec::new(),
+        Some(spec),
+        config,
+    )
+    .await
 }
 
 /// Same as [`create_invoice_for`] but with claim pubkeys resolved by
@@ -101,6 +126,25 @@ pub async fn create_invoice_with_claim_pubkeys(
     claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)>,
     spec_for_resolution: Option<NetSpec>,
 ) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
+    create_invoice_with_claim_pubkeys_and_config(
+        home,
+        network_id,
+        amount_msat,
+        claim_pubkeys,
+        spec_for_resolution,
+        &AdapterConfig::default(),
+    )
+    .await
+}
+
+pub async fn create_invoice_with_claim_pubkeys_and_config(
+    home: &Path,
+    network_id: NetworkId,
+    amount_msat: u64,
+    claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)>,
+    spec_for_resolution: Option<NetSpec>,
+    adapter_config: &AdapterConfig,
+) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
     let mnemonic = read_mnemonic(&seed_path(home)).map_err(|e| e.to_string())?;
     let ids = vec![network_id.clone()];
     let derived = keys::derive_keys(&mnemonic, ids).map_err(|e| e.to_string())?;
@@ -111,24 +155,28 @@ pub async fn create_invoice_with_claim_pubkeys(
     // rootstock claims on-chain with a dedicated per-network EVM
     // account, so the last hop has to lock to *that* key or the payee
     // cannot claim.
+    let receivers = match &spec_for_resolution {
+        Some(spec) => Some(
+            build_receivers_with_config(
+                std::slice::from_ref(spec),
+                &derived,
+                &store_path,
+                Span::current(),
+                adapter_config,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)> = if !claim_pubkeys.is_empty() {
         claim_pubkeys
     } else {
-        match spec_for_resolution {
-            Some(spec) => {
-                let receivers = build_receivers(
-                    std::slice::from_ref(&spec),
-                    &derived,
-                    &store_path,
-                    Span::current(),
-                )
-                .await?;
-                receivers
-                    .get(&network_id)
-                    .and_then(|r| r.claim_pubkey())
-                    .map(|pubkey| vec![(network_id.clone(), pubkey)])
-                    .unwrap_or_default()
-            }
+        match &receivers {
+            Some(receivers) => receivers
+                .get(&network_id)
+                .and_then(|r| r.claim_pubkey())
+                .map(|pubkey| vec![(network_id.clone(), pubkey)])
+                .unwrap_or_default(),
             None => Vec::new(),
         }
     };
@@ -137,6 +185,18 @@ pub async fn create_invoice_with_claim_pubkeys(
     let preimage = generate_preimage();
     let payment_hash = payment_hash_of(preimage);
     let invoice_expiry = now + ttl;
+    // Networks with a native invoice encoding (LND) register the locally
+    // chosen hash and expose the resulting request on the Cassis invoice so
+    // the payer's last hop can fund the exact invoice.
+    let mut payment_request = None;
+    if let Some(receivers) = &receivers {
+        if let Some(receiver) = receivers.get(&network_id) {
+            payment_request = receiver
+                .register_invoice(Bytes32(payment_hash), amount_msat, invoice_expiry, None)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    };
     // The minisqlite Store is not `Send`; scope it so it drops before
     // any `.await` below (the iroh endpoint bind), so the surrounding
     // async fn stays `Send`.
@@ -170,6 +230,7 @@ pub async fn create_invoice_with_claim_pubkeys(
         description: None,
         iroh_peer_id: Some(iroh_peer_id),
         iroh_relay: Some(iroh_relay),
+        payment_request,
     };
     Ok((invoice, Bytes32(payment_hash), preimage))
 }
@@ -281,10 +342,25 @@ pub async fn start_receive(
     networks: &[NetSpec],
     span: Span,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
+    start_receive_with_config(home, networks, span, &AdapterConfig::default()).await
+}
+
+pub async fn start_receive_with_config(
+    home: &Path,
+    networks: &[NetSpec],
+    span: Span,
+    config: &AdapterConfig,
+) -> Result<tokio::task::JoinHandle<()>, String> {
     let ids: Vec<NetworkId> = networks.iter().map(|s| s.network_id()).collect();
     let derived = load_and_derive(home, ids)?;
-    let receivers =
-        build_receivers(networks, &derived, &node_store_path(home), span.clone()).await?;
+    let receivers = build_receivers_with_config(
+        networks,
+        &derived,
+        &node_store_path(home),
+        span.clone(),
+        config,
+    )
+    .await?;
     start_receive_with(home, Arc::new(receivers), networks, span).await
 }
 

@@ -490,6 +490,9 @@ mod tests {
             incoming_descriptor: HtlcDescriptor::Cashu {
                 proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into()],
             },
+            outgoing_target: Some(HtlcDescriptor::Lightning {
+                payment_request: "lnbc...".into(),
+            }),
         });
         let bytes = postcard::to_allocvec(&dispatch).expect("encode dispatch");
         let decoded: Frame = postcard::from_bytes(&bytes).expect("decode dispatch");
@@ -501,6 +504,12 @@ mod tests {
                     HtlcDescriptor::Cashu {
                         proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into(),],
                     }
+                );
+                assert_eq!(
+                    d.outgoing_target,
+                    Some(HtlcDescriptor::Lightning {
+                        payment_request: "lnbc...".into(),
+                    })
                 );
             }
             other => panic!("unexpected frame: {other:?}"),

@@ -9,9 +9,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cassis_client::adapters::{build_receivers, build_senders};
+use cassis_client::adapters::{
+    build_receivers_with_config, build_senders_with_config, AdapterConfig,
+};
 use cassis_client::netspec::NetSpec;
-use cassis_client::ops::{create_invoice_for, node_store_path, start_receive, unix_now};
+use cassis_client::ops::{
+    create_invoice_for_with_config, node_store_path, start_receive_with_config, unix_now,
+};
 use cassis_client::paths::{cassis_home, set_home_override, store_path};
 use cassis_client::seed_store::{read_mnemonic, seed_path, write_mnemonic};
 use cassis_client::store::{InvoiceStatus, Store};
@@ -39,12 +43,19 @@ async fn main() {
     if let Some(home) = cli.home.as_deref() {
         set_home_override(PathBuf::from(home));
     }
+    let adapter_config = match lnd_adapter_config(&cli) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("invalid LND configuration: {error}");
+            std::process::exit(2);
+        }
+    };
     let result: Result<(), String> = match cli.command {
         Commands::Pay {
             invoice,
             from,
             nostr_relay,
-        } => cmd_pay(invoice, from, nostr_relay).await,
+        } => cmd_pay(invoice, from, nostr_relay, &adapter_config).await,
         Commands::Invoice {
             amount,
             network,
@@ -62,10 +73,11 @@ async fn main() {
                 expires_at,
                 wait,
                 timeout,
+                &adapter_config,
             )
             .await
         }
-        Commands::Receive => cmd_receive().await,
+        Commands::Receive => cmd_receive(&adapter_config).await,
         Commands::Invoices { command } => match command {
             cli::InvoicesCommands::List { status } => cmd_invoices_list(status),
             cli::InvoicesCommands::Show { payment_hash } => cmd_invoices_show(payment_hash),
@@ -125,6 +137,30 @@ fn open_store() -> Result<Store, String> {
 fn derive_for(mnemonic: &str, specs: &[NetSpec]) -> Result<keys::DerivedKeys, String> {
     let ids: Vec<NetworkId> = specs.iter().map(|s| s.network_id()).collect();
     keys::derive_keys(mnemonic, ids).map_err(|e| e.to_string())
+}
+
+/// Build the shared adapter configuration from the global LND flags.
+/// Without `--lnd-rest-url` the config carries no LND connection and any
+/// `lightning` network request fails with a clear configuration error when
+/// the adapter is built.
+fn lnd_adapter_config(cli: &Cli) -> Result<AdapterConfig, String> {
+    #[cfg(feature = "lightning")]
+    {
+        let lnd = match &cli.lnd_rest_url {
+            None => None,
+            Some(rest_url) => Some(cassis_lightning::LndConfig::new(
+                rest_url.clone(),
+                cli.lnd_tls_cert.as_deref().map(PathBuf::from),
+                cli.lnd_macaroon.as_deref().map(PathBuf::from),
+            )),
+        };
+        Ok(AdapterConfig { lnd })
+    }
+    #[cfg(not(feature = "lightning"))]
+    {
+        let _ = cli;
+        Ok(AdapterConfig::default())
+    }
 }
 
 // ============================================================================
@@ -218,7 +254,12 @@ fn save_registered_networks(store: &mut Store, networks: &[String]) -> Result<()
 // pay
 // ============================================================================
 
-async fn cmd_pay(invoice: String, from: String, nostr_relay: Vec<String>) -> Result<(), String> {
+async fn cmd_pay(
+    invoice: String,
+    from: String,
+    nostr_relay: Vec<String>,
+    adapter_config: &AdapterConfig,
+) -> Result<(), String> {
     let invoice_struct: Invoice =
         serde_json::from_str(&invoice).map_err(|e| format!("invalid invoice JSON: {e}"))?;
     let sender_network = NetworkId(from.clone());
@@ -235,11 +276,12 @@ async fn cmd_pay(invoice: String, from: String, nostr_relay: Vec<String>) -> Res
     let net_spec = NetSpec::parse(&dest_network.0)?;
     let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&net_spec))?;
-    let senders = build_senders(
+    let senders = build_senders_with_config(
         &[net_spec],
         &derived,
         &node_store_path(&node_home()),
         info_span!("node", node = "cassis-cli"),
+        adapter_config,
     )
     .await?;
     let client = CassisClient::new(senders, relays).await;
@@ -271,12 +313,19 @@ async fn cmd_invoice(
     expires_at: Option<u64>,
     wait: bool,
     timeout: u64,
+    adapter_config: &AdapterConfig,
 ) -> Result<(), String> {
     let spec = NetSpec::parse(&network)?;
     let network_id = spec.network_id();
     let expiry = expires_at.unwrap_or(unix_now() + 600);
-    let (invoice, payment_hash, preimage) =
-        create_invoice_for(&node_home(), network_id.clone(), spec.clone(), amount).await?;
+    let (invoice, payment_hash, preimage) = create_invoice_for_with_config(
+        &node_home(),
+        network_id.clone(),
+        spec.clone(),
+        amount,
+        adapter_config,
+    )
+    .await?;
     println!("payment_hash: {payment_hash}");
     println!("preimage:     {}", lowercase_hex::encode(&preimage));
     println!("network:      {network_id}");
@@ -294,11 +343,12 @@ async fn cmd_invoice(
     let deadline = now.saturating_add(timeout);
     let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let receivers = build_receivers(
+    let receivers = build_receivers_with_config(
         std::slice::from_ref(&spec),
         &derived,
         &node_store_path(&node_home()),
         info_span!("node", node = "cassis-cli"),
+        adapter_config,
     )
     .await?;
     let receiver_map: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>> =
@@ -321,7 +371,7 @@ async fn cmd_invoice(
 // receive
 // ============================================================================
 
-async fn cmd_receive() -> Result<(), String> {
+async fn cmd_receive(adapter_config: &AdapterConfig) -> Result<(), String> {
     let home = node_home();
     let mut store = open_store()?;
     let registered = load_registered_networks(&mut store)?;
@@ -338,7 +388,13 @@ async fn cmd_receive() -> Result<(), String> {
         "receive: {} network(s) listening; pending invoices will be claimed",
         specs.len()
     );
-    let _jh = start_receive(&home, &specs, info_span!("node", node = "cassis-cli")).await?;
+    let _jh = start_receive_with_config(
+        &home,
+        &specs,
+        info_span!("node", node = "cassis-cli"),
+        adapter_config,
+    )
+    .await?;
     println!("receive: ready (cassis_client::start_receive spawned the iroh listener)");
     tokio::signal::ctrl_c().await.ok();
     info!("shutting down");
