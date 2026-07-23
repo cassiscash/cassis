@@ -2628,10 +2628,12 @@ name = "cassis-routing"
 version = "0.1.0"
 dependencies = [
  "cassis-core",
+ "js-sys",
  "ritualistic",
  "serde",
  "thiserror 1.0.69",
  "tokio",
+ "tokio_with_wasm",
  "tracing",
 ]
 
