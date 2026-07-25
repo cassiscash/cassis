@@ -75,15 +75,19 @@ ark-bdk-wallet = "0.10"
 esplora-client = { version = "0.10", features = ["async-https"] }
 rustyline = "17"
 
-fedimint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-api-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-client-module = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-core = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-connectors = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-derive-secret = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
-fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", tag = "v0.11.0" }
+# PR #8913 (direct_htlc branch): raw HTLC/PTLC client API on LNv2
+# OutgoingContract — the surface the fedimint adapter's
+# NetworkRouterAdapter implementation is built on. Head commit of the
+# PR as of Sep 2026; swap to a tag once it lands on master.
+fedimint-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-api-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-client-module = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-core = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-connectors = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-derive-secret = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 
 cassis-core = { path = "cassis-core" }
 cassis-keys = { path = "cassis-keys" }

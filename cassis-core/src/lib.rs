@@ -680,10 +680,29 @@ pub enum HtlcDescriptor {
         refund_address: String,
         timelock: u64,
     },
-    /// Fedimint LNv2 contract, identified by the Bolt11 invoice the
-    /// counter-party must pay. Fedimint "sells its own preimage" so
-    /// the descriptor is the invoice, not a proof set.
-    Fedimint { invoice: String },
+    /// Fedimint LNv2 direct HTLC: a raw `OutgoingContract` funded
+    /// between two federation clients with no gateway involvement
+    /// (fedimint PR #8913 client API). Registration descriptors
+    /// carry only `claim_pubkey`; funding descriptors additionally
+    /// carry the funding outpoint and the consensus-JSON encoding of
+    /// the funded contract, which the receiver verifies at funding
+    /// time and later claims with the route preimage.
+    Fedimint {
+        /// Hex 33-byte compressed public key the funder must lock
+        /// the contract to — the receiver's claim key. The receiver
+        /// self-reports the x-only half via
+        /// [`NetworkRouterAdapter::claim_pubkey`]; the descriptor
+        /// pins the exact parity.
+        claim_pubkey: String,
+        /// Hex txid of the funding transaction. `None` on
+        /// registration descriptors, where nothing is funded yet.
+        funding_txid: Option<String>,
+        /// Index of the contract output within the funding
+        /// transaction.
+        funding_out_idx: Option<u64>,
+        /// Consensus-JSON encoding of the funded `OutgoingContract`.
+        contract: Option<String>,
+    },
     /// LND BOLT11 hold invoice. The receiving LND created this invoice
     /// against the route payment hash; the sender must pay this exact
     /// request so the payment secret is preserved.
