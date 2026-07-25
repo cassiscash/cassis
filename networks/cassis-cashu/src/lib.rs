@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
+    WatchError,
 };
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
@@ -545,16 +545,15 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// and waits for the sender to push the HTLC-locked proofs
     /// over (via the cross-network hop layer, out of band from
     /// the mint itself). We park an entry in
-    /// [`CashuAdapter::incoming`] and return immediately; the
-    /// actual wait happens at
+    /// [`CashuAdapter::incoming`]; the actual wait happens at
     /// [`NetworkRouterAdapter::claim_incoming`] time, where we
     /// block on a [`Notify`] until the proofs land.
-    async fn watch_incoming_htlc(
+    async fn register_incoming_htlc(
         &self,
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<IncomingHtlc, WatchError> {
+    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
         // Cashu works in sats; round the msat floor up.
         let min_amount_sat = min_amount_msat.div_ceil(1000).max(1);
         let arrival = Arc::new(Notify::new());
@@ -570,13 +569,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                 arrival,
             },
         );
-        Ok(IncomingHtlc {
-            payment_hash,
-            amount_msat: min_amount_msat,
-            expiry: deadline,
-            sender: String::new(),
-            network: self.network_id.clone(),
-        })
+        Ok(None)
     }
 
     /// Lock `amount_msat` of ecash behind `payment_hash` by

@@ -59,8 +59,8 @@ use bitcoin::Sequence;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
+    WatchError,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -223,7 +223,7 @@ type ArkClient = Client<esplora::EsploraBlockchain, BdkWallet, InMemorySwapStora
 
 struct PendingIncoming {
     /// Set only once a descriptor has been accepted via DISPATCH or a
-    /// COMMIT. A bare `watch_incoming_htlc` registration (invoice
+    /// COMMIT. A bare `register_incoming_htlc` reservation (invoice
     /// creation) does not know the script yet, because the upstream
     /// hop picks sender/server/delays freely.
     options: Option<VhtlcOptions>,
@@ -907,17 +907,17 @@ impl NetworkRouterAdapter for ArkadeAdapter {
         60
     }
 
-    async fn watch_incoming_htlc(
+    async fn register_incoming_htlc(
         &self,
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<IncomingHtlc, WatchError> {
+    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
         if deadline <= Self::unix_now() {
-            return Err(WatchError::DeadlineExceeded);
+            return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
         let expected_sat =
-            msat_to_sat_amount(min_amount_msat).map_err(|e| WatchError::Network(e.to_string()))?;
+            msat_to_sat_amount(min_amount_msat).map_err(|e| HtlcError::Network(e.to_string()))?;
         self.incoming
             .lock()
             .await
@@ -927,13 +927,7 @@ impl NetworkRouterAdapter for ArkadeAdapter {
                 expected_sat,
                 deadline,
             });
-        Ok(IncomingHtlc {
-            payment_hash,
-            amount_msat: min_amount_msat,
-            expiry: deadline,
-            sender: String::new(),
-            network: self.network_id.clone(),
-        })
+        Ok(None)
     }
 
     async fn create_outgoing_htlc(

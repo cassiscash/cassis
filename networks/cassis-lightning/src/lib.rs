@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
+    WatchError,
 };
 use lightning_invoice::Bolt11Invoice;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -470,25 +470,19 @@ impl NetworkRouterAdapter for LndAdapter {
         DEFAULT_INCOMING_DELTA_SECS
     }
 
-    async fn watch_incoming_htlc(
+    async fn register_incoming_htlc(
         &self,
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<IncomingHtlc, WatchError> {
+    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
         if deadline <= unix_now() {
-            return Err(WatchError::DeadlineExceeded);
+            return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
         self.ensure_incoming(payment_hash, min_amount_msat, deadline)
             .await
-            .map_err(WatchError::from)?;
-        Ok(IncomingHtlc {
-            payment_hash,
-            amount_msat: min_amount_msat,
-            expiry: deadline,
-            sender: String::new(),
-            network: self.network_id.clone(),
-        })
+            .map_err(HtlcError::from)?;
+        self.incoming_htlc_descriptor(payment_hash).await
     }
 
     async fn incoming_htlc_descriptor(

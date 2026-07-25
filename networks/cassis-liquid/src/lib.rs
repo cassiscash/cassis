@@ -59,8 +59,8 @@ mod zeroconf;
 
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
+    WatchError,
 };
 use hmac::Mac;
 use lwk_common::Signer as LwkSigner;
@@ -1030,16 +1030,16 @@ impl NetworkRouterAdapter for LiquidAdapter {
         300
     }
 
-    async fn watch_incoming_htlc(
+    async fn register_incoming_htlc(
         &self,
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<IncomingHtlc, WatchError> {
+    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
         if deadline <= Self::unix_now() {
-            return Err(WatchError::DeadlineExceeded);
+            return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
-        let sats = msat_to_sat(min_amount_msat).map_err(|e| WatchError::Network(e.to_string()))?;
+        let sats = msat_to_sat(min_amount_msat).map_err(|e| HtlcError::Network(e.to_string()))?;
         self.incoming
             .lock()
             .await
@@ -1049,13 +1049,7 @@ impl NetworkRouterAdapter for LiquidAdapter {
                 expected_sat: sats,
                 deadline,
             });
-        Ok(IncomingHtlc {
-            payment_hash,
-            amount_msat: min_amount_msat,
-            expiry: deadline,
-            sender: String::new(),
-            network: self.network_id.clone(),
-        })
+        Ok(None)
     }
 
     async fn create_outgoing_htlc(
