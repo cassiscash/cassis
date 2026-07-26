@@ -11,8 +11,8 @@ use alloy::sol_types::SolCall;
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
-    WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, PubKey, WatchError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -614,6 +614,48 @@ impl NetworkRouterAdapter for RootstockAdapter {
             recipient: recipient.to_hex(),
             network: self.config.network_id.clone(),
         })
+    }
+
+    async fn restore_outgoing_htlc(
+        &self,
+        payment: &OutgoingPayment,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), HtlcError> {
+        let HtlcDescriptor::Rootstock {
+            contract,
+            amount_wei,
+            claim_address,
+            refund_address,
+            timelock,
+        } = descriptor.ok_or(HtlcError::Unimplemented)?
+        else {
+            return Err(HtlcError::InvalidParams(
+                "not a Rootstock descriptor".into(),
+            ));
+        };
+        let contract = Address::from_str(contract)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid contract: {e}")))?;
+        let claim_address = Address::from_str(claim_address)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim address: {e}")))?;
+        let refund_address = Address::from_str(refund_address)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid refund address: {e}")))?;
+        let amount_wei = U256::from(*amount_wei);
+        if amount_wei != Self::msat_to_wei(payment.amount_msat) {
+            return Err(HtlcError::InvalidParams(
+                "Rootstock descriptor amount does not match outgoing payment".into(),
+            ));
+        }
+        self.outgoing.lock().await.insert(
+            payment.payment_hash,
+            PendingOutgoing {
+                contract,
+                amount_wei,
+                claim_address,
+                refund_address,
+                timelock: *timelock,
+            },
+        );
+        Ok(())
     }
 
     async fn claim_incoming(

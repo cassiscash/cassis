@@ -59,8 +59,8 @@ mod zeroconf;
 
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
-    WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, PubKey, WatchError,
 };
 use hmac::Mac;
 use lwk_common::Signer as LwkSigner;
@@ -108,8 +108,6 @@ pub const TESTNET_WATERFALLS_URL: &str = "https://waterfalls.liquidwebwallet.org
 
 /// Liquid blocks land about every minute.
 const BLOCK_TIME_SECS: u64 = 60;
-/// Headroom added on top of the expiry-derived refund locktime.
-const REFUND_LOCKTIME_SLACK_BLOCKS: u64 = 6;
 /// Fee rate in sats/kilo-vbyte for lockups, claims and refunds
 /// (0.2 sat/vbyte — Liquid is cheap).
 const FEE_RATE_SATS_KVB: f32 = 200.0;
@@ -545,8 +543,7 @@ impl LiquidAdapter {
         // its EVM address mapping.
         let recipient_full = even_y_pubkey(recipient)?;
         let remaining_blocks = expiry.saturating_sub(now) / BLOCK_TIME_SECS;
-        let refund_locktime = (tip + remaining_blocks + REFUND_LOCKTIME_SLACK_BLOCKS)
-            .min(u64::from(u32::MAX - 1)) as u32;
+        let refund_locktime = (tip + remaining_blocks).min(u64::from(u32::MAX - 1)) as u32;
         Ok(HtlcSpec::build(
             payment_hash,
             recipient_full,
@@ -1171,6 +1168,44 @@ impl NetworkRouterAdapter for LiquidAdapter {
             recipient: recipient.to_hex(),
             network: self.network_id.clone(),
         })
+    }
+
+    async fn restore_outgoing_htlc(
+        &self,
+        payment: &OutgoingPayment,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), HtlcError> {
+        let HtlcDescriptor::Liquid {
+            lockup_txid,
+            lockup_vout,
+            refund_pubkey,
+            refund_locktime,
+        } = descriptor.ok_or(HtlcError::Unimplemented)?
+        else {
+            return Err(HtlcError::InvalidParams("not a liquid descriptor".into()));
+        };
+        let txid = Txid::from_str(lockup_txid)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid lockup txid: {e}")))?;
+        let refund_pubkey = BtcPublicKey::from_str(refund_pubkey)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid refund pubkey: {e}")))?;
+        let recipient = PubKey::from_str(&payment.destination_pubkey)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid recipient pubkey: {e}")))?;
+        let spec = HtlcSpec::build(
+            &payment.payment_hash,
+            even_y_pubkey(&recipient)?,
+            refund_pubkey,
+            *refund_locktime,
+        );
+        let value_sat = msat_to_sat(payment.amount_msat)?;
+        self.outgoing.lock().await.insert(
+            payment.payment_hash,
+            PendingOutgoing {
+                spec,
+                outpoint: OutPoint::new(txid, u32::from(*lockup_vout)),
+                value_sat,
+            },
+        );
+        Ok(())
     }
 
     async fn claim_incoming(

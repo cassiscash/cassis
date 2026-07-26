@@ -61,6 +61,8 @@ pub enum Commands {
     },
     /// Long-running mode: claim incoming payments on the registered networks.
     Receive,
+    /// Resume monitoring persisted outgoing HTLCs for preimages or refunds.
+    Watch,
     /// List invoices persisted in the local store.
     Invoices {
         #[command(subcommand)]

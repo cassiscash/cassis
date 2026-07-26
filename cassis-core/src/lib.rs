@@ -972,6 +972,18 @@ pub trait NetworkRouterAdapter: Send + Sync {
     ) -> Result<HtlcDescriptor, HtlcError> {
         Err(HtlcError::Unimplemented)
     }
+
+    /// Restore sender-side state for an outgoing HTLC created before a
+    /// process restart. `descriptor` is the wire handle previously returned
+    /// by [`NetworkRouterAdapter::outgoing_htlc_descriptor`]. Adapters that
+    /// keep watcher state only in memory should override this to rebuild it.
+    async fn restore_outgoing_htlc(
+        &self,
+        _payment: &OutgoingPayment,
+        _descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), HtlcError> {
+        Err(HtlcError::Unimplemented)
+    }
 }
 
 /// User-facing "receive" side of a network: create an invoice that
@@ -1140,6 +1152,17 @@ pub trait NetworkSenderAdapter: Send + Sync {
         &self,
         _payment_hash: Bytes32,
     ) -> Result<HtlcDescriptor, SendError> {
+        Err(SendError::Unimplemented)
+    }
+
+    /// Restore sender-side state for a pending outgoing HTLC after a
+    /// process restart. The descriptor is the wire handle previously
+    /// returned by `outgoing_htlc_descriptor`.
+    async fn restore_outgoing_payment(
+        &self,
+        _payment: &OutgoingPayment,
+        _descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), SendError> {
         Err(SendError::Unimplemented)
     }
 }
@@ -1362,6 +1385,19 @@ where
         payment_hash: Bytes32,
     ) -> Result<HtlcDescriptor, SendError> {
         NetworkRouterAdapter::outgoing_htlc_descriptor(self, payment_hash)
+            .await
+            .map_err(|e| match e {
+                HtlcError::InvalidParams(msg) => SendError::InvalidParams(msg),
+                other => SendError::Network(other.to_string()),
+            })
+    }
+
+    async fn restore_outgoing_payment(
+        &self,
+        payment: &OutgoingPayment,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), SendError> {
+        NetworkRouterAdapter::restore_outgoing_htlc(self, payment, descriptor)
             .await
             .map_err(|e| match e {
                 HtlcError::InvalidParams(msg) => SendError::InvalidParams(msg),

@@ -70,7 +70,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingPayment, PubKey,
+    WatchError,
 };
 
 /// Per-hop delta the routing layer gets on fedimint legs. Contract
@@ -643,6 +644,64 @@ impl NetworkRouterAdapter for FedimintAdapter {
                     .map_err(|e| HtlcError::Network(format!("serialize outgoing contract: {e}")))?,
             ),
         })
+    }
+
+    async fn restore_outgoing_htlc(
+        &self,
+        payment: &OutgoingPayment,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), HtlcError> {
+        let descriptor = descriptor.ok_or(HtlcError::Unimplemented)?;
+        let (claim_pubkey, funding_txid, funding_out_idx, contract_json) = match descriptor {
+            HtlcDescriptor::Fedimint {
+                claim_pubkey,
+                funding_txid,
+                funding_out_idx,
+                contract,
+            } => (claim_pubkey, funding_txid, funding_out_idx, contract),
+            _ => return Err(HtlcError::InvalidParams("not a fedimint descriptor".into())),
+        };
+        let claim_pk = secp256k1::PublicKey::from_slice(
+            &hex::decode(claim_pubkey)
+                .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?,
+        )
+        .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
+        let txid = TransactionId::from_str(funding_txid.as_deref().ok_or_else(|| {
+            HtlcError::InvalidParams("fedimint descriptor has no funding txid".into())
+        })?)
+        .map_err(|e| HtlcError::InvalidParams(format!("descriptor txid: {e}")))?;
+        let contract: OutgoingContract =
+            serde_json::from_str(contract_json.as_deref().ok_or_else(|| {
+                HtlcError::InvalidParams("fedimint descriptor has no contract".into())
+            })?)
+            .map_err(|e| HtlcError::InvalidParams(format!("descriptor contract: {e}")))?;
+        if contract.claim_pk != claim_pk
+            || contract.payment_image
+                != PaymentImage::Hash(sha256::Hash::from_byte_array(payment.payment_hash.0))
+            || contract.amount.msats != payment.amount_msat
+        {
+            return Err(HtlcError::InvalidParams(
+                "fedimint descriptor does not match outgoing payment".into(),
+            ));
+        }
+        let operation_id = OperationId::from_encodable(&("lnv2-htlc-create", contract.clone()));
+        self.outgoing.lock().await.insert(
+            payment.payment_hash,
+            OutgoingSlot {
+                operation_id,
+                outpoint: OutPoint {
+                    txid,
+                    out_idx: funding_out_idx.ok_or_else(|| {
+                        HtlcError::InvalidParams(
+                            "fedimint descriptor has no funding out idx".into(),
+                        )
+                    })?,
+                },
+                contract,
+                refund_op: None,
+            },
+        );
+        Ok(())
     }
 
     /// Claim the incoming HTLC with the route preimage. Waits (bounded)

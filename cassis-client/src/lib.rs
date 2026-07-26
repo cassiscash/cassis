@@ -19,8 +19,12 @@ use futures::future::join_all;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info, warn};
+
+use crate::store::{OutgoingPaymentStatus, PendingOutgoingPayment, Store};
 
 #[derive(thiserror::Error, Debug)]
 pub enum PayError {
@@ -95,12 +99,167 @@ pub struct CassisClient {
     pub receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
     pub nostr_relays: Vec<String>,
     iroh_client: IrohClient,
+    payment_store_path: PathBuf,
+}
+
+/// Keep payer-owned outgoing HTLC alive until it resolves. Routers have
+/// the same responsibility for their dispatched outgoing HTLCs; the
+/// payer's first HTLC is not present in any router's dispatch table.
+fn spawn_payment_guard(
+    sender: Arc<dyn NetworkSenderAdapter>,
+    payment: OutgoingPayment,
+    invoice: Invoice,
+    store_path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if ops::unix_now() >= payment.expiry {
+                break;
+            }
+            match sender.watch_payment(payment.clone(), payment.expiry).await {
+                Ok(preimage) => {
+                    if let Err(error) = persist_payment_proof(&store_path, &invoice, preimage).await
+                    {
+                        warn!(target: "cassis_client", "failed to persist payment proof: {error}");
+                    }
+                    let _ = mark_outgoing_status(
+                        &store_path,
+                        &payment.payment_hash,
+                        OutgoingPaymentStatus::Completed,
+                    )
+                    .await;
+                    return;
+                }
+                Err(SendError::DeadlineExceeded) if ops::unix_now() >= payment.expiry => {
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        target: "cassis_client",
+                        "sender-side HTLC watch failed for {}: {error}; retrying",
+                        payment.payment_hash.short()
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        loop {
+            match sender.refund_payment(payment.clone()).await {
+                Ok(()) => {
+                    let _ = mark_outgoing_status(
+                        &store_path,
+                        &payment.payment_hash,
+                        OutgoingPaymentStatus::Refunded,
+                    )
+                    .await;
+                    break;
+                }
+                Err(SendError::Network(error)) => {
+                    warn!(
+                        target: "cassis_client",
+                        "sender-side HTLC refund failed: {error}; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Err(error) => {
+                    warn!(target: "cassis_client", "sender-side HTLC refund failed: {error}");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+async fn persist_outgoing_payment(
+    path: &std::path::Path,
+    invoice: &Invoice,
+    payment: &OutgoingPayment,
+    sender_network: &NetworkId,
+    descriptor: Option<&HtlcDescriptor>,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let invoice = invoice.clone();
+    let payment = payment.clone();
+    let sender_network = sender_network.clone();
+    let descriptor = descriptor.cloned();
+    tokio::task::spawn_blocking(move || {
+        let mut store = Store::open(&path).map_err(|e| e.to_string())?;
+        store
+            .insert_outgoing_payment(&invoice, &payment, &sender_network, descriptor.as_ref())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn update_outgoing_descriptor(
+    path: &std::path::Path,
+    payment_hash: Bytes32,
+    descriptor: HtlcDescriptor,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut store = Store::open(&path).map_err(|e| e.to_string())?;
+        store
+            .update_outgoing_descriptor(&payment_hash, &descriptor)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn persist_payment_proof(
+    path: &std::path::Path,
+    invoice: &Invoice,
+    preimage: Bytes32,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let invoice = invoice.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut store = Store::open(&path).map_err(|e| e.to_string())?;
+        store
+            .record_payment_proof(&invoice, preimage)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn mark_outgoing_status(
+    path: &std::path::Path,
+    payment_hash: &Bytes32,
+    status: OutgoingPaymentStatus,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let payment_hash = *payment_hash;
+    tokio::task::spawn_blocking(move || {
+        let mut store = Store::open(&path).map_err(|e| e.to_string())?;
+        store
+            .mark_outgoing_status(&payment_hash, status)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 impl CassisClient {
     pub async fn new(
         senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
         nostr_relays: Vec<String>,
+    ) -> Self {
+        Self::with_store_path(
+            senders,
+            nostr_relays,
+            PathBuf::from("./cassis-client-store.db"),
+        )
+        .await
+    }
+
+    pub async fn with_store_path(
+        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
+        nostr_relays: Vec<String>,
+        payment_store_path: PathBuf,
     ) -> Self {
         let endpoint = Endpoint::builder(presets::N0)
             .bind()
@@ -111,6 +270,7 @@ impl CassisClient {
             receivers: HashMap::new(),
             nostr_relays,
             iroh_client: IrohClient::new(endpoint),
+            payment_store_path,
         }
     }
 
@@ -118,6 +278,21 @@ impl CassisClient {
         senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
         receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
         nostr_relays: Vec<String>,
+    ) -> Self {
+        Self::with_receivers_and_store_path(
+            senders,
+            receivers,
+            nostr_relays,
+            PathBuf::from("./cassis-client-store.db"),
+        )
+        .await
+    }
+
+    pub async fn with_receivers_and_store_path(
+        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
+        receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
+        nostr_relays: Vec<String>,
+        payment_store_path: PathBuf,
     ) -> Self {
         let endpoint = Endpoint::builder(presets::N0)
             .bind()
@@ -128,6 +303,7 @@ impl CassisClient {
             receivers,
             nostr_relays,
             iroh_client: IrohClient::new(endpoint),
+            payment_store_path,
         }
     }
 
@@ -137,6 +313,46 @@ impl CassisClient {
 
     pub fn peer_id(&self) -> String {
         self.iroh_client.peer_id().to_string()
+    }
+
+    /// Resume every payer-owned outgoing HTLC persisted as pending. The
+    /// adapter rebuilds its watcher state from the stored descriptor, then
+    /// the same guard used by [`Self::pay`] watches for a preimage or waits
+    /// for expiry before requesting a refund.
+    pub async fn watch_pending(&self) -> Result<(), String> {
+        let path = self.payment_store_path.clone();
+        let pending: Vec<PendingOutgoingPayment> = tokio::task::spawn_blocking(move || {
+            let mut store = Store::open(&path).map_err(|e| e.to_string())?;
+            store.list_pending_outgoing().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        let mut guards = Vec::with_capacity(pending.len());
+        for row in pending {
+            let sender = self
+                .senders
+                .get(&row.sender_network)
+                .cloned()
+                .ok_or_else(|| format!("sender adapter missing for {}", row.sender_network))?;
+            sender
+                .restore_outgoing_payment(&row.payment, row.descriptor.as_ref())
+                .await
+                .map_err(|e| {
+                    format!(
+                        "cannot restore outgoing HTLC {} on {}: {e}",
+                        row.payment.payment_hash, row.sender_network
+                    )
+                })?;
+            guards.push(spawn_payment_guard(
+                sender,
+                row.payment,
+                row.invoice,
+                self.payment_store_path.clone(),
+            ));
+        }
+        join_all(guards).await;
+        Ok(())
     }
 
     /// Drive the multi-hop PREPARE / DISPATCH / COMMIT protocol
@@ -399,6 +615,23 @@ impl CassisClient {
                 return Err(PayError::Io(err.to_string()));
             }
         };
+        let payment_guard = spawn_payment_guard(
+            sender.clone(),
+            first_payment.clone(),
+            invoice.clone(),
+            self.payment_store_path.clone(),
+        );
+        if let Err(error) = persist_outgoing_payment(
+            &self.payment_store_path,
+            &invoice,
+            &first_payment,
+            &sender_network,
+            None,
+        )
+        .await
+        {
+            warn!(target: "cassis_client", "failed to persist outgoing HTLC: {error}");
+        }
         // The descriptor of the first HTLC is the descriptor
         // the sender adapter hands to the first router. We get
         // it via the router trait method; the blanket impl
@@ -415,6 +648,15 @@ impl CassisClient {
                     return Err(PayError::Io(e.to_string()));
                 }
             };
+        if let Err(error) = update_outgoing_descriptor(
+            &self.payment_store_path,
+            invoice.payment_hash,
+            first_descriptor.clone(),
+        )
+        .await
+        {
+            warn!(target: "cassis_client", "failed to persist outgoing descriptor: {error}");
+        }
 
         // Step 3: walk the route. `descriptor` carries the
         // HTLC info for the *incoming* side of the next hop.
@@ -548,6 +790,18 @@ impl CassisClient {
             )));
         }
 
+        persist_payment_proof(&self.payment_store_path, &invoice, preimage)
+            .await
+            .map_err(PayError::Io)?;
+        mark_outgoing_status(
+            &self.payment_store_path,
+            &invoice.payment_hash,
+            OutgoingPaymentStatus::Completed,
+        )
+        .await
+        .map_err(PayError::Io)?;
+        payment_guard.abort();
+
         // The first-hop HTLC is what the sender adapter
         // already created. Its preimage should now be
         // available on the sender network; surface a
@@ -620,11 +874,37 @@ impl CassisClient {
             )
             .await
             .map_err(|e| PayError::Io(e.to_string()))?;
+        let payment_guard = spawn_payment_guard(
+            sender.clone(),
+            first_payment.clone(),
+            invoice.clone(),
+            self.payment_store_path.clone(),
+        );
+        if let Err(error) = persist_outgoing_payment(
+            &self.payment_store_path,
+            invoice,
+            &first_payment,
+            sender_network,
+            None,
+        )
+        .await
+        {
+            warn!(target: "cassis_client", "failed to persist outgoing HTLC: {error}");
+        }
 
         let descriptor = sender
             .outgoing_htlc_descriptor(invoice.payment_hash)
             .await
             .map_err(|e| PayError::Io(e.to_string()))?;
+        if let Err(error) = update_outgoing_descriptor(
+            &self.payment_store_path,
+            invoice.payment_hash,
+            descriptor.clone(),
+        )
+        .await
+        {
+            warn!(target: "cassis_client", "failed to persist outgoing descriptor: {error}");
+        }
 
         let peer_id = invoice
             .iroh_peer_id
@@ -658,6 +938,18 @@ impl CassisClient {
                 invoice.payment_hash
             )));
         }
+
+        persist_payment_proof(&self.payment_store_path, invoice, preimage)
+            .await
+            .map_err(PayError::Io)?;
+        mark_outgoing_status(
+            &self.payment_store_path,
+            &invoice.payment_hash,
+            OutgoingPaymentStatus::Completed,
+        )
+        .await
+        .map_err(PayError::Io)?;
+        payment_guard.abort();
 
         match sender
             .watch_payment(first_payment.clone(), first_payment.expiry)
