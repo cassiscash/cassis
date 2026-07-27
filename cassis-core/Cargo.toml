@@ -16,6 +16,7 @@ lowercase-hex = { workspace = true, features = ["alloc"] }
 rand = { workspace = true }
 ritualistic = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

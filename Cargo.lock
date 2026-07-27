@@ -2455,6 +2455,7 @@ dependencies = [
  "rand 0.8.7",
  "ritualistic",
  "serde",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

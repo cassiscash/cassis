@@ -28,9 +28,10 @@ pub enum IrohError {
 /// Every message the hop protocol carries on the wire. The
 /// `Direction` tag discriminates sender vs receiver roles; the
 /// router (intermediate hop) handles `Prepare`, `Prepared`,
-/// `Dispatch`, `Dispatched`, `Discard` and `Discarded`; the payee
-/// (final hop) handles `Commit` and `Committed`. Both peers run the
-/// same [`IrohServer`] and dispatch by the tag.
+/// `Dispatch`, `Dispatched`, `Discard`, `Discarded` and the
+/// `Committed` preimage fanout; the payee (final hop) handles
+/// `Commit` and replies `Committed`. Both peers run the same
+/// [`IrohServer`] and dispatch by the tag.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
     Prepare(HopPrepare),
@@ -273,6 +274,27 @@ impl IrohClient {
             Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
             other => Err(IrohError::Protocol(format!(
                 "send_commit: unexpected reply frame {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Push an already-revealed preimage to a router hop so it can
+    /// claim its incoming HTLC without waiting for the poll loop.
+    /// Best-effort: the hop's own watch/refund loop is the fallback.
+    pub async fn send_committed(
+        &self,
+        addr: EndpointAddr,
+        committed: HopCommitted,
+    ) -> Result<HopCommitted, IrohError> {
+        let reply = self
+            .round_trip(addr, Frame::Committed(committed), "send_committed")
+            .await?;
+        match reply {
+            Frame::Committed(m) => Ok(m),
+            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
+            other => Err(IrohError::Protocol(format!(
+                "send_committed: unexpected reply frame {:?}",
                 other
             ))),
         }
