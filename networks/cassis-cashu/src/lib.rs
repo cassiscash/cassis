@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, WatchError, XOnlyPubKey,
 };
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
@@ -110,8 +110,8 @@ pub struct CashuAdapter {
     /// Parity is irrelevant here: NUT-11/14 verification is BIP340
     /// x-only, so the `0x02` prefix `pubkey_from_cassis` re-applies is
     /// never checked against the signature.
-    claim_pubkey: PubKey,
-    invoice_pubkey: PubKey,
+    claim_pubkey: XOnlyPubKey,
+    invoice_pubkey: XOnlyPubKey,
     /// The caller's node span with this adapter's `network` field
     /// attached, entered around every log below so each line carries
     /// both the owning node and the network. Built once in
@@ -146,7 +146,7 @@ impl CashuAdapter {
         network_id: NetworkId,
         mint_url: String,
         secret_key: [u8; 32],
-        invoice_pubkey: PubKey,
+        invoice_pubkey: XOnlyPubKey,
         store: Arc<dyn CashuProofStore>,
         span: Span,
     ) -> CashuResult<Self> {
@@ -511,7 +511,7 @@ pub struct SendResult {
 
 #[async_trait]
 impl NetworkRouterAdapter for CashuAdapter {
-    fn invoice_pubkey(&self) -> PubKey {
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey
     }
 
@@ -525,7 +525,7 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// Computed once in [`CashuAdapter::new`], so an unusable signing
     /// key fails loudly at construction rather than silently
     /// advertising an identity we cannot claim with.
-    fn claim_pubkey(&self) -> PubKey {
+    fn claim_pubkey(&self) -> XOnlyPubKey {
         self.claim_pubkey
     }
 
@@ -554,7 +554,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+    ) -> Result<(), HtlcError> {
         // Cashu works in sats; round the msat floor up.
         let min_amount_sat = min_amount_msat.div_ceil(1000).max(1);
         let arrival = Arc::new(Notify::new());
@@ -570,7 +570,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                 arrival,
             },
         );
-        Ok(None)
+        Ok(())
     }
 
     /// Lock `amount_msat` of ecash behind `payment_hash` by
@@ -584,8 +584,16 @@ impl NetworkRouterAdapter for CashuAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: cassis_core::PubKey,
+        htlc_target: &HtlcTarget,
     ) -> Result<OutgoingHtlc, HtlcError> {
+        let recipient = match htlc_target {
+            HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "cashu requires a pubkey target".into(),
+                ))
+            },
+        };
         if amount_msat == 0 {
             return Err(HtlcError::InvalidParams("amount must be > 0".into()));
         }
@@ -615,7 +623,7 @@ impl NetworkRouterAdapter for CashuAdapter {
             .find(|k| k.id == keyset_id)
             .ok_or_else(|| HtlcError::Network("active keyset disappeared".into()))?
             .clone();
-        let receiver_pubkey = htlc::pubkey_from_cassis(&recipient)
+        let receiver_pubkey = PublicKey::from_slice(&recipient.0)
             .map_err(|e| HtlcError::InvalidParams(e.to_string()))?;
 
         // Build the HTLC-locked outputs. The mint signs them
@@ -821,7 +829,14 @@ impl NetworkRouterAdapter for CashuAdapter {
                 conditions,
                 keyset_id,
                 proofs: Mutex::new(proofs),
-                recipient: payment.destination_pubkey.clone(),
+                recipient: match &payment.destination {
+                    HtlcTarget::XOnlyPubKey(pubkey) => pubkey.to_hex(),
+                    HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                        return Err(HtlcError::InvalidParams(
+                            "cashu requires a pubkey destination".into(),
+                        ))
+                    }
+                },
             },
         );
         Ok(())
@@ -1246,7 +1261,7 @@ mod tests {
         Arc::new(InMemoryProofStore::new())
     }
 
-    fn test_invoice_pubkey() -> PubKey {
+    fn test_invoice_pubkey() -> XOnlyPubKey {
         "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
             .parse()
             .unwrap()

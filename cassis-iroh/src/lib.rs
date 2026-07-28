@@ -68,9 +68,11 @@ impl Frame {
 pub fn node_addr_from_announcement(
     ann: &cassis_core::RouteAnnouncement,
 ) -> Result<EndpointAddr, IrohError> {
-    let peer_id =
-        PublicKey::from_str(&ann.iroh_peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
-    let mut addr = EndpointAddr::new(peer_id);
+    let peer_id: IrohPublicKey = ann
+        .iroh_peer_id
+        .parse::<IrohPublicKey>()
+        .map_err(|e| IrohError::Io(e.to_string()))?;
+    let mut addr = EndpointAddr::new(peer_id.0);
     if let Some(relay_url) = &ann.iroh_relay {
         let relay = RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
         addr = addr.with_relay_url(relay);
@@ -85,8 +87,8 @@ pub fn node_addr_from_invoice(
     peer_id: &str,
     relay: Option<&str>,
 ) -> Result<EndpointAddr, IrohError> {
-    let id = PublicKey::from_str(peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
-    let mut addr = EndpointAddr::new(id);
+    let id = IrohPublicKey::from_str(peer_id).map_err(|e| IrohError::Io(e.to_string()))?;
+    let mut addr = EndpointAddr::new(id.0);
     if let Some(relay_url) = relay {
         let relay = RelayUrl::from_str(relay_url).map_err(|e| IrohError::Io(e.to_string()))?;
         addr = addr.with_relay_url(relay);
@@ -98,6 +100,25 @@ pub fn node_addr_from_invoice(
 pub const DEFAULT_IROH_RELAY: &str = "https://euw1-1.relay.iroh.network";
 
 pub use iroh::{EndpointId, PublicKey};
+
+/// Iroh's Ed25519 endpoint identity. Kept distinct from Cassis secp256k1
+/// X-only and compressed public keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IrohPublicKey(pub PublicKey);
+
+impl FromStr for IrohPublicKey {
+    type Err = <PublicKey as FromStr>::Err;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(PublicKey::from_str(value)?))
+    }
+}
+
+impl std::fmt::Display for IrohPublicKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 /// Per-request handler. The second argument is the authenticated
 /// remote endpoint identity of the connection the frame arrived on,
@@ -490,6 +511,7 @@ pub fn build_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cassis_core::HtlcTarget;
 
     #[test]
     fn dispatch_frame_with_cashu_descriptor_round_trips_through_postcard() {
@@ -500,38 +522,26 @@ mod tests {
         // decode on the router with postcard's WontImplement error
         // and the connection would drop. External tagging round-trips
         // fine.
-        let recipient = cassis_core::PubKey::from_bytes([
-            0x17, 0x16, 0x2c, 0x92, 0x1d, 0xc4, 0xd2, 0x51, 0x8f, 0x9a, 0x10, 0x1d, 0xb3, 0x36,
-            0x95, 0xdf, 0x1a, 0xfb, 0x56, 0xab, 0x82, 0xf5, 0xff, 0x3e, 0x5d, 0xa6, 0xee, 0xc3,
-            0xca, 0x5c, 0xd9, 0x17,
-        ])
-        .expect("valid x-only pubkey");
         let dispatch = Frame::Dispatch(HopDispatch {
             payment_hash: Bytes32([0x42u8; 32]),
-            recipient,
             incoming_descriptor: HtlcDescriptor::Cashu {
                 proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into()],
             },
-            outgoing_target: Some(HtlcDescriptor::Lightning {
-                payment_request: "lnbc...".into(),
-            }),
+            htlc_target: HtlcTarget::LightningInvoice("lnbc...".into()),
         });
         let bytes = postcard::to_allocvec(&dispatch).expect("encode dispatch");
         let decoded: Frame = postcard::from_bytes(&bytes).expect("decode dispatch");
         match decoded {
             Frame::Dispatch(d) => {
-                assert_eq!(d.recipient, recipient);
+                assert_eq!(
+                    d.htlc_target,
+                    HtlcTarget::LightningInvoice("lnbc...".into())
+                );
                 assert_eq!(
                     d.incoming_descriptor,
                     HtlcDescriptor::Cashu {
                         proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into(),],
                     }
-                );
-                assert_eq!(
-                    d.outgoing_target,
-                    Some(HtlcDescriptor::Lightning {
-                        payment_request: "lnbc...".into(),
-                    })
                 );
             }
             other => panic!("unexpected frame: {other:?}"),
@@ -540,13 +550,17 @@ mod tests {
 
     #[test]
     fn commit_frame_with_fedimint_descriptor_round_trips_through_postcard() {
+        let claim_pubkey: cassis_core::PubKey =
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap();
         let commit = Frame::Commit(HopCommit {
             payment_hash: Bytes32([0x24u8; 32]),
             amount_msat: 1234,
             network: NetworkId("fedimint::x".into()),
             incoming_deadline: 1_786_000_000,
             incoming_descriptor: HtlcDescriptor::Fedimint {
-                claim_pubkey: "02aa".into(),
+                claim_pubkey,
                 funding_txid: None,
                 funding_out_idx: None,
                 contract: None,
@@ -558,7 +572,7 @@ mod tests {
             Frame::Commit(c) => assert_eq!(
                 c.incoming_descriptor,
                 HtlcDescriptor::Fedimint {
-                    claim_pubkey: "02aa".into(),
+                    claim_pubkey,
                     funding_txid: None,
                     funding_out_idx: None,
                     contract: None,

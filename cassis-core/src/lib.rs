@@ -1,30 +1,64 @@
 pub mod logging;
+mod primitives;
+pub use primitives::Bytes32;
+mod network;
+pub use network::{cashu_mint_url, is_loopback_host};
 
 use async_trait::async_trait;
-pub use ritualistic::PubKey;
+pub use ritualistic::PubKey as XOnlyPubKey;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use tracing::Span;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Bytes32(pub [u8; 32]);
+/// Full compressed secp256k1 public key: parity byte plus 32-byte X coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PubKey(pub [u8; 33]);
 
-impl Bytes32 {
-    pub fn short(&self) -> String {
-        format!("…{}", self)[60..].to_string()
+impl PubKey {
+    pub fn from_bytes(bytes: [u8; 33]) -> Result<Self, secp256k1::Error> {
+        secp256k1::PublicKey::from_slice(&bytes)?;
+        Ok(Self(bytes))
     }
 
-    /// True when `preimage` is a SHA-256 preimage of this hash. Cheap
-    /// local check used wherever a preimage is received from a peer
-    /// before it is burned on a claim.
-    pub fn matches_preimage(&self, preimage: &Bytes32) -> bool {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(preimage.0);
-        let out = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&out);
-        hash == self.0
+    pub fn as_bytes(&self) -> &[u8; 33] {
+        &self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        lowercase_hex::encode(self.0)
+    }
+
+    pub fn x_only(&self) -> XOnlyPubKey {
+        XOnlyPubKey::from_bytes(self.0[1..].try_into().expect("32-byte X coordinate"))
+            .expect("compressed public key contains valid X coordinate")
+    }
+
+    pub fn to_ecdsa_key(&self) -> secp256k1::PublicKey {
+        secp256k1::PublicKey::from_slice(&self.0).expect("validated compressed public key")
+    }
+}
+
+impl std::str::FromStr for PubKey {
+    type Err = secp256k1::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut bytes = [0u8; 33];
+        lowercase_hex::decode_to_slice(value, &mut bytes)
+            .map_err(|_| secp256k1::Error::InvalidPublicKey)?;
+        Self::from_bytes(bytes)
+    }
+}
+
+impl serde::Serialize for PubKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PubKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -44,39 +78,6 @@ impl Bytes32 {
 /// link back to the owning node.
 pub fn network_span(parent: &Span, network_id: &NetworkId) -> Span {
     tracing::info_span!(parent: parent, "network", network = %network_id)
-}
-
-impl fmt::Debug for Bytes32 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", lowercase_hex::encode(self.0))
-    }
-}
-
-impl fmt::Display for Bytes32 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", lowercase_hex::encode(self.0))
-    }
-}
-
-impl AsRef<[u8]> for Bytes32 {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl serde::Serialize for Bytes32 {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&lowercase_hex::encode(self.0))
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Bytes32 {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        let mut bytes = [0u8; 32];
-        lowercase_hex::decode_to_slice(&s, &mut bytes).map_err(serde::de::Error::custom)?;
-        Ok(Bytes32(bytes))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -279,50 +280,11 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
     }
 }
 
-/// Build the full mint URL for a cashu network id, choosing the
-/// scheme from the host: `http` for loopback (`localhost`, `127.0.0.1`,
-/// `::1`), `https` for everything else. Returns an error if the
-/// network id is not a cashu id.
-pub fn cashu_mint_url(network_id: &NetworkId) -> Result<String, String> {
-    let host = network_id
-        .0
-        .strip_prefix(CASHU_NETWORK_ID_PREFIX)
-        .ok_or_else(|| format!("network id {network_id} is not a cashu id"))?;
-    if host.is_empty() {
-        return Err(format!("network id {network_id} has no host"));
-    }
-    if host.contains("://") {
-        return Err(format!("network id {network_id} must not contain a scheme"));
-    }
-    let scheme = if is_loopback_host(host) {
-        "http"
-    } else {
-        "https"
-    };
-    Ok(format!("{scheme}://{host}"))
-}
-
-/// True if `host` is a loopback address (`localhost`, `127.0.0.1`,
-/// `::1`, with or without a port and IPv6 brackets).
-pub fn is_loopback_host(host: &str) -> bool {
-    let host_part: &str = if let Some(rest) = host.strip_prefix('[') {
-        match rest.find(']') {
-            Some(end) => &rest[..end],
-            None => host,
-        }
-    } else if host == "::1" || host.starts_with("::1:") {
-        "::1"
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    matches!(host_part, "localhost" | "127.0.0.1" | "::1")
-}
-
 /// A directed route offered by a node: receive on `from`, send on `to`.
 /// Each announcement has its own fee schedule, parsed from kind-35515 event tags.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteAnnouncement {
-    pub node_pubkey: ritualistic::PubKey,
+    pub node_pubkey: XOnlyPubKey,
     pub iroh_peer_id: String,
     pub iroh_relay: Option<String>,
     pub from: NetworkId,
@@ -349,30 +311,11 @@ pub struct RouteAnnouncement {
 pub struct Invoice {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
-    pub payee: PubKey,
+    pub payee: XOnlyPubKey,
     pub expires_at: u64,
     pub networks: Vec<NetworkId>,
+    pub address: HtlcTarget,
     pub description: Option<String>,
-    /// Per-network identity the payee will actually claim the final
-    /// HTLC with, one entry per element of `networks`.
-    ///
-    /// `payee` is the payee's *invoice* key and is the right identity
-    /// for networks whose claim signature is over the invoice key
-    /// (cashu). Networks that hold a separate per-network key — e.g.
-    /// rootstock, where the claim is an on-chain transaction signed by
-    /// a dedicated EVM account — must advertise that key here instead,
-    /// otherwise the last hop locks the HTLC to an identity the payee
-    /// cannot claim with.
-    ///
-    /// This is deliberately carried in the invoice (point-to-point)
-    /// rather than published in a Nostr route announcement: the payee
-    /// is not a router and announces nothing. The payer forwards the
-    /// matching entry to the last hop in its DISPATCH.
-    ///
-    /// Absent or missing entries fall back to `payee`, which keeps old
-    /// invoices working.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub claim_pubkeys: Vec<(NetworkId, PubKey)>,
     /// Iroh peer id of the payee's `cassis-cli` endpoint, used by
     /// the payer to send the final COMMIT message directly. `None`
     /// for invoices not produced by a cassis receiver (e.g. raw
@@ -384,27 +327,6 @@ pub struct Invoice {
     /// aren't known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay: Option<String>,
-    /// Native invoice/payment request for networks that need an encoded
-    /// invoice to initiate payment, such as Lightning. Other networks leave
-    /// this unset and continue using the hash plus claim identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payment_request: Option<String>,
-}
-
-impl Invoice {
-    /// Identity the payee will claim the final HTLC with on `network`.
-    ///
-    /// Prefers the network-specific entry from
-    /// [`Invoice::claim_pubkeys`] and falls back to
-    /// [`Invoice::payee`] when the invoice does not carry one (older
-    /// invoices, or networks that claim with the invoice key).
-    pub fn claim_pubkey_for(&self, network: &NetworkId) -> PubKey {
-        self.claim_pubkeys
-            .iter()
-            .find(|(id, _)| id == network)
-            .map(|(_, pubkey)| *pubkey)
-            .unwrap_or(self.payee)
-    }
 }
 
 /// Handle to an in-flight outgoing payment initiated by
@@ -416,7 +338,7 @@ impl Invoice {
 pub struct OutgoingPayment {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
-    pub destination_pubkey: String,
+    pub destination: HtlcTarget,
     pub destination_network: NetworkId,
     pub expiry: u64,
 }
@@ -429,7 +351,26 @@ pub struct HopInstruction {
     pub outgoing_network: NetworkId,
     pub incoming_deadline: u64,
     pub outgoing_expiry: u64,
-    pub recipient: String,
+    pub recipient: HtlcTarget,
+}
+
+/// Network-specific parameters the upstream party needs to address a
+/// hop's incoming HTLC. Replaces the old flat `claim_pubkey` plus the
+/// lightning `incoming_descriptor` with a single self-describing
+/// value: pubkey networks address by claim key, lightning by BOLT11
+/// hold invoice.
+///
+/// Crosses the wire inside the hop protocol frames, which are
+/// serialized with postcard, so like [`HtlcDescriptor`] it must stay
+/// externally tagged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HtlcTarget {
+    /// X-only claim key used by Cashu, Liquid, and Arkade.
+    XOnlyPubKey(XOnlyPubKey),
+    /// Full compressed claim key used by Fedimint.
+    PubKey(PubKey),
+    /// BOLT11 hold invoice the upstream party must pay (lightning).
+    LightningInvoice(String),
 }
 
 /// PREPARE message (sender -> router): ask a hop to reserve capacity
@@ -457,26 +398,22 @@ pub struct HopPrepared {
     pub payment_hash: Bytes32,
     pub accepted: bool,
     pub reason: Option<String>,
-    /// Optional handle the upstream payer must use to fund this hop's
-    /// incoming side. Lightning uses this for the LND hold invoice created
-    /// during PREPARE; other networks leave it unset.
-    pub incoming_descriptor: Option<HtlcDescriptor>,
-    /// The identity this hop will claim its *incoming* HTLC with, as
-    /// reported by its incoming adapter
-    /// ([`NetworkRouterAdapter::claim_pubkey`]).
+    /// Network-specific parameters the upstream party must use to
+    /// address this hop's incoming side, as reported by its incoming
+    /// adapter ([`NetworkRouterAdapter::htlc_target`]).
     ///
-    /// The upstream party (the previous hop, or the payer for hop 0)
-    /// must lock its outgoing HTLC to this key. Having the hop
-    /// self-report it is what makes lock and claim agree by
-    /// construction: no other party has to guess which of the hop's
-    /// keys it actually signs claims with. `None` on a rejection,
-    /// where there is nothing to lock.
+    /// For pubkey networks (cashu, liquid, arkade, rootstock,
+    /// fedimint) this is the claim key the upstream party locks its
+    /// outgoing HTLC to; for lightning it is the BOLT11 hold invoice
+    /// the upstream party must pay. Self-reporting keeps address and
+    /// claim in agreement by construction. `None` on a rejection,
+    /// where there is nothing to address.
     ///
     /// Deliberately carries no `skip_serializing_if`: these frames go
     /// over postcard, which is positional and non-self-describing, so
     /// omitting a field desynchronizes the decoder rather than falling
     /// back to a default. Always serialized, like `reason` above.
-    pub claim_pubkey: Option<PubKey>,
+    pub htlc_target: Option<HtlcTarget>,
 }
 
 /// DISPATCH message (sender -> router): tells a hop that a real
@@ -491,22 +428,20 @@ pub struct HopDispatch {
     pub payment_hash: Bytes32,
     /// Network-specific handle to the deployed incoming HTLC.
     pub incoming_descriptor: HtlcDescriptor,
-    /// Optional target handle for the outgoing network. Lightning routers
-    /// receive the downstream hop's hold invoice here; the outgoing adapter
-    /// pays this exact invoice rather than constructing a raw hash-only send.
-    pub outgoing_target: Option<HtlcDescriptor>,
-    /// Identity the hop must lock its *outgoing* HTLC to: the
-    /// downstream party's `claim_pubkey` for that network (the next
-    /// hop's [`HopPrepared::claim_pubkey`], or the payee's entry from
-    /// [`Invoice::claim_pubkeys`] for the last hop).
+    /// Network-specific parameters for the hop's *outgoing* side: the
+    /// downstream party's self-reported addressing parameters (the
+    /// next hop's [`HopPrepared::htlc_target`], or the
+    /// payee's for the last hop). For pubkey networks this is the
+    /// claim key to lock the outgoing HTLC to; for lightning it is
+    /// the downstream hold invoice to pay.
     ///
     /// This travels in DISPATCH rather than PREPARE because the payer
     /// PREPAREs every hop *concurrently*, so when hop `i`'s PREPARE is
-    /// built the reply from hop `i+1` — and therefore its claim
-    /// identity — is not known yet. DISPATCH is sequential and happens
-    /// strictly after every PREPARE has been answered, so by then the
-    /// downstream identity is always available.
-    pub recipient: PubKey,
+    /// built the reply from hop `i+1` — and therefore its addressing
+    /// parameters — is not known yet. DISPATCH is sequential and
+    /// happens strictly after every PREPARE has been answered, so by
+    /// then the downstream parameters are always available.
+    pub htlc_target: HtlcTarget,
 }
 
 /// Reply to [`HopDispatch`]. Carries the descriptor of the outgoing
@@ -636,7 +571,7 @@ pub enum HtlcDescriptor {
         lockup_vout: u8,
         /// Hex 33-byte compressed pubkey of the sender's refund key
         /// (the witness script's ELSE branch).
-        refund_pubkey: String,
+        refund_pubkey: PubKey,
         /// Absolute Liquid block height opening the refund path.
         refund_locktime: u32,
     },
@@ -665,9 +600,9 @@ pub enum HtlcDescriptor {
     ///   exceed the claim delay, so the receiver wins any
     ///   operator-less race.
     Arkade {
-        sender: String,
-        receiver: String,
-        server: String,
+        sender: XOnlyPubKey,
+        receiver: XOnlyPubKey,
+        server: XOnlyPubKey,
         payment_hash160: String,
         refund_locktime: u32,
         unilateral_claim_delay: u32,
@@ -702,11 +637,8 @@ pub enum HtlcDescriptor {
     /// time and later claims with the route preimage.
     Fedimint {
         /// Hex 33-byte compressed public key the funder must lock
-        /// the contract to — the receiver's claim key. The receiver
-        /// self-reports the x-only half via
-        /// [`NetworkRouterAdapter::claim_pubkey`]; the descriptor
-        /// pins the exact parity.
-        claim_pubkey: String,
+        /// the contract to — the receiver's claim key.
+        claim_pubkey: PubKey,
         /// Hex txid of the funding transaction. `None` on
         /// registration descriptors, where nothing is funded yet.
         funding_txid: Option<String>,
@@ -820,7 +752,7 @@ pub enum SendError {
 pub trait NetworkRouterAdapter: Send + Sync {
     fn network_id(&self) -> NetworkId;
 
-    fn invoice_pubkey(&self) -> PubKey;
+    fn invoice_pubkey(&self) -> XOnlyPubKey;
 
     /// The identity this adapter can actually *claim* an incoming HTLC
     /// with: the public key whose secret key the adapter holds and
@@ -836,7 +768,7 @@ pub trait NetworkRouterAdapter: Send + Sync {
     /// key (cashu). Networks holding a separate per-network key — e.g.
     /// rootstock, whose claim is an on-chain transaction signed by a
     /// dedicated EVM account — must override this.
-    fn claim_pubkey(&self) -> PubKey {
+    fn claim_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey()
     }
 
@@ -847,28 +779,31 @@ pub trait NetworkRouterAdapter: Send + Sync {
     /// parks whatever per-payment state its network needs so the
     /// later [`NetworkRouterAdapter::accept_incoming_htlc`] (DISPATCH)
     /// and [`NetworkRouterAdapter::claim_incoming`] calls can find it.
-    /// Adapters that also expose a network-specific funding handle
-    /// (LND hold invoice, fedimint claim key) return it as the
-    /// descriptor; the payer routes it upstream.
+    /// Adapters that need a remote registration before funding (LND
+    /// hold invoice) create it here.
     ///
-    /// The default is "no registration, no descriptor" — adapters
-    /// needing pre-funding state must override.
+    /// The default is a no-op — adapters needing pre-funding state
+    /// must override.
     async fn register_incoming_htlc(
         &self,
         _payment_hash: Bytes32,
         _min_amount_msat: u64,
         _deadline: u64,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
-        Ok(None)
+    ) -> Result<(), HtlcError> {
+        Ok(())
     }
 
-    /// Return the handle a payer needs to fund a previously registered
-    /// incoming HTLC. Most networks need no extra handle.
-    async fn incoming_htlc_descriptor(
-        &self,
-        _payment_hash: Bytes32,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
-        Ok(None)
+    /// The [`HtlcTarget`] the upstream party must use to
+    /// address a registered incoming HTLC on this adapter. The router
+    /// returns this in the [`HopPrepared`] reply to PREPARE.
+    ///
+    /// Defaults to the claim key ([`NetworkRouterAdapter::claim_pubkey`]),
+    /// correct for networks addressed by pubkey (cashu, liquid, arkade,
+    /// rootstock, fedimint). Lightning overrides this to return the
+    /// per-payment BOLT11 hold invoice created during
+    /// [`NetworkRouterAdapter::register_incoming_htlc`].
+    async fn htlc_target(&self, _payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
+        Ok(HtlcTarget::XOnlyPubKey(self.claim_pubkey()))
     }
 
     /// Cancel an incoming registration that was prepared but never funded.
@@ -882,24 +817,8 @@ pub trait NetworkRouterAdapter: Send + Sync {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: PubKey,
+        htlc_target: &HtlcTarget,
     ) -> Result<OutgoingHtlc, HtlcError>;
-
-    /// Variant used when the destination network needs a wire-level target
-    /// in addition to the generic claim identity. LND uses the downstream
-    /// hold invoice here; existing adapters inherit the legacy behavior.
-    async fn create_outgoing_htlc_with_descriptor(
-        &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-        recipient: PubKey,
-        target: Option<&HtlcDescriptor>,
-    ) -> Result<OutgoingHtlc, HtlcError> {
-        let _ = target;
-        self.create_outgoing_htlc(payment_hash, amount_msat, expiry, recipient)
-            .await
-    }
 
     async fn claim_incoming(
         &self,
@@ -1023,7 +942,7 @@ pub trait NetworkReceiverAdapter: Send + Sync {
     ///
     /// `None` means "no network-specific identity": the payer falls
     /// back to [`Invoice::payee`].
-    fn claim_pubkey(&self) -> Option<PubKey> {
+    fn claim_pubkey(&self) -> Option<XOnlyPubKey> {
         None
     }
 
@@ -1102,42 +1021,21 @@ pub trait NetworkReceiverAdapter: Send + Sync {
 pub trait NetworkSenderAdapter: Send + Sync {
     fn network_id(&self) -> NetworkId;
 
-    /// Initiate a payment to the given destination. The
-    /// `destination_pubkey` is whatever the network needs to identify
-    /// the payee: a node pubkey, a BOLT11 invoice, etc. The
-    /// `destination_network` is the network the payment is being sent
-    /// on (typically `self.network_id()`, but the caller passes it
-    /// for symmetry with the receive side).
+    /// Initiate a payment to the given destination. `addressing` is
+    /// the destination's self-reported [`HtlcTarget`]: the
+    /// claim key to lock to for pubkey networks, or the BOLT11 hold
+    /// invoice to pay for lightning. `destination_network` is the
+    /// network the payment is being sent on (typically
+    /// `self.network_id()`, but the caller passes it for symmetry
+    /// with the receive side).
     async fn pay_invoice(
         &self,
         payment_hash: Bytes32,
         amount_msat: u64,
-        destination_pubkey: PubKey,
+        addressing: &HtlcTarget,
         destination_network: &NetworkId,
         expiry: u64,
     ) -> Result<OutgoingPayment, SendError>;
-
-    /// Variant used when the destination network supplied an invoice or
-    /// another wire-level funding handle during route preparation.
-    async fn pay_invoice_with_descriptor(
-        &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        destination_pubkey: PubKey,
-        destination_network: &NetworkId,
-        expiry: u64,
-        target: Option<&HtlcDescriptor>,
-    ) -> Result<OutgoingPayment, SendError> {
-        let _ = target;
-        self.pay_invoice(
-            payment_hash,
-            amount_msat,
-            destination_pubkey,
-            destination_network,
-            expiry,
-        )
-        .await
-    }
 
     /// Block until the payment reaches a terminal state.
 
@@ -1205,7 +1103,7 @@ where
         NetworkRouterAdapter::incoming_delta_secs(self)
     }
 
-    fn claim_pubkey(&self) -> Option<PubKey> {
+    fn claim_pubkey(&self) -> Option<XOnlyPubKey> {
         Some(NetworkRouterAdapter::claim_pubkey(self))
     }
 
@@ -1226,21 +1124,21 @@ where
             NetworkRouterAdapter::register_incoming_htlc(self, payment_hash, amount_msat, expiry)
                 .await
                 .map_err(|e| ReceiveError::Network(e.to_string()))?;
-        let payment_request = match descriptor {
-            Some(HtlcDescriptor::Lightning { payment_request }) => Some(payment_request),
-            _ => None,
+        let _ = descriptor;
+        let address = match NetworkRouterAdapter::htlc_target(self, payment_hash).await {
+            Ok(target) => target,
+            Err(_) => HtlcTarget::XOnlyPubKey(self.claim_pubkey()),
         };
         Ok(Invoice {
             payment_hash,
             amount_msat,
             payee: self.invoice_pubkey(),
             expires_at: expiry,
-            claim_pubkeys: vec![(network_id.clone(), NetworkRouterAdapter::claim_pubkey(self))],
             networks: vec![network_id],
             description,
             iroh_peer_id: None,
             iroh_relay: None,
-            payment_request,
+            address,
         })
     }
 
@@ -1255,10 +1153,13 @@ where
             NetworkRouterAdapter::register_incoming_htlc(self, payment_hash, amount_msat, expiry)
                 .await
                 .map_err(|e| ReceiveError::Network(e.to_string()))?;
-        Ok(match descriptor {
-            Some(HtlcDescriptor::Lightning { payment_request }) => Some(payment_request),
-            _ => None,
-        })
+        let _ = descriptor;
+        Ok(
+            match NetworkRouterAdapter::htlc_target(self, payment_hash).await {
+                Ok(HtlcTarget::LightningInvoice(payment_request)) => Some(payment_request),
+                _ => None,
+            },
+        )
     }
 
     /// No-op for the router auto-impl: registration (PREPARE) and
@@ -1315,7 +1216,7 @@ where
         &self,
         payment_hash: Bytes32,
         amount_msat: u64,
-        destination_pubkey: PubKey,
+        addressing: &HtlcTarget,
         destination_network: &NetworkId,
         expiry: u64,
     ) -> Result<OutgoingPayment, SendError> {
@@ -1324,38 +1225,7 @@ where
             payment_hash,
             amount_msat,
             expiry,
-            destination_pubkey,
-        )
-        .await
-        .map_err(|e| match e {
-            HtlcError::InvalidParams(msg) => SendError::InvalidParams(msg),
-            other => SendError::Network(other.to_string()),
-        })?;
-        Ok(OutgoingPayment {
-            payment_hash: htlc.payment_hash,
-            amount_msat,
-            destination_pubkey: destination_pubkey.to_hex(),
-            destination_network: destination_network.clone(),
-            expiry,
-        })
-    }
-
-    async fn pay_invoice_with_descriptor(
-        &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        destination_pubkey: PubKey,
-        destination_network: &NetworkId,
-        expiry: u64,
-        target: Option<&HtlcDescriptor>,
-    ) -> Result<OutgoingPayment, SendError> {
-        let htlc = NetworkRouterAdapter::create_outgoing_htlc_with_descriptor(
-            self,
-            payment_hash,
-            amount_msat,
-            expiry,
-            destination_pubkey,
-            target,
+            addressing,
         )
         .await
         .map_err(|e| match e {
@@ -1365,7 +1235,7 @@ where
         Ok(OutgoingPayment {
             payment_hash: htlc.payment_hash,
             amount_msat: htlc.amount_msat,
-            destination_pubkey: destination_pubkey.to_hex(),
+            destination: addressing.clone(),
             destination_network: destination_network.clone(),
             expiry,
         })

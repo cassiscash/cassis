@@ -59,8 +59,8 @@ mod zeroconf;
 
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, PubKey, WatchError, XOnlyPubKey,
 };
 use hmac::Mac;
 use lwk_common::Signer as LwkSigner;
@@ -171,7 +171,7 @@ pub struct LiquidConfig {
     pub persist_dir: Option<PathBuf>,
     /// 32-byte secret key derived from `cassis/network/<network_id>`.
     pub sk: [u8; 32],
-    pub invoice_pubkey: PubKey,
+    pub invoice_pubkey: XOnlyPubKey,
     pub span: Span,
 }
 
@@ -180,7 +180,7 @@ pub struct LiquidConfig {
 pub fn default_config(
     network_id: NetworkId,
     sk: [u8; 32],
-    invoice_pubkey: PubKey,
+    invoice_pubkey: XOnlyPubKey,
     span: Span,
 ) -> LiquidConfig {
     match network_id.0.as_str() {
@@ -312,7 +312,13 @@ impl HtlcSpec {
                     lockup.vout
                 ))
             })?,
-            refund_pubkey: self.refund_pubkey.to_bytes().to_lower_hex_string(),
+            refund_pubkey: PubKey::from_bytes(
+                self.refund_pubkey
+                    .to_bytes()
+                    .try_into()
+                    .expect("compressed refund key is 33 bytes"),
+            )
+            .expect("wallet refund key is valid"),
             refund_locktime: self.refund_locktime,
         })
     }
@@ -349,7 +355,7 @@ struct PendingOutgoing {
 
 pub struct LiquidAdapter {
     network_id: NetworkId,
-    invoice_pubkey: PubKey,
+    invoice_pubkey: XOnlyPubKey,
     span: Span,
     signer: SwSigner,
     fingerprint: Fingerprint,
@@ -359,7 +365,7 @@ pub struct LiquidAdapter {
     claim_pk_full: BtcPublicKey,
     /// x-only half of `claim_pk_full`, the identity counterparties
     /// lock to.
-    claim_xonly: PubKey,
+    claim_xonly: XOnlyPubKey,
     wollet: Arc<Mutex<Wollet>>,
     esplora: Arc<Mutex<EsploraClient>>,
     waterfalls: Arc<Mutex<EsploraClient>>,
@@ -421,7 +427,7 @@ impl LiquidAdapter {
             }
         };
         let claim_bytes = claim_pk_full.to_bytes();
-        let claim_xonly = PubKey::from_bytes(claim_bytes[1..33].try_into().expect("32 bytes"))
+        let claim_xonly = XOnlyPubKey::from_bytes(claim_bytes[1..33].try_into().expect("32 bytes"))
             .map_err(|e| Error::InvalidParams(format!("invalid claim pubkey: {e}")))?;
 
         // Keep custom SLIP-0077 derivation because this signer may not expose
@@ -537,10 +543,7 @@ impl LiquidAdapter {
         if expiry <= now {
             return Err(HtlcError::InvalidParams("expiry in the past".into()));
         }
-        // The recipient's liquid claim identity is `02 || X` of its
-        // x-only key: its adapter normalizes the per-network key to
-        // the even-Y representative, exactly like rootstock does for
-        // its EVM address mapping.
+        // Liquid scripts require the full compressed recipient key.
         let recipient_full = even_y_pubkey(recipient)?;
         let remaining_blocks = expiry.saturating_sub(now) / BLOCK_TIME_SECS;
         let refund_locktime = (tip + remaining_blocks).min(u64::from(u32::MAX - 1)) as u32;
@@ -648,7 +651,7 @@ impl LiquidAdapter {
         };
         let txid = Txid::from_str(lockup_txid)
             .map_err(|e| HtlcError::InvalidParams(format!("invalid lockup txid: {e}")))?;
-        let refund_pubkey = BtcPublicKey::from_str(refund_pubkey)
+        let refund_pubkey = BtcPublicKey::from_slice(refund_pubkey.as_bytes())
             .map_err(|e| HtlcError::InvalidParams(format!("invalid refund pubkey: {e}")))?;
         let spec = HtlcSpec::build(
             payment_hash,
@@ -987,12 +990,9 @@ fn ensure_non_rbf(tx: &Transaction) -> Result<(), HtlcError> {
     Ok(())
 }
 
-fn even_y_pubkey(xonly: &PubKey) -> Result<BtcPublicKey, HtlcError> {
-    let mut bytes = [0u8; 33];
-    bytes[0] = 0x02;
-    bytes[1..].copy_from_slice(xonly.as_bytes());
-    let inner = secp256k1::PublicKey::from_slice(&bytes)
-        .map_err(|e| HtlcError::InvalidParams(format!("invalid x-only identity: {e}")))?;
+fn even_y_pubkey(pubkey: &PubKey) -> Result<BtcPublicKey, HtlcError> {
+    let inner = secp256k1::PublicKey::from_slice(pubkey.as_bytes())
+        .map_err(|e| HtlcError::InvalidParams(format!("invalid compressed pubkey: {e}")))?;
     Ok(BtcPublicKey::new(inner))
 }
 
@@ -1007,14 +1007,23 @@ fn varint_len(n: usize) -> usize {
 
 #[async_trait]
 impl NetworkRouterAdapter for LiquidAdapter {
-    fn invoice_pubkey(&self) -> PubKey {
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey
     }
 
     /// Claims happen with the dedicated even-Y claim key derived at
     /// `CLAIM_KEY_PATH_PREFIX`, not the invoice key.
-    fn claim_pubkey(&self) -> PubKey {
+    fn claim_pubkey(&self) -> XOnlyPubKey {
         self.claim_xonly
+    }
+
+    async fn htlc_target(&self, _payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
+        let mut compressed = [0u8; 33];
+        compressed[0] = 0x02;
+        compressed[1..].copy_from_slice(self.claim_xonly.as_bytes());
+        let pubkey = PubKey::from_bytes(compressed)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim pubkey: {e}")))?;
+        Ok(HtlcTarget::PubKey(pubkey))
     }
 
     fn network_id(&self) -> NetworkId {
@@ -1032,7 +1041,7 @@ impl NetworkRouterAdapter for LiquidAdapter {
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+    ) -> Result<(), HtlcError> {
         if deadline <= Self::unix_now() {
             return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
@@ -1046,7 +1055,7 @@ impl NetworkRouterAdapter for LiquidAdapter {
                 expected_sat: sats,
                 deadline,
             });
-        Ok(None)
+        Ok(())
     }
 
     async fn create_outgoing_htlc(
@@ -1054,8 +1063,16 @@ impl NetworkRouterAdapter for LiquidAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: PubKey,
+        htlc_target: &HtlcTarget,
     ) -> Result<OutgoingHtlc, HtlcError> {
+        let recipient = match htlc_target {
+            HtlcTarget::PubKey(pubkey) => *pubkey,
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "liquid requires a pubkey target".into(),
+                ))
+            }
+        };
         let sats = msat_to_sat(amount_msat)?;
         if sats < MIN_LOCK_SATS {
             return Err(HtlcError::InvalidParams(format!(
@@ -1186,10 +1203,16 @@ impl NetworkRouterAdapter for LiquidAdapter {
         };
         let txid = Txid::from_str(lockup_txid)
             .map_err(|e| HtlcError::InvalidParams(format!("invalid lockup txid: {e}")))?;
-        let refund_pubkey = BtcPublicKey::from_str(refund_pubkey)
+        let refund_pubkey = BtcPublicKey::from_slice(refund_pubkey.as_bytes())
             .map_err(|e| HtlcError::InvalidParams(format!("invalid refund pubkey: {e}")))?;
-        let recipient = PubKey::from_str(&payment.destination_pubkey)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid recipient pubkey: {e}")))?;
+        let recipient = match &payment.destination {
+            HtlcTarget::PubKey(pubkey) => *pubkey,
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "liquid requires a pubkey destination".into(),
+                ))
+            }
+        };
         let spec = HtlcSpec::build(
             &payment.payment_hash,
             even_y_pubkey(&recipient)?,
@@ -1570,7 +1593,7 @@ mod tests {
         let config = default_config(
             NetworkId("liquid::testnet".to_string()),
             [7u8; 32],
-            PubKey::from_bytes([9u8; 32]).unwrap(),
+            XOnlyPubKey::from_bytes([9u8; 32]).unwrap(),
             Span::none(),
         );
         let adapter = LiquidAdapter::new(config).await.unwrap();
@@ -1578,7 +1601,7 @@ mod tests {
         let config2 = default_config(
             NetworkId("liquid::testnet".to_string()),
             [7u8; 32],
-            PubKey::from_bytes([9u8; 32]).unwrap(),
+            XOnlyPubKey::from_bytes([9u8; 32]).unwrap(),
             Span::none(),
         );
         let adapter2 = LiquidAdapter::new(config2).await.unwrap();
@@ -1660,7 +1683,13 @@ mod tests {
         assert_eq!(*lockup_vout, 3);
         assert_eq!(
             refund_pubkey,
-            &spec.refund_pubkey.to_bytes().to_lower_hex_string()
+            &PubKey::from_bytes(
+                spec.refund_pubkey
+                    .to_bytes()
+                    .try_into()
+                    .expect("compressed refund key is 33 bytes")
+            )
+            .unwrap()
         );
         assert_eq!(*refund_locktime, 1234);
 

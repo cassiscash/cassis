@@ -2454,6 +2454,7 @@ dependencies = [
  "lowercase-hex",
  "rand 0.8.7",
  "ritualistic",
+ "secp256k1 0.31.1",
  "serde",
  "sha2 0.10.9",
  "thiserror 1.0.69",

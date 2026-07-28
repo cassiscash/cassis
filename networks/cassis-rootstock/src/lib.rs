@@ -11,8 +11,8 @@ use alloy::sol_types::SolCall;
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, PubKey, WatchError, XOnlyPubKey,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -144,7 +144,7 @@ pub struct RootstockConfig {
     /// [`NetworkRouterAdapter::claim_pubkey`] maps to exactly one EVM
     /// address, and that address is the one this key can sign for.
     pub sk: [u8; 32],
-    pub invoice_pubkey: PubKey,
+    pub invoice_pubkey: XOnlyPubKey,
     pub span: Span,
 }
 
@@ -178,7 +178,7 @@ pub struct RootstockAdapter {
     address: Address,
     /// x-only pubkey of the (normalized) `config.sk`. Advertised to
     /// counterparties so they lock HTLCs to `self.address`.
-    claim_pubkey: PubKey,
+    claim_pubkey: XOnlyPubKey,
     contract: Address,
     provider: Box<dyn Provider + Send + Sync>,
     incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
@@ -218,7 +218,7 @@ impl RootstockAdapter {
         // disagree, every counterparty would lock HTLCs to an address
         // this adapter cannot claim from, and the funds would sit until
         // the timelock expired.
-        let derived = evm_address_from_pubkey(&claim_pubkey);
+        let derived = evm_address_from_xonly(&claim_pubkey);
         if derived != address {
             return Err(Error::InvalidParams(format!(
                 "claim identity mismatch: x-only pubkey {} maps to {derived} but the \
@@ -458,7 +458,7 @@ impl RootstockAdapter {
 
 #[async_trait]
 impl NetworkRouterAdapter for RootstockAdapter {
-    fn invoice_pubkey(&self) -> PubKey {
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
         self.config.invoice_pubkey
     }
 
@@ -467,8 +467,17 @@ impl NetworkRouterAdapter for RootstockAdapter {
     /// override the default. Counterparties lock to
     /// `evm_address_from_pubkey(this)` == `self.address`, which the
     /// constructor already verified.
-    fn claim_pubkey(&self) -> PubKey {
+    fn claim_pubkey(&self) -> XOnlyPubKey {
         self.claim_pubkey
+    }
+
+    async fn htlc_target(&self, _payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
+        let mut compressed = [0u8; 33];
+        compressed[0] = 0x02;
+        compressed[1..].copy_from_slice(self.claim_pubkey.as_bytes());
+        let pubkey = PubKey::from_bytes(compressed)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim pubkey: {e}")))?;
+        Ok(HtlcTarget::PubKey(pubkey))
     }
 
     fn network_id(&self) -> NetworkId {
@@ -487,7 +496,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+    ) -> Result<(), HtlcError> {
         if deadline <= Self::unix_now() {
             return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
@@ -502,7 +511,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         };
         let mut incoming = self.incoming.lock().await;
         incoming.insert(payment_hash, slot);
-        Ok(None)
+        Ok(())
     }
 
     async fn create_outgoing_htlc(
@@ -510,8 +519,16 @@ impl NetworkRouterAdapter for RootstockAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: PubKey,
+        htlc_target: &HtlcTarget,
     ) -> Result<OutgoingHtlc, HtlcError> {
+        let recipient = match htlc_target {
+            HtlcTarget::PubKey(pubkey) => *pubkey,
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "rootstock requires a pubkey target".into(),
+                ))
+            }
+        };
         if amount_msat == 0 {
             return Err(HtlcError::InvalidParams("amount must be > 0".into()));
         }
@@ -1114,7 +1131,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
 pub fn default_config(
     network_id: NetworkId,
     sk: [u8; 32],
-    invoice_pubkey: PubKey,
+    invoice_pubkey: XOnlyPubKey,
     span: Span,
 ) -> RootstockConfig {
     match network_id.0.as_str() {
@@ -1177,7 +1194,7 @@ pub fn address_from_sk(sk: [u8; 32]) -> Result<Address, Error> {
 /// x-only identity it maps to, sharing one secp context and one scalar
 /// multiplication (every caller needs both halves). Kept private:
 /// external callers want [`address_from_sk`] or the adapter itself.
-fn normalized_key(sk: [u8; 32]) -> Result<([u8; 32], PubKey), Error> {
+fn normalized_key(sk: [u8; 32]) -> Result<([u8; 32], XOnlyPubKey), Error> {
     let secp = secp256k1::Secp256k1::signing_only();
     let secret = secp256k1::SecretKey::from_byte_array(sk)
         .map_err(|e| Error::InvalidParams(format!("invalid secret key: {e}")))?;
@@ -1188,7 +1205,7 @@ fn normalized_key(sk: [u8; 32]) -> Result<([u8; 32], PubKey), Error> {
         // x-only identity computed above still holds.
         secp256k1::Parity::Odd => secret.negate().secret_bytes(),
     };
-    let pubkey = PubKey::from_bytes(xonly.serialize())
+    let pubkey = XOnlyPubKey::from_bytes(xonly.serialize())
         .map_err(|e| Error::InvalidParams(format!("invalid x-only pubkey: {e}")))?;
     Ok((normalized, pubkey))
 }
@@ -1204,6 +1221,14 @@ pub fn evm_address_from_pubkey(pubkey: &PubKey) -> Address {
     let uncompressed = pubkey.to_ecdsa_key().serialize_uncompressed();
     // Skip the 0x04 tag: keccak is over the raw 64-byte X || Y.
     Address::from_slice(&alloy::primitives::keccak256(&uncompressed[1..]).0[12..])
+}
+
+fn evm_address_from_xonly(pubkey: &XOnlyPubKey) -> Address {
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..].copy_from_slice(pubkey.as_bytes());
+    let full = PubKey::from_bytes(compressed).expect("valid x-only public key");
+    evm_address_from_pubkey(&full)
 }
 
 /// Wei to reserve for an HTLC transaction of `gas` units at `gas_price`.
@@ -1519,7 +1544,7 @@ mod tests {
             // identity must be the address the normalized key can sign
             // for. Without normalization this fails for odd-Y keys.
             assert_eq!(
-                evm_address_from_pubkey(&pubkey),
+                evm_address_from_xonly(&pubkey),
                 address_from_sk(sk).unwrap(),
                 "advertised identity must map to the signable address",
             );

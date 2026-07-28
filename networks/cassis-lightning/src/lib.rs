@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, WatchError, XOnlyPubKey,
 };
 use lightning_invoice::Bolt11Invoice;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -120,7 +120,7 @@ struct PendingOutgoing {
 pub struct LndAdapter {
     config: LndConfig,
     network_id: NetworkId,
-    invoice_pubkey: PubKey,
+    invoice_pubkey: XOnlyPubKey,
     client: reqwest::Client,
     span: Span,
     incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
@@ -226,7 +226,7 @@ impl LndAdapter {
         let adapter = Self {
             config,
             network_id: network_id.clone(),
-            invoice_pubkey: PubKey([0u8; 32]),
+            invoice_pubkey: XOnlyPubKey([0u8; 32]),
             client,
             span: cassis_core::network_span(&span, &network_id),
             incoming: Mutex::new(HashMap::new()),
@@ -240,7 +240,7 @@ impl LndAdapter {
             Error::InvalidParams(format!("invalid LND identity pubkey: {error}"))
         })?;
         let (xonly, _) = pubkey.x_only_public_key();
-        let invoice_pubkey = PubKey::from_bytes(xonly.serialize()).map_err(|error| {
+        let invoice_pubkey = XOnlyPubKey::from_bytes(xonly.serialize()).map_err(|error| {
             Error::InvalidParams(format!("invalid LND x-only identity: {error}"))
         })?;
 
@@ -478,11 +478,11 @@ impl NetworkRouterAdapter for LndAdapter {
         self.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> PubKey {
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey
     }
 
-    fn claim_pubkey(&self) -> PubKey {
+    fn claim_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey
     }
 
@@ -495,20 +495,17 @@ impl NetworkRouterAdapter for LndAdapter {
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+    ) -> Result<(), HtlcError> {
         if deadline <= unix_now() {
             return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
         self.ensure_incoming(payment_hash, min_amount_msat, deadline)
             .await
             .map_err(HtlcError::from)?;
-        self.incoming_htlc_descriptor(payment_hash).await
+        Ok(())
     }
 
-    async fn incoming_htlc_descriptor(
-        &self,
-        payment_hash: Bytes32,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+    async fn htlc_target(&self, payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
         let payment_request = self
             .incoming
             .lock()
@@ -517,7 +514,7 @@ impl NetworkRouterAdapter for LndAdapter {
             .map(|pending| pending.payment_request.clone())
             .ok_or_else(|| Error::NoIncoming(payment_hash.to_string()))
             .map_err(HtlcError::from)?;
-        Ok(Some(HtlcDescriptor::Lightning { payment_request }))
+        Ok(HtlcTarget::LightningInvoice(payment_request))
     }
 
     async fn cancel_incoming_htlc(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
@@ -533,39 +530,36 @@ impl NetworkRouterAdapter for LndAdapter {
 
     async fn create_outgoing_htlc(
         &self,
-        _payment_hash: Bytes32,
-        _amount_msat: u64,
-        _expiry: u64,
-        _recipient: PubKey,
-    ) -> Result<OutgoingHtlc, HtlcError> {
-        Err(HtlcError::InvalidParams(
-            "LND requires the downstream hold invoice descriptor".into(),
-        ))
-    }
-
-    async fn create_outgoing_htlc_with_descriptor(
-        &self,
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: PubKey,
-        target: Option<&HtlcDescriptor>,
+        htlc_target: &HtlcTarget,
     ) -> Result<OutgoingHtlc, HtlcError> {
+        let payment_request = match htlc_target {
+            HtlcTarget::LightningInvoice(invoice) => invoice.clone(),
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::PubKey(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "lightning requires a hold invoice target".into(),
+                ))
+            }
+        };
         if expiry <= unix_now() {
             return Err(HtlcError::InvalidParams(
                 "outgoing expiry is in the past".into(),
             ));
         }
-        let payment_request = target
-            .ok_or_else(|| HtlcError::InvalidParams("missing LND target invoice".into()))
-            .and_then(|target| {
-                self.parse_target(target, payment_hash, amount_msat)
-                    .map_err(HtlcError::from)
-            })?;
+        self.parse_target(
+            &HtlcDescriptor::Lightning {
+                payment_request: payment_request.clone(),
+            },
+            payment_hash,
+            amount_msat,
+        )
+        .map_err(HtlcError::from)?;
         let pending = PendingOutgoing {
             amount_msat,
             expiry,
-            payment_request,
+            payment_request: payment_request.clone(),
             state: Arc::new(Mutex::new(OutgoingState::Pending)),
             changed: Arc::new(Notify::new()),
             cancel: Arc::new(Notify::new()),
@@ -580,7 +574,7 @@ impl NetworkRouterAdapter for LndAdapter {
             payment_hash,
             amount_msat,
             expiry,
-            recipient: recipient.to_hex(),
+            recipient: payment_request,
             network: self.network_id.clone(),
         })
     }
