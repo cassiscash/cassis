@@ -7,8 +7,8 @@ edition.workspace = true
 cassis-core = { workspace = true }
 lowercase-hex = { workspace = true }
 iroh = { workspace = true }
-postcard = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "sync"] }
 tracing = { workspace = true }
