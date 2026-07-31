@@ -36,13 +36,13 @@ pub(crate) async fn run(network: String, command: ArkadeCommands) -> Result<(), 
 async fn adapter(
     network: &str,
 ) -> Result<(NetSpec, std::sync::Arc<cassis_arkade::ArkadeAdapter>), String> {
-    let testnet = network == "arkade::testnet";
+    let testnet = network == "arkade::mutinynet";
     if !testnet && network != "arkade" {
         return Err(format!(
-            "network 'arkade' only accepts no parameter or 'testnet', got '{network}'"
+            "network 'arkade' only accepts no parameter or 'mutinynet', got '{network}'"
         ));
     }
-    let spec = NetSpec::Arkade { testnet };
+    let spec = NetSpec::Arkade { mutinynet: testnet };
     let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
     let adapter = build_arkade_adapter(&spec, &derived, info_span!("node", node = "cassis-cli"))

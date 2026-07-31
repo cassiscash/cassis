@@ -407,7 +407,7 @@ async fn build_adapter(
         "arkade" => {
             let network_id = match param {
                 None => NetworkId("arkade".to_string()),
-                Some("testnet") => NetworkId("arkade::testnet".to_string()),
+                Some("testnet") => NetworkId("arkade::mutinynet".to_string()),
                 Some(other) => {
                     return Err(format!(
                         "network 'arkade' only accepts no parameter or 'testnet', got '{other}'"
