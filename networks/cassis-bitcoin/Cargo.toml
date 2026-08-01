@@ -1,0 +1,17 @@
+[package]
+name = "cassis-bitcoin"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+async-trait = { workspace = true }
+cassis-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+
+bitcoin = { workspace = true }
+esplora-client = { workspace = true, features = ["async-https"] }

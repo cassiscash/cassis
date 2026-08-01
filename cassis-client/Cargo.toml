@@ -7,6 +7,7 @@ edition.workspace = true
 default = []
 cashu = ["cassis-core/cashu"]
 arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
+bitcoin = ["dep:cassis-bitcoin", "cassis-core/bitcoin"]
 liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["cassis-core/rootstock"]
 lightning = ["dep:cassis-lightning", "cassis-core/lightning"]
@@ -20,6 +21,7 @@ cassis-router = { workspace = true }
 cassis-cashu = { workspace = true }
 cassis-rootstock = { workspace = true }
 cassis-arkade = { workspace = true, optional = true }
+cassis-bitcoin = { workspace = true, optional = true }
 cassis-liquid = { workspace = true, optional = true }
 cassis-lightning = { workspace = true, optional = true }
 clap = { workspace = true }

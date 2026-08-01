@@ -2363,6 +2363,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cassis-bitcoin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "cassis-core",
+ "esplora-client 0.10.0",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cassis-cashu"
 version = "0.1.0"
 dependencies = [
@@ -2415,6 +2428,7 @@ name = "cassis-client"
 version = "0.1.0"
 dependencies = [
  "cassis-arkade",
+ "cassis-bitcoin",
  "cassis-cashu",
  "cassis-core",
  "cassis-iroh",
@@ -2594,6 +2608,7 @@ name = "cassis-router"
 version = "0.1.0"
 dependencies = [
  "cassis-arkade",
+ "cassis-bitcoin",
  "cassis-cashu",
  "cassis-core",
  "cassis-fedimint",
