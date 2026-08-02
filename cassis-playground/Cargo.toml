@@ -16,13 +16,14 @@ name = "cassis-prefund"
 path = "src/bin/prefund.rs"
 
 [dependencies]
-cassis-client = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock"] }
+cassis-client = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock", "bitcoin"] }
 cassis-routing = { workspace = true }
-cassis-core = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock"] }
+cassis-core = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock", "bitcoin"] }
 cassis-keys = { workspace = true }
-cassis-router = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock"] }
+cassis-router = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock", "bitcoin"] }
 cassis-cashu = { workspace = true }
 cassis-arkade = { workspace = true }
+cassis-bitcoin = { workspace = true }
 cassis-liquid = { workspace = true }
 cassis-rootstock = { workspace = true }
 ritualistic = { workspace = true }

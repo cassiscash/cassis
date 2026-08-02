@@ -409,6 +409,140 @@ impl BitcoinAdapter {
             .as_secs()
     }
 
+    /// The address test coins must be sent to so the wallet has
+    /// spendable cash (also where change and claims return to).
+    pub fn deposit_address(&self) -> String {
+        self.funding_address.to_string()
+    }
+
+    /// Spendable wallet cash, in msat (sats * 1000).
+    pub async fn balance_msat(&self) -> Result<u64, HtlcError> {
+        let funding_spk = self.funding_address.script_pubkey();
+        self.scan_unspent(&funding_spk).await.map(|utxos| {
+            utxos
+                .iter()
+                .map(|(_, v)| v.to_sat())
+                .sum::<u64>()
+                .saturating_mul(MSAT_PER_SAT)
+        })
+    }
+
+    /// Send `amount_msat` to `address` from the wallet's P2TR cash,
+    /// change back to the funding address. Mirrors the lockup sweep
+    /// but with a single P2TR recipient instead of an HTLC output.
+    pub async fn transfer_to_address(
+        &self,
+        address: &str,
+        amount_msat: u64,
+    ) -> Result<bitcoin::Txid, HtlcError> {
+        if amount_msat % MSAT_PER_SAT != 0 {
+            return Err(HtlcError::InvalidParams(format!(
+                "amount {amount_msat} msat is not a whole number of satoshis"
+            )));
+        }
+        let amount_sat = amount_msat / MSAT_PER_SAT;
+        if amount_sat < DUST_SATS {
+            return Err(HtlcError::InvalidParams(format!(
+                "amount {amount_sat} sats is below the dust limit of {DUST_SATS} sats"
+            )));
+        }
+        let destination = Address::from_str(address)
+            .map_err(|e| HtlcError::InvalidParams(format!("bad destination address: {e}")))?
+            .require_network(self.network)
+            .map_err(|e| HtlcError::InvalidParams(format!("wrong network for destination: {e}")))?;
+
+        let funding_spk = self.funding_address.script_pubkey();
+        let mut utxos = self.scan_unspent(&funding_spk).await?;
+        utxos.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        let mut selected: Vec<(OutPoint, Amount)> = Vec::new();
+        let mut gathered = 0u64;
+        let mut fee = self.fee_for(Self::vsize_for(0, 0, 1, 0)).to_sat();
+        let mut change_used = false;
+        for utxo in &utxos {
+            gathered += utxo.1.to_sat();
+            selected.push(*utxo);
+            change_used = gathered > amount_sat;
+            if change_used {
+                fee = self
+                    .fee_for(Self::vsize_for(selected.len() as u64, 0, 2, 0))
+                    .to_sat();
+            } else {
+                fee = self
+                    .fee_for(Self::vsize_for(selected.len() as u64, 0, 1, 0))
+                    .to_sat();
+            }
+            if gathered >= amount_sat + fee && (!change_used || gathered - amount_sat >= DUST_SATS)
+            {
+                break;
+            }
+        }
+        if gathered < amount_sat + fee {
+            return Err(HtlcError::Network(format!(
+                "insufficient balance: sending {} sats needs {} sats with fee, wallet holds {gathered}",
+                amount_sat,
+                amount_sat + fee
+            )));
+        }
+        let change = gathered.saturating_sub(amount_sat + fee);
+        let mut outputs = vec![TxOut {
+            value: Amount::from_sat(amount_sat),
+            script_pubkey: destination.script_pubkey(),
+        }];
+        if change_used && change >= DUST_SATS {
+            outputs.push(TxOut {
+                value: Amount::from_sat(change),
+                script_pubkey: funding_spk.clone(),
+            });
+        }
+
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: selected
+                .iter()
+                .map(|(op, _)| TxIn {
+                    previous_output: *op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: outputs,
+        };
+        // P2TR key-path sweep: Schnorr signatures over the taproot
+        // key-spend sighash of each funding input.
+        let secp = Secp256k1::new();
+        let wallet_pair = Keypair::from_secret_key(&secp, &self.wallet_sk);
+        let tweaked_pair = wallet_pair.tap_tweak(&secp, None);
+        let prevouts: Vec<TxOut> = selected
+            .iter()
+            .map(|(_, value)| TxOut {
+                value: *value,
+                script_pubkey: funding_spk.clone(),
+            })
+            .collect();
+        let mut cache = SighashCache::new(&tx);
+        let mut sigs = Vec::with_capacity(selected.len());
+        for (idx, _) in selected.iter().enumerate() {
+            let sh = cache
+                .taproot_key_spend_signature_hash(
+                    idx,
+                    &bitcoin::sighash::Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .map_err(|e| HtlcError::Network(format!("taproot sighash: {e}")))?;
+            let msg = bitcoin::secp256k1::Message::from_digest(*sh.as_ref());
+            sigs.push(
+                secp.sign_schnorr_no_aux_rand(&msg, &tweaked_pair.as_keypair())
+                    .serialize(),
+            );
+        }
+        for (idx, sig) in sigs.into_iter().enumerate() {
+            tx.input[idx].witness = Witness::from_slice(&[sig]);
+        }
+        self.broadcast(&tx, "wallet transfer").await
+    }
+
     /// All unspent `(outpoint, value)` at `script`.
     async fn scan_unspent(&self, script: &ScriptBuf) -> Result<Vec<(OutPoint, Amount)>, HtlcError> {
         let txs = tokio::time::timeout(
