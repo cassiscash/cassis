@@ -5,10 +5,11 @@
 //! timestamp* refund CLTV instead of a block height):
 //!
 //! ```text
-//! OP_HASH160 <hash160(preimage)> OP_EQUAL
-//! OP_IF   <claim_pubkey>
+//! OP_IF   OP_HASH160 <hash160(preimage)> OP_EQUAL
+//!         <claim_pubkey> OP_CHECKSIG
 //! OP_ELSE <refund_locktime> OP_CLTV OP_DROP <refund_pubkey>
-//! OP_ENDIF OP_CHECKSIG
+//!         OP_CHECKSIG
+//! OP_ENDIF
 //! ```
 //!
 //! The taproot internal key is the sender's per-network key (x-only):
@@ -183,7 +184,15 @@ pub fn default_config(
 // ---------------------------------------------------------------------------
 
 /// Build the HTLC taproot script leaf (see crate docs). Keys are
-/// x-only: BIP342 CHECKSIG signs them directly.
+/// x-only: BIP342 CHECKSIG signs them directly. The hash check lives
+/// inside the claim branch so the refund branch never executes any
+/// hash-opcode consumption:
+///
+/// ```text
+/// OP_IF OP_HASH160 <hash> OP_EQUAL <claim_pubkey> OP_CHECKSIG
+/// OP_ELSE <locktime> OP_CLTV OP_DROP <refund_pubkey> OP_CHECKSIG
+/// OP_ENDIF
+/// ```
 fn htlc_script(
     payment_hash160: &[u8; 20],
     claim_pubkey: &[u8; 32],
@@ -191,18 +200,19 @@ fn htlc_script(
     refund_locktime: u32,
 ) -> ScriptBuf {
     ScriptBuilder::new()
+        .push_opcode(OP_IF)
         .push_opcode(OP_HASH160)
         .push_slice(*payment_hash160)
         .push_opcode(OP_EQUAL)
-        .push_opcode(OP_IF)
         .push_slice(*claim_pubkey)
+        .push_opcode(OP_CHECKSIG)
         .push_opcode(OP_ELSE)
         .push_int(i64::from(refund_locktime))
         .push_opcode(OP_CLTV)
         .push_opcode(OP_DROP)
         .push_slice(*refund_pubkey)
-        .push_opcode(OP_ENDIF)
         .push_opcode(OP_CHECKSIG)
+        .push_opcode(OP_ENDIF)
         .into_script()
 }
 
@@ -1313,11 +1323,13 @@ mod tests {
         let refund = xonly_of(3);
         let script = htlc_script(&hash, &claim, &refund, 700_000_000);
         let bytes = script.as_bytes();
-        // OP_HASH160 at the start, hash right after it.
-        assert_eq!(bytes[0], 0xA9_u8);
-        assert_eq!(&bytes[2..22], &hash);
-        // OP_ENDIF + OP_CHECKSIG tail.
-        assert_eq!(&bytes[bytes.len() - 2..], &[0x68u8, 0xACu8]);
+        // OP_IF opener, then OP_HASH160 + hash right after it.
+        assert_eq!(bytes[0], 0x63_u8);
+        assert_eq!(bytes[1], 0xA9_u8);
+        assert_eq!(&bytes[3..23], &hash);
+        // Refund tail: OP_ELSE already seen; final opcodes are
+        // OP_CHECKSIG + OP_ENDIF.
+        assert_eq!(bytes[bytes.len() - 2..], [0xACu8, 0x68u8]);
 
         // The single-leaf taproot tree over the script produces a
         // valid P2TR bech32 address.
