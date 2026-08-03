@@ -6,24 +6,26 @@
 //! and an esplora backend for sync and broadcast.
 //!
 //! HTLCs are plain P2WSH outputs whose single witness script has two
-//! spending paths (boltz-style):
+//! spending paths (boltz-style, with the hash check inside the claim
+//! branch):
 //!
 //! ```text
-//! OP_HASH160 <RIPEMD160(payment_hash)> OP_EQUAL
-//! OP_IF <claim_pubkey>
+//! OP_IF   OP_HASH160 <RIPEMD160(payment_hash)> OP_EQUALVERIFY
+//!         <claim_pubkey> OP_CHECKSIG
 //! OP_ELSE <refund_locktime> OP_CLTV OP_DROP <refund_pubkey>
+//!         OP_CHECKSIG
 //! OP_ENDIF
-//! OP_CHECKSIG
 //! ```
 //!
-//! * **Claim** (receiver): witness `[sig, preimage, script]` — the
-//!   revealed preimage selects the IF branch and the receiver signs
-//!   with its per-network claim key. The lockup output is *unblinded*
-//!   (explicit), so no blinding keys ever cross the protocol.
+//! * **Claim** (receiver): witness
+//!   `[sig, preimage, <true>, script]` — the explicit `OP_TRUE`
+//!   selects the IF branch while the preimage stays on the stack for
+//!   the hash check, and the receiver signs with its per-network
+//!   claim key. The lockup output is *unblinded* (explicit), so no
+//!   blinding keys ever cross the protocol.
 //! * **Refund** (sender): witness `[sig, <empty>, script]` — the
-//!   empty push fails the hash check, selecting the CLTV branch;
-//!   recoverable after an absolute block height derived from the
-//!   route expiry.
+//!   empty push fails OP_IF, selecting the CLTV branch; recoverable
+//!   after an absolute block height derived from the route expiry.
 //!
 //! Claim and refund are built as single-input spends whose fee comes
 //! out of the HTLC value itself (LWK `drain_lbtc_to`), so neither
@@ -80,7 +82,7 @@ use lwk_wollet::elements::confidential::{
 };
 use lwk_wollet::elements::encode::Decodable as _;
 use lwk_wollet::elements::opcodes::all::{
-    OP_CHECKSIG, OP_CLTV, OP_DROP, OP_ELSE, OP_ENDIF, OP_EQUAL, OP_HASH160, OP_IF,
+    OP_CHECKSIG, OP_CLTV, OP_DROP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_HASH160, OP_IF,
 };
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 use lwk_wollet::elements::script::{Builder as ElScriptBuilder, Script as ElScript};
@@ -230,9 +232,11 @@ fn msat_to_sat(amount_msat: u64) -> Result<u64, HtlcError> {
     Ok(amount_msat / MSAT_PER_SAT)
 }
 
-/// Build the HTLC witness script (see the crate docs): preimage
-/// revelation + receiver signature on the IF branch, CLTV-gated
-/// sender recovery on the ELSE branch.
+/// Build the HTLC witness script (see the crate docs): an explicit
+/// OP_TRUE / empty selector picks preimage revelation + receiver
+/// signature on the IF branch or CLTV-gated sender recovery on the
+/// ELSE branch; the hash check sits inside the claim branch, leaving
+/// the preimage on the stack for OP_HASH160.
 fn htlc_script(
     payment_hash160: &[u8; 20],
     claim_pubkey: &BtcPublicKey,
@@ -240,18 +244,19 @@ fn htlc_script(
     refund_locktime: u32,
 ) -> ElScript {
     ElScriptBuilder::new()
+        .push_opcode(OP_IF)
         .push_opcode(OP_HASH160)
         .push_slice(payment_hash160)
-        .push_opcode(OP_EQUAL)
-        .push_opcode(OP_IF)
+        .push_opcode(OP_EQUALVERIFY)
         .push_key(claim_pubkey)
+        .push_opcode(OP_CHECKSIG)
         .push_opcode(OP_ELSE)
         .push_int(i64::from(refund_locktime))
         .push_opcode(OP_CLTV)
         .push_opcode(OP_DROP)
         .push_key(refund_pubkey)
-        .push_opcode(OP_ENDIF)
         .push_opcode(OP_CHECKSIG)
+        .push_opcode(OP_ENDIF)
         .into_script()
 }
 
@@ -743,9 +748,10 @@ impl LiquidAdapter {
     fn max_weight_to_satisfy(script: &ElScript, with_preimage: bool) -> usize {
         let script_len = script.len();
         let mut witness_len = 1; // item count
-                                 // Branch selector: the 32-byte preimage on claims, an empty
-                                 // push on refunds.
-        witness_len += if with_preimage { 1 + 32 } else { 1 };
+                                 // On claims: the 32-byte preimage (hashed by
+                                 // the claim branch) plus a 1-byte OP_TRUE
+                                 // selector; on refunds an empty push only.
+        witness_len += if with_preimage { 1 + 32 + 1 } else { 1 };
         witness_len += 1 + 73; // der sig + sighash byte
         witness_len += varint_len(script_len) + script_len;
         witness_len * 4 + 64 // conservative overhead for the input shell
@@ -753,9 +759,9 @@ impl LiquidAdapter {
 
     /// Sign `pset` with the software signer and return the extracted
     /// transaction with every input's witness built by hand: the HTLC
-    /// input gets `[sig, preimage-or-empty, script]` (the middle item
-    /// selects the script branch), plain p2wpkh wallet inputs get
-    /// `[sig, pubkey]`.
+    /// input gets `[sig, preimage?, true-or-empty, script]` (the
+    /// selector picks the script branch), plain p2wpkh wallet inputs
+    /// get `[sig, pubkey]`.
     ///
     /// Manual witness assembly (instead of `Wollet::finalize`) is
     /// required for the claim path: the preimage is not representable
@@ -795,12 +801,23 @@ impl LiquidAdapter {
                         HtlcError::Network("claim signature missing after sign".into())
                     })?;
                 let (_, preimage, script) = htlc_input.as_ref().expect("matched above");
-                // Witness items are pushed in order, so the branch
-                // selector (preimage or empty vector) must sit *after*
-                // the signature to end up on top of the stack, where
-                // the script's leading OP_HASH160 consumes it.
-                let selector = preimage.map(|p| p.to_vec()).unwrap_or_default();
-                vec![sig.clone(), selector, script.to_bytes()]
+                // Witness items are pushed in order. The selector
+                // (OP_TRUE or empty vector) must sit on top of the
+                // stack for the leading OP_IF; on claims the preimage
+                // goes right below it, free for the branch's
+                // OP_HASH160.
+                let selector = if preimage.is_some() {
+                    vec![1u8]
+                } else {
+                    Vec::new()
+                };
+                let mut witness = vec![sig.clone()];
+                if let Some(p) = preimage {
+                    witness.push(p.to_vec());
+                }
+                witness.push(selector);
+                witness.push(script.to_bytes());
+                witness
             } else if !psbt_input.partial_sigs.is_empty() {
                 // P2WPKH wallet input: [sig, pubkey].
                 let (pk, sig) = psbt_input
@@ -1548,9 +1565,10 @@ impl LiquidAdapter {
     }
 
     /// Pull the preimage from the claim witness of the tx spending
-    /// `outpoint`. Spend witness layout: `[sig, selector, script]`,
-    /// where the selector is the preimage on claims and an empty push
-    /// on refunds.
+    /// `outpoint`. Spend witness layout:
+    /// `[sig, preimage?, selector, script]` — the preimage sits at
+    /// index 1 on claims, where the claim branch's OP_HASH160 pops
+    /// it; refunds carry an empty push there.
     fn extract_preimage(
         tx: &Transaction,
         outpoint: OutPoint,
@@ -1562,7 +1580,7 @@ impl LiquidAdapter {
             .position(|i| i.previous_output == outpoint)
             .ok_or("spending tx does not spend the lockup outpoint")?;
         let stack = &tx.input[vin_index].witness.script_witness;
-        let preimage_bytes = stack.get(1).ok_or("spend witness has no branch selector")?;
+        let preimage_bytes = stack.get(1).ok_or("spend witness has no preimage item")?;
         let preimage: [u8; 32] = preimage_bytes
             .as_slice()
             .try_into()

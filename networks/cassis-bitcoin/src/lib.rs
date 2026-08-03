@@ -5,7 +5,7 @@
 //! timestamp* refund CLTV instead of a block height):
 //!
 //! ```text
-//! OP_IF   OP_HASH160 <hash160(preimage)> OP_EQUAL
+//! OP_IF   OP_HASH160 <hash160(preimage)> OP_EQUALVERIFY
 //!         <claim_pubkey> OP_CHECKSIG
 //! OP_ELSE <refund_locktime> OP_CLTV OP_DROP <refund_pubkey>
 //!         OP_CHECKSIG
@@ -23,7 +23,9 @@
 //!   pays for, sweeping its own P2TR UTXOs (key path); the HTLC
 //!   output is the P2TR of the tweaked single-leaf tree above.
 //! * **Claim** (incoming HTLC): witness
-//!   `[sig, preimage, leaf_script, control_block]`.
+//!   `[sig, preimage, <true>, leaf_script, control_block]` — the
+//!   explicit `OP_TRUE` selects the claim branch while the preimage
+//!   stays on the stack for the hash check.
 //! * **Refund**: once the unix locktime passes, witness
 //!   `[sig, <empty>, leaf_script, control_block]` with the
 //!   transaction locktime set.
@@ -54,7 +56,7 @@ use bitcoin::opcodes::all::OP_CLTV;
 use bitcoin::opcodes::all::OP_DROP;
 use bitcoin::opcodes::all::OP_ELSE;
 use bitcoin::opcodes::all::OP_ENDIF;
-use bitcoin::opcodes::all::OP_EQUAL;
+use bitcoin::opcodes::all::OP_EQUALVERIFY;
 use bitcoin::opcodes::all::OP_HASH160;
 use bitcoin::opcodes::all::OP_IF;
 use bitcoin::script::Builder as ScriptBuilder;
@@ -186,10 +188,11 @@ pub fn default_config(
 /// Build the HTLC taproot script leaf (see crate docs). Keys are
 /// x-only: BIP342 CHECKSIG signs them directly. The hash check lives
 /// inside the claim branch so the refund branch never executes any
-/// hash-opcode consumption:
+/// hash-opcode consumption; the branch selector is an explicit
+/// OP_TRUE / empty push, leaving the preimage free for OP_HASH160:
 ///
 /// ```text
-/// OP_IF OP_HASH160 <hash> OP_EQUAL <claim_pubkey> OP_CHECKSIG
+/// OP_IF OP_HASH160 <hash> OP_EQUALVERIFY <claim_pubkey> OP_CHECKSIG
 /// OP_ELSE <locktime> OP_CLTV OP_DROP <refund_pubkey> OP_CHECKSIG
 /// OP_ENDIF
 /// ```
@@ -203,7 +206,7 @@ fn htlc_script(
         .push_opcode(OP_IF)
         .push_opcode(OP_HASH160)
         .push_slice(*payment_hash160)
-        .push_opcode(OP_EQUAL)
+        .push_opcode(OP_EQUALVERIFY)
         .push_slice(*claim_pubkey)
         .push_opcode(OP_CHECKSIG)
         .push_opcode(OP_ELSE)
@@ -893,16 +896,17 @@ impl BitcoinAdapter {
             .to_vec();
         // Witness items land on the stack in order: the signature sits
         // at the bottom (CHECKSIG pops it after the branch supplies
-        // the pubkey), the preimage-or-empty selector on top (the
-        // leading OP_HASH160 consumes it), then script + control
-        // block.
-        let selector: Vec<u8> = preimage.map(|p| p.0.to_vec()).unwrap_or_default();
-        tx.input[0].witness = Witness::from_slice(&[
-            sig,
-            selector,
-            witness_script.to_bytes(),
-            control_block.serialize(),
-        ]);
+        // the pubkey), the preimage above it (OP_HASH160 pops it
+        // inside the claim branch), and the OP_TRUE / empty branch
+        // selector on top for OP_IF.
+        let mut witness_items: Vec<Vec<u8>> = vec![sig];
+        witness_items.extend(match preimage {
+            Some(p) => vec![p.0.to_vec(), vec![1u8]],
+            None => vec![Vec::new()],
+        });
+        witness_items.push(witness_script.to_bytes());
+        witness_items.push(control_block.serialize());
+        tx.input[0].witness = Witness::from_slice(&witness_items);
         self.broadcast(
             &tx,
             if is_claim {
@@ -1323,10 +1327,13 @@ mod tests {
         let refund = xonly_of(3);
         let script = htlc_script(&hash, &claim, &refund, 700_000_000);
         let bytes = script.as_bytes();
-        // OP_IF opener, then OP_HASH160 + hash right after it.
+        // OP_IF opener, then OP_HASH160 + hash right after it,
+        // closed by OP_EQUALVERIFY (0x88) so the claim branch leaves
+        // the signature on the stack for CHECKSIG.
         assert_eq!(bytes[0], 0x63_u8);
         assert_eq!(bytes[1], 0xA9_u8);
         assert_eq!(&bytes[3..23], &hash);
+        assert_eq!(bytes[23], 0x88_u8);
         // Refund tail: OP_ELSE already seen; final opcodes are
         // OP_CHECKSIG + OP_ENDIF.
         assert_eq!(bytes[bytes.len() - 2..], [0xACu8, 0x68u8]);
