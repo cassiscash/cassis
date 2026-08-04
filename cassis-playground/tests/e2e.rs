@@ -32,7 +32,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cassis_core::HopPrepare;
 use cassis_playground::{
     command_fund, command_pay, command_router, command_router_with_veto, node_home, Playground,
     DEFAULT_PREFUND_SEED, E2E_ROOT,
@@ -313,7 +312,7 @@ async fn payment_fails_when_router_vetoes() {
         .unwrap();
 
     // Bob rejects every PREPARE outright.
-    let veto_all: Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync> =
+    let veto_all: cassis_router::PrepareVeto =
         Arc::new(|_prepare| Some("bob is in a bad mood".to_string()));
     command_router_with_veto(
         &pg,
@@ -371,11 +370,10 @@ async fn payment_fails_when_second_hop_vetoes() {
 
     // Derek vetoes anything above a small threshold; the payment amount
     // is above it, so his hop rejects.
-    let veto_large: Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync> =
-        Arc::new(|prepare| {
-            (prepare.amount_msat > 100_000)
-                .then(|| format!("derek refuses {} msat", prepare.amount_msat))
-        });
+    let veto_large: cassis_router::PrepareVeto = Arc::new(|prepare| {
+        (prepare.amount_msat > 100_000)
+            .then(|| format!("derek refuses {} msat", prepare.amount_msat))
+    });
     command_router_with_veto(
         &pg,
         "derek",

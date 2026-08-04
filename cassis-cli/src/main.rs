@@ -341,6 +341,7 @@ async fn cmd_watch(adapter_config: &AdapterConfig) -> Result<(), String> {
 // invoice
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)] // clap-bound flags, CLI glue
 async fn cmd_invoice(
     amount: u64,
     network: String,
@@ -363,7 +364,7 @@ async fn cmd_invoice(
     )
     .await?;
     println!("payment_hash: {payment_hash}");
-    println!("preimage:     {}", lowercase_hex::encode(&preimage));
+    println!("preimage:     {}", lowercase_hex::encode(preimage));
     println!("network:      {network_id}");
     println!("amount_msat:  {amount}");
     println!("expires_at:   {expiry}");
@@ -489,8 +490,8 @@ fn cmd_invoices_list(status_str: Option<String>) -> Result<(), String> {
         return Ok(());
     }
     println!(
-        "{:<66} {:>12}  {:<10}  {:<8}  {}",
-        "payment_hash", "amount_msat", "network", "status", "created_at"
+        "{:<66} {:>12}  {:<10}  {:<8}  created_at",
+        "payment_hash", "amount_msat", "network", "status"
     );
     for r in &rows {
         println!(
@@ -510,7 +511,7 @@ fn cmd_invoices_show(payment_hash_str: String) -> Result<(), String> {
     let mut store = open_store()?;
     let row = store.get(&ph).map_err(|e| e.to_string())?;
     println!("payment_hash: {}", row.payment_hash);
-    println!("preimage:     {}", lowercase_hex::encode(&row.preimage));
+    println!("preimage:     {}", lowercase_hex::encode(row.preimage));
     println!("amount_msat:  {}", row.amount_msat);
     println!("network:      {}", row.network_id);
     println!("payee:        {}", row.payee.as_deref().unwrap_or("-"));

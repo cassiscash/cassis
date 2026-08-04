@@ -223,7 +223,7 @@ fn payment_hash160(payment_hash: &Bytes32) -> [u8; 20] {
 }
 
 fn msat_to_sat(amount_msat: u64) -> Result<u64, HtlcError> {
-    if amount_msat % MSAT_PER_SAT != 0 {
+    if !amount_msat.is_multiple_of(MSAT_PER_SAT) {
         return Err(HtlcError::InvalidParams(format!(
             "amount {amount_msat} msat is not a whole number of satoshis; \
              liquid amounts must be multiples of {MSAT_PER_SAT} msat"
@@ -460,6 +460,7 @@ impl LiquidAdapter {
             let lock_path = persist_dir.join(".lock");
             let lock = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&lock_path)

@@ -205,7 +205,7 @@ fn exit_delay_secs(delay: Sequence) -> u32 {
 }
 
 fn msat_to_sat_amount(amount_msat: u64) -> Result<bitcoin::Amount, HtlcError> {
-    if amount_msat % MSAT_PER_SAT != 0 {
+    if !amount_msat.is_multiple_of(MSAT_PER_SAT) {
         return Err(HtlcError::InvalidParams(format!(
             "amount {amount_msat} msat is not a whole number of satoshis; \
              arkade amounts must be multiples of {MSAT_PER_SAT} msat"
@@ -726,7 +726,7 @@ impl ArkadeAdapter {
             vtxo.outpoint,
             vtxo.assets,
         );
-        let outputs = vec![SendReceiver::bitcoin(our_address.clone(), vtxo.amount)];
+        let outputs = vec![SendReceiver::bitcoin(our_address, vtxo.amount)];
 
         let txid = self
             .submit_vhtlc_spend(
@@ -1068,7 +1068,7 @@ impl NetworkRouterAdapter for ArkadeAdapter {
             vtxo.outpoint,
             vtxo.assets,
         );
-        let outputs = vec![SendReceiver::bitcoin(our_address.clone(), vtxo.amount)];
+        let outputs = vec![SendReceiver::bitcoin(our_address, vtxo.amount)];
 
         let txid = self
             .submit_vhtlc_spend(input, &outputs, &our_address, self.signer_with(None))

@@ -55,7 +55,7 @@ impl fmt::Display for BalanceMsat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let digits = self.0.to_string();
         for (index, digit) in digits.chars().enumerate() {
-            if index > 0 && (digits.len() - index) % 3 == 0 {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
                 f.write_str("_")?;
             }
             write!(f, "{digit}")?;
@@ -1270,7 +1270,7 @@ pub async fn command_router_with_veto(
     playground: &Playground,
     node_id: &str,
     network_ids: Vec<String>,
-    prepare_veto: Option<Arc<dyn Fn(&cassis_core::HopPrepare) -> Option<String> + Send + Sync>>,
+    prepare_veto: Option<cassis_router::PrepareVeto>,
 ) -> Result<(), String> {
     if !playground.nodes.lock().await.contains_key(node_id) {
         return Err(format!("unknown node '{node_id}'"));

@@ -61,7 +61,7 @@ fn generate_preimage() -> [u8; 32] {
 /// Hash a 32-byte preimage with SHA-256 to produce a payment hash.
 pub fn payment_hash_of(preimage: [u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(&preimage);
+    h.update(preimage);
     let out = h.finalize();
     let mut out32 = [0u8; 32];
     out32.copy_from_slice(&out);

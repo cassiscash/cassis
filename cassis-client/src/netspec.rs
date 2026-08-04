@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(s.kind_name(), "liquid");
         let s = NetSpec::parse("liquid::testnet").unwrap();
         assert_eq!(s.network_id().0, "liquid::testnet");
-        assert!(matches!(NetSpec::parse("liquid::foo"), Err(_)));
+        assert!(NetSpec::parse("liquid::foo").is_err());
     }
 
     #[test]
@@ -179,7 +179,7 @@ mod tests {
         let s = NetSpec::parse("lightning").unwrap();
         assert_eq!(s.network_id().0, "lightning");
         assert_eq!(s.kind_name(), "lightning");
-        assert!(matches!(NetSpec::parse("lightning::testnet"), Err(_)));
+        assert!(NetSpec::parse("lightning::testnet").is_err());
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(s.kind_name(), "arkade");
         let s = NetSpec::parse("arkade::mutinynet").unwrap();
         assert_eq!(s.network_id().0, "arkade::mutinynet");
-        assert!(matches!(NetSpec::parse("arkade::foo"), Err(_)));
+        assert!(NetSpec::parse("arkade::foo").is_err());
     }
 
     #[test]
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(s.kind_name(), "bitcoin");
         let s = NetSpec::parse("bitcoin::mutinynet").unwrap();
         assert_eq!(s.network_id().0, "bitcoin::mutinynet");
-        assert!(matches!(NetSpec::parse("bitcoin::foo"), Err(_)));
-        assert!(matches!(NetSpec::parse("bitcoin::testnet"), Err(_)));
+        assert!(NetSpec::parse("bitcoin::foo").is_err());
+        assert!(NetSpec::parse("bitcoin::testnet").is_err());
     }
 }
