@@ -1,4 +1,4 @@
-use crate::{arkade, cashu, liquid, rootstock};
+use crate::{arkade, cashu, fedimint, liquid, rootstock};
 use clap::{Parser, Subcommand};
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
@@ -112,7 +112,7 @@ pub enum Commands {
     },
     /// Register a network to participate in. The argument format
     /// mirrors `cassis-router`: `cashu::host`, `rootstock`,
-    /// `rootstock::testnet`.
+    /// `rootstock::testnet`, `fedimint::<invite-code>`.
     Register {
         #[arg(long, action = clap::ArgAction::Append, value_name = "SPEC")]
         network: Vec<String>,
@@ -124,6 +124,16 @@ pub enum Commands {
         network: String,
         #[command(subcommand)]
         command: rootstock::RootstockCommands,
+    },
+    /// Fedimint (ecash federation) wallet.
+    Fedimint {
+        /// Network spec: `fedimint::<invite-code>` (or a `db::` path
+        /// to re-open an already-joined client).
+        #[arg(long, action = clap::ArgAction::Set, value_name = "SPEC")]
+        network: String,
+
+        #[command(subcommand)]
+        command: fedimint::FedimintCommands,
     },
     /// Run the multi-network routing daemon. Replaced by the GUI.
     Router {

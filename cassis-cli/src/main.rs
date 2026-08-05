@@ -28,6 +28,7 @@ use tracing::{error, info, info_span};
 mod arkade;
 mod cashu;
 mod cli;
+mod fedimint;
 mod liquid;
 mod rootstock;
 use cli::{Cli, Commands};
@@ -113,6 +114,7 @@ async fn main() {
         }
         Commands::Register { network } => cmd_register(network),
         Commands::Rootstock { network, command } => rootstock::run(network, command).await,
+        Commands::Fedimint { network, command } => fedimint::run(network, command).await,
         Commands::Router { .. } => {
             Err("'router' is now integrated into the GUI; run `cargo run -p cassis-gui`".into())
         }

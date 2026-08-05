@@ -87,6 +87,7 @@ fedimint-connectors = { git = "https://github.com/fedimint/fedimint", rev = "cf5
 fedimint-derive-secret = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 fedimint-mint-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
+fedimint-wallet-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 
 cassis-core = { path = "cassis-core" }

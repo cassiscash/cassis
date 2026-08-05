@@ -11,6 +11,7 @@ pub enum NetSpec {
     Bitcoin { mutinynet: bool },
     Liquid { testnet: bool },
     Rootstock { testnet: bool },
+    Fedimint { address: String },
     Lightning,
 }
 
@@ -42,6 +43,21 @@ impl NetSpec {
                     "network 'rootstock' only accepts no parameter or 'testnet', got '{other}'"
                 )),
             },
+            "fedimint" => {
+                let address = param.ok_or_else(|| {
+                    "network 'fedimint' requires a federation address (invite code or \
+                     db::path), e.g. fedimint::fed1q..."
+                        .to_string()
+                })?;
+                if address.is_empty() {
+                    return Err(
+                        "network 'fedimint' requires a non-empty federation address".to_string(),
+                    );
+                }
+                Ok(NetSpec::Fedimint {
+                    address: address.to_string(),
+                })
+            }
             "lightning" => match param {
                 None => Ok(NetSpec::Lightning),
                 Some(other) => Err(format!(
@@ -82,6 +98,7 @@ impl NetSpec {
             NetSpec::Bitcoin { .. } => "bitcoin",
             NetSpec::Liquid { .. } => "liquid",
             NetSpec::Rootstock { .. } => "rootstock",
+            NetSpec::Fedimint { .. } => "fedimint",
             NetSpec::Lightning => "lightning",
         }
     }
@@ -109,6 +126,7 @@ impl NetSpec {
             } else {
                 "rootstock".to_string()
             }),
+            NetSpec::Fedimint { address } => NetworkId(format!("fedimint::{address}")),
             NetSpec::Lightning => NetworkId("lightning".to_string()),
         }
     }

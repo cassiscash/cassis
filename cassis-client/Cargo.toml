@@ -10,6 +10,7 @@ arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
 bitcoin = ["dep:cassis-bitcoin", "cassis-core/bitcoin"]
 liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["cassis-core/rootstock"]
+fedimint = ["dep:cassis-fedimint"]
 lightning = ["dep:cassis-lightning", "cassis-core/lightning"]
 
 [dependencies]
@@ -20,6 +21,7 @@ cassis-iroh = { workspace = true }
 cassis-router = { workspace = true }
 cassis-cashu = { workspace = true }
 cassis-rootstock = { workspace = true }
+cassis-fedimint = { workspace = true, optional = true }
 cassis-arkade = { workspace = true, optional = true }
 cassis-bitcoin = { workspace = true, optional = true }
 cassis-liquid = { workspace = true, optional = true }
