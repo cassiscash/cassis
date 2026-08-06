@@ -10,7 +10,7 @@ members = [
   "networks/cassis-bitcoin",
   "networks/cassis-rootstock",
   "networks/cassis-liquid",
-  "networks/cassis-lightning",
+  "networks/cassis-lnd",
   "cassis-router",
   "cassis-client",
   "cassis-cli",
@@ -100,6 +100,6 @@ cassis-arkade = { path = "networks/cassis-arkade" }
 cassis-bitcoin = { path = "networks/cassis-bitcoin" }
 cassis-rootstock = { path = "networks/cassis-rootstock" }
 cassis-liquid = { path = "networks/cassis-liquid" }
-cassis-lightning = { path = "networks/cassis-lightning" }
+cassis-lnd = { path = "networks/cassis-lnd" }
 cassis-router = { path = "cassis-router" }
 cassis-client = { path = "cassis-client" }

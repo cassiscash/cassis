@@ -250,7 +250,7 @@ impl LndAdapter {
         });
         adapter.span.in_scope(|| {
             debug!(
-                target: "cassis_lightning",
+                target: "cassis_lnd",
                 "LND adapter ready: rest_url={} identity={}",
                 adapter.config.rest_url,
                 invoice_pubkey.to_hex(),

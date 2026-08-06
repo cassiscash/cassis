@@ -44,13 +44,7 @@ async fn main() {
     if let Some(home) = cli.home.as_deref() {
         set_home_override(PathBuf::from(home));
     }
-    let adapter_config = match lnd_adapter_config(&cli) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("invalid LND configuration: {error}");
-            std::process::exit(2);
-        }
-    };
+    let adapter_config = AdapterConfig::default();
     let result: Result<(), String> = match cli.command {
         Commands::Pay {
             invoice,
@@ -113,6 +107,12 @@ async fn main() {
             Err("'cassis-cli liquid' requires building with the 'liquid' feature".to_string())
         }
         Commands::Register { network } => cmd_register(network),
+        Commands::Lnd {
+            lnd_rest_url,
+            lnd_tls_cert,
+            lnd_macaroon,
+            command,
+        } => cmd_lnd(lnd_rest_url, lnd_tls_cert, lnd_macaroon, command).await,
         Commands::Rootstock { network, command } => rootstock::run(network, command).await,
         Commands::Fedimint { network, command } => fedimint::run(network, command).await,
         Commands::Router { .. } => {
@@ -142,27 +142,66 @@ fn derive_for(mnemonic: &str, specs: &[NetSpec]) -> Result<keys::DerivedKeys, St
     keys::derive_keys(mnemonic, ids).map_err(|e| e.to_string())
 }
 
-/// Build the shared adapter configuration from the global LND flags.
-/// Without `--lnd-rest-url` the config carries no LND connection and any
-/// `lightning` network request fails with a clear configuration error when
-/// the adapter is built.
-fn lnd_adapter_config(cli: &Cli) -> Result<AdapterConfig, String> {
+/// Shared adapter configuration for the non-LND commands: no LND
+/// connection is available outside the `lnd` subcommand, so a
+/// `lightning`-network request through the generic commands fails with
+/// a clear configuration error when the adapter is built.
+///
+/// Everything LND-specific lives in the `lnd` subcommand; later
+/// backends (`cln`, `phoenixd`) implement the same `lightning`
+/// network spec with their own per-backend configuration.
+async fn cmd_lnd(
+    lnd_rest_url: Option<String>,
+    lnd_tls_cert: Option<String>,
+    lnd_macaroon: Option<String>,
+    command: cli::LndCommands,
+) -> Result<(), String> {
     #[cfg(feature = "lightning")]
     {
-        let lnd = match &cli.lnd_rest_url {
-            None => None,
-            Some(rest_url) => Some(cassis_lightning::LndConfig::new(
-                rest_url.clone(),
-                cli.lnd_tls_cert.as_deref().map(PathBuf::from),
-                cli.lnd_macaroon.as_deref().map(PathBuf::from),
+        let rest_url = lnd_rest_url
+            .ok_or_else(|| "'lnd' requires --lnd-rest-url, e.g. https://127.0.0.1:8080".to_string())?;
+        let adapter_config = AdapterConfig {
+            lnd: Some(cassis_lnd::LndConfig::new(
+                rest_url,
+                lnd_tls_cert.as_deref().map(PathBuf::from),
+                lnd_macaroon.as_deref().map(PathBuf::from),
             )),
         };
-        Ok(AdapterConfig { lnd })
+        match command {
+            cli::LndCommands::Pay {
+                invoice,
+                from,
+                nostr_relay,
+            } => cmd_pay(invoice, from, nostr_relay, &adapter_config).await,
+            cli::LndCommands::Invoice {
+                amount,
+                network,
+                payee,
+                description,
+                expires_at,
+                wait,
+                timeout,
+            } => {
+                cmd_invoice(
+                    amount,
+                    network,
+                    payee,
+                    description,
+                    expires_at,
+                    wait,
+                    timeout,
+                    &adapter_config,
+                )
+                .await
+            }
+            cli::LndCommands::Receive => cmd_receive(&adapter_config).await,
+            cli::LndCommands::Watch => cmd_watch(&adapter_config).await,
+        }
     }
     #[cfg(not(feature = "lightning"))]
     {
-        let _ = cli;
-        Ok(AdapterConfig::default())
+        let _ = (lnd_rest_url, lnd_tls_cert, lnd_macaroon, command);
+        Err("'cassis-cli lnd' requires building with the 'lightning' feature".to_string())
     }
 }
 

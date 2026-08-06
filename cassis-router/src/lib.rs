@@ -73,7 +73,7 @@ pub struct RouterConfig {
     /// Connection to the external LND REST API. LND is deliberately
     /// configured outside the Cassis node rather than embedded in it.
     #[cfg(feature = "lightning")]
-    pub lnd_config: Option<cassis_lightning::LndConfig>,
+    pub lnd_config: Option<cassis_lnd::LndConfig>,
     /// Adapter instances the caller already opened (e.g. a
     /// long-running wallet process holding exclusive Liquid
     /// wallet state). When an entry's [`NetworkId`] matches a
@@ -290,7 +290,7 @@ async fn build_adapter(
     span: Span,
     #[cfg(feature = "cashu")] cashu_store: &Arc<dyn cassis_cashu::CashuProofStore>,
     #[cfg(feature = "liquid")] liquid_store_dir: Option<&Path>,
-    #[cfg(feature = "lightning")] lnd_config: Option<&cassis_lightning::LndConfig>,
+    #[cfg(feature = "lightning")] lnd_config: Option<&cassis_lnd::LndConfig>,
 ) -> Result<NetworkEntry, String> {
     let (kind, param) = cassis_core::split_spec(spec);
 
@@ -534,7 +534,7 @@ async fn build_adapter(
                 "network 'lightning' requires an LND REST configuration".to_string()
             })?;
             let network_id = NetworkId("lightning".to_string());
-            let adapter = cassis_lightning::LndAdapter::new(
+            let adapter = cassis_lnd::LndAdapter::new(
                 network_id.clone(),
                 config.clone(),
                 span.clone(),

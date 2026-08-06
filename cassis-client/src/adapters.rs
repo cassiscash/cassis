@@ -18,7 +18,7 @@ use crate::store::CashuProofDb;
 #[derive(Clone, Debug, Default)]
 pub struct AdapterConfig {
     #[cfg(feature = "lightning")]
-    pub lnd: Option<cassis_lightning::LndConfig>,
+    pub lnd: Option<cassis_lnd::LndConfig>,
 }
 
 pub async fn build_receivers(
@@ -168,7 +168,7 @@ async fn build_pair(
                 .lnd
                 .as_ref()
                 .ok_or_else(|| "network 'lightning' requires LND configuration".to_string())?;
-            let adapter = cassis_lightning::LndAdapter::new(network_id.clone(), lnd.clone(), span)
+            let adapter = cassis_lnd::LndAdapter::new(network_id.clone(), lnd.clone(), span)
                 .await
                 .map_err(|error| format!("LND adapter init failed: {error}"))?;
             Ok(AdapterPair {

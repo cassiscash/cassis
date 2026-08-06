@@ -1,5 +1,5 @@
 [package]
-name = "cassis-lightning"
+name = "cassis-lnd"
 version.workspace = true
 edition.workspace = true
 

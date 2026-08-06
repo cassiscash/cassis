@@ -15,16 +15,6 @@ pub struct Cli {
     /// `$CASSIS_HOME` if set, otherwise `$HOME/.cassis`.
     #[arg(long, global = true, value_name = "DIR")]
     pub home: Option<String>,
-    /// LND REST base URL for the `lightning` network
-    /// (e.g. `https://127.0.0.1:8080`).
-    #[arg(long, global = true, value_name = "URL")]
-    pub lnd_rest_url: Option<String>,
-    /// Path to LND's `tls.cert` for REST authentication.
-    #[arg(long, global = true, value_name = "PATH")]
-    pub lnd_tls_cert: Option<String>,
-    /// Path to the LND macaroon for REST authentication.
-    #[arg(long, global = true, value_name = "PATH")]
-    pub lnd_macaroon: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -110,6 +100,23 @@ pub enum Commands {
         #[command(subcommand)]
         command: liquid::LiquidCommands,
     },
+    /// LND-backed `lightning` node operations. The LND connection is
+    /// configured with the flags below; the `lightning` network spec
+    /// stays independent of the backend (an `cln`/`phoenixd` crate
+    /// will expose its own subcommand later).
+    Lnd {
+        /// LND REST base URL, e.g. `https://127.0.0.1:8080`.
+        #[arg(long, value_name = "URL")]
+        lnd_rest_url: Option<String>,
+        /// Path to LND's `tls.cert` for REST authentication.
+        #[arg(long, value_name = "PATH")]
+        lnd_tls_cert: Option<String>,
+        /// Path to the LND macaroon for REST authentication.
+        #[arg(long, value_name = "PATH")]
+        lnd_macaroon: Option<String>,
+        #[command(subcommand)]
+        command: LndCommands,
+    },
     /// Register a network to participate in. The argument format
     /// mirrors `cassis-router`: `cashu::host`, `rootstock`,
     /// `rootstock::testnet`, `fedimint::<invite-code>`.
@@ -142,6 +149,41 @@ pub enum Commands {
         #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
         nostr_relay: Vec<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LndCommands {
+    /// Pay an invoice over Lightning.
+    Pay {
+        #[arg(long)]
+        invoice: String,
+        #[arg(long, default_value = "lightning")]
+        from: String,
+        /// Nostr relays to query for route announcements.
+        #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
+        nostr_relay: Vec<String>,
+    },
+    /// Create a Lightning invoice and persist the preimage locally.
+    Invoice {
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, default_value = "lightning")]
+        network: String,
+        #[arg(long)]
+        payee: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        expires_at: Option<u64>,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+    /// Long-running mode: claim incoming Lightning payments.
+    Receive,
+    /// Resume monitoring persisted outgoing HTLCs.
+    Watch,
 }
 
 #[derive(Subcommand, Debug)]
