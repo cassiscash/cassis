@@ -221,6 +221,7 @@ async fn build_pair(
                     network_id.clone(),
                     address.clone(),
                     network_sk(derived, &network_id)?,
+                    fedimint_data_dir(store_path),
                 )
                 .await
                 .map_err(|e| format!("fedimint adapter init failed: {e}"))?,
@@ -237,6 +238,17 @@ async fn build_pair(
             spec.kind_name()
         )),
     }
+}
+
+/// Data directory for a fedimint federation client DB: the parent of
+/// the node's store file (the same base the liquid wallet directories
+/// hang off), then a `fedimint/<slug>` subdirectory.
+#[cfg(feature = "fedimint")]
+fn fedimint_data_dir(store_path: &Path) -> std::path::PathBuf {
+    store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("fedimint")
 }
 
 pub fn mint_url_to_host(mint_url: &str) -> Result<String, String> {
@@ -316,6 +328,7 @@ pub async fn build_liquid_adapter(
 pub async fn build_fedimint_adapter(
     spec: &NetSpec,
     derived: &DerivedKeys,
+    store_path: &Path,
 ) -> Result<Arc<cassis_fedimint::FedimintAdapter>, String> {
     let NetSpec::Fedimint { address } = spec else {
         return Err(format!(
@@ -325,10 +338,15 @@ pub async fn build_fedimint_adapter(
     };
     let network_id = spec.network_id();
     let sk = network_sk(derived, &network_id)?;
-    cassis_fedimint::FedimintAdapter::new(network_id, address.clone(), sk)
-        .await
-        .map(Arc::new)
-        .map_err(|e| format!("fedimint adapter init failed: {e}"))
+    cassis_fedimint::FedimintAdapter::new(
+        network_id,
+        address.clone(),
+        sk,
+        fedimint_data_dir(store_path),
+    )
+    .await
+    .map(Arc::new)
+    .map_err(|e| format!("fedimint adapter init failed: {e}"))
 }
 
 /// Build a concrete `cassis_rootstock::RootstockAdapter` for a

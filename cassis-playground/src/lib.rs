@@ -1311,6 +1311,7 @@ pub async fn command_router_with_veto(
         span: router_span.clone(),
         cashu_store: Arc::new(CashuProofDb::new(node_store_path(&home))),
         liquid_store_dir: None,
+        fedimint_data_dir: Some(home.clone()),
         prebuilt_adapters,
         prepare_veto,
     };

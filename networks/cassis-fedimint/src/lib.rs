@@ -170,8 +170,16 @@ struct OutgoingSlot {
 /// (downloading the `ClientConfig` over iroh if the address is a
 /// `fed1q…` invite code, or re-opening an existing client DB) and
 /// starts the client's executor.
+///
+/// `data_dir` is the node's shared data directory: the federation
+/// client DB lives at `data_dir/fedimint/<slug>` for that
+/// federation's network id, mirroring how the other wallets store
+/// their databases under the node's data dir.
 pub struct FedimintAdapter {
     network_id: NetworkId,
+    /// Node data directory the federation DB is rooted under
+    /// (db files live at `data_dir/fedimint/<slug>/db`).
+    data_dir: PathBuf,
     client: ClientHandleArc,
     /// Static claim keypair, derived from the per-network secret with
     /// even (0x02) compressed parity so the advertised identity —
@@ -202,6 +210,7 @@ impl FedimintAdapter {
         network_id: NetworkId,
         address: String,
         secret: [u8; 32],
+        data_dir: std::path::PathBuf,
     ) -> Result<Self, String> {
         // Connector stack: defaults enable iroh next (`/v1`) and the
         // `iroh://` scheme. Guardian endpoints in the federation
@@ -225,10 +234,10 @@ impl FedimintAdapter {
         let root_secret = DerivableSecret::new_root(&seed64, ROOT_SECRET_SALT);
         let root_secret = RootSecret::StandardDoubleDerive(root_secret);
 
-        // RocksDB path. The daemon doesn't pass a base path today,
-        // so we put it under a fixed dir keyed by a sanitized
-        // fragment of the network id.
-        let db_dir = Self::db_dir_for(&network_id);
+        // RocksDB path: under the node's shared data dir, keyed by a
+        // sanitized fragment of the network id (same convention as the
+        // other wallets' per-network subdirectories).
+        let db_dir = Self::db_dir_for(&network_id, &data_dir);
         tokio::fs::create_dir_all(&db_dir)
             .await
             .map_err(|e| format!("failed to create db dir {}: {e}", db_dir.display()))?;
@@ -295,6 +304,7 @@ impl FedimintAdapter {
 
         Ok(Self {
             network_id,
+            data_dir,
             client,
             claim_keypair,
             claim_pk,
@@ -323,7 +333,7 @@ impl FedimintAdapter {
         }
     }
 
-    fn db_dir_for(network_id: &NetworkId) -> PathBuf {
+    fn db_dir_for(network_id: &NetworkId, data_dir: &std::path::Path) -> PathBuf {
         let slug = network_id
             .0
             .strip_prefix("fedimint::")
@@ -338,12 +348,9 @@ impl FedimintAdapter {
                 }
             })
             .collect();
-        PathBuf::from(format!("./cassis-fedimint-db/{safe}"))
+        data_dir.join("fedimint").join(safe)
     }
 
-    /// Borrow the LNv2 client module from a client handle. The
-    /// returned reference is tied to the input borrow; safe to use
-    /// across `await` points since `Arc<ClientHandle>` is `Sync`.
     /// Wallet balance in msat, bitcoin-denominated (same bucket the
     /// outgoing contracts are funded from).
     pub async fn balance_msat(&self) -> Result<u64, String> {
@@ -357,7 +364,7 @@ impl FedimintAdapter {
 
     /// Local RocksDB directory the federation client is opened from.
     pub fn db_dir(&self) -> PathBuf {
-        Self::db_dir_for(&self.network_id)
+        Self::db_dir_for(&self.network_id, &self.data_dir)
     }
 
     // ==================================================================

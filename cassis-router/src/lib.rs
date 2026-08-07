@@ -74,6 +74,10 @@ pub struct RouterConfig {
     /// configured outside the Cassis node rather than embedded in it.
     #[cfg(feature = "lightning")]
     pub lnd_config: Option<cassis_lnd::LndConfig>,
+    /// Data directory under which Fedimint federation client
+    /// databases are stored (`<dir>/fedimint/<slug>`). Required only
+    /// when routing the `fedimint` network.
+    pub fedimint_data_dir: Option<std::path::PathBuf>,
     /// Adapter instances the caller already opened (e.g. a
     /// long-running wallet process holding exclusive Liquid
     /// wallet state). When an entry's [`NetworkId`] matches a
@@ -147,6 +151,8 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
                 config.liquid_store_dir.as_deref(),
                 #[cfg(feature = "lightning")]
                 config.lnd_config.as_ref(),
+                #[cfg(feature = "fedimint")]
+                config.fedimint_data_dir.as_deref(),
             )
             .await
             {
@@ -291,6 +297,7 @@ async fn build_adapter(
     #[cfg(feature = "cashu")] cashu_store: &Arc<dyn cassis_cashu::CashuProofStore>,
     #[cfg(feature = "liquid")] liquid_store_dir: Option<&Path>,
     #[cfg(feature = "lightning")] lnd_config: Option<&cassis_lnd::LndConfig>,
+    #[cfg(feature = "fedimint")] fedimint_data_dir: Option<&std::path::Path>,
 ) -> Result<NetworkEntry, String> {
     let (kind, param) = cassis_core::split_spec(spec);
 
@@ -346,10 +353,19 @@ async fn build_adapter(
             // upstream hops lock contracts to a key we can actually
             // claim with.
             let sk = network_sk(derived, &network_id)?;
+            let data_dir = fedimint_data_dir.ok_or_else(|| {
+                "network 'fedimint' requires a fedimint_data_dir in the router config"
+                    .to_string()
+            })?;
             let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
-                cassis_fedimint::FedimintAdapter::new(network_id.clone(), invite.to_string(), sk)
-                    .await
-                    .map_err(|e| format!("fedimint adapter init failed: {e}"))?,
+                cassis_fedimint::FedimintAdapter::new(
+                    network_id.clone(),
+                    invite.to_string(),
+                    sk,
+                    data_dir.to_path_buf(),
+                )
+                .await
+                .map_err(|e| format!("fedimint adapter init failed: {e}"))?,
             );
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {

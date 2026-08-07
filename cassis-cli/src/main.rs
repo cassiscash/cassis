@@ -158,8 +158,9 @@ async fn cmd_lnd(
 ) -> Result<(), String> {
     #[cfg(feature = "lightning")]
     {
-        let rest_url = lnd_rest_url
-            .ok_or_else(|| "'lnd' requires --lnd-rest-url, e.g. https://127.0.0.1:8080".to_string())?;
+        let rest_url = lnd_rest_url.ok_or_else(|| {
+            "'lnd' requires --lnd-rest-url, e.g. https://127.0.0.1:8080".to_string()
+        })?;
         let adapter_config = AdapterConfig {
             lnd: Some(cassis_lnd::LndConfig::new(
                 rest_url,

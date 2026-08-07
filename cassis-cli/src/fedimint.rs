@@ -7,6 +7,10 @@ use cassis_client::adapters::build_fedimint_adapter;
 #[cfg(feature = "fedimint")]
 use cassis_client::netspec::NetSpec;
 #[cfg(feature = "fedimint")]
+use cassis_client::ops::node_store_path;
+#[cfg(feature = "fedimint")]
+use cassis_client::paths::cassis_home;
+#[cfg(feature = "fedimint")]
 use cassis_core::NetworkRouterAdapter;
 
 #[derive(Subcommand, Debug)]
@@ -78,7 +82,7 @@ async fn adapter(
     }
     let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let adapter = build_fedimint_adapter(&spec, &derived).await?;
+    let adapter = build_fedimint_adapter(&spec, &derived, &node_store_path(&cassis_home())).await?;
     Ok((spec, adapter))
 }
 
