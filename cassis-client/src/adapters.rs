@@ -19,6 +19,8 @@ use crate::store::CashuProofDb;
 pub struct AdapterConfig {
     #[cfg(feature = "lightning")]
     pub lnd: Option<cassis_lnd::LndConfig>,
+    #[cfg(feature = "spark")]
+    pub spark: Option<cassis_spark::SparkConfig>,
 }
 
 pub async fn build_receivers(
@@ -171,6 +173,27 @@ async fn build_pair(
             let adapter = cassis_lnd::LndAdapter::new(network_id.clone(), lnd.clone(), span)
                 .await
                 .map_err(|error| format!("LND adapter init failed: {error}"))?;
+            Ok(AdapterPair {
+                network_id,
+                receiver: adapter.clone(),
+                sender: adapter,
+            })
+        }
+        #[cfg(feature = "spark")]
+        NetSpec::Spark { .. } => {
+            let spark = config
+                .spark
+                .clone()
+                .ok_or_else(|| "network 'spark' requires Breez SDK configuration".to_string())?;
+            let adapter = cassis_spark::SparkAdapter::new(
+                network_id.clone(),
+                spark,
+                network_sk(derived, &network_id)?,
+                derived.invoice.pubkey(),
+                span,
+            )
+            .await
+            .map_err(|e| format!("spark adapter init failed: {e}"))?;
             Ok(AdapterPair {
                 network_id,
                 receiver: adapter.clone(),

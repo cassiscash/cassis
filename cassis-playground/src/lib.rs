@@ -807,6 +807,9 @@ impl Playground {
             NetSpec::Lightning => {
                 return Err("playground does not support the 'lightning' network yet".into());
             }
+            NetSpec::Spark => {
+                return Err("playground does not support the 'spark' network yet".into());
+            }
             NetSpec::Fedimint { .. } => {
                 return Err("playground does not support the 'fedimint' network yet".into());
             }
@@ -983,6 +986,7 @@ pub async fn command_fund(
             fund_rootstock(&playground.prefund_rootstock, node_id, &wallet, amount).await
         }
         NetSpec::Lightning => Err("playground does not support funding 'lightning'".into()),
+        NetSpec::Spark => Err("playground does not support funding 'spark'".into()),
         NetSpec::Fedimint { .. } => Err("playground does not support funding 'fedimint'".into()),
     }
 }

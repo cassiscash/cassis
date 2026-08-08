@@ -523,7 +523,9 @@ impl NetworkRouterAdapter for RootstockAdapter {
     ) -> Result<OutgoingHtlc, HtlcError> {
         let recipient = match htlc_target {
             HtlcTarget::PubKey(pubkey) => *pubkey,
-            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::XOnlyPubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "rootstock requires a pubkey target".into(),
                 ))

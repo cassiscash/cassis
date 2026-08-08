@@ -759,7 +759,9 @@ impl NetworkRouterAdapter for FedimintAdapter {
         }
         let recipient = match htlc_target {
             HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "fedimint requires a pubkey target".into(),
                 ))

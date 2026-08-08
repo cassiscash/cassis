@@ -935,7 +935,9 @@ impl NetworkRouterAdapter for ArkadeAdapter {
     ) -> Result<OutgoingHtlc, HtlcError> {
         let recipient = match htlc_target {
             HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "arkade requires a pubkey target".into(),
                 ))
@@ -995,7 +997,9 @@ impl NetworkRouterAdapter for ArkadeAdapter {
         let options = Self::parse_vhtlc_options(descriptor.ok_or(HtlcError::Unimplemented)?)?;
         let recipient = match &payment.destination {
             HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "arkade requires a pubkey destination".into(),
                 ))

@@ -589,7 +589,9 @@ impl NetworkRouterAdapter for CashuAdapter {
     ) -> Result<OutgoingHtlc, HtlcError> {
         let recipient = match htlc_target {
             HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "cashu requires a pubkey target".into(),
                 ))
@@ -832,7 +834,9 @@ impl NetworkRouterAdapter for CashuAdapter {
                 proofs: Mutex::new(proofs),
                 recipient: match &payment.destination {
                     HtlcTarget::XOnlyPubKey(pubkey) => pubkey.to_hex(),
-                    HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                    HtlcTarget::PubKey(_)
+                    | HtlcTarget::LightningInvoice(_)
+                    | HtlcTarget::SparkAddress(_) => {
                         return Err(HtlcError::InvalidParams(
                             "cashu requires a pubkey destination".into(),
                         ))

@@ -12,6 +12,7 @@ liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["cassis-core/rootstock"]
 fedimint = ["dep:cassis-fedimint"]
 lightning = ["dep:cassis-lnd", "cassis-core/lightning"]
+spark = ["dep:cassis-spark", "cassis-core/spark"]
 
 [dependencies]
 cassis-core = { workspace = true, features = ["cashu", "rootstock"] }
@@ -26,6 +27,7 @@ cassis-arkade = { workspace = true, optional = true }
 cassis-bitcoin = { workspace = true, optional = true }
 cassis-liquid = { workspace = true, optional = true }
 cassis-lnd = { workspace = true, optional = true }
+cassis-spark = { workspace = true, optional = true }
 clap = { workspace = true }
 futures = { workspace = true }
 iroh = { workspace = true }

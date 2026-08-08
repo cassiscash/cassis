@@ -537,7 +537,7 @@ impl NetworkRouterAdapter for LndAdapter {
     ) -> Result<OutgoingHtlc, HtlcError> {
         let payment_request = match htlc_target {
             HtlcTarget::LightningInvoice(invoice) => invoice.clone(),
-            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::PubKey(_) => {
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::PubKey(_) | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "lightning requires a hold invoice target".into(),
                 ))

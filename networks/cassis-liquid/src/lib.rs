@@ -1085,7 +1085,9 @@ impl NetworkRouterAdapter for LiquidAdapter {
     ) -> Result<OutgoingHtlc, HtlcError> {
         let recipient = match htlc_target {
             HtlcTarget::PubKey(pubkey) => *pubkey,
-            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::XOnlyPubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "liquid requires a pubkey target".into(),
                 ))
@@ -1225,7 +1227,9 @@ impl NetworkRouterAdapter for LiquidAdapter {
             .map_err(|e| HtlcError::InvalidParams(format!("invalid refund pubkey: {e}")))?;
         let recipient = match &payment.destination {
             HtlcTarget::PubKey(pubkey) => *pubkey,
-            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::XOnlyPubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "liquid requires a pubkey destination".into(),
                 ))

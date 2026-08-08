@@ -1048,7 +1048,9 @@ impl NetworkRouterAdapter for BitcoinAdapter {
     ) -> Result<OutgoingHtlc, HtlcError> {
         let recipient_xonly = match htlc_target {
             HtlcTarget::XOnlyPubKey(pk) => *pk,
-            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
                 return Err(HtlcError::InvalidParams(
                     "bitcoin requires a pubkey target".into(),
                 ))

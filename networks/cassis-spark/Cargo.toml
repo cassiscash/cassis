@@ -1,0 +1,15 @@
+[package]
+name = "cassis-spark"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
+spark-wallet = { git = "https://github.com/breez/spark-sdk", tag = "0.23.0" }
+cassis-core = { workspace = true }
+lightning-invoice = { workspace = true }
+lowercase-hex = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing = { workspace = true }

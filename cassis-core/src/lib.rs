@@ -158,6 +158,7 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
         || id.0 == "rootstock"
         || id.0 == "rootstock::testnet"
         || id.0 == "lightning"
+        || id.0 == "spark"
     {
         return id.clone();
     }
@@ -294,6 +295,19 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
                 .to_string(),
         ),
 
+        #[cfg(feature = "spark")]
+        "spark" => match param {
+            None => Ok(NetworkId("spark".to_string())),
+            Some(other) => Err(format!(
+                "network 'spark' does not accept a parameter, got '{other}'"
+            )),
+        },
+        #[cfg(not(feature = "spark"))]
+        "spark" => Err(
+            "network 'spark' requested but cassis-core was not compiled with the 'spark' feature"
+                .to_string(),
+        ),
+
         _ => Err(format!("unsupported network kind '{kind}'")),
     }
 }
@@ -389,6 +403,9 @@ pub enum HtlcTarget {
     PubKey(PubKey),
     /// BOLT11 hold invoice the upstream party must pay (lightning).
     LightningInvoice(String),
+    /// Spark address (`spark:...`/`sp1...`) the upstream party sends a
+    /// Spark HTLC transfer to (spark).
+    SparkAddress(String),
 }
 
 /// PREPARE message (sender -> router): ask a hop to reserve capacity
@@ -706,6 +723,19 @@ pub enum HtlcDescriptor {
     /// against the route payment hash; the sender must pay this exact
     /// request so the payment secret is preserved.
     Lightning { payment_request: String },
+    /// Spark HTLC transfer. `address` is the Spark address the sender
+    /// locked the HTLC to (the receiver's address; the receiver claims
+    /// it with `claim_htlc` + preimage, keyed by the payment hash the
+    /// descriptor travels with). `expiry_secs` is the HTLC expiry
+    /// duration the sender passed, so the receiver can tell how long
+    /// it has left. `transfer_id` is the Spark transfer id the sender
+    /// can be re-polled by after a restart (`None` only when the
+    /// sender sent without keeping the id).
+    Spark {
+        address: String,
+        expiry_secs: u64,
+        transfer_id: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
