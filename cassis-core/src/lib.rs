@@ -674,12 +674,12 @@ pub enum HtlcDescriptor {
     /// leaf are x-only (BIP342), so the receiver's x-only network
     /// identity goes into the script unchanged.
     ///
-    /// The descriptor pins the lockup transaction and carries what the
-    /// receiver cannot derive itself: the sender's internal taproot
-    /// key (the refunable key-path signer, and the collaborator for
-    /// future joint settlement), the refund pubkey and locktime. The
-    /// receiver rebuilds leaf hash, tweaked output key and address
-    /// from its own x-only claim key plus these fields.
+    /// The descriptor pins the lockup transaction and carries the
+    /// refund pubkey and locktime. The fixed BIP-341 NUMS internal
+    /// taproot key is retained as a protocol assertion: the receiver
+    /// derives it locally and rejects descriptors that do not match it.
+    /// The receiver rebuilds the leaf hash, tweaked output key and
+    /// address from its own x-only claim key plus these fields.
     Bitcoin {
         /// Hex txid (display order) of the broadcast lockup
         /// transaction.
@@ -689,9 +689,9 @@ pub enum HtlcDescriptor {
         /// Hex 20-byte RIPEMD160(SHA256(preimage)) burned into the
         /// script.
         payment_hash160: String,
-        /// X-only key of the sender's internal taproot key: the
-        /// unpruned key path can later serve collaborative
-        /// settlement.
+        /// X-only BIP-341 NUMS internal taproot key. It has no known
+        /// discrete logarithm, so the HTLC key path is intentionally
+        /// unspendable; retained on wire as a protocol assertion.
         internal_key: XOnlyPubKey,
         /// X-only pubkey of the sender's refund leaf (the witness
         /// script's ELSE branch).

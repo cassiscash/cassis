@@ -12,11 +12,10 @@
 //! OP_ENDIF
 //! ```
 //!
-//! The taproot internal key is the sender's per-network key (x-only):
-//! it controls an *unpruned key path* that can serve collaborative
-//! settlement later (a joint key-path spend only needs both parties,
-//! no leaves), while the recovery paths live in the script leaf. All
-//! keys are x-only (BIP342 CHECKSIG), so network identities drop
+//! The taproot internal key is the BIP-341 Nothing-Up-My-Sleeve (NUMS)
+//! point. It has no known discrete logarithm, so the HTLC key path is
+//! intentionally unspendable; only the script leaf can spend the output.
+//! All keys are x-only (BIP342 CHECKSIG), so network identities drop
 //! straight into the script.
 //!
 //! * **Lockup** (outgoing HTLC): an on-chain transaction the sender
@@ -41,7 +40,7 @@
 //! BIP342 signatures: script-path CHECKSIGs sign with the *leaf*
 //! pubkey tweaked alone (no branch commitment), independent of the
 //! internal key — so `claim` signs with the receiver's key even
-//! though the tree's internal key is the sender's.
+//! though the tree's internal key is the shared NUMS point.
 
 use async_trait::async_trait;
 use bitcoin::absolute;
@@ -112,6 +111,19 @@ const P2TR_INPUT_VB: u64 = 58;
 const HTLC_INPUT_VB: u64 = 68;
 const P2TR_OUTPUT_VB: u64 = 43;
 const HTLC_OUTPUT_VB: u64 = 43;
+
+/// BIP-341's canonical Nothing-Up-My-Sleeve point, encoded as an
+/// x-only public key. Its discrete logarithm is unknown, so using it as
+/// the HTLC internal key makes key-path spending impossible.
+const NUMS_INTERNAL_KEY: [u8; 32] = [
+    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
+    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
+];
+
+fn nums_internal_key() -> XOnlyPublicKey {
+    XOnlyPublicKey::from_slice(&NUMS_INTERNAL_KEY)
+        .expect("BIP-341 NUMS point is a valid x-only public key")
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -243,9 +255,6 @@ struct HtlcOptions {
     /// lockup outpoint rides along.
     lockup_txid: bitcoin::Txid,
     lockup_vout: u32,
-    /// Sender's internal taproot key: key-path signer (future
-    /// collaborative settlement) and the tree's untweaked key.
-    internal_key: XOnlyPublicKey,
     /// Receiver's claim leaf key.
     claim_pubkey: XOnlyPublicKey,
     /// Sender's refund leaf key.
@@ -268,7 +277,8 @@ impl HtlcOptions {
     }
 
     /// The P2TR output the HTLC locks into (tweaked output key of the
-    /// single-leaf tree).
+    /// single-leaf tree). Internal key is always fixed NUMS, never the
+    /// wallet key.
     fn spend_info(
         &self,
         secp: &Secp256k1<bitcoin::secp256k1::VerifyOnly>,
@@ -276,7 +286,7 @@ impl HtlcOptions {
         TaprootBuilder::new()
             .add_leaf(0, self.witness_script())
             .map_err(|_| HtlcError::Network("taproot leaf insert failed".into()))?
-            .finalize(secp, self.internal_key)
+            .finalize(secp, nums_internal_key())
             .map_err(|_| HtlcError::Network("taproot tree finalize failed".into()))
     }
 
@@ -321,12 +331,15 @@ impl HtlcOptions {
         }
         let lockup_txid = bitcoin::Txid::from_str(lockup_txid)
             .map_err(|e| HtlcError::InvalidParams(format!("bad lockup_txid: {e}")))?;
+        if internal_key.as_bytes() != NUMS_INTERNAL_KEY.as_slice() {
+            return Err(HtlcError::InvalidParams(
+                "bitcoin HTLC internal key is not the BIP-341 NUMS point".into(),
+            ));
+        }
         Ok(Self {
             payment_hash160: expected,
             lockup_txid,
             lockup_vout: u32::from(*lockup_vout),
-            internal_key: XOnlyPublicKey::from_slice(internal_key.as_bytes())
-                .map_err(|e| HtlcError::InvalidParams(format!("internal key: {e}")))?,
             claim_pubkey: *our_claim_pk,
             refund_pubkey: XOnlyPublicKey::from_slice(refund_pubkey.as_bytes())
                 .map_err(|e| HtlcError::InvalidParams(format!("refund pubkey: {e}")))?,
@@ -363,12 +376,11 @@ pub struct BitcoinAdapter {
     #[allow(dead_code)] // printed at construction; useful in logs
     esplora_url: String,
     fee_rate_vb: u64,
-    /// Owns the funding address (P2TR sweep cash, key path) and the
-    /// taproot internal key of the HTLC trees it locks out.
+    /// Owns the funding address (P2TR sweep cash, key path).
     wallet_sk: bitcoin::secp256k1::SecretKey,
-    /// X-only half of `wallet_sk`: taproot wallet key (funding address
-    /// key path), internal key of outgoing HTLC trees, refund leaf
-    /// key, and claim identity.
+    /// X-only half of `wallet_sk`: funding address key path, refund leaf
+    /// key, and claim identity. HTLC internal keys are fixed NUMS, not
+    /// this wallet key.
     key_xonly: XOnlyPublicKey,
     invoice_pubkey: XOnlyPubKey,
     /// P2TR address wallet UTXOs are swept from and change returns to.
@@ -858,7 +870,7 @@ impl BitcoinAdapter {
         // leaf pubkey tweaked on its own (no branch commitment); the
         // tweaking is keypair-local, a signing ctx suffices. The claim
         // branch embeds our claim x-only key (checked on accept) so its
-        // secret is always ours; refunds sign with the internal key.
+        // secret is always ours; refunds sign with the refund leaf key.
         let signing_secp = Secp256k1::new();
         let claim_pair = Keypair::from_secret_key(&signing_secp, &self.wallet_sk);
         let wallet_pair = Keypair::from_secret_key(&signing_secp, &self.wallet_sk);
@@ -1086,7 +1098,6 @@ impl NetworkRouterAdapter for BitcoinAdapter {
             payment_hash160: HtlcOptions::payment_hash160(&payment_hash),
             lockup_txid: bitcoin::Txid::from_slice(&[0u8; 32]).expect("all-zero txid"),
             lockup_vout: 0,
-            internal_key: self.key_xonly,
             claim_pubkey: b_xonly(&recipient_xonly)?,
             refund_pubkey: self.key_xonly,
             refund_locktime,
@@ -1118,7 +1129,7 @@ impl NetworkRouterAdapter for BitcoinAdapter {
             lockup_txid: slot.lockup_txid.to_string(),
             lockup_vout: slot.lockup_vout as u8,
             payment_hash160: lower_hex(&slot.options.payment_hash160.to_byte_array()),
-            internal_key: XOnlyPubKey::from_bytes(slot.options.internal_key.serialize())
+            internal_key: XOnlyPubKey::from_bytes(nums_internal_key().serialize())
                 .map_err(|e| HtlcError::Network(format!("internal key: {e}")))?,
             refund_pubkey: XOnlyPubKey::from_bytes(slot.options.refund_pubkey.serialize())
                 .map_err(|e| HtlcError::Network(format!("refund pubkey: {e}")))?,
@@ -1344,22 +1355,61 @@ mod tests {
                 .parse()
                 .unwrap(),
             lockup_vout: 0,
-            internal_key: bitcoin::XOnlyPublicKey::from_slice(&xonly_of(9)).unwrap(),
             claim_pubkey: bitcoin::XOnlyPublicKey::from_slice(&claim).unwrap(),
             refund_pubkey: bitcoin::XOnlyPublicKey::from_slice(&refund).unwrap(),
             refund_locktime: 700_000_000,
         };
         let secp = Secp256k1::verification_only();
         let info = options.spend_info(&secp).unwrap();
+        assert_eq!(info.internal_key().serialize(), NUMS_INTERNAL_KEY);
         let spk = ScriptBuf::new_p2tr_tweaked(info.output_key());
         let address = Address::from_script(&spk, bitcoin::Network::Bitcoin).unwrap();
         assert!(address.to_string().starts_with("bc1"));
 
         // A control block exists for the leaf (claim/refund spin on
         // their existence at spend time).
-        assert!(info
+        let control_block = info
             .control_block(&(options.witness_script(), LeafVersion::TapScript))
-            .is_some());
+            .expect("single-leaf tree has a control block");
+        assert_eq!(control_block.internal_key.serialize(), NUMS_INTERNAL_KEY);
+    }
+
+    #[test]
+    fn descriptor_accepts_nums_and_rejects_other_internal_keys() {
+        let secp = Secp256k1::signing_only();
+        let xonly_of = |seed: u8| -> [u8; 32] {
+            bitcoin::key::Keypair::from_secret_key(
+                &secp,
+                &bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap(),
+            )
+            .x_only_public_key()
+            .0
+            .serialize()
+        };
+        let payment_hash = Bytes32([7u8; 32]);
+        let descriptor = HtlcDescriptor::Bitcoin {
+            lockup_txid: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            lockup_vout: 0,
+            payment_hash160: lower_hex(
+                &HtlcOptions::payment_hash160(&payment_hash).to_byte_array(),
+            ),
+            internal_key: XOnlyPubKey::from_bytes(NUMS_INTERNAL_KEY).unwrap(),
+            refund_pubkey: XOnlyPubKey::from_bytes(xonly_of(3)).unwrap(),
+            refund_locktime: 700_000_000,
+        };
+        let our_claim_pk = bitcoin::XOnlyPublicKey::from_slice(&xonly_of(2)).unwrap();
+        HtlcOptions::parse_descriptor(&descriptor, payment_hash, &our_claim_pk)
+            .expect("canonical NUMS descriptor must parse");
+
+        let mut bad_descriptor = descriptor;
+        let HtlcDescriptor::Bitcoin { internal_key, .. } = &mut bad_descriptor else {
+            unreachable!()
+        };
+        *internal_key = XOnlyPubKey::from_bytes(xonly_of(9)).unwrap();
+        let err = HtlcOptions::parse_descriptor(&bad_descriptor, payment_hash, &our_claim_pk)
+            .expect_err("non-NUMS internal keys must be rejected");
+        assert!(err.to_string().contains("NUMS"));
     }
 
     #[test]
