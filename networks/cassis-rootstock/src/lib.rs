@@ -486,7 +486,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
 
     /// Rootstock blocks land every ~30 s; the router needs
     /// headroom to lock, watch and claim. Mirrors the
-    /// `fallback_incoming_delta` table.
+    /// `NetworkId::default_incoming_delta` table.
     fn incoming_delta_secs(&self) -> u64 {
         600
     }

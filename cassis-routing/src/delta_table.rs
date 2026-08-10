@@ -1,32 +1,5 @@
 use cassis_core::NetworkId;
 
-/// Fallback per-hop incoming delta (seconds) for a given network, used when
-/// a route announcement did not publish an `incoming_delta_secs` tag.
-///
-/// Values mirror the `incoming_delta_secs()` declared on each network
-/// adapter (`cassisd` and the per-network crates):
-///   - arkade: 60 (`arkade` and `arkade::mutinynet`)
-///   - fedimint: 30
-///   - cashu: 30
-///   - liquid: 300 (`liquid` and `liquid::testnet`)
-///   - rootstock: 600 (both mainnet and `rootstock::testnet`)
-///   - lightning: 30
-///
-/// The default (30 s) matches the most common adapter and is used for
-/// any network not in the table.
-pub fn fallback_incoming_delta(network: &NetworkId) -> u64 {
-    match network.0.as_str() {
-        "arkade" | "arkade::mutinynet" => 60,
-        "bitcoin" | "bitcoin::mutinynet" => 300,
-        "fedimint" => 30,
-        "cashu" => 30,
-        "liquid" | "liquid::testnet" => 300,
-        "rootstock" | "rootstock::testnet" => 600,
-        "lightning" => 30,
-        _ => 30,
-    }
-}
-
 /// Fallback per-hop transit slack (seconds): extra buffer the sender
 /// adds to deadlines to absorb in-flight latency and clock skew between
 /// sender and a hop. Used when a route announcement did not publish a
@@ -42,34 +15,6 @@ pub fn fallback_transit_slack(_network: &NetworkId) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn known_networks_return_documented_values() {
-        assert_eq!(fallback_incoming_delta(&NetworkId("arkade".into())), 60);
-        assert_eq!(
-            fallback_incoming_delta(&NetworkId("arkade::mutinynet".into())),
-            60
-        );
-        assert_eq!(fallback_incoming_delta(&NetworkId("fedimint".into())), 30);
-        assert_eq!(fallback_incoming_delta(&NetworkId("cashu".into())), 30);
-        assert_eq!(fallback_incoming_delta(&NetworkId("liquid".into())), 300);
-        assert_eq!(
-            fallback_incoming_delta(&NetworkId("liquid::testnet".into())),
-            300
-        );
-        assert_eq!(fallback_incoming_delta(&NetworkId("rootstock".into())), 600);
-        assert_eq!(
-            fallback_incoming_delta(&NetworkId("rootstock::testnet".into())),
-            600
-        );
-        assert_eq!(fallback_incoming_delta(&NetworkId("lightning".into())), 30);
-    }
-
-    #[test]
-    fn unknown_network_returns_default() {
-        assert_eq!(fallback_incoming_delta(&NetworkId("mystery".into())), 30);
-        assert_eq!(fallback_incoming_delta(&NetworkId("".into())), 30);
-    }
 
     #[test]
     fn fallback_transit_slack_is_60_for_known_and_unknown_networks() {

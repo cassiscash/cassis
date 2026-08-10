@@ -12,8 +12,8 @@ use cassis_core::{
 };
 use cassis_iroh::{node_addr_from_announcement, node_addr_from_invoice, IrohClient};
 use cassis_routing::{
-    build_graph, compute_hop_expiries, fallback_incoming_delta, fallback_transit_slack,
-    fetch_announcements, find_route as find_route_in_graph,
+    build_graph, compute_hop_expiries, fallback_transit_slack, fetch_announcements,
+    find_route as find_route_in_graph,
 };
 use futures::future::join_all;
 use iroh::endpoint::presets;
@@ -409,7 +409,7 @@ impl CassisClient {
                 let delta = if hop.node.incoming_delta_secs > 0 {
                     hop.node.incoming_delta_secs
                 } else {
-                    fallback_incoming_delta(&hop.incoming)
+                    hop.incoming.default_incoming_delta()
                 };
                 let slack = if hop.node.transit_slack_secs > 0 {
                     hop.node.transit_slack_secs
@@ -426,7 +426,7 @@ impl CassisClient {
         // moment the payer decides to start — and every leg (the
         // routers plus the payee's claim window) stacks its buffer on
         // top of the previous one toward the sender.
-        let payee_delta = fallback_incoming_delta(&dest_network);
+        let payee_delta = dest_network.default_incoming_delta();
         let payee_slack = fallback_transit_slack(&dest_network);
         buffers.push(payee_delta.saturating_add(payee_slack));
         let expiries = compute_hop_expiries(now, &buffers);
@@ -838,7 +838,7 @@ impl CassisClient {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let delta = fallback_incoming_delta(dest_network);
+        let delta = dest_network.default_incoming_delta();
         let slack = fallback_transit_slack(dest_network);
         let outgoing_expiry = now.saturating_add(delta).saturating_add(slack);
 

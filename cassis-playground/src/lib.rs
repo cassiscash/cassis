@@ -1512,14 +1512,15 @@ async fn command_route(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let destination_delta = cassis_routing::fallback_incoming_delta(&destination_network)
+    let destination_delta = destination_network
+        .default_incoming_delta()
         .saturating_add(cassis_routing::fallback_transit_slack(&destination_network));
     let mut expiries = vec![now.saturating_add(destination_delta)];
     for hop in route.iter().rev() {
         let delta = if hop.node.incoming_delta_secs > 0 {
             hop.node.incoming_delta_secs
         } else {
-            cassis_routing::fallback_incoming_delta(&hop.incoming)
+            hop.incoming.default_incoming_delta()
         };
         let slack = if hop.node.transit_slack_secs > 0 {
             hop.node.transit_slack_secs

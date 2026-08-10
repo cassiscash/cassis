@@ -83,6 +83,26 @@ pub fn network_span(parent: &Span, network_id: &NetworkId) -> Span {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NetworkId(pub String);
 
+impl NetworkId {
+    /// Default per-hop incoming delta (seconds) for this network.
+    ///
+    /// Used when a route announcement does not publish an
+    /// `incoming_delta_secs` tag. Values mirror the `incoming_delta_secs()`
+    /// methods declared by network adapters. Unknown networks use 30 seconds.
+    pub fn default_incoming_delta(&self) -> u64 {
+        match self.0.as_str() {
+            "arkade" | "arkade::mutinynet" => 60,
+            "bitcoin" | "bitcoin::mutinynet" => 300,
+            "fedimint" => 30,
+            "cashu" => 30,
+            "liquid" | "liquid::testnet" => 300,
+            "rootstock" | "rootstock::testnet" => 600,
+            "lightning" => 30,
+            _ => 30,
+        }
+    }
+}
+
 impl fmt::Display for NetworkId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
@@ -1398,6 +1418,31 @@ mod tests {
     #[test]
     fn split_spec_treats_single_colon_as_whole_kind() {
         assert_eq!(split_spec("cashu:host:port"), ("cashu:host:port", None));
+    }
+
+    #[test]
+    fn network_id_default_incoming_delta_matches_adapters() {
+        for (network, expected) in [
+            ("arkade", 60),
+            ("arkade::mutinynet", 60),
+            ("bitcoin", 300),
+            ("bitcoin::mutinynet", 300),
+            ("fedimint", 30),
+            ("cashu", 30),
+            ("liquid", 300),
+            ("liquid::testnet", 300),
+            ("rootstock", 600),
+            ("rootstock::testnet", 600),
+            ("lightning", 30),
+        ] {
+            assert_eq!(NetworkId(network.into()).default_incoming_delta(), expected);
+        }
+    }
+
+    #[test]
+    fn network_id_default_incoming_delta_defaults_unknown_networks() {
+        assert_eq!(NetworkId("mystery".into()).default_incoming_delta(), 30);
+        assert_eq!(NetworkId("".into()).default_incoming_delta(), 30);
     }
 
     #[cfg(feature = "cashu")]

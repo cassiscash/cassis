@@ -11,7 +11,7 @@ use tracing::{debug, info};
 
 mod delta_table;
 
-pub use delta_table::{fallback_incoming_delta, fallback_transit_slack};
+pub use delta_table::fallback_transit_slack;
 
 /// Maximum time we wait for Nostr relays to respond in
 /// [`fetch_announcements`] before giving up.
@@ -615,17 +615,17 @@ mod tests {
     // ---- fallback table tests ----
 
     #[test]
-    fn fallback_known_networks() {
-        assert_eq!(fallback_incoming_delta(&NetworkId("fedimint".into())), 30);
-        assert_eq!(fallback_incoming_delta(&NetworkId("cashu".into())), 30);
-        assert_eq!(fallback_incoming_delta(&NetworkId("liquid".into())), 300);
-        assert_eq!(fallback_incoming_delta(&NetworkId("rootstock".into())), 600);
+    fn default_incoming_delta_known_networks() {
+        assert_eq!(NetworkId("fedimint".into()).default_incoming_delta(), 30);
+        assert_eq!(NetworkId("cashu".into()).default_incoming_delta(), 30);
+        assert_eq!(NetworkId("liquid".into()).default_incoming_delta(), 300);
+        assert_eq!(NetworkId("rootstock".into()).default_incoming_delta(), 600);
     }
 
     #[test]
-    fn fallback_unknown_network_returns_default() {
-        assert_eq!(fallback_incoming_delta(&NetworkId("mystery".into())), 30);
-        assert_eq!(fallback_incoming_delta(&NetworkId("".into())), 30);
+    fn default_incoming_delta_unknown_network_returns_default() {
+        assert_eq!(NetworkId("mystery".into()).default_incoming_delta(), 30);
+        assert_eq!(NetworkId("".into()).default_incoming_delta(), 30);
     }
 
     // ---- announcement schema tests ----
