@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use cassis_client::netspec::NetSpec;
 use cassis_client::ops::{
-    create_invoice_with_claim_pubkeys, init_node_home, load_and_derive, node_store_path,
-    start_receive_with,
+    create_invoice_with_adapter, init_node_home, load_and_derive, node_store_path,
+    start_receive_with, unix_now,
 };
 use cassis_client::store::CashuProofDb;
 use cassis_client::CassisClient;
 use cassis_core::logging::ScopeFields;
-use cassis_core::{NetworkId, NetworkReceiverAdapter, NetworkRouterAdapter, NetworkSenderAdapter};
+use cassis_core::{NetworkAdapter, NetworkId};
 use cdk::nuts::Token;
 use ritualistic::server::{CustomRelay, RelayInternals};
 use ritualistic::{Event as NostrEvent, Filter as NostrFilter};
@@ -144,27 +144,7 @@ enum NodeWallet {
 }
 
 impl NodeWallet {
-    fn router(&self) -> Arc<dyn NetworkRouterAdapter> {
-        match self {
-            NodeWallet::Cashu(a) => a.clone(),
-            NodeWallet::Arkade(a) => a.clone(),
-            NodeWallet::Bitcoin(a) => a.clone(),
-            NodeWallet::Liquid(a) => a.clone(),
-            NodeWallet::Rootstock(a) => a.clone(),
-        }
-    }
-
-    fn receiver(&self) -> Arc<dyn NetworkReceiverAdapter> {
-        match self {
-            NodeWallet::Cashu(a) => a.clone(),
-            NodeWallet::Arkade(a) => a.clone(),
-            NodeWallet::Bitcoin(a) => a.clone(),
-            NodeWallet::Liquid(a) => a.clone(),
-            NodeWallet::Rootstock(a) => a.clone(),
-        }
-    }
-
-    fn sender(&self) -> Arc<dyn NetworkSenderAdapter> {
+    fn router(&self) -> Arc<dyn NetworkAdapter> {
         match self {
             NodeWallet::Cashu(a) => a.clone(),
             NodeWallet::Arkade(a) => a.clone(),
@@ -1313,6 +1293,7 @@ pub async fn command_router_with_veto(
         nostr_relays: vec![RELAY.to_string()],
         derived_keys: derived,
         span: router_span.clone(),
+        state_path: Some(home.join("router-state.json")),
         cashu_store: Arc::new(CashuProofDb::new(node_store_path(&home))),
         liquid_store_dir: None,
         fedimint_data_dir: Some(home.clone()),
@@ -1359,53 +1340,50 @@ pub async fn command_pay(
     let target_spec = target_specs.first().ok_or("target has no networks")?;
     let target_home = node_home(&playground.root, target);
     let target_network = target_spec.network_id();
-    // Resolve the claim identity from the target's already-open
-    // receiver instead of rebuilding one.
-    let claim_pubkeys = playground
+    // Create invoice through target's already-open adapter. Same Arc later
+    // serves receive daemon, so reservation/native invoice state stays live.
+    let target_adapter = playground
         .ensure_wallet(target, &target_network)
         .await?
-        .receiver()
-        .claim_pubkey()
-        .map(|pubkey| vec![(target_network.clone(), pubkey)])
-        .unwrap_or_default();
-    let (invoice, _, _) = create_invoice_with_claim_pubkeys(
+        .router();
+    let (invoice, _, _) = create_invoice_with_adapter(
         &target_home,
-        target_network,
+        target_adapter.as_ref(),
+        target_network.clone(),
         amount,
-        claim_pubkeys,
-        None,
+        unix_now().saturating_add(600),
     )
     .await?;
-    let mut receivers = HashMap::new();
+    let mut adapters = HashMap::new();
     for spec in &target_specs {
-        receivers.insert(
+        adapters.insert(
             spec.network_id(),
             playground
                 .ensure_wallet(target, &spec.network_id())
                 .await?
-                .receiver(),
+                .router(),
         );
     }
     // The listener keeps running detached; dropping the handle does
     // not stop the task.
     let _listener = start_receive_with(
         &target_home,
-        Arc::new(receivers),
+        Arc::new(adapters),
         &target_specs,
         playground.node_span(target).await,
     )
     .await?;
-    let mut senders = HashMap::new();
+    let mut adapters = HashMap::new();
     for spec in &sender_specs {
-        senders.insert(
+        adapters.insert(
             spec.network_id(),
             playground
                 .ensure_wallet(sender, &spec.network_id())
                 .await?
-                .sender(),
+                .router(),
         );
     }
-    let client = CassisClient::new(senders, vec![RELAY.to_string()]).await;
+    let client = CassisClient::new(adapters, vec![RELAY.to_string()]).await;
     set_status(playground, sender, Status::Paying).await;
     set_status(playground, target, Status::Receiving).await;
     let result = client

@@ -2473,6 +2473,7 @@ dependencies = [
  "cassis-rootstock",
  "cassis-router",
  "cassis-routing",
+ "cassis-spark",
  "cdk",
  "clap",
  "futures",
@@ -2508,6 +2509,7 @@ dependencies = [
  "clap",
  "futures",
  "iroh 1.0.3",
+ "lowercase-hex",
  "minisqlite",
  "rand 0.8.7",
  "serde",
@@ -2676,6 +2678,7 @@ dependencies = [
 name = "cassis-router"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "cassis-arkade",
  "cassis-bitcoin",
  "cassis-cashu",
@@ -2687,9 +2690,12 @@ dependencies = [
  "cassis-lnd",
  "cassis-rootstock",
  "cassis-routing",
+ "cassis-spark",
  "iroh 1.0.3",
  "lowercase-hex",
  "ritualistic",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

@@ -2,9 +2,8 @@
 //! commands. The GUI and the CLI both call these so there is no
 //! duplicated orchestration logic.
 
-use cassis_core::{Bytes32, HtlcTarget, Invoice, NetworkId, NetworkReceiverAdapter};
+use cassis_core::{Bytes32, Invoice, NetworkAdapter, NetworkId};
 use cassis_iroh::{Frame, IrohServer, PublicKey};
-use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -12,12 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::error;
-use tracing::{info, Instrument, Span};
+use tracing::{info, warn, Instrument, Span};
 
 pub use crate::netspec::NetSpec;
 pub use crate::seed_store::{read_mnemonic, seed_path, write_mnemonic};
 
-use crate::adapters::{build_receivers_with_config, AdapterConfig};
+use crate::adapters::{build_adapters_with_config, AdapterConfig};
 use crate::store::{InvoiceRow, InvoiceStatus, Store};
 use cassis_keys as keys;
 
@@ -52,12 +51,6 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn generate_preimage() -> [u8; 32] {
-    let mut p = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut p);
-    p
-}
-
 /// Hash a 32-byte preimage with SHA-256 to produce a payment hash.
 pub fn payment_hash_of(preimage: [u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -74,172 +67,69 @@ pub fn load_and_derive(home: &Path, ids: Vec<NetworkId>) -> Result<keys::Derived
     keys::derive_keys(&mn, ids).map_err(|e| e.to_string())
 }
 
-/// Build a serialized `Invoice` for `network_id` worth `amount_msat` sat.
-/// Generates the preimage locally and persists the row in the node's
-/// store. Returns the Invoice (with the local iroh peer id baked in)
-/// ready for the payer to consume.
+/// Create and persist invoice using an already-open adapter object.
 ///
-/// The caller may pass pre-resolved claim pubkeys (taken from an
-/// already-open receiver adapter) to avoid reopening network wallets
-/// just to read `claim_pubkey()`. When empty, receivers are built for
-/// the sole purpose of resolving the claim identity.
-pub async fn create_invoice_for(
+/// Adapter state stays in caller-owned instance, so later receive/COMMIT
+/// operations address same reservation and native invoice.
+pub async fn create_invoice_with_adapter(
     home: &Path,
-    network_id: NetworkId,
-    spec: NetSpec,
-    amount_msat: u64,
-) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
-    create_invoice_for_with_config(
-        home,
-        network_id,
-        spec,
-        amount_msat,
-        &AdapterConfig::default(),
-    )
-    .await
-}
-
-pub async fn create_invoice_for_with_config(
-    home: &Path,
-    network_id: NetworkId,
-    spec: NetSpec,
-    amount_msat: u64,
-    config: &AdapterConfig,
-) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
-    create_invoice_with_claim_pubkeys_and_config(
-        home,
-        network_id,
-        amount_msat,
-        Vec::new(),
-        Some(spec),
-        config,
-    )
-    .await
-}
-
-/// Same as [`create_invoice_for`] but with claim pubkeys resolved by
-/// the caller (or empty to fall back to [`Invoice::payee`]).
-pub async fn create_invoice_with_claim_pubkeys(
-    home: &Path,
+    adapter: &dyn NetworkAdapter,
     network_id: NetworkId,
     amount_msat: u64,
-    claim_pubkeys: Vec<(NetworkId, cassis_core::XOnlyPubKey)>,
-    spec_for_resolution: Option<NetSpec>,
+    expiry: u64,
 ) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
-    create_invoice_with_claim_pubkeys_and_config(
-        home,
-        network_id,
-        amount_msat,
-        claim_pubkeys,
-        spec_for_resolution,
-        &AdapterConfig::default(),
-    )
-    .await
-}
-
-pub async fn create_invoice_with_claim_pubkeys_and_config(
-    home: &Path,
-    network_id: NetworkId,
-    amount_msat: u64,
-    claim_pubkeys: Vec<(NetworkId, cassis_core::XOnlyPubKey)>,
-    spec_for_resolution: Option<NetSpec>,
-    adapter_config: &AdapterConfig,
-) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
-    let mnemonic = read_mnemonic(&seed_path(home)).map_err(|e| e.to_string())?;
-    let ids = vec![network_id.clone()];
-    let derived = keys::derive_keys(&mnemonic, ids).map_err(|e| e.to_string())?;
-
-    let store_path = node_store_path(home);
-    // Ask the receiver adapter which identity it will actually claim
-    // with on this network. For cashu that is the invoice key, but
-    // rootstock claims on-chain with a dedicated per-network EVM
-    // account, so the last hop has to lock to *that* key or the payee
-    // cannot claim.
-    let receivers = match &spec_for_resolution {
-        Some(spec) => Some(
-            build_receivers_with_config(
-                std::slice::from_ref(spec),
-                &derived,
-                &store_path,
-                Span::current(),
-                adapter_config,
-            )
-            .await?,
-        ),
-        None => None,
-    };
-    let claim_pubkeys: Vec<(NetworkId, cassis_core::XOnlyPubKey)> = if !claim_pubkeys.is_empty() {
-        claim_pubkeys
-    } else {
-        match &receivers {
-            Some(receivers) => receivers
-                .get(&network_id)
-                .and_then(|r| r.claim_pubkey())
-                .map(|pubkey| vec![(network_id.clone(), pubkey)])
-                .unwrap_or_default(),
-            None => Vec::new(),
-        }
-    };
-    let now = unix_now();
-    let ttl = 600u64;
-    let preimage = generate_preimage();
-    let payment_hash = payment_hash_of(preimage);
-    let invoice_expiry = now + ttl;
-    // Networks with a native invoice encoding (LND) register the locally
-    // chosen hash and expose the resulting request on the Cassis invoice so
-    // the payer's last hop can fund the exact invoice.
-    let mut payment_request = None;
-    if let Some(receivers) = &receivers {
-        if let Some(receiver) = receivers.get(&network_id) {
-            payment_request = receiver
-                .register_invoice(Bytes32(payment_hash), amount_msat, invoice_expiry, None)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-    };
-    // The minisqlite Store is not `Send`; scope it so it drops before
-    // any `.await` below (the iroh endpoint bind), so the surrounding
-    // async fn stays `Send`.
-    {
-        let mut store = Store::open(&store_path).map_err(|e| e.to_string())?;
-        let row = InvoiceRow {
-            payment_hash: Bytes32(payment_hash),
-            preimage,
-            amount_msat,
-            network_id: network_id.clone(),
-            payee: None,
-            description: None,
-            expires_at: invoice_expiry,
-            status: InvoiceStatus::Pending,
-            created_at: now,
-            claimed_at: None,
-        };
-        store.insert_invoice(&row).map_err(|e| e.to_string())?;
+    if adapter.network_id() != network_id {
+        return Err(format!(
+            "adapter network {} does not match invoice network {}",
+            adapter.network_id(),
+            network_id
+        ));
     }
+    if amount_msat == 0 {
+        return Err("invoice amount must be positive".to_string());
+    }
+    if expiry <= unix_now() {
+        return Err("invoice expiry must be in the future".to_string());
+    }
+    let handle = cassis_core::create_invoice_handle(adapter, amount_msat, expiry, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut invoice = handle.invoice;
+    invoice.networks = vec![network_id];
+    invoice.expires_at = expiry;
 
-    // Bind a transient iroh endpoint so the payer can dial COMMIT.
+    let derived = load_and_derive(home, vec![invoice.networks[0].clone()])?;
     let (iroh_peer_id, iroh_relay) = iroh_endpoint_info(&derived.iroh).await?;
+    invoice.iroh_peer_id = Some(iroh_peer_id);
+    invoice.iroh_relay = Some(iroh_relay);
 
-    let address = match payment_request {
-        Some(payment_request) => HtlcTarget::LightningInvoice(payment_request),
-        None => claim_pubkeys
-            .iter()
-            .find(|(id, _)| id == &network_id)
-            .map(|(_, pubkey)| HtlcTarget::XOnlyPubKey(*pubkey))
-            .unwrap_or(HtlcTarget::XOnlyPubKey(derived.invoice.pubkey())),
-    };
-    let invoice = Invoice {
-        payment_hash: Bytes32(payment_hash),
-        amount_msat,
-        payee: derived.invoice.pubkey(),
-        expires_at: invoice_expiry,
-        networks: vec![network_id],
-        address,
-        description: None,
-        iroh_peer_id: Some(iroh_peer_id),
-        iroh_relay: Some(iroh_relay),
-    };
-    Ok((invoice, Bytes32(payment_hash), preimage))
+    let payment_hash = invoice.payment_hash;
+    let now = unix_now();
+    {
+        let mut store = Store::open(&node_store_path(home)).map_err(|e| e.to_string())?;
+        store
+            .insert_invoice(&InvoiceRow {
+                payment_hash,
+                preimage: handle.preimage.0,
+                amount_msat,
+                network_id: invoice.networks[0].clone(),
+                payee: None,
+                description: None,
+                expires_at: expiry,
+                status: InvoiceStatus::Pending,
+                created_at: now,
+                claimed_at: None,
+            })
+            .map_err(|e| e.to_string())?;
+        store
+            .insert_invoice_handle(&cassis_core::InvoiceHandle {
+                invoice: invoice.clone(),
+                reservation: handle.reservation,
+                preimage: handle.preimage,
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok((invoice, payment_hash, handle.preimage.0))
 }
 
 async fn iroh_endpoint_info(secret: &iroh::SecretKey) -> Result<(String, String), String> {
@@ -258,8 +148,9 @@ async fn iroh_endpoint_info(secret: &iroh::SecretKey) -> Result<(String, String)
 /// and claiming the incoming HTLC on its receiver adapter.
 pub async fn handle_commit_frame(
     frame: Frame,
-    receivers: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>>,
+    adapters: Arc<HashMap<NetworkId, Arc<dyn NetworkAdapter>>>,
     store_path: PathBuf,
+    _remote: PublicKey,
 ) -> Result<Frame, cassis_iroh::IrohError> {
     let commit = match frame {
         Frame::Commit(c) => c,
@@ -270,16 +161,72 @@ pub async fn handle_commit_frame(
             )))
         }
     };
-    // Look up the persisted preimage.
-    let preimage = {
+    if !commit.operation_id.is_valid() {
+        return Err(cassis_iroh::IrohError::Protocol(
+            "COMMIT operation_id must be 32 hexadecimal characters".to_string(),
+        ));
+    }
+    if let Some((payment_hash, preimage)) = {
+        let mut store = Store::open(&store_path)
+            .map_err(|e| cassis_iroh::IrohError::Protocol(format!("store: {e}")))?;
+        store
+            .get_commit_attempt(&commit.operation_id)
+            .map_err(|e| cassis_iroh::IrohError::Protocol(format!("commit replay lookup: {e}")))?
+    } {
+        if payment_hash != commit.payment_hash {
+            return Err(cassis_iroh::IrohError::Protocol(
+                "commit replay operation_id hash mismatch".to_string(),
+            ));
+        }
+        return Ok(Frame::Committed(cassis_core::HopCommitted {
+            payment_hash,
+            operation_id: commit.operation_id.clone(),
+            preimage: Bytes32(preimage),
+        }));
+    }
+    // Load persisted invoice state. COMMIT must use invoice's original
+    // reservation operation; creating a second reservation for same hash
+    // would violate adapter duplicate-hash protection.
+    let (preimage, invoice, reservation) = {
         let mut store = Store::open(&store_path)
             .map_err(|e| cassis_iroh::IrohError::Protocol(format!("store: {e}")))?;
         let row = store
             .get(&commit.payment_hash)
             .map_err(|e| cassis_iroh::IrohError::Protocol(format!("lookup: {e}")))?;
-        row.preimage
+        let handle = store
+            .list_invoice_handles()
+            .map_err(|e| cassis_iroh::IrohError::Protocol(format!("invoice handle lookup: {e}")))?
+            .into_iter()
+            .find(|handle| handle.invoice.payment_hash == commit.payment_hash)
+            .ok_or_else(|| {
+                cassis_iroh::IrohError::Protocol(format!(
+                    "no invoice reservation for payment_hash={}",
+                    commit.payment_hash.short()
+                ))
+            })?;
+        (row.preimage, handle.invoice, handle.reservation)
     };
-    let receiver = receivers.get(&commit.network).ok_or_else(|| {
+    if invoice.amount_msat != commit.amount_msat {
+        return Err(cassis_iroh::IrohError::Protocol(format!(
+            "COMMIT amount {} does not match invoice amount {}",
+            commit.amount_msat, invoice.amount_msat
+        )));
+    }
+    if !invoice
+        .networks
+        .iter()
+        .any(|network| network == &commit.network)
+    {
+        return Err(cassis_iroh::IrohError::Protocol(
+            "COMMIT network does not match invoice network".to_string(),
+        ));
+    }
+    if commit.incoming_deadline > invoice.expires_at {
+        return Err(cassis_iroh::IrohError::Protocol(
+            "COMMIT deadline exceeds invoice expiry".to_string(),
+        ));
+    }
+    let receiver = adapters.get(&commit.network).ok_or_else(|| {
         cassis_iroh::IrohError::Protocol(format!("no receiver for {}", commit.network))
     })?;
     info!(
@@ -296,20 +243,19 @@ pub async fn handle_commit_frame(
     let preimage = Bytes32(preimage);
     info!(
         target: "cassis_client",
-        "revealing preimage and claiming incoming HTLC for payment_hash={} on {}: \
-         preimage={preimage}",
+        "revealing preimage and claiming incoming HTLC for payment_hash={} on {}",
         commit.payment_hash.short(),
         commit.network,
     );
     receiver
-        .accept_incoming_via_descriptor(
-            commit.payment_hash,
-            &commit.incoming_descriptor,
-            commit.incoming_deadline,
-        )
+        .restore_incoming_reservation(&reservation)
+        .await
+        .map_err(|e| cassis_iroh::IrohError::Protocol(format!("restore reservation: {e}")))?;
+    let accepted = receiver
+        .accept_incoming(&reservation, &commit.incoming_descriptor)
         .await
         .map_err(|e| cassis_iroh::IrohError::Protocol(format!("accept_incoming: {e}")))?;
-    if let Err(e) = receiver.claim_incoming(commit.payment_hash, preimage).await {
+    if let Err(e) = receiver.claim_incoming(&accepted, preimage).await {
         error!(
             target: "cassis_client",
             "incoming HTLC claim failed for payment_hash={} on {}: {e}",
@@ -329,8 +275,12 @@ pub async fn handle_commit_frame(
     store
         .mark_status(&commit.payment_hash, InvoiceStatus::Claimed)
         .map_err(|e| cassis_iroh::IrohError::Protocol(format!("mark claimed: {e}")))?;
+    store
+        .insert_commit_attempt(&commit.operation_id, commit.payment_hash, preimage.0)
+        .map_err(|e| cassis_iroh::IrohError::Protocol(format!("record commit attempt: {e}")))?;
     Ok(Frame::Committed(cassis_core::HopCommitted {
         payment_hash: commit.payment_hash,
+        operation_id: commit.operation_id,
         preimage,
     }))
 }
@@ -360,7 +310,7 @@ pub async fn start_receive_with_config(
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let ids: Vec<NetworkId> = networks.iter().map(|s| s.network_id()).collect();
     let derived = load_and_derive(home, ids)?;
-    let receivers = build_receivers_with_config(
+    let adapters = build_adapters_with_config(
         networks,
         &derived,
         &node_store_path(home),
@@ -368,7 +318,7 @@ pub async fn start_receive_with_config(
         config,
     )
     .await?;
-    start_receive_with(home, Arc::new(receivers), networks, span).await
+    start_receive_with(home, Arc::new(adapters), networks, span).await
 }
 
 /// [`start_receive`] with caller-supplied receiver adapters, so an
@@ -376,7 +326,7 @@ pub async fn start_receive_with_config(
 /// networks hold exclusive locks on their wallet state).
 pub async fn start_receive_with(
     home: &Path,
-    receivers: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>>,
+    adapters: Arc<HashMap<NetworkId, Arc<dyn NetworkAdapter>>>,
     networks: &[NetSpec],
     span: Span,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
@@ -395,14 +345,14 @@ pub async fn start_receive_with(
     let store_path = node_store_path(home);
     // Spawn the COMMIT-handler server task.
     {
-        let receivers = receivers.clone();
+        let adapters = adapters.clone();
         let store_path = store_path.clone();
         let handler_span = span.clone();
-        let handler = Arc::new(move |frame: Frame, _remote: PublicKey| {
-            let receivers = receivers.clone();
+        let handler = Arc::new(move |frame: Frame, remote: PublicKey| {
+            let adapters = adapters.clone();
             let store_path = store_path.clone();
             Box::pin(
-                async move { handle_commit_frame(frame, receivers, store_path).await }
+                async move { handle_commit_frame(frame, adapters, store_path, remote).await }
                     .instrument(handler_span.clone()),
             )
                 as std::pin::Pin<
@@ -419,9 +369,8 @@ pub async fn start_receive_with(
         });
     }
 
-    // Claim any pending invoices via the legacy watch path (this also
-    // wakes the COMMIT flow). Then idle; the iroh server task above
-    // keeps the runtime alive. Drop the JoinHandle to stop.
+    // Watch pending invoice reservations and claim them when funded.
+    // Then idle; iroh server task keeps runtime alive. Drop JoinHandle to stop.
     let pending: Vec<crate::store::InvoiceRow> = {
         let mut store = Store::open(&store_path).map_err(|e| e.to_string())?;
         let rows = store
@@ -431,24 +380,72 @@ pub async fn start_receive_with(
             .filter(|r| networks.iter().any(|s| s.network_id() == r.network_id))
             .collect()
     };
+    let handles = {
+        let mut store = Store::open(&store_path).map_err(|e| e.to_string())?;
+        store.list_invoice_handles().map_err(|e| e.to_string())?
+    };
     let jh = tokio::spawn(
         async move {
             for row in pending {
-                let r = receivers.get(&row.network_id);
-                if let Some(rv) = r {
-                    let deadline = row.expires_at.min(unix_now().saturating_add(3600));
-                    // Block until the upstream hop funds the invoice (or the
-                    // deadline passes), then claim with the revealed preimage.
-                    let fund = tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        rv.watch_incoming(row.payment_hash, deadline),
-                    )
-                    .await;
-                    if let Ok(Ok(preimage)) = fund {
-                        let _ = rv.claim_incoming(row.payment_hash, preimage).await;
-                        if let Ok(mut st) = Store::open(&store_path) {
-                            let _ = st.mark_status(&row.payment_hash, InvoiceStatus::Claimed);
+                let Some(rv) = adapters.get(&row.network_id) else {
+                    continue;
+                };
+                let Some(handle) = handles
+                    .iter()
+                    .find(|handle| handle.invoice.payment_hash == row.payment_hash)
+                else {
+                    warn!(
+                        target: "cassis_client",
+                        "no invoice handle for pending payment_hash={}; COMMIT path only",
+                        row.payment_hash.short(),
+                    );
+                    continue;
+                };
+                if let Err(error) = rv.restore_incoming_reservation(&handle.reservation).await {
+                    warn!(
+                        target: "cassis_client",
+                        "cannot restore invoice reservation {}: {error}; COMMIT remains authoritative",
+                        row.payment_hash.short(),
+                    );
+                    continue;
+                }
+                let deadline = row.expires_at.min(unix_now().saturating_add(3600));
+                let fund = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    rv.watch_incoming(&handle.reservation, deadline),
+                )
+                .await;
+                match fund {
+                    Ok(Ok(())) => match rv
+                        .claim_reserved_incoming(&handle.reservation, handle.preimage)
+                        .await
+                    {
+                        Ok(()) => {
+                            if let Ok(mut st) = Store::open(&store_path) {
+                                let _ = st.mark_status(&row.payment_hash, InvoiceStatus::Claimed);
+                            }
                         }
+                        Err(error) => {
+                            warn!(
+                                target: "cassis_client",
+                                "reservation claim unavailable for {}: {error}; COMMIT remains authoritative",
+                                row.payment_hash.short(),
+                            );
+                        }
+                    },
+                    Ok(Err(error)) => {
+                        warn!(
+                            target: "cassis_client",
+                            "invoice watcher unavailable for {}: {error}; COMMIT remains authoritative",
+                            row.payment_hash.short(),
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            target: "cassis_client",
+                            "invoice watcher timed out for {}",
+                            row.payment_hash.short(),
+                        );
                     }
                 }
             }

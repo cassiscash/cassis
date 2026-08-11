@@ -7,10 +7,13 @@ edition.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 cassis-core = { workspace = true }
 cassis-iroh = { workspace = true }
 cassis-keys = { workspace = true }
 cassis-routing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 iroh = { workspace = true }
 lowercase-hex = { workspace = true }
 ritualistic = { workspace = true }
@@ -46,6 +49,10 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.cassis-spark]
+workspace = true
+optional = true
+
 [features]
 arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
 bitcoin = ["dep:cassis-bitcoin", "cassis-core/bitcoin"]
@@ -54,3 +61,4 @@ fedimint = ["dep:cassis-fedimint"]
 liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["dep:cassis-rootstock", "cassis-core/rootstock"]
 lightning = ["dep:cassis-lnd", "cassis-core/lightning"]
+spark = ["dep:cassis-spark", "cassis-core/spark"]

@@ -1,4 +1,7 @@
-use cassis_core::{Bytes32, HtlcDescriptor, HtlcTarget, Invoice, NetworkId, OutgoingPayment};
+use cassis_core::{
+    Bytes32, HtlcDescriptor, HtlcTarget, Invoice, InvoiceHandle, NetworkId, OperationId,
+    OutgoingPayment,
+};
 use minisqlite::{Connection, Error as SqlError, Value};
 
 /// Re-export of `minisqlite::Value` so callers can pattern-match SQL
@@ -23,21 +26,28 @@ CREATE TABLE IF NOT EXISTS invoices (
 );
 CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices(status);
 
+-- One row per payment *attempt*. `operation_id` identifies a single
+-- protocol attempt and is the primary key; `payment_hash` identifies
+-- the payment intent and is deliberately non-unique so a retried or
+-- re-routed payment can keep several attempts alive side by side.
 CREATE TABLE IF NOT EXISTS outgoing_payments (
-    payment_hash       TEXT PRIMARY KEY,
+    operation_id       TEXT PRIMARY KEY,
+    payment_hash       TEXT NOT NULL,
     invoice_json       TEXT NOT NULL,
     sender_network     TEXT NOT NULL,
     amount_msat        INTEGER NOT NULL,
     destination_pubkey TEXT NOT NULL,
     destination_network TEXT NOT NULL,
     expiry             INTEGER NOT NULL,
-    descriptor_json    TEXT,
+    descriptor_json    TEXT NOT NULL,
     status             TEXT NOT NULL,
     created_at         INTEGER NOT NULL,
     resolved_at        INTEGER
 );
 CREATE INDEX IF NOT EXISTS outgoing_payments_status_idx
     ON outgoing_payments(status);
+CREATE INDEX IF NOT EXISTS outgoing_payments_hash_idx
+    ON outgoing_payments(payment_hash);
 
 CREATE TABLE IF NOT EXISTS payment_proofs (
     payment_hash TEXT PRIMARY KEY,
@@ -54,6 +64,21 @@ CREATE TABLE IF NOT EXISTS cashu_proofs (
     created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS cashu_proofs_mint_idx ON cashu_proofs(mint_url);
+
+CREATE TABLE IF NOT EXISTS invoice_handles (
+    payment_hash   TEXT PRIMARY KEY,
+    operation_id   TEXT NOT NULL,
+    invoice_json   TEXT NOT NULL,
+    reservation_json TEXT NOT NULL,
+    preimage       BLOB NOT NULL,
+    created_at     INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS commit_attempts (
+    operation_id TEXT PRIMARY KEY,
+    payment_hash TEXT NOT NULL,
+    preimage     BLOB NOT NULL,
+    created_at   INTEGER NOT NULL
+);
 ";
 
 /// Lifecycle of an invoice row.
@@ -121,7 +146,6 @@ pub struct PendingOutgoingPayment {
     pub invoice: Invoice,
     pub payment: OutgoingPayment,
     pub sender_network: NetworkId,
-    pub descriptor: Option<HtlcDescriptor>,
     pub created_at: u64,
 }
 
@@ -156,6 +180,16 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let mut conn = Connection::open(path)?;
         conn.execute(SCHEMA)?;
+        #[cfg(unix)]
+        if path.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)
+                .map_err(|error| StoreError::Sqlite(error.to_string()))?
+                .permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(path, permissions)
+                .map_err(|error| StoreError::Sqlite(error.to_string()))?;
+        }
         Ok(Self { conn })
     }
 
@@ -215,59 +249,179 @@ impl Store {
         Ok(())
     }
 
+    /// Persist one outgoing attempt keyed by its `operation_id`. Two
+    /// attempts for the same `payment_hash` coexist: the primary key is
+    /// the attempt identifier, so a retry with a fresh operation id
+    /// becomes its own row instead of clobbering the previous one.
     pub fn insert_outgoing_payment(
         &mut self,
         invoice: &Invoice,
         payment: &OutgoingPayment,
         sender_network: &NetworkId,
-        descriptor: Option<&HtlcDescriptor>,
     ) -> Result<(), StoreError> {
+        validate_operation_id(&payment.operation_id)?;
+        if invoice.payment_hash != payment.payment_hash {
+            return Err(StoreError::Invalid(
+                "invoice payment hash does not match outgoing payment".into(),
+            ));
+        }
         let invoice_json = serde_json::to_string(invoice)
             .map_err(|e| StoreError::Invalid(format!("encode invoice: {e}")))?;
-        let descriptor_json = descriptor
-            .map(serde_json::to_string)
-            .transpose()
+        let descriptor = &payment.descriptor;
+        let descriptor_json = serde_json::to_string(descriptor)
             .map_err(|e| StoreError::Invalid(format!("encode descriptor: {e}")))?;
+        let destination_json = serde_json::to_string(&payment.destination)
+            .map_err(|e| StoreError::Invalid(format!("encode destination: {e}")))?;
+        let existing = self.conn.query(&format!(
+            "SELECT payment_hash, invoice_json, amount_msat, destination_pubkey, \
+                    destination_network, expiry, descriptor_json \
+             FROM outgoing_payments WHERE operation_id={};",
+            escape_sql_string(payment.operation_id.as_str())
+        ))?;
+        if let Some(row) = existing.rows.first() {
+            let existing_hash = parse_payment_hash_bytes(&text_at(row, 0, "payment_hash")?)
+                .ok_or_else(|| StoreError::Invalid("payment_hash".into()))?;
+            let same = existing_hash == payment.payment_hash
+                && text_at(row, 1, "invoice_json")?.as_str() == invoice_json.as_str()
+                && int_at(row, 2, "amount_msat")? as u64 == payment.amount_msat
+                && text_at(row, 3, "destination_pubkey")?.as_str() == destination_json.as_str()
+                && text_at(row, 4, "destination_network")?.as_str()
+                    == payment.destination_network.0.as_str()
+                && int_at(row, 5, "expiry")? as u64 == payment.expiry
+                && text_at(row, 6, "descriptor_json")?.as_str() == descriptor_json.as_str();
+            if same {
+                return Ok(());
+            }
+            return Err(StoreError::Invalid(format!(
+                "operation_id {} is already bound to different outgoing state",
+                payment.operation_id
+            )));
+        }
         self.conn.execute(&format!(
-            "INSERT OR REPLACE INTO outgoing_payments \
-             (payment_hash, invoice_json, sender_network, amount_msat, destination_pubkey, \
+            "INSERT INTO outgoing_payments \
+             (operation_id, payment_hash, invoice_json, sender_network, amount_msat, destination_pubkey, \
               destination_network, expiry, descriptor_json, status, created_at, resolved_at) \
-             VALUES ('{}', {}, {}, {}, {}, {}, {}, {}, '{}', {}, NULL);",
+             VALUES ({}, '{}', {}, {}, {}, {}, {}, {}, {}, '{}', {}, NULL);",
+            escape_sql_string(payment.operation_id.as_str()),
             payment.payment_hash,
             escape_sql_string(&invoice_json),
             escape_sql_string(&sender_network.0),
             payment.amount_msat,
-            escape_sql_string(
-                &serde_json::to_string(&payment.destination)
-                    .map_err(|e| StoreError::Invalid(format!("encode destination: {e}")))?
-            ),
+            escape_sql_string(&destination_json),
             escape_sql_string(&payment.destination_network.0),
             payment.expiry,
-            option_sql_string(&descriptor_json),
+            escape_sql_string(&descriptor_json),
             OutgoingPaymentStatus::Pending.as_str(),
             unix_now(),
         ))?;
         Ok(())
     }
 
-    pub fn update_outgoing_descriptor(
+    pub fn get_commit_attempt(
         &mut self,
-        payment_hash: &Bytes32,
-        descriptor: &HtlcDescriptor,
+        operation_id: &OperationId,
+    ) -> Result<Option<(Bytes32, [u8; 32])>, StoreError> {
+        let result = self.conn.query(&format!(
+            "SELECT payment_hash, preimage FROM commit_attempts WHERE operation_id={};",
+            escape_sql_string(operation_id.as_str())
+        ))?;
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+        let payment_hash = parse_payment_hash_bytes(&text_at(row, 0, "payment_hash")?)
+            .ok_or_else(|| StoreError::Invalid("commit payment_hash".into()))?;
+        let bytes = lowercase_hex::decode(&text_at(row, 1, "preimage")?)
+            .map_err(|e| StoreError::Invalid(format!("commit preimage: {e}")))?;
+        let preimage = bytes
+            .try_into()
+            .map_err(|_| StoreError::Invalid("commit preimage must be 32 bytes".into()))?;
+        Ok(Some((payment_hash, preimage)))
+    }
+
+    pub fn insert_commit_attempt(
+        &mut self,
+        operation_id: &OperationId,
+        payment_hash: Bytes32,
+        preimage: [u8; 32],
     ) -> Result<(), StoreError> {
-        let descriptor_json = serde_json::to_string(descriptor)
-            .map_err(|e| StoreError::Invalid(format!("encode descriptor: {e}")))?;
+        validate_operation_id(operation_id)?;
         self.conn.execute(&format!(
-            "UPDATE outgoing_payments SET descriptor_json={} WHERE payment_hash='{}';",
-            escape_sql_string(&descriptor_json),
+            "INSERT OR REPLACE INTO commit_attempts \
+             (operation_id, payment_hash, preimage, created_at) VALUES ({}, '{}', '{}', {});",
+            escape_sql_string(operation_id.as_str()),
             payment_hash,
+            lowercase_hex::encode(preimage),
+            unix_now(),
         ))?;
         Ok(())
     }
 
+    pub fn insert_invoice_handle(&mut self, handle: &InvoiceHandle) -> Result<(), StoreError> {
+        if !handle.reservation.operation_id.is_valid() {
+            return Err(StoreError::Invalid(
+                "invoice reservation operation_id must be 32 hexadecimal characters".into(),
+            ));
+        }
+        if handle.invoice.networks.len() != 1
+            || handle.reservation.payment_hash != handle.invoice.payment_hash
+            || handle.reservation.network != handle.invoice.networks[0]
+        {
+            return Err(StoreError::Invalid(
+                "invoice handle reservation does not match invoice".into(),
+            ));
+        }
+        let invoice_json = serde_json::to_string(&handle.invoice)
+            .map_err(|e| StoreError::Invalid(format!("encode invoice handle: {e}")))?;
+        let reservation_json = serde_json::to_string(&handle.reservation)
+            .map_err(|e| StoreError::Invalid(format!("encode invoice reservation: {e}")))?;
+        let preimage = lowercase_hex::encode(handle.preimage.0);
+        self.conn.execute(&format!(
+            "INSERT OR REPLACE INTO invoice_handles \
+             (payment_hash, operation_id, invoice_json, reservation_json, preimage, created_at) \
+             VALUES ('{}', {}, {}, {}, '{}', {});",
+            handle.invoice.payment_hash,
+            escape_sql_string(handle.reservation.operation_id.as_str()),
+            escape_sql_string(&invoice_json),
+            escape_sql_string(&reservation_json),
+            preimage,
+            unix_now(),
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_invoice_handles(&mut self) -> Result<Vec<InvoiceHandle>, StoreError> {
+        let result = self.conn.query(
+            "SELECT invoice_json, reservation_json, preimage FROM invoice_handles ORDER BY created_at ASC;",
+        )?;
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                let invoice: Invoice = serde_json::from_str(&text_at(row, 0, "invoice_json")?)
+                    .map_err(|e| StoreError::Invalid(format!("invoice_json: {e}")))?;
+                let reservation = serde_json::from_str(&text_at(row, 1, "reservation_json")?)
+                    .map_err(|e| StoreError::Invalid(format!("reservation_json: {e}")))?;
+                let preimage_hex = text_at(row, 2, "preimage")?;
+                let bytes = lowercase_hex::decode(&preimage_hex)
+                    .map_err(|e| StoreError::Invalid(format!("preimage: {e}")))?;
+                let preimage: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| StoreError::Invalid("preimage must be 32 bytes".into()))?;
+                Ok(InvoiceHandle {
+                    invoice,
+                    reservation,
+                    preimage: Bytes32(preimage),
+                })
+            })
+            .collect()
+    }
+
+    /// Every attempt still in `pending`, oldest first. The returned
+    /// `operation_id` is the row key, so callers mark or restore the
+    /// exact attempt they resumed.
     pub fn list_pending_outgoing(&mut self) -> Result<Vec<PendingOutgoingPayment>, StoreError> {
         let result = self.conn.query(
-            "SELECT invoice_json, payment_hash, sender_network, amount_msat, \
+            "SELECT operation_id, payment_hash, invoice_json, sender_network, amount_msat, \
                     destination_pubkey, destination_network, expiry, descriptor_json, created_at \
              FROM outgoing_payments WHERE status='pending' ORDER BY created_at ASC;",
         )?;
@@ -278,16 +432,19 @@ impl Store {
             .collect()
     }
 
+    /// Resolve one attempt by its `operation_id`. Attempts sharing a
+    /// `payment_hash` are left untouched.
     pub fn mark_outgoing_status(
         &mut self,
-        payment_hash: &Bytes32,
+        operation_id: &OperationId,
         status: OutgoingPaymentStatus,
     ) -> Result<(), StoreError> {
+        validate_operation_id(operation_id)?;
         self.conn.execute(&format!(
-            "UPDATE outgoing_payments SET status='{}', resolved_at={} WHERE payment_hash='{}';",
+            "UPDATE outgoing_payments SET status='{}', resolved_at={} WHERE operation_id={};",
             status.as_str(),
             unix_now(),
-            payment_hash,
+            escape_sql_string(operation_id.as_str()),
         ))?;
         Ok(())
     }
@@ -400,42 +557,50 @@ fn row_from_values(row: &[Value]) -> Result<InvoiceRow, StoreError> {
 }
 
 fn pending_outgoing_from_values(row: &[Value]) -> Result<PendingOutgoingPayment, StoreError> {
-    let invoice: Invoice = serde_json::from_str(&text_at(row, 0, "invoice_json")?)
-        .map_err(|e| StoreError::Invalid(format!("invoice_json: {e}")))?;
+    let operation_id = OperationId(text_at(row, 0, "operation_id")?);
+    if !operation_id.is_valid() {
+        return Err(StoreError::Invalid(
+            "operation_id must be 32 hexadecimal characters".into(),
+        ));
+    }
     let payment_hash = parse_payment_hash_bytes(&text_at(row, 1, "payment_hash")?)
         .ok_or_else(|| StoreError::Invalid("payment_hash".into()))?;
-    let sender_network = NetworkId(text_at(row, 2, "sender_network")?);
-    let amount_msat = int_at(row, 3, "amount_msat")? as u64;
-    let destination = serde_json::from_str::<HtlcTarget>(&text_at(row, 4, "destination_pubkey")?)
+    let invoice: Invoice = serde_json::from_str(&text_at(row, 2, "invoice_json")?)
+        .map_err(|e| StoreError::Invalid(format!("invoice_json: {e}")))?;
+    let sender_network = NetworkId(text_at(row, 3, "sender_network")?);
+    let amount_msat = int_at(row, 4, "amount_msat")? as u64;
+    let destination = serde_json::from_str::<HtlcTarget>(&text_at(row, 5, "destination_pubkey")?)
         .map_err(|e| StoreError::Invalid(format!("destination_pubkey: {e}")))?;
-    let destination_network = NetworkId(text_at(row, 5, "destination_network")?);
-    let expiry = int_at(row, 6, "expiry")? as u64;
-    let descriptor = match row.get(7) {
-        Some(Value::Null) | None => None,
-        Some(Value::Text(value)) => Some(
-            serde_json::from_str(value)
-                .map_err(|e| StoreError::Invalid(format!("descriptor_json: {e}")))?,
-        ),
-        other => {
-            return Err(StoreError::Invalid(format!(
-                "descriptor_json: expected nullable text, got {other:?}"
-            )))
-        }
-    };
-    let created_at = int_at(row, 8, "created_at")? as u64;
+    let destination_network = NetworkId(text_at(row, 6, "destination_network")?);
+    let expiry = int_at(row, 7, "expiry")? as u64;
+    let descriptor: HtlcDescriptor = serde_json::from_str(&text_at(row, 8, "descriptor_json")?)
+        .map_err(|e| StoreError::Invalid(format!("descriptor_json: {e}")))?;
+    let created_at = int_at(row, 9, "created_at")? as u64;
     Ok(PendingOutgoingPayment {
         invoice,
         payment: OutgoingPayment {
+            operation_id,
             payment_hash,
             amount_msat,
             destination,
             destination_network,
             expiry,
+            descriptor,
         },
         sender_network,
-        descriptor,
         created_at,
     })
+}
+
+/// Reject operation ids that could not round-trip through the store's
+/// primary key column.
+fn validate_operation_id(operation_id: &OperationId) -> Result<(), StoreError> {
+    if !operation_id.is_valid() {
+        return Err(StoreError::Invalid(
+            "operation_id must be 32 hexadecimal characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn text_at(row: &[Value], idx: usize, field: &str) -> Result<String, StoreError> {
@@ -725,6 +890,114 @@ mod hex {
             s.push_str(&format!("{b:02x}"));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use cassis_core::{IncomingReservation, XOnlyPubKey};
+
+    fn test_key() -> XOnlyPubKey {
+        XOnlyPubKey::from_bytes([
+            0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+            0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
+            0x16, 0xf8, 0x17, 0x98,
+        ])
+        .expect("valid test x-only key")
+    }
+
+    fn fixture_invoice() -> Invoice {
+        Invoice {
+            payment_hash: Bytes32([7u8; 32]),
+            amount_msat: 1_000,
+            payee: test_key(),
+            expires_at: 2_000,
+            networks: vec![NetworkId("cashu".into())],
+            address: HtlcTarget::XOnlyPubKey(test_key()),
+            description: None,
+            iroh_peer_id: None,
+            iroh_relay: None,
+        }
+    }
+
+    fn fixture_payment(invoice: &Invoice, operation_id: &str) -> OutgoingPayment {
+        OutgoingPayment {
+            operation_id: OperationId(operation_id.into()),
+            payment_hash: invoice.payment_hash,
+            amount_msat: invoice.amount_msat,
+            destination: HtlcTarget::XOnlyPubKey(test_key()),
+            destination_network: NetworkId("cashu".into()),
+            expiry: 2_000,
+            descriptor: HtlcDescriptor::Cashu {
+                proofs_b64: vec!["descriptor".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn outgoing_attempts_are_keyed_by_operation_id() {
+        let mut store = Store::in_memory().expect("open store");
+        let invoice = fixture_invoice();
+        let first = fixture_payment(&invoice, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let second = fixture_payment(&invoice, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        store
+            .insert_outgoing_payment(&invoice, &first, &NetworkId("cashu".into()))
+            .expect("insert first");
+        store
+            .insert_outgoing_payment(&invoice, &second, &NetworkId("cashu".into()))
+            .expect("insert second");
+
+        let pending = store.list_pending_outgoing().expect("list pending");
+        assert_eq!(pending.len(), 2);
+        assert!(pending
+            .iter()
+            .any(|row| row.payment.operation_id == first.operation_id));
+        assert!(pending
+            .iter()
+            .any(|row| row.payment.operation_id == second.operation_id));
+
+        store
+            .mark_outgoing_status(&first.operation_id, OutgoingPaymentStatus::Completed)
+            .expect("mark first");
+        let pending = store.list_pending_outgoing().expect("list after mark");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].payment.operation_id, second.operation_id);
+    }
+
+    #[test]
+    fn operation_keyed_auxiliary_rows_round_trip() {
+        let mut store = Store::in_memory().expect("open store");
+        let operation_id = OperationId("cccccccccccccccccccccccccccccccc".into());
+        let payment_hash = Bytes32([4u8; 32]);
+        store
+            .insert_commit_attempt(&operation_id, payment_hash, [3u8; 32])
+            .expect("insert commit attempt");
+        assert_eq!(
+            store
+                .get_commit_attempt(&operation_id)
+                .expect("get commit attempt"),
+            Some((payment_hash, [3u8; 32]))
+        );
+
+        let invoice = fixture_invoice();
+        let reservation_payment_hash = invoice.payment_hash;
+        let handle = InvoiceHandle {
+            invoice,
+            reservation: IncomingReservation {
+                operation_id: OperationId("dddddddddddddddddddddddddddddddd".into()),
+                payment_hash: reservation_payment_hash,
+                network: NetworkId("cashu".into()),
+                amount_msat: 1_000,
+                deadline: 2_000,
+                target: HtlcTarget::XOnlyPubKey(test_key()),
+            },
+            preimage: Bytes32([6u8; 32]),
+        };
+        store.insert_invoice_handle(&handle).expect("insert handle");
+        let handles = store.list_invoice_handles().expect("list handles");
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].reservation, handle.reservation);
     }
 }
 

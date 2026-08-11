@@ -11,8 +11,9 @@ use alloy::sol_types::SolCall;
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, PubKey, WatchError, XOnlyPubKey,
+    AcceptedIncoming, AdapterError, Bytes32, HtlcDescriptor, HtlcTarget, IncomingRequest,
+    IncomingReservation, NetworkAdapter, NetworkId, OperationId, OutgoingPayment, OutgoingRequest,
+    PubKey, XOnlyPubKey,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -113,19 +114,13 @@ pub enum Error {
     NoOutgoing(String),
 }
 
-impl From<Error> for HtlcError {
-    fn from(e: Error) -> HtlcError {
+impl From<Error> for AdapterError {
+    fn from(e: Error) -> AdapterError {
         match e {
-            Error::InvalidParams(s) | Error::InvalidAddress(s) => HtlcError::InvalidParams(s),
-            Error::NoIncoming(s) | Error::NoOutgoing(s) => HtlcError::InvalidParams(s),
-            other => HtlcError::Network(other.to_string()),
+            Error::InvalidParams(s) | Error::InvalidAddress(s) => AdapterError::InvalidParams(s),
+            Error::NoIncoming(s) | Error::NoOutgoing(s) => AdapterError::InvalidParams(s),
+            other => AdapterError::Network(other.to_string()),
         }
-    }
-}
-
-impl From<Error> for WatchError {
-    fn from(e: Error) -> WatchError {
-        WatchError::Network(e.to_string())
     }
 }
 
@@ -141,30 +136,79 @@ pub struct RootstockConfig {
     ///
     /// Normalized to its even-Y form in [`RootstockAdapter::new`] so
     /// that the x-only pubkey advertised via
-    /// [`NetworkRouterAdapter::claim_pubkey`] maps to exactly one EVM
+    /// [`NetworkAdapter::claim_pubkey`] maps to exactly one EVM
     /// address, and that address is the one this key can sign for.
     pub sk: [u8; 32],
     pub invoice_pubkey: XOnlyPubKey,
     pub span: Span,
 }
 
-#[derive(Clone, Debug)]
-struct PendingIncoming {
-    contract: Address,
-    amount_wei: U256,
-    refund_address: Address,
-    timelock: u64,
-    deadline: u64,
-    arrival: Arc<Notify>,
-}
-
-#[derive(Clone, Debug)]
-struct PendingOutgoing {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootstockHtlc {
     contract: Address,
     amount_wei: U256,
     claim_address: Address,
     refund_address: Address,
     timelock: u64,
+}
+
+impl RootstockHtlc {
+    fn parse(descriptor: &HtlcDescriptor) -> Result<Self, AdapterError> {
+        let HtlcDescriptor::Rootstock {
+            contract,
+            amount_wei,
+            claim_address,
+            refund_address,
+            timelock,
+        } = descriptor
+        else {
+            return Err(AdapterError::InvalidParams(format!(
+                "unsupported htlc descriptor for rootstock network: {descriptor:?}"
+            )));
+        };
+        Ok(Self {
+            contract: Address::from_str(contract).map_err(|e| {
+                AdapterError::InvalidParams(format!("invalid contract address: {e}"))
+            })?,
+            amount_wei: U256::from(*amount_wei),
+            claim_address: Address::from_str(claim_address)
+                .map_err(|e| AdapterError::InvalidParams(format!("invalid claim address: {e}")))?,
+            refund_address: Address::from_str(refund_address)
+                .map_err(|e| AdapterError::InvalidParams(format!("invalid refund address: {e}")))?,
+            timelock: *timelock,
+        })
+    }
+
+    fn to_descriptor(&self) -> Result<HtlcDescriptor, AdapterError> {
+        Ok(HtlcDescriptor::Rootstock {
+            contract: format!("{:#x}", self.contract),
+            amount_wei: self.amount_wei.try_into().map_err(|_| {
+                AdapterError::Network("amount_wei overflows descriptor field".into())
+            })?,
+            claim_address: format!("{:#x}", self.claim_address),
+            refund_address: format!("{:#x}", self.refund_address),
+            timelock: self.timelock,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingIncoming {
+    payment_hash: Bytes32,
+    reserved_amount_wei: U256,
+    deadline: u64,
+    accepted: Option<AcceptedIncoming>,
+    arrival: Arc<Notify>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingOutgoing {
+    payment_hash: Bytes32,
+    amount_msat: u64,
+    expiry: u64,
+    recipient: PubKey,
+    funded: Option<RootstockHtlc>,
+    verified: bool,
 }
 
 pub struct RootstockAdapter {
@@ -181,8 +225,8 @@ pub struct RootstockAdapter {
     claim_pubkey: XOnlyPubKey,
     contract: Address,
     provider: Box<dyn Provider + Send + Sync>,
-    incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
-    outgoing: Mutex<HashMap<Bytes32, PendingOutgoing>>,
+    incoming: Mutex<HashMap<OperationId, PendingIncoming>>,
+    outgoing: Mutex<HashMap<OperationId, PendingOutgoing>>,
 }
 
 impl std::fmt::Debug for RootstockAdapter {
@@ -281,14 +325,14 @@ impl RootstockAdapter {
 
     /// Reject a balance that cannot cover the gas for an HTLC claim.
     ///
-    /// Shared by the PREPARE-time [`NetworkRouterAdapter::can_claim`]
+    /// Shared by the PREPARE-time [`NetworkAdapter::can_claim`]
     /// and the claim itself, so both agree on what "affordable" means.
-    /// The lock side lives in [`NetworkRouterAdapter::can_route`], which
+    /// The lock side lives in [`NetworkAdapter::can_route`], which
     /// reserves the same gas on top of the HTLC value.
-    fn ensure_claim_gas(&self, balance: U256, gas_price: u128) -> Result<(), HtlcError> {
+    fn ensure_claim_gas(&self, balance: U256, gas_price: u128) -> Result<(), AdapterError> {
         let reserve = gas_reserve(CLAIM_TX_GAS, gas_price);
         if balance < reserve {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "account {} cannot afford claim gas on {}: \
                  need ~{reserve} wei at {gas_price} wei/gas, have {balance} wei",
                 self.address, self.config.network_id,
@@ -456,290 +500,758 @@ impl RootstockAdapter {
     }
 }
 
-#[async_trait]
-impl NetworkRouterAdapter for RootstockAdapter {
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.config.invoice_pubkey
-    }
-
-    /// Rootstock claims are on-chain transactions signed by a dedicated
-    /// per-network EVM account, *not* by the invoice key, so this must
-    /// override the default. Counterparties lock to
-    /// `evm_address_from_pubkey(this)` == `self.address`, which the
-    /// constructor already verified.
-    fn claim_pubkey(&self) -> XOnlyPubKey {
-        self.claim_pubkey
-    }
-
-    async fn htlc_target(&self, _payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
+impl RootstockAdapter {
+    fn claim_target(&self) -> Result<HtlcTarget, AdapterError> {
         let mut compressed = [0u8; 33];
         compressed[0] = 0x02;
         compressed[1..].copy_from_slice(self.claim_pubkey.as_bytes());
         let pubkey = PubKey::from_bytes(compressed)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim pubkey: {e}")))?;
+            .map_err(|e| AdapterError::InvalidParams(format!("invalid claim pubkey: {e}")))?;
         Ok(HtlcTarget::PubKey(pubkey))
     }
 
+    fn validate_incoming_request(&self, request: &IncomingRequest) -> Result<(), AdapterError> {
+        if !request.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "operation_id must be 32 hexadecimal characters".into(),
+            ));
+        }
+        if request.payment_hash.0.iter().all(|byte| *byte == 0) {
+            return Err(AdapterError::InvalidParams("zero payment hash".into()));
+        }
+        if request.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams(
+                "incoming amount must be > 0".into(),
+            ));
+        }
+        if request
+            .preimage
+            .is_some_and(|preimage| !request.payment_hash.matches_preimage(&preimage))
+        {
+            return Err(AdapterError::InvalidParams(
+                "incoming preimage does not match payment hash".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn incoming_reservation(
+        &self,
+        request: &IncomingRequest,
+        target: HtlcTarget,
+    ) -> IncomingReservation {
+        IncomingReservation {
+            operation_id: request.operation_id.clone(),
+            payment_hash: request.payment_hash,
+            network: self.network_id(),
+            amount_msat: request.amount_msat,
+            deadline: request.deadline,
+            target,
+        }
+    }
+
+    fn validate_incoming_reservation(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        if !reservation.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "operation_id must be 32 hexadecimal characters".into(),
+            ));
+        }
+        if reservation.network != self.network_id() {
+            return Err(AdapterError::InvalidParams(format!(
+                "reservation network {} does not match adapter {}",
+                reservation.network,
+                self.network_id()
+            )));
+        }
+        if reservation.payment_hash.0.iter().all(|byte| *byte == 0) {
+            return Err(AdapterError::InvalidParams("zero payment hash".into()));
+        }
+        if reservation.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams(
+                "incoming amount must be > 0".into(),
+            ));
+        }
+        if reservation.target != self.claim_target()? {
+            return Err(AdapterError::InvalidParams(
+                "incoming reservation targets wrong Rootstock claim key".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_incoming_state(
+        &self,
+        state: &PendingIncoming,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        if state.payment_hash != reservation.payment_hash
+            || state.deadline != reservation.deadline
+            || state.reserved_amount_wei != Self::msat_to_wei(reservation.amount_msat)
+        {
+            return Err(AdapterError::InvalidParams(format!(
+                "incoming reservation does not match operation {}",
+                reservation.operation_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn accepted_incoming_matches(left: &AcceptedIncoming, right: &AcceptedIncoming) -> bool {
+        left.reservation == right.reservation
+            && left.descriptor == right.descriptor
+            && left.amount_msat == right.amount_msat
+    }
+
+    fn amount_msat_from_wei(&self, amount_wei: U256) -> Result<u64, AdapterError> {
+        let wei_per_msat = U256::from(WEI_PER_RBTC / MSAT_PER_RBTC);
+        let (msat, remainder) = (amount_wei / wei_per_msat, amount_wei % wei_per_msat);
+        if !remainder.is_zero() {
+            return Err(AdapterError::InvalidParams(
+                "Rootstock HTLC amount is not a whole number of msat".into(),
+            ));
+        }
+        let msat: u128 = msat
+            .try_into()
+            .map_err(|_| AdapterError::InvalidParams("HTLC amount overflows u128 msat".into()))?;
+        u64::try_from(msat)
+            .map_err(|_| AdapterError::InvalidParams("HTLC amount overflows u64 msat".into()))
+    }
+
+    fn validate_outgoing_request(&self, request: &OutgoingRequest) -> Result<PubKey, AdapterError> {
+        if !request.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "operation_id must be 32 hexadecimal characters".into(),
+            ));
+        }
+        if request.network != self.network_id() {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing network {} does not match adapter {}",
+                request.network,
+                self.network_id()
+            )));
+        }
+        if request.payment_hash.0.iter().all(|byte| *byte == 0) {
+            return Err(AdapterError::InvalidParams("zero payment hash".into()));
+        }
+        if request.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams("amount must be > 0".into()));
+        }
+        match request.target {
+            HtlcTarget::PubKey(pubkey) => Ok(pubkey),
+            HtlcTarget::XOnlyPubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => Err(AdapterError::InvalidParams(
+                "rootstock requires a full pubkey target".into(),
+            )),
+        }
+    }
+
+    fn validate_outgoing_payment(
+        &self,
+        payment: &OutgoingPayment,
+    ) -> Result<(PubKey, RootstockHtlc), AdapterError> {
+        if !payment.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "operation_id must be 32 hexadecimal characters".into(),
+            ));
+        }
+        if payment.destination_network != self.network_id() {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing network {} does not match adapter {}",
+                payment.destination_network,
+                self.network_id()
+            )));
+        }
+        if payment.payment_hash.0.iter().all(|byte| *byte == 0) {
+            return Err(AdapterError::InvalidParams("zero payment hash".into()));
+        }
+        if payment.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams("amount must be > 0".into()));
+        }
+        let recipient = match payment.destination {
+            HtlcTarget::PubKey(pubkey) => pubkey,
+            HtlcTarget::XOnlyPubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
+                return Err(AdapterError::InvalidParams(
+                    "rootstock requires a full pubkey destination".into(),
+                ))
+            }
+        };
+        let htlc = RootstockHtlc::parse(&payment.descriptor)?;
+        if htlc.contract != self.contract {
+            return Err(AdapterError::InvalidParams(format!(
+                "descriptor contract {} does not match configured contract {}",
+                htlc.contract, self.contract
+            )));
+        }
+        if htlc.amount_wei != Self::msat_to_wei(payment.amount_msat) {
+            return Err(AdapterError::InvalidParams(
+                "Rootstock descriptor amount does not match outgoing payment".into(),
+            ));
+        }
+        if htlc.claim_address != evm_address_from_pubkey(&recipient) {
+            return Err(AdapterError::InvalidParams(
+                "Rootstock descriptor claim address does not match destination".into(),
+            ));
+        }
+        if htlc.refund_address != self.address {
+            return Err(AdapterError::InvalidParams(
+                "Rootstock descriptor refund address is not this adapter".into(),
+            ));
+        }
+        Ok((recipient, htlc))
+    }
+
+    fn outgoing_state_matches_request(
+        state: &PendingOutgoing,
+        request: &OutgoingRequest,
+        recipient: &PubKey,
+    ) -> Result<(), AdapterError> {
+        if state.payment_hash != request.payment_hash
+            || state.amount_msat != request.amount_msat
+            || state.expiry != request.expiry
+            || state.recipient != *recipient
+        {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing operation {} already exists with different parameters",
+                request.operation_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn outgoing_state_matches_payment(
+        &self,
+        state: &PendingOutgoing,
+        payment: &OutgoingPayment,
+        recipient: &PubKey,
+        htlc: &RootstockHtlc,
+    ) -> Result<(), AdapterError> {
+        if state.payment_hash != payment.payment_hash
+            || state.amount_msat != payment.amount_msat
+            || state.expiry != payment.expiry
+            || state.recipient != *recipient
+        {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing state does not match operation {}",
+                payment.operation_id
+            )));
+        }
+        let Some(funded) = state.funded.as_ref() else {
+            return Err(AdapterError::NotFound(format!(
+                "outgoing operation {} is still being created",
+                payment.operation_id
+            )));
+        };
+        if funded.contract != htlc.contract
+            || funded.amount_wei != htlc.amount_wei
+            || funded.claim_address != htlc.claim_address
+            || funded.refund_address != htlc.refund_address
+            || funded.timelock != htlc.timelock
+        {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing state does not match descriptor for operation {}",
+                payment.operation_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn outgoing_payment_from_state(
+        &self,
+        operation_id: &OperationId,
+        state: &PendingOutgoing,
+    ) -> Result<OutgoingPayment, AdapterError> {
+        let funded = state.funded.as_ref().ok_or_else(|| {
+            AdapterError::Retryable(format!(
+                "outgoing operation {operation_id} is still being created"
+            ))
+        })?;
+        Ok(OutgoingPayment {
+            operation_id: operation_id.clone(),
+            payment_hash: state.payment_hash,
+            amount_msat: state.amount_msat,
+            destination: HtlcTarget::PubKey(state.recipient),
+            destination_network: self.network_id(),
+            expiry: state.expiry,
+            descriptor: funded.to_descriptor()?,
+        })
+    }
+
+    async fn discard_unfunded_outgoing(&self, operation_id: &OperationId, payment_hash: Bytes32) {
+        let mut outgoing = self.outgoing.lock().await;
+        if outgoing
+            .get(operation_id)
+            .is_some_and(|state| state.payment_hash == payment_hash && state.funded.is_none())
+        {
+            outgoing.remove(operation_id);
+        }
+    }
+
+    async fn verify_htlc(
+        &self,
+        htlc: &RootstockHtlc,
+        payment_hash: Bytes32,
+    ) -> Result<(), AdapterError> {
+        if htlc.contract != self.contract {
+            return Err(AdapterError::InvalidParams(format!(
+                "descriptor contract {} does not match configured contract {}",
+                htlc.contract, self.contract
+            )));
+        }
+        self.span.in_scope(|| {
+            info!(
+                target: "cassis_rootstock",
+                "checking htlc target={} amount={} hash={}",
+                htlc.claim_address,
+                htlc.amount_wei,
+                payment_hash.short(),
+            );
+        });
+        let hash_values_request = TransactionRequest::default().to(htlc.contract).input(
+            IEtherSwap::hashValuesCall {
+                preimageHash: B256::from_slice(payment_hash.as_ref()),
+                amount: htlc.amount_wei,
+                claimAddress: htlc.claim_address,
+                refundAddress: htlc.refund_address,
+                timelock: U256::from(htlc.timelock),
+            }
+            .abi_encode()
+            .into(),
+        );
+        let hash_values = self
+            .provider
+            .call(hash_values_request)
+            .await
+            .map_err(|e| AdapterError::Network(format!("hashValues() failed: {e}")))?;
+        if hash_values.len() < 32 {
+            return Err(AdapterError::Network(format!(
+                "hashValues() returned {} bytes, expected 32",
+                hash_values.len()
+            )));
+        }
+        let swap_hash = B256::from_slice(&hash_values[..32]);
+        let request = TransactionRequest::default()
+            .to(htlc.contract)
+            .input(IEtherSwap::swapsCall(swap_hash).abi_encode().into());
+        let out_bytes = self
+            .provider
+            .call(request)
+            .await
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        if out_bytes.len() < 32 {
+            return Err(AdapterError::Network(format!(
+                "swaps() returned {} bytes, expected >=32",
+                out_bytes.len()
+            )));
+        }
+        if out_bytes[31] == 0 {
+            return Err(AdapterError::Network(
+                "swap not found on chain (hash mismatch)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn accepted_incoming_from_descriptor(
+        &self,
+        reservation: &IncomingReservation,
+        descriptor: &HtlcDescriptor,
+        verify_chain: bool,
+    ) -> Result<AcceptedIncoming, AdapterError> {
+        self.validate_incoming_reservation(reservation)?;
+        let htlc = RootstockHtlc::parse(descriptor)?;
+        if htlc.contract != self.contract {
+            return Err(AdapterError::InvalidParams(format!(
+                "descriptor contract {} does not match configured contract {}",
+                htlc.contract, self.contract
+            )));
+        }
+        if htlc.claim_address != self.address {
+            return Err(AdapterError::InvalidParams(format!(
+                "incoming HTLC is locked to {}, which this node cannot claim; expected {} \
+                 (upstream hop locked to the wrong identity)",
+                htlc.claim_address, self.address
+            )));
+        }
+        let amount_msat = self.amount_msat_from_wei(htlc.amount_wei)?;
+        if amount_msat < reservation.amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "Rootstock HTLC amount {amount_msat} msat below reserved {} msat",
+                reservation.amount_msat
+            )));
+        }
+        if verify_chain {
+            let latest = self
+                .block_number()
+                .await
+                .map_err(|e| AdapterError::Network(e.to_string()))?;
+            let required_timelock = latest.saturating_add(
+                reservation
+                    .deadline
+                    .saturating_sub(Self::unix_now())
+                    .div_ceil(RSK_BLOCK_TIME_SECS),
+            );
+            if htlc.timelock < required_timelock {
+                return Err(AdapterError::InvalidParams(format!(
+                    "Rootstock refund timelock {} opens before claim deadline (need {required_timelock})",
+                    htlc.timelock
+                )));
+            }
+            self.verify_htlc(&htlc, reservation.payment_hash).await?;
+        }
+        Ok(AcceptedIncoming {
+            reservation: reservation.clone(),
+            descriptor: descriptor.clone(),
+            amount_msat,
+        })
+    }
+}
+
+#[async_trait]
+impl NetworkAdapter for RootstockAdapter {
     fn network_id(&self) -> NetworkId {
         self.config.network_id.clone()
     }
 
-    /// Rootstock blocks land every ~30 s; the router needs
-    /// headroom to lock, watch and claim. Mirrors the
-    /// `NetworkId::default_incoming_delta` table.
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
+        self.config.invoice_pubkey
+    }
+
+    /// Rootstock claims use dedicated per-network EVM account, not invoice key.
+    fn claim_pubkey(&self) -> XOnlyPubKey {
+        self.claim_pubkey
+    }
+
     fn incoming_delta_secs(&self) -> u64 {
         600
     }
 
-    async fn register_incoming_htlc(
+    async fn reserve_incoming(
         &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
-        if deadline <= Self::unix_now() {
-            return Err(HtlcError::InvalidParams("deadline in the past".into()));
-        }
-        let arrival = Arc::new(Notify::new());
-        let slot = PendingIncoming {
-            contract: self.contract,
-            amount_wei: Self::msat_to_wei(min_amount_msat),
-            refund_address: Address::ZERO,
-            timelock: 0,
-            deadline,
-            arrival,
-        };
+        request: IncomingRequest,
+    ) -> Result<IncomingReservation, AdapterError> {
+        self.validate_incoming_request(&request)?;
+        let reservation = self.incoming_reservation(&request, self.claim_target()?);
         let mut incoming = self.incoming.lock().await;
-        incoming.insert(payment_hash, slot);
+        if let Some(existing) = incoming.get(&request.operation_id) {
+            self.validate_incoming_state(existing, &reservation)?;
+            return Ok(reservation);
+        }
+        if request.deadline <= Self::unix_now() {
+            return Err(AdapterError::InvalidParams("deadline in the past".into()));
+        }
+        if incoming
+            .values()
+            .any(|state| state.payment_hash == request.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Rootstock payment hash already has an active reservation".into(),
+            ));
+        }
+        incoming.insert(
+            request.operation_id.clone(),
+            PendingIncoming {
+                payment_hash: request.payment_hash,
+                reserved_amount_wei: Self::msat_to_wei(request.amount_msat),
+                deadline: request.deadline,
+                accepted: None,
+                arrival: Arc::new(Notify::new()),
+            },
+        );
+        Ok(reservation)
+    }
+
+    async fn cancel_incoming(&self, reservation: &IncomingReservation) -> Result<(), AdapterError> {
+        self.validate_incoming_reservation(reservation)?;
+        let mut incoming = self.incoming.lock().await;
+        let Some(state) = incoming.get(&reservation.operation_id) else {
+            return Ok(());
+        };
+        self.validate_incoming_state(state, reservation)?;
+        if state.accepted.is_some() {
+            return Err(AdapterError::InvalidParams(
+                "cannot cancel an accepted incoming HTLC".into(),
+            ));
+        }
+        let arrival = state.arrival.clone();
+        incoming.remove(&reservation.operation_id);
+        arrival.notify_waiters();
         Ok(())
     }
 
-    async fn create_outgoing_htlc(
+    async fn accept_incoming(
         &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-        htlc_target: &HtlcTarget,
-    ) -> Result<OutgoingHtlc, HtlcError> {
-        let recipient = match htlc_target {
-            HtlcTarget::PubKey(pubkey) => *pubkey,
-            HtlcTarget::XOnlyPubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
-                return Err(HtlcError::InvalidParams(
-                    "rootstock requires a pubkey target".into(),
+        reservation: &IncomingReservation,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<AcceptedIncoming, AdapterError> {
+        self.validate_incoming_reservation(reservation)?;
+        {
+            let incoming = self.incoming.lock().await;
+            let state = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming reservation for operation {}",
+                    reservation.operation_id
                 ))
-            }
-        };
-        if amount_msat == 0 {
-            return Err(HtlcError::InvalidParams("amount must be > 0".into()));
-        }
-        let now = Self::unix_now();
-        if expiry <= now {
-            return Err(HtlcError::InvalidParams("expiry in the past".into()));
-        }
-        let claim_address = evm_address_from_pubkey(&recipient);
-        let amount_wei = Self::msat_to_wei(amount_msat);
-        self.span.in_scope(|| {
-            info!(
-                target: "cassis_rootstock",
-                "preparing htlc amount={} to={} hash={}",
-                amount_msat,
-                claim_address,
-                payment_hash.short(),
-            );
-        });
-        let latest = self
-            .block_number()
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let remaining = expiry.saturating_sub(now);
-        let blocks_ahead = remaining.div_ceil(RSK_BLOCK_TIME_SECS);
-        let timelock = latest.saturating_add(blocks_ahead);
-
-        // EtherSwap calls it `preimageHash` (ABI-fixed), but it is
-        // the route's payment hash: SHA256(preimage).
-        let payment_hash_word = B256::from_slice(payment_hash.as_ref());
-        let gas_price = self
-            .gas_price_wei()
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let request = TransactionRequest::default()
-            .to(self.contract)
-            .value(amount_wei)
-            .gas_price(gas_price)
-            .gas_limit(LOCK_TX_GAS)
-            .input(
-                IEtherSwap::lockCall {
-                    preimageHash: payment_hash_word,
-                    claimAddress: claim_address,
-                    timelock: U256::from(timelock),
+            })?;
+            self.validate_incoming_state(state, reservation)?;
+            if let Some(accepted) = &state.accepted {
+                if accepted.descriptor == *descriptor {
+                    return Ok(accepted.clone());
                 }
-                .abi_encode()
-                .into(),
-            );
-        let pending = self
-            .provider
-            .send_transaction(request)
-            .await
-            .map_err(|e| HtlcError::Network(format!("lock send: {e}")))?;
-        let tx_hash = *pending.tx_hash();
-        let receipt = pending
-            .get_receipt()
-            .await
-            .map_err(|e| HtlcError::Network(format!("lock receipt (tx {tx_hash}): {e}")))?;
-        if !receipt.status() {
-            return Err(HtlcError::Network(format!(
-                "lock transaction {tx_hash} reverted"
+                return Err(AdapterError::InvalidParams(format!(
+                    "incoming operation {} was accepted with a different descriptor",
+                    reservation.operation_id
+                )));
+            }
+        }
+
+        let accepted = self
+            .accepted_incoming_from_descriptor(reservation, descriptor, true)
+            .await?;
+        let mut incoming = self.incoming.lock().await;
+        let state = incoming.get_mut(&reservation.operation_id).ok_or_else(|| {
+            AdapterError::NotFound(format!(
+                "incoming reservation for operation {} disappeared",
+                reservation.operation_id
+            ))
+        })?;
+        self.validate_incoming_state(state, reservation)?;
+        if let Some(existing) = &state.accepted {
+            if existing.descriptor == accepted.descriptor {
+                return Ok(existing.clone());
+            }
+            return Err(AdapterError::InvalidParams(format!(
+                "incoming operation {} was accepted with a different descriptor",
+                reservation.operation_id
             )));
         }
-        self.span.in_scope(|| {
-            info!(target: "cassis_rootstock", "htlc prepared tx={tx_hash}");
-            debug!(
-                target: "cassis_rootstock",
-                "lock tx sent: payment_hash={} claim={} amount_wei={} timelock={} tx={tx_hash}",
-                payment_hash,
-                claim_address,
-                amount_wei,
-                timelock,
-            );
-        });
-        let mut outgoing = self.outgoing.lock().await;
-        outgoing.insert(
-            payment_hash,
-            PendingOutgoing {
-                contract: self.contract,
-                amount_wei,
-                claim_address,
-                refund_address: self.address,
-                timelock,
-            },
-        );
-        drop(outgoing);
-        let descriptor = HtlcDescriptor::Rootstock {
-            contract: format!("{:#x}", self.contract),
-            amount_wei: amount_wei
-                .try_into()
-                .map_err(|_| HtlcError::Network("amount_wei overflows descriptor field".into()))?,
-            claim_address: format!("{:#x}", claim_address),
-            refund_address: format!("{:#x}", self.address),
-            timelock,
-        };
-        self.verify_incoming_htlc(&descriptor, payment_hash).await?;
-        Ok(OutgoingHtlc {
-            payment_hash,
-            amount_msat,
-            expiry,
-            recipient: recipient.to_hex(),
-            network: self.config.network_id.clone(),
-        })
+        let arrival = state.arrival.clone();
+        state.accepted = Some(accepted.clone());
+        drop(incoming);
+        arrival.notify_waiters();
+        Ok(accepted)
     }
 
-    async fn restore_outgoing_htlc(
-        &self,
-        payment: &OutgoingPayment,
-        descriptor: Option<&HtlcDescriptor>,
-    ) -> Result<(), HtlcError> {
-        let HtlcDescriptor::Rootstock {
-            contract,
-            amount_wei,
-            claim_address,
-            refund_address,
-            timelock,
-        } = descriptor.ok_or(HtlcError::Unimplemented)?
-        else {
-            return Err(HtlcError::InvalidParams(
-                "not a Rootstock descriptor".into(),
-            ));
-        };
-        let contract = Address::from_str(contract)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid contract: {e}")))?;
-        let claim_address = Address::from_str(claim_address)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim address: {e}")))?;
-        let refund_address = Address::from_str(refund_address)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid refund address: {e}")))?;
-        let amount_wei = U256::from(*amount_wei);
-        if amount_wei != Self::msat_to_wei(payment.amount_msat) {
-            return Err(HtlcError::InvalidParams(
-                "Rootstock descriptor amount does not match outgoing payment".into(),
+    async fn restore_incoming(&self, accepted: &AcceptedIncoming) -> Result<(), AdapterError> {
+        {
+            let incoming = self.incoming.lock().await;
+            if let Some(state) = incoming.get(&accepted.reservation.operation_id) {
+                self.validate_incoming_state(state, &accepted.reservation)?;
+                if let Some(existing) = &state.accepted {
+                    if Self::accepted_incoming_matches(existing, accepted) {
+                        return Ok(());
+                    }
+                    return Err(AdapterError::InvalidParams(format!(
+                        "incoming operation {} has different restored state",
+                        accepted.reservation.operation_id
+                    )));
+                }
+            } else if incoming
+                .values()
+                .any(|state| state.payment_hash == accepted.reservation.payment_hash)
+            {
+                return Err(AdapterError::Retryable(
+                    "Rootstock payment hash already belongs to another active reservation".into(),
+                ));
+            }
+        }
+
+        let canonical = self
+            .accepted_incoming_from_descriptor(&accepted.reservation, &accepted.descriptor, true)
+            .await?;
+        if !Self::accepted_incoming_matches(&canonical, accepted) {
+            return Err(AdapterError::InvalidParams(
+                "restored incoming state does not match its descriptor".into(),
             ));
         }
-        self.outgoing.lock().await.insert(
-            payment.payment_hash,
-            PendingOutgoing {
-                contract,
-                amount_wei,
-                claim_address,
-                refund_address,
-                timelock: *timelock,
+
+        let mut incoming = self.incoming.lock().await;
+        if let Some(state) = incoming.get(&accepted.reservation.operation_id) {
+            self.validate_incoming_state(state, &accepted.reservation)?;
+            if let Some(existing) = &state.accepted {
+                if Self::accepted_incoming_matches(existing, accepted) {
+                    return Ok(());
+                }
+                return Err(AdapterError::InvalidParams(format!(
+                    "incoming operation {} was accepted with a different descriptor",
+                    accepted.reservation.operation_id
+                )));
+            }
+            let arrival = state.arrival.clone();
+            incoming
+                .get_mut(&accepted.reservation.operation_id)
+                .expect("entry checked above")
+                .accepted = Some(accepted.clone());
+            drop(incoming);
+            arrival.notify_waiters();
+            return Ok(());
+        }
+        if incoming
+            .values()
+            .any(|state| state.payment_hash == accepted.reservation.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Rootstock payment hash already belongs to another active reservation".into(),
+            ));
+        }
+        let arrival = Arc::new(Notify::new());
+        incoming.insert(
+            accepted.reservation.operation_id.clone(),
+            PendingIncoming {
+                payment_hash: accepted.reservation.payment_hash,
+                reserved_amount_wei: Self::msat_to_wei(accepted.reservation.amount_msat),
+                deadline: accepted.reservation.deadline,
+                accepted: Some(accepted.clone()),
+                arrival: arrival.clone(),
             },
         );
+        drop(incoming);
+        arrival.notify_waiters();
         Ok(())
+    }
+
+    async fn watch_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        deadline: u64,
+    ) -> Result<(), AdapterError> {
+        self.validate_incoming_reservation(reservation)?;
+        let (arrival, accepted, reservation_deadline) = {
+            let incoming = self.incoming.lock().await;
+            let state = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::Retryable(format!(
+                    "incoming reservation for operation {} no longer exists",
+                    reservation.operation_id
+                ))
+            })?;
+            self.validate_incoming_state(state, reservation)?;
+            (
+                state.arrival.clone(),
+                state.accepted.clone(),
+                state.deadline,
+            )
+        };
+        if accepted.is_some() {
+            return Ok(());
+        }
+        let deadline = deadline.min(reservation_deadline);
+        loop {
+            let now = Self::unix_now();
+            if now >= deadline {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            let wait = Duration::from_secs((deadline - now).clamp(1, POLL_INTERVAL_SECS));
+            if tokio::time::timeout(wait, arrival.notified())
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let incoming = self.incoming.lock().await;
+            let state = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::Retryable(format!(
+                    "incoming reservation for operation {} was canceled",
+                    reservation.operation_id
+                ))
+            })?;
+            self.validate_incoming_state(state, reservation)?;
+            if state.accepted.is_some() {
+                return Ok(());
+            }
+        }
     }
 
     async fn claim_incoming(
         &self,
-        payment_hash: Bytes32,
+        accepted: &AcceptedIncoming,
         preimage: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let slot = {
-            let incoming = self.incoming.lock().await;
-            incoming.get(&payment_hash).cloned()
-        };
-        let slot = slot.ok_or_else(|| {
-            HtlcError::InvalidParams(format!("no incoming HTLC for {payment_hash:?}"))
-        })?;
-        let now = Self::unix_now();
-        if slot.deadline <= now {
-            return Err(HtlcError::Network("incoming deadline exceeded".into()));
-        }
-        if slot.amount_wei.is_zero() {
-            return Err(HtlcError::InvalidParams(
-                "incoming HTLC has no amount (descriptor not yet accepted)".into(),
+    ) -> Result<(), AdapterError> {
+        let canonical = self
+            .accepted_incoming_from_descriptor(&accepted.reservation, &accepted.descriptor, false)
+            .await?;
+        if !Self::accepted_incoming_matches(&canonical, accepted) {
+            return Err(AdapterError::InvalidParams(
+                "accepted incoming state does not match its descriptor".into(),
             ));
+        }
+        if !accepted
+            .reservation
+            .payment_hash
+            .matches_preimage(&preimage)
+        {
+            return Err(AdapterError::InvalidParams(
+                "preimage does not hash to the payment hash".into(),
+            ));
+        }
+        let htlc = RootstockHtlc::parse(&accepted.descriptor)?;
+        let state: Option<PendingIncoming> = {
+            let incoming = self.incoming.lock().await;
+            let state = incoming.get(&accepted.reservation.operation_id);
+            if let Some(state) = state {
+                self.validate_incoming_state(state, &accepted.reservation)?;
+                let stored = state.accepted.as_ref().ok_or_else(|| {
+                    AdapterError::InvalidParams(format!(
+                        "incoming operation {} has not been accepted",
+                        accepted.reservation.operation_id
+                    ))
+                })?;
+                if !Self::accepted_incoming_matches(stored, accepted) {
+                    return Err(AdapterError::InvalidParams(
+                        "accepted incoming state does not match adapter state".into(),
+                    ));
+                }
+                Some(state.clone())
+            } else {
+                None
+            }
+        };
+        let Some(state) = state else {
+            // Successful claim already removed state. Same-handle retry is complete.
+            return Ok(());
+        };
+        let stored = state
+            .accepted
+            .as_ref()
+            .expect("accepted state checked above");
+        if Self::unix_now() >= stored.reservation.deadline {
+            return Err(AdapterError::Network("incoming deadline exceeded".into()));
         }
         let gas_price = self
             .gas_price_wei()
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        // Log the funding state of the claiming account up front: an
-        // unfunded account is rejected by RSK with "the sender account
-        // doesn't exist" (-32010), which says nothing about *which*
-        // account, so surface it here.
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let balance = self
             .provider
             .get_balance(self.address)
             .await
-            .map_err(|e| HtlcError::Network(format!("get_balance: {e}")))?;
+            .map_err(|e| AdapterError::Network(format!("get_balance: {e}")))?;
         self.span.in_scope(|| {
             info!(
                 target: "cassis_rootstock",
-                "claiming htlc {} with preimage={} from={} balance={} wei \
-                 amount={} wei gas_price={} wei",
-                payment_hash.short(),
-                preimage,
+                "claiming htlc {} from={} balance={} wei amount={} wei gas_price={} wei",
+                accepted.reservation.payment_hash.short(),
                 self.address,
                 balance,
-                slot.amount_wei,
+                htlc.amount_wei,
                 gas_price,
             );
         });
-        // Same check PREPARE ran, re-run here because PREPARE may have
-        // been minutes ago and the account can have been drained by
-        // another claim since. Reuses the balance and gas price already
-        // fetched above rather than calling `can_claim`, which would
-        // repeat both RPC round-trips on the hot claim path.
         self.ensure_claim_gas(balance, gas_price)?;
         let request = TransactionRequest::default()
-            .to(slot.contract)
+            .to(htlc.contract)
             .gas_price(gas_price)
             .gas_limit(CLAIM_TX_GAS)
             .input(
                 IEtherSwap::claimCall {
                     preimage: B256::from_slice(preimage.as_ref()),
-                    amount: slot.amount_wei,
-                    refundAddress: slot.refund_address,
-                    timelock: U256::from(slot.timelock),
+                    amount: htlc.amount_wei,
+                    refundAddress: htlc.refund_address,
+                    timelock: U256::from(htlc.timelock),
                 }
                 .abi_encode()
                 .into(),
@@ -748,14 +1260,14 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .provider
             .send_transaction(request)
             .await
-            .map_err(|e| HtlcError::Network(format!("claim send: {e}")))?;
+            .map_err(|e| AdapterError::Network(format!("claim send: {e}")))?;
         let tx_hash = *pending.tx_hash();
         let receipt = pending
             .get_receipt()
             .await
-            .map_err(|e| HtlcError::Network(format!("claim receipt (tx {tx_hash}): {e}")))?;
+            .map_err(|e| AdapterError::Network(format!("claim receipt (tx {tx_hash}): {e}")))?;
         if !receipt.status() {
-            return Err(HtlcError::Network(format!(
+            return Err(AdapterError::Network(format!(
                 "claim transaction {tx_hash} reverted"
             )));
         }
@@ -763,118 +1275,267 @@ impl NetworkRouterAdapter for RootstockAdapter {
             info!(
                 target: "cassis_rootstock",
                 "htlc claimed for {}: tx={tx_hash}",
-                payment_hash.short(),
+                accepted.reservation.payment_hash.short(),
             );
         });
-        let mut incoming = self.incoming.lock().await;
-        incoming.remove(&payment_hash);
+        self.incoming
+            .lock()
+            .await
+            .remove(&accepted.reservation.operation_id);
         Ok(())
     }
 
-    async fn refund_outgoing(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
-        let slot = {
-            let outgoing = self.outgoing.lock().await;
-            outgoing.get(&payment_hash).cloned()
-        };
-        let slot = slot.ok_or_else(|| {
-            HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
-        })?;
-        let latest = self
-            .block_number()
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        if latest < slot.timelock {
-            return Err(HtlcError::InvalidParams(format!(
-                "timelock not reached: latest={latest} timelock={}",
-                slot.timelock
-            )));
-        }
-        let gas_price = self
-            .gas_price_wei()
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let request = TransactionRequest::default()
-            .to(slot.contract)
-            .gas_price(gas_price)
-            .input(
-                IEtherSwap::refundCall {
-                    preimageHash: B256::from_slice(payment_hash.as_ref()),
-                    amount: slot.amount_wei,
-                    // Must be the address the swap was *locked* to, not
-                    // ours: `hashValues` commits to the claim address,
-                    // and the 4-arg `refund` supplies `msg.sender` as
-                    // the refund address. Passing our own address here
-                    // produces a hash for which no swap exists, so
-                    // every refund reverts.
-                    claimAddress: slot.claim_address,
-                    timelock: U256::from(slot.timelock),
-                }
-                .abi_encode()
-                .into(),
-            );
-        let pending = self
-            .provider
-            .send_transaction(request)
-            .await
-            .map_err(|e| HtlcError::Network(format!("refund send: {e}")))?;
-        let tx_hash = *pending.tx_hash();
-        let receipt = pending
-            .get_receipt()
-            .await
-            .map_err(|e| HtlcError::Network(format!("refund receipt (tx {tx_hash}): {e}")))?;
-        if !receipt.status() {
-            return Err(HtlcError::Network(format!(
-                "refund transaction {tx_hash} reverted"
-            )));
-        }
-        let mut outgoing = self.outgoing.lock().await;
-        outgoing.remove(&payment_hash);
-        Ok(())
-    }
-
-    async fn watch_preimage(
+    async fn claim_reserved_incoming(
         &self,
-        payment_hash: Bytes32,
+        reservation: &IncomingReservation,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let accepted = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming Rootstock reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            slot.accepted.clone().ok_or(AdapterError::Unimplemented)
+        }?;
+        self.claim_incoming(&accepted, preimage).await
+    }
+
+    async fn create_outgoing(
+        &self,
+        request: OutgoingRequest,
+    ) -> Result<OutgoingPayment, AdapterError> {
+        let recipient = self.validate_outgoing_request(&request)?;
+        let existing_funded = {
+            let mut outgoing = self.outgoing.lock().await;
+            if let Some(existing) = outgoing.get(&request.operation_id) {
+                Self::outgoing_state_matches_request(existing, &request, &recipient)?;
+                let funded = existing.funded.clone();
+                if funded.is_none() {
+                    return Err(AdapterError::Retryable(format!(
+                        "Rootstock outgoing operation {} is already being created",
+                        request.operation_id
+                    )));
+                }
+                if existing.verified {
+                    return self.outgoing_payment_from_state(&request.operation_id, existing);
+                }
+                funded
+            } else {
+                if request.expiry <= Self::unix_now() {
+                    return Err(AdapterError::InvalidParams("expiry in the past".into()));
+                }
+                if outgoing
+                    .values()
+                    .any(|state| state.payment_hash == request.payment_hash)
+                {
+                    return Err(AdapterError::Retryable(
+                        "Rootstock payment hash already has an active outgoing payment".into(),
+                    ));
+                }
+                outgoing.insert(
+                    request.operation_id.clone(),
+                    PendingOutgoing {
+                        payment_hash: request.payment_hash,
+                        amount_msat: request.amount_msat,
+                        expiry: request.expiry,
+                        recipient,
+                        funded: None,
+                        verified: false,
+                    },
+                );
+                None
+            }
+        };
+
+        if let Some(funded) = existing_funded {
+            let htlc = funded.to_descriptor()?;
+            let parsed = RootstockHtlc::parse(&htlc)?;
+            self.verify_htlc(&parsed, request.payment_hash).await?;
+            let mut outgoing = self.outgoing.lock().await;
+            let state = outgoing.get_mut(&request.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "outgoing operation {} disappeared during verification",
+                    request.operation_id
+                ))
+            })?;
+            state.verified = true;
+            return self.outgoing_payment_from_state(&request.operation_id, state);
+        }
+
+        let operation_id = request.operation_id.clone();
+        let payment_hash = request.payment_hash;
+        let result: Result<B256, AdapterError> = async {
+            let now = Self::unix_now();
+            let latest = self
+                .block_number()
+                .await
+                .map_err(|e| AdapterError::Network(e.to_string()))?;
+            let remaining = request.expiry.saturating_sub(now);
+            let blocks_ahead = remaining.div_ceil(RSK_BLOCK_TIME_SECS);
+            let timelock = latest.saturating_add(blocks_ahead);
+            let claim_address = evm_address_from_pubkey(&recipient);
+            let amount_wei = Self::msat_to_wei(request.amount_msat);
+            let htlc = RootstockHtlc {
+                contract: self.contract,
+                amount_wei,
+                claim_address,
+                refund_address: self.address,
+                timelock,
+            };
+            // Validate descriptor range before broadcasting funds.
+            let _ = htlc.to_descriptor()?;
+            self.span.in_scope(|| {
+                info!(
+                    target: "cassis_rootstock",
+                    "preparing htlc amount={} to={} hash={}",
+                    request.amount_msat,
+                    claim_address,
+                    payment_hash.short(),
+                );
+            });
+            let gas_price = self
+                .gas_price_wei()
+                .await
+                .map_err(|e| AdapterError::Network(e.to_string()))?;
+            let tx_request = TransactionRequest::default()
+                .to(self.contract)
+                .value(amount_wei)
+                .gas_price(gas_price)
+                .gas_limit(LOCK_TX_GAS)
+                .input(
+                    IEtherSwap::lockCall {
+                        preimageHash: B256::from_slice(payment_hash.as_ref()),
+                        claimAddress: claim_address,
+                        timelock: U256::from(timelock),
+                    }
+                    .abi_encode()
+                    .into(),
+                );
+            let pending = self
+                .provider
+                .send_transaction(tx_request)
+                .await
+                .map_err(|e| AdapterError::Network(format!("lock send: {e}")))?;
+            let tx_hash = *pending.tx_hash();
+
+            // Persist recovery state as soon as broadcast is accepted, before
+            // waiting on receipt. Later receipt/verification errors must not
+            // make exact retry fund a second HTLC.
+            {
+                let mut outgoing = self.outgoing.lock().await;
+                let state = outgoing.get_mut(&operation_id).ok_or_else(|| {
+                    AdapterError::Network("outgoing operation disappeared after lock send".into())
+                })?;
+                if state.payment_hash != payment_hash {
+                    return Err(AdapterError::Network(
+                        "outgoing operation state changed after lock send".into(),
+                    ));
+                }
+                state.funded = Some(htlc);
+            }
+
+            let receipt = pending
+                .get_receipt()
+                .await
+                .map_err(|e| AdapterError::Network(format!("lock receipt (tx {tx_hash}): {e}")))?;
+            if !receipt.status() {
+                return Err(AdapterError::Network(format!(
+                    "lock transaction {tx_hash} reverted"
+                )));
+            }
+            self.span.in_scope(|| {
+                info!(target: "cassis_rootstock", "htlc prepared tx={tx_hash}");
+                debug!(
+                    target: "cassis_rootstock",
+                    "lock tx sent: payment_hash={} claim={} amount_wei={} timelock={} tx={tx_hash}",
+                    payment_hash, claim_address, amount_wei, timelock,
+                );
+            });
+            let funded = {
+                let state = self.outgoing.lock().await;
+                let state = state.get(&operation_id).ok_or_else(|| {
+                    AdapterError::Network("outgoing operation disappeared after lock".into())
+                })?;
+                state.funded.clone().ok_or_else(|| {
+                    AdapterError::Network("outgoing recovery state missing after lock".into())
+                })?
+            };
+            self.verify_htlc(&funded, payment_hash).await?;
+            Ok(tx_hash)
+        }
+        .await;
+        if result.is_err() {
+            self.discard_unfunded_outgoing(&operation_id, payment_hash)
+                .await;
+        }
+        result?;
+
+        let mut outgoing = self.outgoing.lock().await;
+        let state = outgoing.get_mut(&operation_id).ok_or_else(|| {
+            AdapterError::NotFound(format!(
+                "outgoing operation {operation_id} disappeared after funding"
+            ))
+        })?;
+        state.verified = true;
+        self.outgoing_payment_from_state(&operation_id, state)
+    }
+
+    async fn watch_outgoing(
+        &self,
+        payment: &OutgoingPayment,
         deadline: u64,
-    ) -> Result<Bytes32, WatchError> {
+    ) -> Result<Bytes32, AdapterError> {
+        let (recipient, htlc) = self.validate_outgoing_payment(payment)?;
+        {
+            let outgoing = self.outgoing.lock().await;
+            let state = outgoing.get(&payment.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no outgoing payment for operation {}",
+                    payment.operation_id
+                ))
+            })?;
+            self.outgoing_state_matches_payment(state, payment, &recipient, &htlc)?;
+        }
         let interval = Duration::from_secs(POLL_INTERVAL_SECS);
-        let mut last_scanned: Option<u64> = None;
+        let mut last_scanned = None;
         loop {
             if Self::unix_now() >= deadline {
-                return Err(WatchError::DeadlineExceeded);
+                return Err(AdapterError::DeadlineExceeded);
             }
             let latest = match self.block_number().await {
-                Ok(n) => n,
-                Err(e) => {
+                Ok(number) => number,
+                Err(error) => {
                     self.span.in_scope(|| {
-                        warn!(target: "cassis_rootstock", "watch_preimage block_number failed: {e}");
+                        warn!(target: "cassis_rootstock", "outgoing watch block_number failed: {error}");
                     });
                     tokio::time::sleep(interval).await;
                     continue;
                 }
             };
-            let from = last_scanned.map(|n| n + 1).unwrap_or(latest);
+            let from = last_scanned.map(|number| number + 1).unwrap_or(latest);
             for block_number in from..=latest {
                 match self
-                    .find_claim_preimage_in_block(block_number, payment_hash)
+                    .find_claim_preimage_in_block(block_number, payment.payment_hash)
                     .await
                 {
                     Ok(Some(preimage)) => {
                         self.span.in_scope(|| {
                             info!(
                                 target: "cassis_rootstock",
-                                "preimage observed on chain in block {block_number} for {}: \
-                                 preimage={preimage}",
-                                payment_hash.short(),
+                                "preimage observed on chain in block {block_number} for {}",
+                                payment.payment_hash.short(),
                             );
                         });
                         return Ok(preimage);
                     }
                     Ok(None) => {}
-                    Err(e) => self.span.in_scope(|| {
+                    Err(error) => self.span.in_scope(|| {
                         warn!(
                             target: "cassis_rootstock",
-                            "watch_preimage block scan failed at {block_number}: {e}"
+                            "outgoing watch block scan failed at {block_number}: {error}"
                         );
                     }),
                 }
@@ -884,24 +1545,148 @@ impl NetworkRouterAdapter for RootstockAdapter {
         }
     }
 
-    async fn can_route(&self, amount_msat: u64) -> Result<(), HtlcError> {
+    async fn refund_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        let (recipient, htlc) = self.validate_outgoing_payment(payment)?;
+        let funded = {
+            let outgoing = self.outgoing.lock().await;
+            let Some(state) = outgoing.get(&payment.operation_id) else {
+                // Successful refund already removed state. Same-handle retry is complete.
+                return Ok(());
+            };
+            self.outgoing_state_matches_payment(state, payment, &recipient, &htlc)?;
+            state.funded.clone().expect("validated funded state")
+        };
+        let latest = self
+            .block_number()
+            .await
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        if latest < funded.timelock {
+            return Err(AdapterError::Retryable(format!(
+                "timelock not reached: latest={latest} timelock={}",
+                funded.timelock
+            )));
+        }
+        let gas_price = self
+            .gas_price_wei()
+            .await
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        let request = TransactionRequest::default()
+            .to(funded.contract)
+            .gas_price(gas_price)
+            .input(
+                IEtherSwap::refundCall {
+                    preimageHash: B256::from_slice(payment.payment_hash.as_ref()),
+                    amount: funded.amount_wei,
+                    // Four-argument refund commits to original claim address.
+                    claimAddress: funded.claim_address,
+                    timelock: U256::from(funded.timelock),
+                }
+                .abi_encode()
+                .into(),
+            );
+        let pending = self
+            .provider
+            .send_transaction(request)
+            .await
+            .map_err(|e| AdapterError::Network(format!("refund send: {e}")))?;
+        let tx_hash = *pending.tx_hash();
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| AdapterError::Network(format!("refund receipt (tx {tx_hash}): {e}")))?;
+        if !receipt.status() {
+            return Err(AdapterError::Network(format!(
+                "refund transaction {tx_hash} reverted"
+            )));
+        }
+        self.outgoing.lock().await.remove(&payment.operation_id);
+        Ok(())
+    }
+
+    async fn restore_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        let (recipient, htlc) = self.validate_outgoing_payment(payment)?;
+        {
+            let outgoing = self.outgoing.lock().await;
+            if let Some(state) = outgoing.get(&payment.operation_id) {
+                self.outgoing_state_matches_payment(state, payment, &recipient, &htlc)?;
+                if state.verified {
+                    return Ok(());
+                }
+            } else if outgoing
+                .values()
+                .any(|state| state.payment_hash == payment.payment_hash)
+            {
+                return Err(AdapterError::Retryable(
+                    "Rootstock payment hash already has another active outgoing payment".into(),
+                ));
+            }
+        }
+
+        self.verify_htlc(&htlc, payment.payment_hash).await?;
+        let mut outgoing = self.outgoing.lock().await;
+        if let Some(state) = outgoing.get_mut(&payment.operation_id) {
+            self.outgoing_state_matches_payment(state, payment, &recipient, &htlc)?;
+            state.verified = true;
+            return Ok(());
+        }
+        if outgoing
+            .values()
+            .any(|state| state.payment_hash == payment.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Rootstock payment hash already has another active outgoing payment".into(),
+            ));
+        }
+        outgoing.insert(
+            payment.operation_id.clone(),
+            PendingOutgoing {
+                payment_hash: payment.payment_hash,
+                amount_msat: payment.amount_msat,
+                expiry: payment.expiry,
+                recipient,
+                funded: Some(htlc),
+                verified: true,
+            },
+        );
+        Ok(())
+    }
+
+    async fn restore_incoming_reservation(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        let restored = self
+            .reserve_incoming(IncomingRequest {
+                operation_id: reservation.operation_id.clone(),
+                payment_hash: reservation.payment_hash,
+                amount_msat: reservation.amount_msat,
+                deadline: reservation.deadline,
+                preimage: None,
+            })
+            .await?;
+        if restored == *reservation {
+            Ok(())
+        } else {
+            Err(AdapterError::InvalidParams(
+                "restored Rootstock reservation differs from persisted state".into(),
+            ))
+        }
+    }
+
+    async fn can_route(&self, amount_msat: u64) -> Result<(), AdapterError> {
         let balance = self
             .provider
             .get_balance(self.address)
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        // The lock is itself a transaction, so the value alone is not
-        // enough — without gas headroom `can_route` passes and the lock
-        // then fails for want of gas, which is the same trap `can_claim`
-        // closes on the incoming side.
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let gas_price = self
             .gas_price_wei()
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let gas = gas_reserve(LOCK_TX_GAS, gas_price);
         let needed = Self::msat_to_wei(amount_msat).saturating_add(gas);
         if balance < needed {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "insufficient rootstock balance on {}: need {needed} wei \
                  (including ~{gas} wei gas), have {balance} wei",
                 self.address,
@@ -910,218 +1695,17 @@ impl NetworkRouterAdapter for RootstockAdapter {
         Ok(())
     }
 
-    /// Claiming on rootstock is an on-chain transaction, so it needs gas
-    /// even though the claimed value flows *in*. An unfunded account is
-    /// rejected outright by RSK ("the sender account doesn't exist",
-    /// -32010) because it has no state-trie entry at all.
-    ///
-    /// Checked at PREPARE time so the hop is rejected before it locks
-    /// anything downstream, instead of stranding an outgoing HTLC it
-    /// cannot recoup. `amount_msat` is deliberately unused: the claimed
-    /// value arrives, so only the gas matters.
-    async fn can_claim(&self, _amount_msat: u64) -> Result<(), HtlcError> {
+    async fn can_claim(&self, _amount_msat: u64) -> Result<(), AdapterError> {
         let balance = self
             .provider
             .get_balance(self.address)
             .await
-            .map_err(|e| HtlcError::Network(format!("get_balance: {e}")))?;
+            .map_err(|e| AdapterError::Network(format!("get_balance: {e}")))?;
         let gas_price = self
             .gas_price_wei()
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         self.ensure_claim_gas(balance, gas_price)
-    }
-
-    async fn verify_incoming_htlc(
-        &self,
-        descriptor: &HtlcDescriptor,
-        payment_hash: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let (contract_addr, amount_wei, claim_addr, refund_addr, timelock) = match descriptor {
-            HtlcDescriptor::Rootstock {
-                contract,
-                amount_wei,
-                claim_address,
-                refund_address,
-                timelock,
-            } => {
-                let contract_addr = Address::from_str(contract).map_err(|e| {
-                    HtlcError::InvalidParams(format!("invalid contract address: {e}"))
-                })?;
-                let refund_addr = Address::from_str(refund_address).map_err(|e| {
-                    HtlcError::InvalidParams(format!("invalid refund address: {e}"))
-                })?;
-                let claim_addr = Address::from_str(claim_address)
-                    .map_err(|e| HtlcError::InvalidParams(format!("invalid claim address: {e}")))?;
-                (
-                    contract_addr,
-                    U256::from(*amount_wei),
-                    claim_addr,
-                    refund_addr,
-                    *timelock,
-                )
-            }
-            other => {
-                return Err(HtlcError::Network(format!(
-                    "unsupported htlc descriptor for rootstock network: {other:?}"
-                )));
-            }
-        };
-        self.span.in_scope(|| {
-            info!(
-                target: "cassis_rootstock",
-                "checking htlc target={} amount={} hash={}",
-                claim_addr,
-                amount_wei,
-                payment_hash.short(),
-            );
-        });
-        let hash_values_call = IEtherSwap::hashValuesCall {
-            preimageHash: B256::from_slice(payment_hash.as_ref()),
-            amount: amount_wei,
-            claimAddress: claim_addr,
-            refundAddress: refund_addr,
-            timelock: U256::from(timelock),
-        };
-        let hash_values_request = TransactionRequest::default()
-            .to(contract_addr)
-            .input(hash_values_call.abi_encode().into());
-        let hash_values = self
-            .provider
-            .call(hash_values_request)
-            .await
-            .map_err(|e| HtlcError::Network(format!("hashValues() failed: {e}")))?;
-        if hash_values.len() < 32 {
-            return Err(HtlcError::Network(format!(
-                "hashValues() returned {} bytes, expected 32",
-                hash_values.len()
-            )));
-        }
-        let swap_hash = B256::from_slice(&hash_values[..32]);
-        let call = IEtherSwap::swapsCall(swap_hash);
-        let request = TransactionRequest::default()
-            .to(contract_addr)
-            .input(call.abi_encode().into());
-        let out_bytes = self
-            .provider
-            .call(request)
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        if out_bytes.len() < 32 {
-            return Err(HtlcError::Network(format!(
-                "swaps() returned {} bytes, expected >=32",
-                out_bytes.len()
-            )));
-        }
-        let locked = out_bytes[31] != 0;
-        if !locked {
-            return Err(HtlcError::Network(
-                "swap not found on chain (hash mismatch)".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn accept_incoming_htlc(
-        &self,
-        payment_hash: Bytes32,
-        descriptor: &HtlcDescriptor,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
-        self.verify_incoming_htlc(descriptor, payment_hash).await?;
-        let (contract_str, amount_wei, claim_address, refund_address, timelock) = match descriptor {
-            HtlcDescriptor::Rootstock {
-                contract,
-                amount_wei,
-                claim_address,
-                refund_address,
-                timelock,
-            } => (
-                contract.clone(),
-                *amount_wei,
-                claim_address.clone(),
-                refund_address.clone(),
-                *timelock,
-            ),
-            _ => unreachable!("verify_incoming_htlc rejects other variants"),
-        };
-        // Reject an HTLC we could never claim. `verify_incoming_htlc`
-        // only proves *a* swap with these values exists on chain; it
-        // says nothing about whether we are its `claimAddress`. Since
-        // the contract commits `msg.sender` as the claim address, a
-        // mismatch here means `claim_incoming` would revert later, after
-        // we had already funded the outgoing HTLC. Fail at DISPATCH
-        // instead, while the hop can still be rejected cheaply.
-        //
-        // This check cannot live in `verify_incoming_htlc`, because
-        // `create_outgoing_htlc` reuses that method to confirm its own
-        // lock landed — and there we are the locker, not the claimer.
-        let claim_addr = Address::from_str(&claim_address)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid claim address: {e}")))?;
-        if claim_addr != self.address {
-            return Err(HtlcError::InvalidParams(format!(
-                "incoming HTLC is locked to {claim_addr}, which this node cannot claim; \
-                 expected {} (upstream hop locked to the wrong identity)",
-                self.address,
-            )));
-        }
-        let contract = Address::from_str(&contract_str)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid contract address: {e}")))?;
-        let refund_address = Address::from_str(&refund_address)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid refund address: {e}")))?;
-        let mut incoming = self.incoming.lock().await;
-        let arrival = match incoming.get_mut(&payment_hash) {
-            Some(slot) => {
-                slot.contract = contract;
-                slot.amount_wei = U256::from(amount_wei);
-                slot.refund_address = refund_address;
-                slot.timelock = timelock;
-                slot.deadline = deadline;
-                slot.arrival.clone()
-            }
-            None => {
-                let arrival = Arc::new(Notify::new());
-                incoming.insert(
-                    payment_hash,
-                    PendingIncoming {
-                        contract,
-                        amount_wei: U256::from(amount_wei),
-                        refund_address,
-                        timelock,
-                        deadline,
-                        arrival: arrival.clone(),
-                    },
-                );
-                arrival
-            }
-        };
-        drop(incoming);
-        arrival.notify_one();
-        Ok(())
-    }
-
-    async fn outgoing_htlc_descriptor(
-        &self,
-        payment_hash: Bytes32,
-    ) -> Result<HtlcDescriptor, HtlcError> {
-        let slot = {
-            let outgoing = self.outgoing.lock().await;
-            outgoing.get(&payment_hash).cloned()
-        };
-        let slot = slot.ok_or_else(|| {
-            HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
-        })?;
-        let amount_wei: u128 = slot
-            .amount_wei
-            .try_into()
-            .map_err(|_| HtlcError::Network("amount_wei overflows u128".into()))?;
-        Ok(HtlcDescriptor::Rootstock {
-            contract: format!("{:#x}", slot.contract),
-            amount_wei,
-            claim_address: format!("{:#x}", slot.claim_address),
-            refund_address: format!("{:#x}", slot.refund_address),
-            timelock: slot.timelock,
-        })
     }
 }
 

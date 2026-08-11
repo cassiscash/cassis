@@ -31,6 +31,7 @@ cassis-spark = { workspace = true, optional = true }
 clap = { workspace = true }
 futures = { workspace = true }
 iroh = { workspace = true }
+lowercase-hex = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -78,7 +78,7 @@ rustyline = "17"
 
 # PR #8913 (direct_htlc branch): raw HTLC/PTLC client API on LNv2
 # OutgoingContract — the surface the fedimint adapter's
-# NetworkRouterAdapter implementation is built on. Head commit of the
+# NetworkAdapter implementation is built on. Head commit of the
 # PR as of Sep 2026; swap to a tag once it lands on master.
 fedimint-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 fedimint-api-client = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }

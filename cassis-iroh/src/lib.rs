@@ -1,6 +1,6 @@
 use cassis_core::{
     Bytes32, HopCommit, HopCommitted, HopDiscard, HopDiscarded, HopDispatch, HopDispatched,
-    HopPrepare, HopPrepared, HtlcDescriptor, NetworkId,
+    HopPrepare, HopPrepared, HtlcDescriptor, NetworkId, OperationId,
 };
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
@@ -11,9 +11,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-pub const ALPN_PROTOCOL: &[u8] = b"cassis-hop/1";
+pub const ALPN_PROTOCOL: &[u8] = b"cassis-hop/2";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(thiserror::Error, Debug)]
 pub enum IrohError {
@@ -21,6 +23,12 @@ pub enum IrohError {
     Io(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("remote error (retryable={retryable}, operation_id={operation_id}): {message}")]
+    Remote {
+        message: String,
+        retryable: bool,
+        operation_id: OperationId,
+    },
     #[error("connection closed")]
     Closed,
 }
@@ -44,11 +52,27 @@ pub enum Frame {
     Discarded(HopDiscarded),
     Error {
         payment_hash: Bytes32,
+        operation_id: OperationId,
         message: String,
+        retryable: bool,
     },
 }
 
 impl Frame {
+    pub fn operation_id(&self) -> OperationId {
+        match self {
+            Frame::Prepare(m) => m.operation_id.clone(),
+            Frame::Prepared(m) => m.operation_id.clone(),
+            Frame::Dispatch(m) => m.operation_id.clone(),
+            Frame::Dispatched(m) => m.operation_id.clone(),
+            Frame::Commit(m) => m.operation_id.clone(),
+            Frame::Committed(m) => m.operation_id.clone(),
+            Frame::Discard(m) => m.operation_id.clone(),
+            Frame::Discarded(m) => m.operation_id.clone(),
+            Frame::Error { operation_id, .. } => operation_id.clone(),
+        }
+    }
+
     pub fn payment_hash(&self) -> Bytes32 {
         match self {
             Frame::Prepare(m) => m.payment_hash,
@@ -175,24 +199,30 @@ impl IrohClient {
             "{op}: connecting to {} (relay={:?}, direct_addrs={})...",
             addr.id, relay, direct
         );
-        let conn = match self.endpoint.connect(addr, ALPN_PROTOCOL).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!(target: "iroh_client", "connect error: {e}");
-                let mut source = e.source();
-                while let Some(cause) = source {
-                    error!(target: "iroh_client", "  caused by: {cause}");
-                    source = cause.source();
+        let conn =
+            match tokio::time::timeout(REQUEST_TIMEOUT, self.endpoint.connect(addr, ALPN_PROTOCOL))
+                .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    error!(target: "iroh_client", "connect error: {e}");
+                    let mut source = e.source();
+                    while let Some(cause) = source {
+                        error!(target: "iroh_client", "  caused by: {cause}");
+                        source = cause.source();
+                    }
+                    return Err(IrohError::Io(format!("{e:#}")));
                 }
-                return Err(IrohError::Io(format!("{e:#}")));
-            }
-        };
+                Err(_) => return Err(IrohError::Io(format!("{op}: connect timed out"))),
+            };
         debug!(target: "iroh_client", "{op}: connected, opening bi stream...");
 
-        let (mut writer, mut reader) = conn
-            .open_bi()
-            .await
-            .map_err(|e| IrohError::Io(e.to_string()))?;
+        let (mut writer, mut reader) =
+            match tokio::time::timeout(REQUEST_TIMEOUT, conn.open_bi()).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(IrohError::Io(e.to_string())),
+                Err(_) => return Err(IrohError::Io(format!("{op}: open_bi timed out"))),
+            };
         debug!(target: "iroh_client", "{op}: stream opened, writing frame...");
 
         let data = serde_json::to_vec(&send).map_err(|e| IrohError::Protocol(e.to_string()))?;
@@ -207,12 +237,14 @@ impl IrohClient {
             data.len()
         );
 
-        let buf = match reader.read_to_end(1024 * 1024).await {
-            Ok(b) => b,
-            Err(e) => {
+        let buf = match tokio::time::timeout(REQUEST_TIMEOUT, reader.read_to_end(1024 * 1024)).await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
                 error!(target: "iroh_client", "read_to_end error: {e:?}");
                 return Err(IrohError::Io(format!("read error: {e:?}")));
             }
+            Err(_) => return Err(IrohError::Io(format!("{op}: response timed out"))),
         };
         debug!(
             target: "iroh_client",
@@ -230,15 +262,33 @@ impl IrohClient {
         addr: EndpointAddr,
         prepare: HopPrepare,
     ) -> Result<HopPrepared, IrohError> {
+        let expected_hash = prepare.payment_hash;
+        let expected_operation = prepare.operation_id.clone();
         let reply = self
             .round_trip(addr, Frame::Prepare(prepare), "send_prepare")
             .await?;
         match reply {
-            Frame::Prepared(m) => Ok(m),
-            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
+            Frame::Prepared(m)
+                if m.payment_hash == expected_hash && m.operation_id == expected_operation =>
+            {
+                Ok(m)
+            }
+            Frame::Prepared(m) => Err(IrohError::Protocol(format!(
+                "send_prepare: response correlation mismatch: expected {expected_hash}/{expected_operation}, got {}/{}",
+                m.payment_hash, m.operation_id
+            ))),
+            Frame::Error {
+                message,
+                retryable,
+                operation_id,
+                ..
+            } => Err(IrohError::Remote {
+                message,
+                retryable,
+                operation_id,
+            }),
             other => Err(IrohError::Protocol(format!(
-                "send_prepare: unexpected reply frame {:?}",
-                other
+                "send_prepare: unexpected reply frame {other:?}"
             ))),
         }
     }
@@ -248,15 +298,24 @@ impl IrohClient {
         addr: EndpointAddr,
         dispatch: HopDispatch,
     ) -> Result<HopDispatched, IrohError> {
+        let expected_hash = dispatch.payment_hash;
+        let expected_operation = dispatch.operation_id.clone();
         let reply = self
             .round_trip(addr, Frame::Dispatch(dispatch), "send_dispatch")
             .await?;
         match reply {
-            Frame::Dispatched(m) => Ok(m),
-            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
+            Frame::Dispatched(m)
+                if m.payment_hash == expected_hash && m.operation_id == expected_operation =>
+            {
+                Ok(m)
+            }
+            Frame::Dispatched(m) => Err(IrohError::Protocol(format!(
+                "send_dispatch: response correlation mismatch: expected {expected_hash}/{}, got {}/{}",
+                expected_operation, m.payment_hash, m.operation_id
+            ))),
+            Frame::Error { message, retryable, operation_id, .. } => Err(IrohError::Remote { message, retryable, operation_id }),
             other => Err(IrohError::Protocol(format!(
-                "send_dispatch: unexpected reply frame {:?}",
-                other
+                "send_dispatch: unexpected reply frame {other:?}"
             ))),
         }
     }
@@ -269,15 +328,33 @@ impl IrohClient {
         addr: EndpointAddr,
         discard: HopDiscard,
     ) -> Result<HopDiscarded, IrohError> {
+        let expected_hash = discard.payment_hash;
+        let expected_operation = discard.operation_id.clone();
         let reply = self
             .round_trip(addr, Frame::Discard(discard), "send_discard")
             .await?;
         match reply {
-            Frame::Discarded(m) => Ok(m),
-            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
+            Frame::Discarded(m)
+                if m.payment_hash == expected_hash && m.operation_id == expected_operation =>
+            {
+                Ok(m)
+            }
+            Frame::Discarded(m) => Err(IrohError::Protocol(format!(
+                "send_discard: response correlation mismatch: expected {expected_hash}/{expected_operation}, got {}/{}",
+                m.payment_hash, m.operation_id
+            ))),
+            Frame::Error {
+                message,
+                retryable,
+                operation_id,
+                ..
+            } => Err(IrohError::Remote {
+                message,
+                retryable,
+                operation_id,
+            }),
             other => Err(IrohError::Protocol(format!(
-                "send_discard: unexpected reply frame {:?}",
-                other
+                "send_discard: unexpected reply frame {other:?}"
             ))),
         }
     }
@@ -287,15 +364,33 @@ impl IrohClient {
         addr: EndpointAddr,
         commit: HopCommit,
     ) -> Result<HopCommitted, IrohError> {
+        let expected_hash = commit.payment_hash;
+        let expected_operation = commit.operation_id.clone();
         let reply = self
             .round_trip(addr, Frame::Commit(commit), "send_commit")
             .await?;
         match reply {
-            Frame::Committed(m) => Ok(m),
-            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
+            Frame::Committed(m)
+                if m.payment_hash == expected_hash && m.operation_id == expected_operation =>
+            {
+                Ok(m)
+            }
+            Frame::Committed(m) => Err(IrohError::Protocol(format!(
+                "send_commit: response correlation mismatch: expected {expected_hash}/{expected_operation}, got {}/{}",
+                m.payment_hash, m.operation_id
+            ))),
+            Frame::Error {
+                message,
+                retryable,
+                operation_id,
+                ..
+            } => Err(IrohError::Remote {
+                message,
+                retryable,
+                operation_id,
+            }),
             other => Err(IrohError::Protocol(format!(
-                "send_commit: unexpected reply frame {:?}",
-                other
+                "send_commit: unexpected reply frame {other:?}"
             ))),
         }
     }
@@ -308,15 +403,33 @@ impl IrohClient {
         addr: EndpointAddr,
         committed: HopCommitted,
     ) -> Result<HopCommitted, IrohError> {
+        let expected_hash = committed.payment_hash;
+        let expected_operation = committed.operation_id.clone();
         let reply = self
             .round_trip(addr, Frame::Committed(committed), "send_committed")
             .await?;
         match reply {
-            Frame::Committed(m) => Ok(m),
-            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
+            Frame::Committed(m)
+                if m.payment_hash == expected_hash && m.operation_id == expected_operation =>
+            {
+                Ok(m)
+            }
+            Frame::Committed(m) => Err(IrohError::Protocol(format!(
+                "send_committed: response correlation mismatch: expected {expected_hash}/{expected_operation}, got {}/{}",
+                m.payment_hash, m.operation_id
+            ))),
+            Frame::Error {
+                message,
+                retryable,
+                operation_id,
+                ..
+            } => Err(IrohError::Remote {
+                message,
+                retryable,
+                operation_id,
+            }),
             other => Err(IrohError::Protocol(format!(
-                "send_committed: unexpected reply frame {:?}",
-                other
+                "send_committed: unexpected reply frame {other:?}"
             ))),
         }
     }
@@ -437,16 +550,19 @@ impl IrohServer {
 
 async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), IrohError> {
     debug!(target: "iroh_server", "accept_bi waiting for stream...");
-    let (mut writer, mut reader) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| IrohError::Io(e.to_string()))?;
+    let (mut writer, mut reader) =
+        match tokio::time::timeout(REQUEST_TIMEOUT, conn.accept_bi()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return Err(IrohError::Io(error.to_string())),
+            Err(_) => return Err(IrohError::Io("accept_bi timed out".to_string())),
+        };
     debug!(target: "iroh_server", "stream opened, reading payload...");
 
-    let buf = reader
-        .read_to_end(1024 * 1024)
-        .await
-        .map_err(|e| IrohError::Io(e.to_string()))?;
+    let buf = match tokio::time::timeout(REQUEST_TIMEOUT, reader.read_to_end(1024 * 1024)).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(error)) => return Err(IrohError::Io(error.to_string())),
+        Err(_) => return Err(IrohError::Io("request read timed out".to_string())),
+    };
     debug!(target: "iroh_server", "read {} byte(s) of payload", buf.len());
 
     let frame: Frame =
@@ -457,6 +573,7 @@ async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), Ir
         frame.payment_hash()
     );
     let payment_hash = frame.payment_hash();
+    let operation_id = frame.operation_id();
     // Authenticated transport identity of the requester: iroh's
     // handshake already tied this connection to the peer key, so this
     // is the authoritative "who sent it" for peer-binding checks.
@@ -467,7 +584,9 @@ async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), Ir
             error!(target: "iroh_server", "handler returned error: {e}");
             Frame::Error {
                 payment_hash,
+                operation_id,
                 message: e.to_string(),
+                retryable: false,
             }
         }
     };
@@ -494,6 +613,7 @@ async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), Ir
 /// payee needs to claim the final HTLC.
 pub fn build_commit(
     payment_hash: Bytes32,
+    operation_id: cassis_core::OperationId,
     amount_msat: u64,
     network: NetworkId,
     incoming_deadline: u64,
@@ -501,6 +621,7 @@ pub fn build_commit(
 ) -> HopCommit {
     HopCommit {
         payment_hash,
+        operation_id,
         amount_msat,
         network,
         incoming_deadline,
@@ -511,7 +632,7 @@ pub fn build_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cassis_core::HtlcTarget;
+    use cassis_core::{HtlcTarget, OperationId};
 
     #[test]
     fn dispatch_frame_with_cashu_descriptor_round_trips_through_json() {
@@ -524,6 +645,7 @@ mod tests {
         // fine (and now over JSON).
         let dispatch = Frame::Dispatch(HopDispatch {
             payment_hash: Bytes32([0x42u8; 32]),
+            operation_id: OperationId("test-operation".into()),
             incoming_descriptor: HtlcDescriptor::Cashu {
                 proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into()],
             },
@@ -556,6 +678,7 @@ mod tests {
                 .unwrap();
         let commit = Frame::Commit(HopCommit {
             payment_hash: Bytes32([0x24u8; 32]),
+            operation_id: OperationId("commit-operation".into()),
             amount_msat: 1234,
             network: NetworkId("fedimint::x".into()),
             incoming_deadline: 1_786_000_000,

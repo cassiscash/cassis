@@ -6,9 +6,9 @@ pub mod seed_store;
 pub mod store;
 
 use cassis_core::{
-    Bytes32, HopCommit, HopCommitted, HopDiscard, HopDispatch, HopPrepare, HtlcDescriptor, Invoice,
-    NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment, PaymentResult,
-    PaymentStatus, RouteHop, SendError,
+    AdapterError, Bytes32, HopCommit, HopCommitted, HopDiscard, HopDispatch, HopPrepare,
+    HtlcDescriptor, HtlcTarget, Invoice, InvoiceHandle, NetworkAdapter, NetworkId, OperationId,
+    OutgoingPayment, OutgoingRequest, PaymentResult, PaymentStatus, RouteHop,
 };
 use cassis_iroh::{node_addr_from_announcement, node_addr_from_invoice, IrohClient};
 use cassis_routing::{
@@ -32,6 +32,8 @@ pub enum PayError {
     Route(String),
     #[error("io error: {0}")]
     Io(String),
+    #[error("remote error (retryable={retryable}): {message}")]
+    Remote { message: String, retryable: bool },
     #[error("hop rejected at index {index}: {reason}")]
     HopRejected { index: usize, reason: String },
     #[error("payee commit failed: {0}")]
@@ -42,7 +44,12 @@ pub enum PayError {
 
 impl From<cassis_iroh::IrohError> for PayError {
     fn from(e: cassis_iroh::IrohError) -> Self {
-        PayError::Io(e.to_string())
+        match e {
+            cassis_iroh::IrohError::Remote {
+                message, retryable, ..
+            } => PayError::Remote { message, retryable },
+            other => PayError::Io(other.to_string()),
+        }
     }
 }
 
@@ -50,8 +57,10 @@ impl From<cassis_iroh::IrohError> for PayError {
 pub enum ReceiveFlowError {
     #[error("network not registered: {0}")]
     UnknownNetwork(String),
+    #[error("invoice reservation not found: {0}")]
+    MissingReservation(String),
     #[error("receive error: {0}")]
-    Receive(#[from] cassis_core::ReceiveError),
+    Adapter(#[from] AdapterError),
 }
 
 #[derive(Clone, Debug)]
@@ -94,19 +103,64 @@ pub async fn find_route(
     Ok(hops)
 }
 
+/// Compute amount required at each hop. Each router subtracts its fee
+/// from incoming amount and forwards remainder. Payer therefore locks
+/// invoice amount plus all downstream fees on first hop.
+fn route_amounts(invoice_amount_msat: u64, route: &[RouteHop]) -> Result<Vec<u64>, PayError> {
+    let mut amounts = vec![0u64; route.len() + 1];
+    amounts[route.len()] = invoice_amount_msat;
+    for index in (0..route.len()).rev() {
+        let downstream = amounts[index + 1];
+        let node = &route[index].node;
+        let proportional =
+            (node.fee_ppm as u128).saturating_mul(downstream as u128) / 1_000_000u128;
+        let fee = (node.fee_base_msat as u128)
+            .saturating_add(proportional)
+            .min(u64::MAX as u128) as u64;
+        let amount = (downstream as u128)
+            .checked_add(fee as u128)
+            .ok_or_else(|| PayError::Route("route fee overflows amount".to_string()))?;
+        if amount > u64::MAX as u128 {
+            return Err(PayError::Route("route fee overflows amount".to_string()));
+        }
+        amounts[index] = amount as u64;
+    }
+    Ok(amounts)
+}
+
 pub struct CassisClient {
-    pub senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
-    pub receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
+    pub adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
     pub nostr_relays: Vec<String>,
     iroh_client: IrohClient,
     payment_store_path: PathBuf,
+    invoice_handles: Arc<tokio::sync::Mutex<HashMap<Bytes32, InvoiceHandle>>>,
+}
+
+async fn create_outgoing_payment(
+    adapter: &dyn NetworkAdapter,
+    payment_hash: Bytes32,
+    amount_msat: u64,
+    target: &HtlcTarget,
+    network: &NetworkId,
+    expiry: u64,
+) -> Result<OutgoingPayment, AdapterError> {
+    adapter
+        .create_outgoing(OutgoingRequest {
+            operation_id: OperationId::random(),
+            payment_hash,
+            amount_msat,
+            expiry,
+            target: target.clone(),
+            network: network.clone(),
+        })
+        .await
 }
 
 /// Keep payer-owned outgoing HTLC alive until it resolves. Routers have
 /// the same responsibility for their dispatched outgoing HTLCs; the
 /// payer's first HTLC is not present in any router's dispatch table.
 fn spawn_payment_guard(
-    sender: Arc<dyn NetworkSenderAdapter>,
+    sender: Arc<dyn NetworkAdapter>,
     payment: OutgoingPayment,
     invoice: Invoice,
     store_path: PathBuf,
@@ -116,7 +170,7 @@ fn spawn_payment_guard(
             if ops::unix_now() >= payment.expiry {
                 break;
             }
-            match sender.watch_payment(payment.clone(), payment.expiry).await {
+            match sender.watch_outgoing(&payment, payment.expiry).await {
                 Ok(preimage) => {
                     if let Err(error) = persist_payment_proof(&store_path, &invoice, preimage).await
                     {
@@ -124,16 +178,16 @@ fn spawn_payment_guard(
                     }
                     let _ = mark_outgoing_status(
                         &store_path,
-                        &payment.payment_hash,
+                        &payment.operation_id,
                         OutgoingPaymentStatus::Completed,
                     )
                     .await;
                     return;
                 }
-                Err(SendError::DeadlineExceeded) if ops::unix_now() >= payment.expiry => {
+                Err(AdapterError::DeadlineExceeded) if ops::unix_now() >= payment.expiry => {
                     break;
                 }
-                Err(error) => {
+                Err(AdapterError::Network(error)) | Err(AdapterError::Retryable(error)) => {
                     warn!(
                         target: "cassis_client",
                         "sender-side HTLC watch failed for {}: {error}; retrying",
@@ -141,21 +195,29 @@ fn spawn_payment_guard(
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+                Err(error) => {
+                    warn!(
+                        target: "cassis_client",
+                        "sender-side HTLC watch failed for {}: {error}; entering refund path",
+                        payment.payment_hash.short()
+                    );
+                    break;
+                }
             }
         }
 
         loop {
-            match sender.refund_payment(payment.clone()).await {
+            match sender.refund_outgoing(&payment).await {
                 Ok(()) => {
                     let _ = mark_outgoing_status(
                         &store_path,
-                        &payment.payment_hash,
+                        &payment.operation_id,
                         OutgoingPaymentStatus::Refunded,
                     )
                     .await;
                     break;
                 }
-                Err(SendError::Network(error)) => {
+                Err(AdapterError::Network(error)) | Err(AdapterError::Retryable(error)) => {
                     warn!(
                         target: "cassis_client",
                         "sender-side HTLC refund failed: {error}; retrying"
@@ -176,33 +238,15 @@ async fn persist_outgoing_payment(
     invoice: &Invoice,
     payment: &OutgoingPayment,
     sender_network: &NetworkId,
-    descriptor: Option<&HtlcDescriptor>,
 ) -> Result<(), String> {
     let path = path.to_path_buf();
     let invoice = invoice.clone();
     let payment = payment.clone();
     let sender_network = sender_network.clone();
-    let descriptor = descriptor.cloned();
     tokio::task::spawn_blocking(move || {
         let mut store = Store::open(&path).map_err(|e| e.to_string())?;
         store
-            .insert_outgoing_payment(&invoice, &payment, &sender_network, descriptor.as_ref())
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-async fn update_outgoing_descriptor(
-    path: &std::path::Path,
-    payment_hash: Bytes32,
-    descriptor: HtlcDescriptor,
-) -> Result<(), String> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut store = Store::open(&path).map_err(|e| e.to_string())?;
-        store
-            .update_outgoing_descriptor(&payment_hash, &descriptor)
+            .insert_outgoing_payment(&invoice, &payment, &sender_network)
             .map_err(|e| e.to_string())
     })
     .await
@@ -228,15 +272,15 @@ async fn persist_payment_proof(
 
 async fn mark_outgoing_status(
     path: &std::path::Path,
-    payment_hash: &Bytes32,
+    operation_id: &OperationId,
     status: OutgoingPaymentStatus,
 ) -> Result<(), String> {
     let path = path.to_path_buf();
-    let payment_hash = *payment_hash;
+    let operation_id = operation_id.clone();
     tokio::task::spawn_blocking(move || {
         let mut store = Store::open(&path).map_err(|e| e.to_string())?;
         store
-            .mark_outgoing_status(&payment_hash, status)
+            .mark_outgoing_status(&operation_id, status)
             .map_err(|e| e.to_string())
     })
     .await
@@ -245,11 +289,11 @@ async fn mark_outgoing_status(
 
 impl CassisClient {
     pub async fn new(
-        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
+        adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
         nostr_relays: Vec<String>,
     ) -> Self {
         Self::with_store_path(
-            senders,
+            adapters,
             nostr_relays,
             PathBuf::from("./cassis-client-store.db"),
         )
@@ -257,7 +301,7 @@ impl CassisClient {
     }
 
     pub async fn with_store_path(
-        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
+        adapters: HashMap<NetworkId, Arc<dyn NetworkAdapter>>,
         nostr_relays: Vec<String>,
         payment_store_path: PathBuf,
     ) -> Self {
@@ -266,44 +310,11 @@ impl CassisClient {
             .await
             .expect("failed to bind iroh endpoint for client");
         Self {
-            senders,
-            receivers: HashMap::new(),
+            adapters,
             nostr_relays,
             iroh_client: IrohClient::new(endpoint),
             payment_store_path,
-        }
-    }
-
-    pub async fn with_receivers(
-        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
-        receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
-        nostr_relays: Vec<String>,
-    ) -> Self {
-        Self::with_receivers_and_store_path(
-            senders,
-            receivers,
-            nostr_relays,
-            PathBuf::from("./cassis-client-store.db"),
-        )
-        .await
-    }
-
-    pub async fn with_receivers_and_store_path(
-        senders: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>,
-        receivers: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>,
-        nostr_relays: Vec<String>,
-        payment_store_path: PathBuf,
-    ) -> Self {
-        let endpoint = Endpoint::builder(presets::N0)
-            .bind()
-            .await
-            .expect("failed to bind iroh endpoint for client");
-        Self {
-            senders,
-            receivers,
-            nostr_relays,
-            iroh_client: IrohClient::new(endpoint),
-            payment_store_path,
+            invoice_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -331,19 +342,16 @@ impl CassisClient {
         let mut guards = Vec::with_capacity(pending.len());
         for row in pending {
             let sender = self
-                .senders
+                .adapters
                 .get(&row.sender_network)
                 .cloned()
                 .ok_or_else(|| format!("sender adapter missing for {}", row.sender_network))?;
-            sender
-                .restore_outgoing_payment(&row.payment, row.descriptor.as_ref())
-                .await
-                .map_err(|e| {
-                    format!(
-                        "cannot restore outgoing HTLC {} on {}: {e}",
-                        row.payment.payment_hash, row.sender_network
-                    )
-                })?;
+            sender.restore_outgoing(&row.payment).await.map_err(|e| {
+                format!(
+                    "cannot restore outgoing HTLC {} on {}: {e}",
+                    row.payment.payment_hash, row.sender_network
+                )
+            })?;
             guards.push(spawn_payment_guard(
                 sender,
                 row.payment,
@@ -359,11 +367,9 @@ impl CassisClient {
     /// described in the user-facing docs:
     ///
     /// 1. PREPARE every router hop in order; abort if any rejects.
-    /// 2. Create the first HTLC on the sender's network
-    ///    (the sender adapter's `pay_invoice`).
-    /// 3. Walk the route: DISPATCH to hop `i` with the descriptor
-    ///    returned by hop `i-1` (or by `pay_invoice` for the
-    ///    first hop).
+    /// 2. Create first outgoing HTLC on sender adapter.
+    /// 3. Walk route: DISPATCH to hop `i` with descriptor returned by
+    ///    hop `i-1` (or first outgoing payment).
     /// 4. After the last router, COMMIT directly to the payee's
     ///    iroh endpoint with the final descriptor and wait for
     ///    the preimage.
@@ -377,15 +383,18 @@ impl CassisClient {
             .first()
             .ok_or_else(|| PayError::Route("invoice has no network".to_string()))?
             .clone();
+        if sender_network == dest_network {
+            return self
+                .pay_same_network(&invoice, &dest_network, &sender_network)
+                .await;
+        }
+
         let route = self
             .find_route(&dest_network, invoice.amount_msat, sender_network.clone())
             .await
             .map_err(|err| PayError::Route(err.to_string()))?;
 
         if route.is_empty() {
-            // No router hops: payer and payee share a network. Shortcut
-            // the routing cascade — create the HTLC directly on that
-            // network and COMMIT straight to the payee.
             return self
                 .pay_same_network(&invoice, &dest_network, &sender_network)
                 .await;
@@ -403,6 +412,7 @@ impl CassisClient {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let hop_amounts = route_amounts(invoice.amount_msat, &route)?;
         let mut buffers: Vec<u64> = route
             .iter()
             .map(|hop| {
@@ -439,6 +449,9 @@ impl CassisClient {
             })
             .collect::<Result<Vec<_>, PayError>>()?;
 
+        let attempt_ids: Vec<OperationId> =
+            (0..route.len()).map(|_| OperationId::random()).collect();
+        let all_hop_indices: Vec<usize> = (0..route.len()).collect();
         let prepares: Vec<(usize, HopPrepare)> = route
             .iter()
             .enumerate()
@@ -447,7 +460,9 @@ impl CassisClient {
                     idx,
                     HopPrepare {
                         payment_hash: invoice.payment_hash,
-                        amount_msat: invoice.amount_msat,
+                        operation_id: attempt_ids[idx].clone(),
+                        amount_msat: hop_amounts[idx],
+                        outgoing_amount_msat: hop_amounts[idx + 1],
                         incoming_network: hop.incoming.clone(),
                         outgoing_network: hop.outgoing.clone(),
                         incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
@@ -504,12 +519,20 @@ impl CassisClient {
         // whole list is scanned even after a failure so late-accepting
         // hops are not forgotten when it is time to DISCARD.
         let mut acks: Vec<cassis_core::HopPrepared> = Vec::new();
-        let mut reserved_idx: Vec<usize> = Vec::new();
+        let mut reservation_ids: Vec<cassis_core::OperationId> = Vec::new();
         let mut first_failure: Option<PayError> = None;
         for (idx, reply) in replies.into_iter().enumerate() {
             match reply {
                 Ok(ack) if ack.accepted => {
-                    reserved_idx.push(idx);
+                    let operation_id = ack.operation_id.clone();
+                    if operation_id != attempt_ids[idx] {
+                        first_failure.get_or_insert(PayError::HopRejected {
+                            index: idx,
+                            reason: "PREPARE operation_id did not match payer attempt".to_string(),
+                        });
+                        continue;
+                    }
+                    reservation_ids.push(operation_id);
                     acks.push(ack);
                 }
                 Ok(ack) => {
@@ -522,7 +545,7 @@ impl CassisClient {
             }
         }
         if let Some(err) = first_failure {
-            self.discard_reservations(&addrs, invoice.payment_hash, &reserved_idx)
+            self.discard_reservations(&addrs, invoice.payment_hash, &all_hop_indices, &attempt_ids)
                 .await;
             return Err(err);
         }
@@ -550,9 +573,13 @@ impl CassisClient {
                 None => {
                     // Every hop accepted, so every hop is holding a
                     // reservation; none was DISPATCHed yet.
-                    let reserved = (0..route.len()).collect::<Vec<usize>>();
-                    self.discard_reservations(&addrs, invoice.payment_hash, &reserved)
-                        .await;
+                    self.discard_reservations(
+                        &addrs,
+                        invoice.payment_hash,
+                        &all_hop_indices,
+                        &attempt_ids,
+                    )
+                    .await;
                     return Err(PayError::HopRejected {
                         index: idx,
                         reason: "hop accepted the PREPARE but reported no addressing parameters"
@@ -563,19 +590,19 @@ impl CassisClient {
         }
         htlc_targets.push(invoice.address.clone());
 
-        // From here until the first DISPATCH succeeds, every route hop
-        // holds exactly one unused reservation. Any abort in this
-        // window releases the full set.
-        let all_hops: Vec<usize> = (0..route.len()).collect();
-
         // Step 2: pay the first hop. The sender adapter creates
         // the first HTLC and returns the OutgoingPayment
         // descriptor (cashu proofs, etc.).
-        let sender = match self.senders.get(&sender_network) {
+        let sender = match self.adapters.get(&sender_network) {
             Some(s) => s.clone(),
             None => {
-                self.discard_reservations(&addrs, invoice.payment_hash, &all_hops)
-                    .await;
+                self.discard_reservations(
+                    &addrs,
+                    invoice.payment_hash,
+                    &all_hop_indices,
+                    &attempt_ids,
+                )
+                .await;
                 return Err(PayError::Route(
                     "sender network adapter missing".to_string(),
                 ));
@@ -589,24 +616,26 @@ impl CassisClient {
         // its announced node key: those are different keys whenever the
         // network claims with a dedicated per-network key (rootstock).
         let first_target = &htlc_targets[0];
-        let first_payment: OutgoingPayment = match sender
-            .pay_invoice(
-                invoice.payment_hash,
-                invoice.amount_msat,
-                first_target,
-                // The HTLC is created on our own sending network, which
-                // `validate_route_networks` proved is the first hop's
-                // incoming network.
-                &sender_network,
-                first_outgoing_expiry,
-            )
-            .await
+        let first_payment: OutgoingPayment = match create_outgoing_payment(
+            sender.as_ref(),
+            invoice.payment_hash,
+            hop_amounts[0],
+            first_target,
+            &sender_network,
+            first_outgoing_expiry,
+        )
+        .await
         {
             Ok(p) => p,
             Err(err) => {
                 // Nothing funded yet on any hop; free every reservation.
-                self.discard_reservations(&addrs, invoice.payment_hash, &all_hops)
-                    .await;
+                self.discard_reservations(
+                    &addrs,
+                    invoice.payment_hash,
+                    &all_hop_indices,
+                    &attempt_ids,
+                )
+                .await;
                 return Err(PayError::Io(err.to_string()));
             }
         };
@@ -621,37 +650,14 @@ impl CassisClient {
             &invoice,
             &first_payment,
             &sender_network,
-            None,
         )
         .await
         {
             warn!(target: "cassis_client", "failed to persist outgoing HTLC: {error}");
         }
-        // The descriptor of the first HTLC is the descriptor
-        // the sender adapter hands to the first router. We get
-        // it via the router trait method; the blanket impl
-        // does the lookup.
-        let first_descriptor: HtlcDescriptor =
-            match sender.outgoing_htlc_descriptor(invoice.payment_hash).await {
-                Ok(d) => d,
-                Err(e) => {
-                    // The first HTLC exists (its own unwind stays with
-                    // the sender adapter's refund path), but no router
-                    // has been DISPATCHed: free their reservations.
-                    self.discard_reservations(&addrs, invoice.payment_hash, &all_hops)
-                        .await;
-                    return Err(PayError::Io(e.to_string()));
-                }
-            };
-        if let Err(error) = update_outgoing_descriptor(
-            &self.payment_store_path,
-            invoice.payment_hash,
-            first_descriptor.clone(),
-        )
-        .await
-        {
-            warn!(target: "cassis_client", "failed to persist outgoing descriptor: {error}");
-        }
+        // Descriptor travels with funded payment handle. No second
+        // adapter map lookup or post-funding serialization window.
+        let first_descriptor: HtlcDescriptor = first_payment.descriptor.clone();
 
         // Step 3: walk the route. `descriptor` carries the
         // HTLC info for the *incoming* side of the next hop.
@@ -659,27 +665,26 @@ impl CassisClient {
         for (i, hop) in route.iter().enumerate() {
             let dispatch = HopDispatch {
                 payment_hash: invoice.payment_hash,
+                operation_id: reservation_ids[i].clone(),
                 incoming_descriptor: descriptor,
                 htlc_target: htlc_targets[i + 1].clone(),
             };
             let peer = hop.node.node_pubkey;
             let addr = addrs[i].clone();
             info!(
-                target: "cassis_client",
-                 "DISPATCH hop {}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
-                  amount_msat={} incoming_deadline={} outgoing_expiry={} addressing={:?} \
-                 payment_hash={} incoming_descriptor={:?}",
-                i+1,
-                route.len(),
-                hop.incoming,
-                hop.outgoing,
-                invoice.amount_msat,
-                expiries[i],
-                expiries[i + 1],
-                 dispatch.htlc_target,
-                dispatch.payment_hash,
-                dispatch.incoming_descriptor,
-            );
+            target: "cassis_client",
+             "DISPATCH hop {}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+              amount_msat={} incoming_deadline={} outgoing_expiry={} addressing=<redacted> \
+             payment_hash={} incoming_descriptor=<redacted>",
+            i+1,
+            route.len(),
+            hop.incoming,
+            hop.outgoing,
+            invoice.amount_msat,
+            expiries[i],
+            expiries[i + 1],
+            dispatch.payment_hash,
+                        );
             debug!(
                 target: "cassis_client",
                 "  DISPATCH hop {}: in={} out={} amount={} msat",
@@ -701,18 +706,36 @@ impl CassisClient {
                     // consumed its reservation before failing — or not
                     // heard from us at all — so the safe set to free is
                     // this hop plus everything downstream.
-                    let pending: Vec<usize> = (i..route.len()).collect();
-                    self.discard_reservations(&addrs, invoice.payment_hash, &pending)
-                        .await;
+                    self.discard_reservations(
+                        &addrs,
+                        invoice.payment_hash,
+                        &all_hop_indices,
+                        &attempt_ids,
+                    )
+                    .await;
                     return Err(PayError::Io(e.to_string()));
                 }
             };
+            if reply.payment_hash != invoice.payment_hash
+                || reply.operation_id != reservation_ids[i]
+            {
+                self.discard_reservations(
+                    &addrs,
+                    invoice.payment_hash,
+                    &all_hop_indices,
+                    &attempt_ids,
+                )
+                .await;
+                return Err(PayError::Io(format!(
+                    "DISPATCH response correlation mismatch at hop {}",
+                    i + 1
+                )));
+            }
             info!(
                 target: "cassis_client",
-                "DISPATCH hop {}/{}: peer={peer} outgoing_descriptor={:?}",
-                i+1,
+                "DISPATCH hop {}/{}: peer={peer} outgoing_descriptor=<redacted>",
+                i + 1,
                 route.len(),
-                reply.outgoing_descriptor,
             );
             descriptor = reply.outgoing_descriptor;
         }
@@ -728,6 +751,7 @@ impl CassisClient {
             .map_err(|e| PayError::Commit(format!("payee addr: {e}")))?;
         let commit = HopCommit {
             payment_hash: invoice.payment_hash,
+            operation_id: OperationId::random(),
             amount_msat: invoice.amount_msat,
             network: dest_network.clone(),
             incoming_deadline: invoice.expires_at,
@@ -745,11 +769,9 @@ impl CassisClient {
         // HTLC, and so can every hop in between.
         info!(
             target: "cassis_client",
-            "payee accepted COMMIT for payment_hash={} on {}: preimage={} \
-             (received from payee)",
+            "payee accepted COMMIT for payment_hash={} on {} (preimage received)",
             invoice.payment_hash.short(),
             dest_network,
-            preimage,
         );
         if preimage.0 == [0u8; 32] {
             return Err(PayError::Commit(
@@ -772,7 +794,7 @@ impl CassisClient {
         // loop to observe the preimage on its downstream network.
         // Best-effort: a hop that misses the fanout still settles via
         // its own watch/refund loop.
-        self.fanout_preimage(&addrs, invoice.payment_hash, preimage)
+        self.fanout_preimage(&addrs, &reservation_ids, invoice.payment_hash, preimage)
             .await;
 
         persist_payment_proof(&self.payment_store_path, &invoice, preimage)
@@ -780,7 +802,7 @@ impl CassisClient {
             .map_err(PayError::Io)?;
         mark_outgoing_status(
             &self.payment_store_path,
-            &invoice.payment_hash,
+            &first_payment.operation_id,
             OutgoingPaymentStatus::Completed,
         )
         .await
@@ -794,11 +816,11 @@ impl CassisClient {
         // caller on the sender-side watch because the
         // preimage is already proven by the payee.
         match sender
-            .watch_payment(first_payment.clone(), first_payment.expiry)
+            .watch_outgoing(&first_payment, first_payment.expiry)
             .await
         {
             Ok(_) => {}
-            Err(SendError::DeadlineExceeded) => {
+            Err(AdapterError::DeadlineExceeded) => {
                 warn!(
                     target: "cassis_client",
                     "  sender-side watch timed out (preimage already proven by COMMIT)"
@@ -830,7 +852,7 @@ impl CassisClient {
         sender_network: &NetworkId,
     ) -> Result<PaymentResult, PayError> {
         let sender = self
-            .senders
+            .adapters
             .get(sender_network)
             .ok_or_else(|| PayError::Route("sender network adapter missing".to_string()))?;
 
@@ -844,16 +866,16 @@ impl CassisClient {
 
         let htlc_target = invoice.address.clone();
 
-        let first_payment = sender
-            .pay_invoice(
-                invoice.payment_hash,
-                invoice.amount_msat,
-                &htlc_target,
-                sender_network,
-                outgoing_expiry,
-            )
-            .await
-            .map_err(|e| PayError::Io(e.to_string()))?;
+        let first_payment = create_outgoing_payment(
+            sender.as_ref(),
+            invoice.payment_hash,
+            invoice.amount_msat,
+            &htlc_target,
+            sender_network,
+            outgoing_expiry,
+        )
+        .await
+        .map_err(|e| PayError::Io(e.to_string()))?;
         let payment_guard = spawn_payment_guard(
             sender.clone(),
             first_payment.clone(),
@@ -865,26 +887,13 @@ impl CassisClient {
             invoice,
             &first_payment,
             sender_network,
-            None,
         )
         .await
         {
             warn!(target: "cassis_client", "failed to persist outgoing HTLC: {error}");
         }
 
-        let descriptor = sender
-            .outgoing_htlc_descriptor(invoice.payment_hash)
-            .await
-            .map_err(|e| PayError::Io(e.to_string()))?;
-        if let Err(error) = update_outgoing_descriptor(
-            &self.payment_store_path,
-            invoice.payment_hash,
-            descriptor.clone(),
-        )
-        .await
-        {
-            warn!(target: "cassis_client", "failed to persist outgoing descriptor: {error}");
-        }
+        let descriptor = first_payment.descriptor.clone();
 
         let peer_id = invoice
             .iroh_peer_id
@@ -894,6 +903,7 @@ impl CassisClient {
             .map_err(|e| PayError::Commit(format!("payee addr: {e}")))?;
         let commit = HopCommit {
             payment_hash: invoice.payment_hash,
+            operation_id: OperationId::random(),
             amount_msat: invoice.amount_msat,
             network: dest_network.clone(),
             incoming_deadline: invoice.expires_at,
@@ -924,7 +934,7 @@ impl CassisClient {
             .map_err(PayError::Io)?;
         mark_outgoing_status(
             &self.payment_store_path,
-            &invoice.payment_hash,
+            &first_payment.operation_id,
             OutgoingPaymentStatus::Completed,
         )
         .await
@@ -932,11 +942,11 @@ impl CassisClient {
         payment_guard.abort();
 
         match sender
-            .watch_payment(first_payment.clone(), first_payment.expiry)
+            .watch_outgoing(&first_payment, first_payment.expiry)
             .await
         {
             Ok(_) => {}
-            Err(SendError::DeadlineExceeded) => {
+            Err(AdapterError::DeadlineExceeded) => {
                 warn!(
                     target: "cassis_client",
                     "  sender-side watch timed out (preimage already proven by COMMIT)"
@@ -967,38 +977,51 @@ impl CassisClient {
         addrs: &[EndpointAddr],
         payment_hash: Bytes32,
         hop_indices: &[usize],
+        operation_ids: &[OperationId],
     ) {
-        if hop_indices.is_empty() {
+        if operation_ids.is_empty() || hop_indices.len() != operation_ids.len() {
             return;
         }
         info!(
             target: "cassis_client",
-            "payment aborted: sending DISCARD for payment_hash={} to {} hop(s)",
-            payment_hash.short(),
-            hop_indices.len(),
+            "payment aborted: sending DISCARD for {} reservation(s)",
+            operation_ids.len(),
         );
-        let futs = hop_indices.iter().map(|&i| {
-            let addr = addrs[i].clone();
-            async move {
-                match self
-                    .iroh_client
-                    .send_discard(addr, HopDiscard { payment_hash })
-                    .await
-                {
-                    Ok(ack) => debug!(
-                        target: "cassis_client",
-                        "DISCARD hop {}: released={}",
-                        i + 1,
-                        ack.released,
-                    ),
-                    Err(e) => warn!(
-                        target: "cassis_client",
-                        "DISCARD hop {} failed (best effort): {e}",
-                        i + 1,
-                    ),
-                }
-            }
-        });
+        let futs = hop_indices
+            .iter()
+            .zip(operation_ids)
+            .map(|(hop_index, operation_id)| {
+                let Some(addr) = addrs.get(*hop_index).cloned() else {
+                    return futures::future::Either::Left(async {});
+                };
+                let operation_id = operation_id.clone();
+                futures::future::Either::Right(async move {
+                    match self
+                        .iroh_client
+                        .send_discard(
+                            addr,
+                            HopDiscard {
+                                payment_hash,
+                                operation_id,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(ack) => debug!(
+                            target: "cassis_client",
+                            "DISCARD hop {}: released={}",
+                            hop_index + 1,
+                            ack.released,
+                        ),
+                        Err(e) => warn!(
+                            target: "cassis_client",
+                            "DISCARD hop {} failed (best effort): {e}",
+                            hop_index + 1,
+                        ),
+                    }
+                })
+            });
+        let futs: Vec<_> = futs.collect();
         join_all(futs).await;
     }
 
@@ -1010,9 +1033,19 @@ impl CassisClient {
     async fn fanout_preimage(
         &self,
         addrs: &[EndpointAddr],
+        operation_ids: &[OperationId],
         payment_hash: Bytes32,
         preimage: Bytes32,
     ) {
+        if addrs.len() != operation_ids.len() {
+            warn!(
+                target: "cassis_client",
+                "skip preimage fanout: {} addresses but {} operation ids",
+                addrs.len(),
+                operation_ids.len(),
+            );
+            return;
+        }
         info!(
             target: "cassis_client",
             "fanning preimage out to {} hop(s) for payment_hash={}",
@@ -1023,6 +1056,7 @@ impl CassisClient {
             let addr = addr.clone();
             let committed = HopCommitted {
                 payment_hash,
+                operation_id: operation_ids[i].clone(),
                 preimage,
             };
             async move {
@@ -1043,6 +1077,23 @@ impl CassisClient {
         join_all(futs).await;
     }
 
+    pub async fn restore_invoice_handles(&self) -> Result<(), String> {
+        let path = self.payment_store_path.clone();
+        let handles = tokio::task::spawn_blocking(move || {
+            let mut store = Store::open(&path).map_err(|e| e.to_string())?;
+            store.list_invoice_handles().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let mut memory = self.invoice_handles.lock().await;
+        memory.extend(
+            handles
+                .into_iter()
+                .map(|handle| (handle.invoice.payment_hash, handle)),
+        );
+        Ok(())
+    }
+
     pub async fn find_route(
         &self,
         destination_network: &NetworkId,
@@ -1061,11 +1112,40 @@ impl CassisClient {
     fn receiver_for(
         &self,
         network: &NetworkId,
-    ) -> Result<Arc<dyn NetworkReceiverAdapter>, ReceiveFlowError> {
-        self.receivers
+    ) -> Result<Arc<dyn NetworkAdapter>, ReceiveFlowError> {
+        self.adapters
             .get(network)
             .cloned()
             .ok_or_else(|| ReceiveFlowError::UnknownNetwork(network.0.clone()))
+    }
+
+    pub async fn create_invoice_handle(
+        &self,
+        network: &NetworkId,
+        amount_msat: u64,
+        expiry: u64,
+        description: Option<String>,
+    ) -> Result<InvoiceHandle, ReceiveFlowError> {
+        let receiver = self.receiver_for(network)?;
+        let handle =
+            cassis_core::create_invoice_handle(receiver.as_ref(), amount_msat, expiry, description)
+                .await?;
+        self.invoice_handles
+            .lock()
+            .await
+            .insert(handle.invoice.payment_hash, handle.clone());
+        let path = self.payment_store_path.clone();
+        let stored_handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = Store::open(&path).map_err(|e| e.to_string())?;
+            store
+                .insert_invoice_handle(&stored_handle)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| AdapterError::Network(e.to_string()))?
+        .map_err(AdapterError::Network)?;
+        Ok(handle)
     }
 
     pub async fn create_invoice(
@@ -1075,11 +1155,10 @@ impl CassisClient {
         expiry: u64,
         description: Option<String>,
     ) -> Result<Invoice, ReceiveFlowError> {
-        let receiver = self.receiver_for(network)?;
-        let invoice = receiver
-            .create_invoice(amount_msat, expiry, description)
-            .await?;
-        Ok(invoice)
+        Ok(self
+            .create_invoice_handle(network, amount_msat, expiry, description)
+            .await?
+            .invoice)
     }
 
     pub async fn wait_for_incoming(
@@ -1089,8 +1168,22 @@ impl CassisClient {
         deadline: u64,
     ) -> Result<Bytes32, ReceiveFlowError> {
         let receiver = self.receiver_for(network)?;
-        let preimage = receiver.watch_incoming(payment_hash, deadline).await?;
-        Ok(preimage)
+        let handle = self
+            .invoice_handles
+            .lock()
+            .await
+            .get(&payment_hash)
+            .cloned();
+        let Some(handle) = handle else {
+            return Err(ReceiveFlowError::MissingReservation(format!(
+                "payment_hash={}",
+                payment_hash.short()
+            )));
+        };
+        receiver
+            .watch_incoming(&handle.reservation, deadline)
+            .await?;
+        Ok(handle.preimage)
     }
 
     pub async fn claim_invoice(
@@ -1100,7 +1193,21 @@ impl CassisClient {
         preimage: Bytes32,
     ) -> Result<(), ReceiveFlowError> {
         let receiver = self.receiver_for(network)?;
-        receiver.claim_incoming(payment_hash, preimage).await?;
+        let handle = self
+            .invoice_handles
+            .lock()
+            .await
+            .get(&payment_hash)
+            .cloned()
+            .ok_or_else(|| {
+                ReceiveFlowError::MissingReservation(format!(
+                    "payment_hash={}",
+                    payment_hash.short()
+                ))
+            })?;
+        receiver
+            .claim_reserved_incoming(&handle.reservation, preimage)
+            .await?;
         Ok(())
     }
 
@@ -1144,6 +1251,11 @@ fn validate_route_networks(
 ) -> Result<(), PayError> {
     // Callers reject empty routes before reaching here.
     let first = &route[0];
+    if first.incoming.0 == "spark" {
+        return Err(PayError::Route(
+            "Spark can be used as destination bridge, not route source".to_string(),
+        ));
+    }
     if &first.incoming != sender_network {
         return Err(PayError::Route(format!(
             "first hop receives on {} but we are sending on {sender_network}",
@@ -1151,6 +1263,14 @@ fn validate_route_networks(
         )));
     }
     for (idx, pair) in route.windows(2).enumerate() {
+        if pair[0].outgoing.0 == "spark" || pair[1].incoming.0 == "spark" {
+            return Err(PayError::Route(format!(
+                "Spark route leg {} has unsupported role direction: {} -> {}",
+                idx + 1,
+                pair[0].outgoing,
+                pair[1].incoming,
+            )));
+        }
         if pair[0].outgoing != pair[1].incoming {
             return Err(PayError::Route(format!(
                 "discontiguous route: hop {} sends on {} but hop {} receives on {}",
@@ -1182,4 +1302,36 @@ fn preimage_matches(preimage: &Bytes32, payment_hash: &Bytes32) -> bool {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&out);
     hash == payment_hash.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cassis_core::{RouteAnnouncement, XOnlyPubKey};
+
+    fn hop(from: &str, to: &str, fee_base_msat: u64, fee_ppm: u64) -> RouteHop {
+        RouteHop {
+            node: RouteAnnouncement {
+                node_pubkey: XOnlyPubKey([0u8; 32]),
+                iroh_peer_id: String::new(),
+                iroh_relay: None,
+                from: NetworkId(from.into()),
+                to: NetworkId(to.into()),
+                fee_base_msat,
+                fee_ppm,
+                incoming_delta_secs: 0,
+                transit_slack_secs: 0,
+                relays: Vec::new(),
+            },
+            incoming: NetworkId(from.into()),
+            outgoing: NetworkId(to.into()),
+        }
+    }
+
+    #[test]
+    fn route_amounts_add_each_hop_fee_to_upstream_amounts() {
+        let route = vec![hop("a", "b", 100, 10_000), hop("b", "c", 100, 10_000)];
+        let amounts = route_amounts(1_000, &route).expect("amounts fit");
+        assert_eq!(amounts, vec![1_221, 1_110, 1_000]);
+    }
 }

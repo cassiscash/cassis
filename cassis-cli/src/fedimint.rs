@@ -11,7 +11,7 @@ use cassis_client::ops::node_store_path;
 #[cfg(feature = "fedimint")]
 use cassis_client::paths::cassis_home;
 #[cfg(feature = "fedimint")]
-use cassis_core::NetworkRouterAdapter;
+use cassis_core::NetworkAdapter;
 
 #[derive(Subcommand, Debug)]
 pub enum FedimintCommands {

@@ -1,14 +1,12 @@
-//! Build network senders/receivers for a list of [`NetSpec`]s. Used by
-//! the GUI and the CLI to materialise the per-network adapters from a
-//! node's derived keys, and to construct concrete
-//! (`cassis_cashu::CashuAdapter`, `cassis_rootstock::RootstockAdapter`)
-//! instances for the wallet/CLI subcommands.
+//! Build one direct network adapter map for a list of [`NetSpec`]s.
+//! Router, client, receive daemon, and CLI all consume same adapter
+//! boundary. Concrete constructors remain available for wallet commands.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use cassis_core::{NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter};
+use cassis_core::{NetworkAdapter, NetworkId};
 use cassis_keys::DerivedKeys;
 use tracing::Span;
 
@@ -23,59 +21,33 @@ pub struct AdapterConfig {
     pub spark: Option<cassis_spark::SparkConfig>,
 }
 
-pub async fn build_receivers(
+pub async fn build_adapters(
     specs: &[NetSpec],
     derived: &DerivedKeys,
     store_path: &Path,
     span: Span,
-) -> Result<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>, String> {
-    build_receivers_with_config(specs, derived, store_path, span, &AdapterConfig::default()).await
+) -> Result<HashMap<NetworkId, Arc<dyn NetworkAdapter>>, String> {
+    build_adapters_with_config(specs, derived, store_path, span, &AdapterConfig::default()).await
 }
 
-pub async fn build_receivers_with_config(
-    specs: &[NetSpec],
-    derived: &DerivedKeys,
-    store_path: &Path,
-    span: Span,
-    config: &AdapterConfig,
-) -> Result<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>, String> {
-    let mut out: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>> = HashMap::new();
-    for spec in specs {
-        let entry = build_pair(spec, derived, store_path, span.clone(), config).await?;
-        out.insert(entry.network_id.clone(), entry.receiver);
-    }
-    Ok(out)
-}
-
-pub async fn build_senders(
-    specs: &[NetSpec],
-    derived: &DerivedKeys,
-    store_path: &Path,
-    span: Span,
-) -> Result<HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>, String> {
-    build_senders_with_config(specs, derived, store_path, span, &AdapterConfig::default()).await
-}
-
-pub async fn build_senders_with_config(
+pub async fn build_adapters_with_config(
     specs: &[NetSpec],
     derived: &DerivedKeys,
     store_path: &Path,
     span: Span,
     config: &AdapterConfig,
-) -> Result<HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>, String> {
-    let mut out: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>> = HashMap::new();
+) -> Result<HashMap<NetworkId, Arc<dyn NetworkAdapter>>, String> {
+    let mut out = HashMap::new();
     for spec in specs {
-        let entry = build_pair(spec, derived, store_path, span.clone(), config).await?;
-        out.insert(entry.network_id.clone(), entry.sender);
+        let entry = build_one(spec, derived, store_path, span.clone(), config).await?;
+        out.insert(entry.network_id, entry.adapter);
     }
     Ok(out)
 }
 
-pub struct AdapterPair {
+struct AdapterEntry {
     pub network_id: NetworkId,
-    pub receiver: Arc<dyn NetworkReceiverAdapter>,
-    #[allow(dead_code)]
-    pub sender: Arc<dyn NetworkSenderAdapter>,
+    pub adapter: Arc<dyn NetworkAdapter>,
 }
 
 /// Per-network signing key for `network_id`, or a descriptive error.
@@ -96,13 +68,13 @@ fn network_sk(derived: &DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32],
 }
 
 #[allow(unused_variables)]
-async fn build_pair(
+async fn build_one(
     spec: &NetSpec,
     derived: &DerivedKeys,
     store_path: &Path,
     span: Span,
     config: &AdapterConfig,
-) -> Result<AdapterPair, String> {
+) -> Result<AdapterEntry, String> {
     let network_id = spec.network_id();
     match spec {
         NetSpec::Cashu { mint_url, host: _ } => {
@@ -119,10 +91,9 @@ async fn build_pair(
                 )
                 .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         #[cfg(feature = "liquid")]
@@ -142,10 +113,9 @@ async fn build_pair(
             let adapter = cassis_liquid::LiquidAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("liquid adapter init failed: {e}"))?;
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         NetSpec::Rootstock { .. } => {
@@ -158,10 +128,9 @@ async fn build_pair(
             let adapter = cassis_rootstock::RootstockAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         #[cfg(feature = "lightning")]
@@ -173,18 +142,14 @@ async fn build_pair(
             let adapter = cassis_lnd::LndAdapter::new(network_id.clone(), lnd.clone(), span)
                 .await
                 .map_err(|error| format!("LND adapter init failed: {error}"))?;
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         #[cfg(feature = "spark")]
         NetSpec::Spark { .. } => {
-            let spark = config
-                .spark
-                .clone()
-                .ok_or_else(|| "network 'spark' requires Breez SDK configuration".to_string())?;
+            let spark = config.spark.clone().unwrap_or_default();
             let adapter = cassis_spark::SparkAdapter::new(
                 network_id.clone(),
                 spark,
@@ -194,10 +159,9 @@ async fn build_pair(
             )
             .await
             .map_err(|e| format!("spark adapter init failed: {e}"))?;
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         #[cfg(feature = "arkade")]
@@ -211,10 +175,9 @@ async fn build_pair(
             let adapter = cassis_arkade::ArkadeAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("arkade adapter init failed: {e}"))?;
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         #[cfg(feature = "bitcoin")]
@@ -231,10 +194,9 @@ async fn build_pair(
                     .await
                     .map_err(|e| format!("bitcoin adapter init failed: {e}"))?,
             );
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         #[cfg(feature = "fedimint")]
@@ -249,10 +211,9 @@ async fn build_pair(
                 .await
                 .map_err(|e| format!("fedimint adapter init failed: {e}"))?,
             );
-            Ok(AdapterPair {
+            Ok(AdapterEntry {
                 network_id,
-                receiver: adapter.clone(),
-                sender: adapter,
+                adapter,
             })
         }
         #[allow(unreachable_patterns)]

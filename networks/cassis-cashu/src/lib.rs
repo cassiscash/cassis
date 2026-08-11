@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, WatchError, XOnlyPubKey,
+    AcceptedIncoming, AdapterError, Bytes32, HtlcDescriptor, HtlcTarget, IncomingRequest,
+    IncomingReservation, NetworkAdapter, NetworkId, OperationId, OutgoingPayment, OutgoingRequest,
+    XOnlyPubKey,
 };
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
@@ -37,7 +38,7 @@ pub use errors::CashuError as Error;
 use errors::{CashuError, CashuResult};
 use htlc::{
     add_preimage_to_proofs, build_htlc_outputs, claim_pubkey_from_secret, htlc_conditions, proof_y,
-    verify_proofs_htlc, verify_proofs_htlc_locked,
+    verify_proofs_htlc, verify_proofs_htlc_locked, verify_proofs_htlc_locked_for_recipient,
 };
 pub use store::CashuProofStore;
 
@@ -45,39 +46,66 @@ pub use store::CashuProofStore;
 /// amount)`.
 type BlindingTriple = (Secret, cdk::nuts::nut01::SecretKey, Amount);
 
-/// Receiver-side state for an outstanding incoming HTLC.
+/// Receiver-side state for an outstanding incoming HTLC, parked by
+/// [`NetworkAdapter::reserve_incoming`] and keyed by operation id in
+/// [`CashuAdapter::incoming`].
 pub struct PendingIncoming {
+    /// Route payment hash this reservation is for. Payment hashes
+    /// identify intent, so it is kept next to the operation id: a
+    /// caller holding the wrong reservation must never be able to
+    /// accept or claim another operation's contract.
+    payment_hash: Bytes32,
     /// SHA-256 of the preimage, hex-encoded the way the cashu
     /// secret `data` field wants it.
     payment_hash_hex: String,
-    /// Face value of the HTLC, in sats.
+    /// Face value the routing layer asked for, in msat. Echoed back
+    /// verbatim in the [`IncomingReservation`] so a retry of the same
+    /// operation returns an identical handle.
+    amount_msat: u64,
+    /// Face value of the HTLC, in sats — the mint-facing floor
+    /// [`NetworkAdapter::accept_incoming`] checks the funded proofs
+    /// against.
     amount_sat: u64,
     /// Unix deadline after which the receiver gives up waiting
     /// for the sender's proofs to arrive.
     deadline: u64,
     /// HTLC-locked proofs the sender (or previous hop) pushed to
     /// us. Populated by
-    /// [`NetworkRouterAdapter::accept_incoming_htlc`] in the
-    /// multi-hop flow, or by
-    /// [`NetworkRouterAdapter::create_outgoing_htlc`] in the
+    /// [`NetworkAdapter::accept_incoming`] in the multi-hop flow, or
+    /// by [`NetworkAdapter::create_outgoing`] in the
     /// single-process test flow. None until then; in the
     /// single-process test the create-side fills it in and
     /// notifies `arrival`.
     proofs: Mutex<Option<Proofs>>,
     /// Notified when the matching HTLC proofs have been deposited
     /// by the create-side or by
-    /// [`NetworkRouterAdapter::accept_incoming_htlc`].
+    /// [`NetworkAdapter::accept_incoming`].
     arrival: Arc<Notify>,
 }
 
-/// Sender-side state for an outstanding outgoing HTLC.
+/// Sender-side state for an outstanding outgoing HTLC, keyed by
+/// operation id in [`CashuAdapter::outgoing`].
 struct PendingOutgoing {
+    /// Route payment hash these proofs are locked under. Stored so
+    /// an operation-keyed lookup can reject a mismatched
+    /// [`OutgoingPayment`], and so the same-process test path can
+    /// find the receiver-side reservation for the same payment.
+    payment_hash: Bytes32,
     /// Face value of the HTLC, in sats.
     #[allow(dead_code)]
     amount_sat: u64,
+    /// Face value the caller asked for, in msat. `amount_sat` is
+    /// the rounded-up native value the mint actually locked, so the
+    /// protocol figure is kept separately for the
+    /// [`OutgoingPayment`] handle.
+    amount_msat: u64,
     /// Unix locktime after which the sender can refund.
     #[allow(dead_code)]
     locktime: u64,
+    /// Destination this lock was funded for, carried so a retry of
+    /// the same operation can be checked against the request that
+    /// started it.
+    destination: HtlcTarget,
     /// NUT-14 spending conditions used to lock the proofs.
     #[allow(dead_code)]
     conditions: SpendingConditions,
@@ -123,14 +151,19 @@ pub struct CashuAdapter {
     /// unrelated tasks where the ambient span is unrelated or absent.
     span: Span,
     keysets: Arc<Mutex<Vec<KeySetInfo>>>,
-    /// In-flight outgoing HTLCs we have locked at the mint, keyed
-    /// by the payment hash so the cross-network hop layer can pair
-    /// each sender-side lock with the matching receiver-side
-    /// claim.
-    outgoing: Mutex<HashMap<Bytes32, PendingOutgoing>>,
-    /// In-flight incoming HTLCs we are expecting proofs for, keyed
-    /// by the same payment hash.
-    incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
+    /// In-flight outgoing HTLCs we have locked at the mint, keyed by
+    /// the operation that funded them. The payment hash lives inside
+    /// the entry so a second operation cannot quietly take over an
+    /// existing lock, and so a retry of the *same* operation is
+    /// answered from state instead of locking funds twice.
+    outgoing: Mutex<HashMap<OperationId, PendingOutgoing>>,
+    /// Serializes external NUT-03 funding calls. Without this, two
+    /// concurrent retries could both pass the map check and lock funds
+    /// twice for one operation.
+    outgoing_creation_lock: Arc<Mutex<()>>,
+    /// In-flight incoming HTLCs we are expecting proofs for, keyed by
+    /// the operation that reserved them.
+    incoming: Mutex<HashMap<OperationId, PendingIncoming>>,
     /// Persistence for the wallet-held ecash. All proofs the adapter
     /// receives (claims, deposits) are stored here and balances are
     /// computed from it on demand — never held in a field.
@@ -182,6 +215,7 @@ impl CashuAdapter {
             span,
             keysets: Arc::new(Mutex::new(Vec::new())),
             outgoing: Mutex::new(HashMap::new()),
+            outgoing_creation_lock: Arc::new(Mutex::new(())),
             incoming: Mutex::new(HashMap::new()),
             store,
         })
@@ -276,27 +310,144 @@ impl CashuAdapter {
     }
 
     /// Look up a sender-side HTLC's proofs (test/diagnostic
-    /// accessor).
+    /// accessor). The map is keyed by operation id, so this scans it
+    /// for the entry carrying `payment_hash`.
     pub async fn outgoing_proofs(&self, payment_hash: Bytes32) -> Option<Vec<Proof>> {
         let outgoing = self.outgoing.lock().await;
-        let slot = outgoing.get(&payment_hash)?;
+        let slot = outgoing
+            .values()
+            .find(|slot| slot.payment_hash == payment_hash)?;
         let proofs = slot.proofs.lock().await.clone();
         drop(outgoing);
         Some(proofs)
     }
 
-    /// Look up a receiver-side pending incoming HTLC.
+    /// Look up a receiver-side pending incoming HTLC by payment hash
+    /// (test/diagnostic accessor).
     pub async fn incoming_slot(&self, payment_hash: Bytes32) -> Option<PendingIncoming> {
         let incoming = self.incoming.lock().await;
-        let slot = incoming.get(&payment_hash)?;
+        let slot = incoming
+            .values()
+            .find(|slot| slot.payment_hash == payment_hash)?;
         let proofs = slot.proofs.lock().await.clone();
         Some(PendingIncoming {
+            payment_hash: slot.payment_hash,
             payment_hash_hex: slot.payment_hash_hex.clone(),
+            amount_msat: slot.amount_msat,
             amount_sat: slot.amount_sat,
             deadline: slot.deadline,
             proofs: Mutex::new(proofs),
             arrival: slot.arrival.clone(),
         })
+    }
+
+    /// Build the handle for a parked incoming entry. Both
+    /// [`NetworkAdapter::reserve_incoming`] and its retry path go
+    /// through here, so the same operation can never be answered with
+    /// two different reservations.
+    fn incoming_reservation(
+        &self,
+        operation_id: &OperationId,
+        slot: &PendingIncoming,
+    ) -> IncomingReservation {
+        IncomingReservation {
+            operation_id: operation_id.clone(),
+            payment_hash: slot.payment_hash,
+            network: self.network_id.clone(),
+            amount_msat: slot.amount_msat,
+            deadline: slot.deadline,
+            // Cashu is addressed by claim key: counterparties lock the
+            // HTLC proofs to the key this adapter signs NUT-14
+            // witnesses with.
+            target: HtlcTarget::XOnlyPubKey(self.claim_pubkey),
+        }
+    }
+
+    /// The [`AcceptedIncoming`] already committed for `reservation`,
+    /// if this operation has one. Makes a repeated
+    /// [`NetworkAdapter::accept_incoming`] idempotent: the proof set
+    /// accepted the first time stays authoritative and the returned
+    /// descriptor is rebuilt from it, so a caller's journal never
+    /// records a payload other than the one that was verified.
+    async fn accepted_incoming(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<Option<AcceptedIncoming>, AdapterError> {
+        let stored = {
+            let incoming = self.incoming.lock().await;
+            let Some(slot) = incoming.get(&reservation.operation_id) else {
+                return Ok(None);
+            };
+            if slot.payment_hash != reservation.payment_hash
+                || slot.amount_msat != reservation.amount_msat
+                || slot.deadline != reservation.deadline
+            {
+                return Err(AdapterError::InvalidParams(
+                    "Cashu reservation operation id does not match this payment state".into(),
+                ));
+            }
+            let stored = slot.proofs.lock().await.clone();
+            stored
+        };
+        let Some(proofs) = stored.filter(|proofs| !proofs.is_empty()) else {
+            return Ok(None);
+        };
+        let amount_sat: u64 = proofs.iter().map(|proof| u64::from(proof.amount)).sum();
+        Ok(Some(AcceptedIncoming {
+            reservation: reservation.clone(),
+            descriptor: cashu_descriptor(&proofs)?,
+            amount_msat: amount_sat.saturating_mul(1000),
+        }))
+    }
+
+    /// The [`OutgoingPayment`] for an attempt this adapter has already
+    /// funded, or `None` when the operation is unknown. An entry that
+    /// is recorded without proofs is an error rather than `None`, so a
+    /// retry can never mistake a half-recorded lock for "not started
+    /// yet" and fund the same amount twice.
+    async fn funded_outgoing(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<OutgoingPayment>, AdapterError> {
+        let (payment_hash, amount_msat, destination, expiry, proofs) = {
+            let outgoing = self.outgoing.lock().await;
+            let Some(slot) = outgoing.get(operation_id) else {
+                return Ok(None);
+            };
+            let proofs = slot.proofs.lock().await.clone();
+            (
+                slot.payment_hash,
+                slot.amount_msat,
+                slot.destination.clone(),
+                slot.locktime,
+                proofs,
+            )
+        };
+        if proofs.is_empty() {
+            return Err(AdapterError::Retryable(
+                "outgoing Cashu lock is recorded without proofs".into(),
+            ));
+        }
+        Ok(Some(OutgoingPayment {
+            operation_id: operation_id.clone(),
+            payment_hash,
+            amount_msat,
+            destination,
+            destination_network: self.network_id.clone(),
+            expiry,
+            descriptor: cashu_descriptor(&proofs)?,
+        }))
+    }
+
+    /// The parked receiver-side entry for `payment_hash`, if this
+    /// adapter holds a reservation for it. The incoming map is keyed by
+    /// operation, so hash lookups scan it.
+    async fn receiver_operation(&self, payment_hash: Bytes32) -> Option<OperationId> {
+        let incoming = self.incoming.lock().await;
+        incoming
+            .iter()
+            .find(|(_, slot)| slot.payment_hash == payment_hash)
+            .map(|(operation_id, _)| operation_id.clone())
     }
 
     /// Build `n` fresh blinding triples (`secret`, `r`,
@@ -497,6 +648,70 @@ impl CashuAdapter {
             change: change.to_vec(),
         })
     }
+
+    async fn verify_mint_proofs(
+        &self,
+        proofs: &Proofs,
+        payment_hash: Bytes32,
+    ) -> Result<(), AdapterError> {
+        if proofs.is_empty() {
+            return Err(AdapterError::InvalidParams("empty Cashu proof set".into()));
+        }
+        let keyset_id = proofs[0].keyset_id;
+        if proofs.iter().any(|proof| proof.keyset_id != keyset_id) {
+            return Err(AdapterError::InvalidParams(
+                "Cashu proof set mixes keysets".into(),
+            ));
+        }
+        let keysets = self
+            .ensure_keysets()
+            .await
+            .map_err(|error| AdapterError::Network(error.to_string()))?;
+        let keyset = keysets
+            .iter()
+            .find(|keyset| keyset.id == keyset_id)
+            .ok_or_else(|| AdapterError::InvalidParams("unknown Cashu keyset".into()))?;
+        if !keyset.active || keyset.unit != CurrencyUnit::Sat {
+            return Err(AdapterError::InvalidParams(
+                "Cashu HTLC keyset is not active sat keyset".into(),
+            ));
+        }
+        let recipient = PublicKey::from_slice(&self.claim_pubkey.0)
+            .map_err(|error| AdapterError::InvalidParams(error.to_string()))?;
+        verify_proofs_htlc_locked_for_recipient(proofs, &payment_hash.0, &recipient)
+            .map_err(|error| AdapterError::InvalidParams(error.to_string()))?;
+        let ys = proofs
+            .iter()
+            .map(proof_y)
+            .collect::<CashuResult<Vec<_>>>()
+            .map_err(|error| AdapterError::Network(error.to_string()))?;
+        let response = self
+            .client
+            .post_check_state(CheckStateRequest { ys })
+            .await
+            .map_err(|error| AdapterError::Network(error.to_string()))?;
+        if response.states.len() != proofs.len() {
+            return Err(AdapterError::InvalidParams(
+                "mint returned incomplete proof state set".into(),
+            ));
+        }
+        for state in response.states {
+            match state.state {
+                ProofState::Unspent => {}
+                ProofState::Pending | ProofState::Reserved => {
+                    return Err(AdapterError::Retryable(
+                        "Cashu proof is not settled yet".into(),
+                    ));
+                }
+                ProofState::Spent | ProofState::PendingSpent => {
+                    return Err(AdapterError::InvalidParams(
+                        "Cashu proof is already spent".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Result of [`CashuAdapter::swap_proofs_for_amount`]. The adapter
@@ -511,7 +726,11 @@ pub struct SendResult {
 }
 
 #[async_trait]
-impl NetworkRouterAdapter for CashuAdapter {
+impl NetworkAdapter for CashuAdapter {
+    fn network_id(&self) -> NetworkId {
+        self.network_id.clone()
+    }
+
     fn invoice_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey
     }
@@ -530,10 +749,6 @@ impl NetworkRouterAdapter for CashuAdapter {
         self.claim_pubkey
     }
 
-    fn network_id(&self) -> NetworkId {
-        self.network_id.clone()
-    }
-
     /// Cashu contracts are confirmed in seconds (the swap endpoint
     /// returns the new blind signatures atomically with the
     /// input spend). 30 s gives the routing layer a comfortable
@@ -542,64 +757,546 @@ impl NetworkRouterAdapter for CashuAdapter {
         30
     }
 
-    /// Register an expected incoming HTLC. Cashu has no notion of
+    /// Reserve an expected incoming HTLC. Cashu has no notion of
     /// "publishing" an incoming contract — the receiver just sits
     /// and waits for the sender to push the HTLC-locked proofs
     /// over (via the cross-network hop layer, out of band from
     /// the mint itself). We park an entry in
-    /// [`CashuAdapter::incoming`]; the actual wait happens at
-    /// [`NetworkRouterAdapter::claim_incoming`] time, where we
+    /// [`CashuAdapter::incoming`], keyed by `request.operation_id`;
+    /// the actual wait happens at
+    /// [`NetworkAdapter::watch_incoming`] and
+    /// [`NetworkAdapter::claim_incoming`] time, where we
     /// block on a [`Notify`] until the proofs land.
-    async fn register_incoming_htlc(
+    ///
+    /// A retry of the same operation returns the reservation already
+    /// on record. A *different* operation claiming the same payment
+    /// hash is rejected: a payment hash identifies intent, and one
+    /// intent must never be reservable — or claimable — twice.
+    async fn reserve_incoming(
         &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
+        request: IncomingRequest,
+    ) -> Result<IncomingReservation, AdapterError> {
+        if request.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams(
+                "incoming amount must be > 0".into(),
+            ));
+        }
+        if request.deadline <= now_unix_secs() {
+            return Err(AdapterError::InvalidParams("deadline in the past".into()));
+        }
+        if request
+            .preimage
+            .is_some_and(|preimage| !request.payment_hash.matches_preimage(&preimage))
+        {
+            return Err(AdapterError::InvalidParams(
+                "incoming preimage does not match payment hash".into(),
+            ));
+        }
         // Cashu works in sats; round the msat floor up.
-        let min_amount_sat = min_amount_msat.div_ceil(1000).max(1);
-        let arrival = Arc::new(Notify::new());
-        let payment_hash_hex = lowercase_hex::encode(payment_hash.0);
+        let amount_sat = request.amount_msat.div_ceil(1000).max(1);
         let mut incoming = self.incoming.lock().await;
+        match incoming.get(&request.operation_id) {
+            Some(slot)
+                if slot.payment_hash == request.payment_hash
+                    && slot.amount_msat == request.amount_msat
+                    && slot.deadline == request.deadline =>
+            {
+                return Ok(self.incoming_reservation(&request.operation_id, slot));
+            }
+            Some(_) => {
+                return Err(AdapterError::InvalidParams(
+                    "Cashu operation id is already reserved for another payment hash".into(),
+                ));
+            }
+            None => {}
+        }
+        if incoming
+            .values()
+            .any(|slot| slot.payment_hash == request.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Cashu payment hash already has an active reservation".into(),
+            ));
+        }
         incoming.insert(
-            payment_hash,
+            request.operation_id.clone(),
             PendingIncoming {
-                payment_hash_hex,
-                amount_sat: min_amount_sat,
-                deadline,
+                payment_hash: request.payment_hash,
+                payment_hash_hex: lowercase_hex::encode(request.payment_hash.0),
+                amount_msat: request.amount_msat,
+                amount_sat,
+                deadline: request.deadline,
                 proofs: Mutex::new(None),
-                arrival,
+                arrival: Arc::new(Notify::new()),
             },
         );
+        let slot = incoming
+            .get(&request.operation_id)
+            .expect("reservation just inserted");
+        Ok(self.incoming_reservation(&request.operation_id, slot))
+    }
+
+    async fn restore_incoming_reservation(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        let restored = self
+            .reserve_incoming(IncomingRequest {
+                operation_id: reservation.operation_id.clone(),
+                payment_hash: reservation.payment_hash,
+                amount_msat: reservation.amount_msat,
+                deadline: reservation.deadline,
+                preimage: None,
+            })
+            .await?;
+        if restored == *reservation {
+            Ok(())
+        } else {
+            Err(AdapterError::InvalidParams(
+                "restored Cashu reservation differs from persisted state".into(),
+            ))
+        }
+    }
+
+    /// Drop an unfunded reservation. Cashu holds nothing at the mint
+    /// for an unfunded incoming HTLC — the sender simply never pushes
+    /// the proofs — so releasing is a local delete.
+    ///
+    /// Cancelling unknown or already-cancelled operation is a no-op.
+    /// Accepted/funded operation cannot be cancelled through this path.
+    async fn cancel_incoming(&self, reservation: &IncomingReservation) -> Result<(), AdapterError> {
+        let mut incoming = self.incoming.lock().await;
+        let Some(slot) = incoming.get(&reservation.operation_id) else {
+            return Ok(());
+        };
+        if slot.payment_hash != reservation.payment_hash
+            || slot.amount_msat != reservation.amount_msat
+            || slot.deadline != reservation.deadline
+        {
+            return Err(AdapterError::InvalidParams(
+                "Cashu reservation operation id does not match this payment state".into(),
+            ));
+        }
+        if slot.proofs.lock().await.is_some() {
+            return Err(AdapterError::InvalidParams(
+                "cannot cancel an accepted incoming Cashu operation".into(),
+            ));
+        }
+        incoming.remove(&reservation.operation_id);
         Ok(())
     }
 
-    /// Lock `amount_msat` of ecash behind `payment_hash` by
-    /// swapping unrestricted proofs (already in the adapter's
-    /// local balance — see [`CashuAdapter::add_balance`] for the
-    /// funding path) for HTLC-locked ones via NUT-03. The
-    /// resulting proofs are stashed in [`CashuAdapter::outgoing`]
-    /// and any matching incoming waiter is notified.
-    async fn create_outgoing_htlc(
+    /// Verify a funded incoming HTLC and commit it to its
+    /// reservation. The proofs are checked against the mint (NUT-07)
+    /// *and* against this adapter's claim key, so a descriptor we
+    /// cannot actually spend is rejected before the hop commits its
+    /// outgoing HTLC.
+    async fn accept_incoming(
         &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-        htlc_target: &HtlcTarget,
-    ) -> Result<OutgoingHtlc, HtlcError> {
-        let recipient = match htlc_target {
+        reservation: &IncomingReservation,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<AcceptedIncoming, AdapterError> {
+        // Re-accept of an operation we already committed: hand back
+        // the proofs on record. Re-running the mint check here would
+        // see them as spent once the claim has run, turning a
+        // harmless retry into a failure.
+        if let Some(accepted) = self.accepted_incoming(reservation).await? {
+            return Ok(accepted);
+        }
+        let proofs = proofs_from_descriptor(descriptor)?;
+        self.verify_mint_proofs(&proofs, reservation.payment_hash)
+            .await?;
+        let conditions = SpendingConditions::try_from(&proofs[0].secret)
+            .map_err(|error| AdapterError::InvalidParams(error.to_string()))?;
+        if conditions
+            .locktime()
+            .is_none_or(|locktime| locktime < reservation.deadline)
+        {
+            return Err(AdapterError::InvalidParams(
+                "Cashu refund locktime opens before claim deadline".into(),
+            ));
+        }
+        let amount_sat: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
+        let arrival = {
+            let mut incoming = self.incoming.lock().await;
+            let slot = incoming.get_mut(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming Cashu reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            if slot.payment_hash != reservation.payment_hash
+                || slot.amount_msat != reservation.amount_msat
+                || slot.deadline != reservation.deadline
+            {
+                return Err(AdapterError::InvalidParams(
+                    "Cashu reservation operation id does not match this payment state".into(),
+                ));
+            }
+            if amount_sat < slot.amount_sat {
+                return Err(AdapterError::InvalidParams(format!(
+                    "Cashu HTLC amount {amount_sat} sat below reserved {} sat",
+                    slot.amount_sat
+                )));
+            }
+            *slot.proofs.lock().await = Some(proofs);
+            slot.arrival.clone()
+        };
+        arrival.notify_one();
+        Ok(AcceptedIncoming {
+            reservation: reservation.clone(),
+            descriptor: descriptor.clone(),
+            // Cashu denominates sats; report the observed native
+            // amount in protocol msat.
+            amount_msat: amount_sat.saturating_mul(1000),
+        })
+    }
+
+    /// Rebuild the receiver-side wait state from a journal replay.
+    ///
+    /// Only local checks run here: the mint was already consulted when
+    /// the HTLC was accepted, and a restart must not turn into a
+    /// network round-trip that can fail while funds sit locked and
+    /// claimable. The proofs are re-checked against the route hash and
+    /// this adapter's claim key, and must still cover the reservation.
+    async fn restore_incoming(&self, accepted: &AcceptedIncoming) -> Result<(), AdapterError> {
+        let reservation = &accepted.reservation;
+        let proofs = proofs_from_descriptor(&accepted.descriptor)?;
+        if proofs.is_empty() {
+            return Err(AdapterError::InvalidParams(
+                "empty Cashu HTLC descriptor".into(),
+            ));
+        }
+        let recipient = PublicKey::from_slice(&self.claim_pubkey.0)
+            .map_err(|error| AdapterError::InvalidParams(error.to_string()))?;
+        verify_proofs_htlc_locked_for_recipient(&proofs, &reservation.payment_hash.0, &recipient)
+            .map_err(|error| AdapterError::InvalidParams(error.to_string()))?;
+        let amount_sat: u64 = proofs.iter().map(|proof| u64::from(proof.amount)).sum();
+        let amount_sat_floor = reservation.amount_msat.div_ceil(1000).max(1);
+        if amount_sat < amount_sat_floor {
+            return Err(AdapterError::InvalidParams(format!(
+                "Cashu HTLC amount {amount_sat} sat below reserved {amount_sat_floor} sat"
+            )));
+        }
+        let arrival = {
+            let mut incoming = self.incoming.lock().await;
+            // Keep an existing `Notify` so a waiter parked on the live
+            // entry is not stranded by the replay.
+            let arrival = incoming
+                .get(&reservation.operation_id)
+                .map(|slot| slot.arrival.clone())
+                .unwrap_or_else(|| Arc::new(Notify::new()));
+            incoming.insert(
+                reservation.operation_id.clone(),
+                PendingIncoming {
+                    payment_hash: reservation.payment_hash,
+                    payment_hash_hex: lowercase_hex::encode(reservation.payment_hash.0),
+                    amount_msat: reservation.amount_msat,
+                    amount_sat: amount_sat_floor,
+                    deadline: reservation.deadline,
+                    proofs: Mutex::new(Some(proofs)),
+                    arrival: arrival.clone(),
+                },
+            );
+            arrival
+        };
+        arrival.notify_waiters();
+        Ok(())
+    }
+
+    /// Wait until the sender's proofs for this reservation have
+    /// landed. The mint pushes nothing, so this parks on the same
+    /// [`Notify`] the claimer waits on.
+    async fn watch_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        deadline: u64,
+    ) -> Result<(), AdapterError> {
+        let (arrival, reservation_deadline) = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming Cashu reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            if slot.payment_hash != reservation.payment_hash
+                || slot.amount_msat != reservation.amount_msat
+                || slot.deadline != reservation.deadline
+            {
+                return Err(AdapterError::InvalidParams(
+                    "Cashu reservation operation id does not match this payment state".into(),
+                ));
+            }
+            (slot.arrival.clone(), slot.deadline)
+        };
+        let ready = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming Cashu reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            let ready = slot.proofs.lock().await.is_some();
+            ready
+        };
+        if ready {
+            return Ok(());
+        }
+        let deadline = deadline.min(reservation_deadline);
+        loop {
+            if now_unix_secs() >= deadline {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            let wait = deadline.saturating_sub(now_unix_secs()).max(1);
+            if tokio::time::timeout(std::time::Duration::from_secs(wait), arrival.notified())
+                .await
+                .is_err()
+            {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            let ready = {
+                let incoming = self.incoming.lock().await;
+                let Some(slot) = incoming.get(&reservation.operation_id) else {
+                    return Err(AdapterError::NotFound(
+                        "incoming Cashu reservation disappeared".to_string(),
+                    ));
+                };
+                let ready = slot.proofs.lock().await.is_some();
+                ready
+            };
+            if ready {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Claim an accepted incoming HTLC by swapping its locked proofs
+    /// at the mint with `preimage` attached as a witness. The
+    /// locktime is irrelevant on this path (the receiver is
+    /// always allowed to spend per NUT-14).
+    async fn claim_incoming(
+        &self,
+        accepted: &AcceptedIncoming,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let payment_hash = accepted.reservation.payment_hash;
+        // Check the preimage against the hash before it goes anywhere
+        // near the mint: publishing a wrong preimage would make the
+        // whole upstream chain claimable and settle nothing here.
+        if !payment_hash.matches_preimage(&preimage) {
+            return Err(AdapterError::InvalidParams(
+                "preimage does not match the payment hash".into(),
+            ));
+        }
+        let (arrival, deadline, proofs_slot) = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming
+                .get(&accepted.reservation.operation_id)
+                .ok_or_else(|| {
+                    AdapterError::NotFound(format!(
+                        "no incoming Cashu reservation for operation {}",
+                        accepted.reservation.operation_id
+                    ))
+                })?;
+            if slot.payment_hash != payment_hash {
+                return Err(AdapterError::InvalidParams(
+                    "Cashu reservation operation id does not match this payment".into(),
+                ));
+            }
+            let proofs_slot = slot.proofs.lock().await.clone();
+            let arrival = slot.arrival.clone();
+            let slot_deadline = slot.deadline;
+            (arrival, slot_deadline, proofs_slot)
+        };
+        // Block (with a small grace) until the proofs have
+        // landed. The cross-network hop layer populates them
+        // either via accept_incoming (multi-hop path) or via
+        // create_outgoing on this same adapter (single-process test
+        // path).
+        if proofs_slot.is_none() {
+            let grace = wait_grace_secs(deadline);
+            if tokio::time::timeout(std::time::Duration::from_secs(grace), arrival.notified())
+                .await
+                .is_err()
+            {
+                return Err(AdapterError::Network(
+                    "timed out waiting for HTLC proofs to arrive".into(),
+                ));
+            }
+        }
+
+        // Re-read after the (possible) wait.
+        let locked: Proofs = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming
+                .get(&accepted.reservation.operation_id)
+                .ok_or_else(|| {
+                    AdapterError::NotFound(format!(
+                        "no incoming Cashu reservation for operation {}",
+                        accepted.reservation.operation_id
+                    ))
+                })?;
+            let proofs = slot.proofs.lock().await.clone();
+            drop(incoming);
+            proofs.ok_or_else(|| AdapterError::Network("HTLC proofs missing".into()))?
+        };
+        if locked.is_empty() {
+            return Err(AdapterError::Network("HTLC proofs missing".into()));
+        }
+
+        // Sanity check the preimage actually matches the hash
+        // the proofs are locked under. This is the receiver
+        // path of NUT-14 and is what makes the swap at the
+        // mint valid.
+        // This is the point of no return for a payee: adding the
+        // preimage to the witness and swapping at the mint publishes it,
+        // making the whole upstream chain claimable. Log it before it
+        // becomes public knowledge.
+        self.span.in_scope(|| {
+            tracing::info!(
+                target: "cassis_cashu",
+                "revealing preimage to mint for {} ({} proof(s))",
+                payment_hash.short(),
+                locked.len(),
+            );
+        });
+        let mut proofs = locked;
+        let signing_key = cdk::nuts::nut01::SecretKey::from_slice(&self.secret_key)
+            .map_err(|e| AdapterError::Network(format!("invalid Cashu signing key: {e}")))?;
+        add_preimage_to_proofs(&mut proofs, &preimage.0, &signing_key)
+            .map_err(|e| AdapterError::InvalidParams(e.to_string()))?;
+        verify_proofs_htlc(&proofs).map_err(|e| AdapterError::InvalidParams(e.to_string()))?;
+
+        // Build the swap-to-self: outputs use unrestricted
+        // spending conditions (no HTLC, no P2PK) so the
+        // receiver can spend the resulting ecash directly.
+        let keyset_id = proofs[0].keyset_id;
+        let total_sat: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
+        let keyset = self
+            .ensure_keysets()
+            .await
+            .map_err(|e| AdapterError::Network(e.to_string()))?
+            .iter()
+            .find(|k| k.id == keyset_id)
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::Network(format!("mint no longer advertises keyset {keyset_id}"))
+            })?;
+        let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
+        let split = Self::split_for_swap(total_sat, &fee_and_amounts)
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        let keys = self
+            .get_keys(&keyset_id)
+            .await
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        let request = cdk::nuts::nut03::SwapRequest::new(proofs, outputs);
+        let response = self
+            .client
+            .post_swap(request)
+            .await
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        let new_proofs = Self::unblind_response(response, triples, &keys)
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        // Add the freshly-minted proofs to the receiver's wallet
+        // store so the adapter can spend them on future hops.
+        self.add_balance(new_proofs)
+            .await
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        self.span.in_scope(|| {
+            tracing::info!(
+                target: "cassis_cashu",
+                "htlc claimed for {}: {total_sat} sat swapped to unrestricted proofs",
+                payment_hash.short(),
+            );
+        });
+
+        // Drop the receiver's reservation now it is settled.
+        self.incoming
+            .lock()
+            .await
+            .remove(&accepted.reservation.operation_id);
+        Ok(())
+    }
+
+    /// Claim straight from reservation state, for the native receive
+    /// path where the caller only kept the reservation handle. The
+    /// proofs deposited by [`NetworkAdapter::accept_incoming`] (or by
+    /// the same-adapter create path) are all a claim needs, so this
+    /// rebuilds the accepted handle and takes the normal claim route.
+    async fn claim_reserved_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let accepted = self.accepted_incoming(reservation).await?.ok_or_else(|| {
+            AdapterError::Retryable(format!(
+                "Cashu reservation {} is not funded yet",
+                reservation.operation_id
+            ))
+        })?;
+        self.claim_incoming(&accepted, preimage).await
+    }
+
+    /// Lock `request.amount_msat` of ecash behind the route payment
+    /// hash by swapping unrestricted proofs (already in the adapter's
+    /// local balance — see [`CashuAdapter::add_balance`] for the
+    /// funding path) for HTLC-locked ones via NUT-03. The resulting
+    /// proofs are stashed in [`CashuAdapter::outgoing`] and any
+    /// matching incoming waiter is notified; the base64 descriptor
+    /// travels back to the sender inside the returned
+    /// [`OutgoingPayment`].
+    async fn create_outgoing(
+        &self,
+        request: OutgoingRequest,
+    ) -> Result<OutgoingPayment, AdapterError> {
+        let _creation_guard = self.outgoing_creation_lock.lock().await;
+        let recipient = match &request.target {
             HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
             HtlcTarget::PubKey(_)
             | HtlcTarget::LightningInvoice(_)
             | HtlcTarget::SparkAddress(_) => {
-                return Err(HtlcError::InvalidParams(
+                return Err(AdapterError::InvalidParams(
                     "cashu requires a pubkey target".into(),
                 ))
             }
         };
-        if amount_msat == 0 {
-            return Err(HtlcError::InvalidParams("amount must be > 0".into()));
+        if request.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams("amount must be > 0".into()));
         }
+        if request.expiry <= now_unix_secs() {
+            return Err(AdapterError::InvalidParams("expiry in the past".into()));
+        }
+        // Retry of an attempt we already funded: hand back the very
+        // same payment rather than locking the funds a second time.
+        if let Some(existing) = self.funded_outgoing(&request.operation_id).await? {
+            if existing.payment_hash != request.payment_hash
+                || existing.amount_msat != request.amount_msat
+                || existing.destination != request.target
+            {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing retry does not match the operation already in flight".into(),
+                ));
+            }
+            return Ok(existing);
+        }
+        if self
+            .outgoing
+            .lock()
+            .await
+            .values()
+            .any(|slot| slot.payment_hash == request.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Cashu payment hash already has a live outgoing lock".into(),
+            ));
+        }
+        let payment_hash = request.payment_hash;
+        let amount_msat = request.amount_msat;
+        let expiry = request.expiry;
         self.span.in_scope(|| {
             tracing::info!(
                 target: "cassis_cashu",
@@ -609,25 +1306,22 @@ impl NetworkRouterAdapter for CashuAdapter {
                 recipient.to_hex(),
             );
         });
-        if expiry <= now_unix_secs() {
-            return Err(HtlcError::InvalidParams("expiry in the past".into()));
-        }
         let amount_sat = amount_msat.div_ceil(1000).max(1);
         let keyset_id = self
             .active_keyset_id()
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let keysets = self
             .ensure_keysets()
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let keyset = keysets
             .iter()
             .find(|k| k.id == keyset_id)
-            .ok_or_else(|| HtlcError::Network("active keyset disappeared".into()))?
+            .ok_or_else(|| AdapterError::Network("active keyset disappeared".into()))?
             .clone();
         let receiver_pubkey = PublicKey::from_slice(&recipient.0)
-            .map_err(|e| HtlcError::InvalidParams(e.to_string()))?;
+            .map_err(|e| AdapterError::InvalidParams(e.to_string()))?;
 
         // Build the HTLC-locked outputs. The mint signs them
         // under the spending conditions embedded in each
@@ -640,8 +1334,8 @@ impl NetworkRouterAdapter for CashuAdapter {
             &receiver_pubkey,
         )
         .map_err(|e| match e {
-            CashuError::HtlcExpired => HtlcError::InvalidParams("expiry in past".into()),
-            other => HtlcError::Network(other.to_string()),
+            CashuError::HtlcExpired => AdapterError::InvalidParams("expiry in past".into()),
+            other => AdapterError::Network(other.to_string()),
         })?;
         let n_output = outputs.premints.len();
 
@@ -656,11 +1350,11 @@ impl NetworkRouterAdapter for CashuAdapter {
         let available = self
             .store
             .list_proofs(&self.mint_url_str)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let (inputs, inputs_total, fee_sat) =
             Self::pick_inputs(&available, keyset_id, amount_sat, keyset.input_fee_ppk);
         if inputs_total < amount_sat.saturating_add(fee_sat) {
-            return Err(HtlcError::Network(format!(
+            return Err(AdapterError::Network(format!(
                 "insufficient cashu balance: need {} sat (amount + fee), have {} sat",
                 amount_sat.saturating_add(fee_sat),
                 inputs_total
@@ -675,13 +1369,13 @@ impl NetworkRouterAdapter for CashuAdapter {
         let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
         let change_amounts = if change_sat > 0 {
             Self::split_for_swap(change_sat, &fee_and_amounts)
-                .map_err(|e| HtlcError::Network(e.to_string()))?
+                .map_err(|e| AdapterError::Network(e.to_string()))?
         } else {
             Vec::new()
         };
         let (change_triples, change_blinded) =
             Self::fresh_outputs(change_amounts.len(), keyset_id, &change_amounts)
-                .map_err(|e| HtlcError::Network(e.to_string()))?;
+                .map_err(|e| AdapterError::Network(e.to_string()))?;
 
         let mut output_blinded = outputs
             .premints
@@ -690,21 +1384,21 @@ impl NetworkRouterAdapter for CashuAdapter {
             .collect::<Vec<_>>();
         output_blinded.extend(change_blinded);
 
-        let request = cdk::nuts::nut03::SwapRequest::new(inputs.clone(), output_blinded);
+        let swap = cdk::nuts::nut03::SwapRequest::new(inputs.clone(), output_blinded);
         let response = self
             .client
-            .post_swap(request)
+            .post_swap(swap)
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         // The mint burned the input proofs at the swap; drop them
         // from the wallet store so balances stay accurate.
         self.store
             .remove_proofs(&self.mint_url_str, &inputs)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let keys = self
             .get_keys(&keyset_id)
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
 
         // Re-build the (secret, r, amount) triples in the same
         // order so the unblind lines up. The premints carry the
@@ -718,9 +1412,9 @@ impl NetworkRouterAdapter for CashuAdapter {
             .collect();
         triples.extend(change_triples);
         let new_proofs = Self::unblind_response(response, triples, &keys)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         if new_proofs.len() < n_output {
-            return Err(HtlcError::Network(format!(
+            return Err(AdapterError::Network(format!(
                 "mint returned {} proofs, expected at least {n_output}",
                 new_proofs.len()
             )));
@@ -730,241 +1424,126 @@ impl NetworkRouterAdapter for CashuAdapter {
         // the future), so `verify_htlc` cannot validate them; check
         // the secret structure against the payment hash instead.
         verify_proofs_htlc_locked(proofs, &payment_hash.0)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         // Persist the change back to the wallet.
         if !change.is_empty() {
             self.store
                 .insert_proofs(&self.mint_url_str, change)
-                .map_err(|e| HtlcError::Network(e.to_string()))?;
+                .map_err(|e| AdapterError::Network(e.to_string()))?;
         }
 
+        let conditions = htlc_conditions(&payment_hash.0, expiry, &receiver_pubkey)
+            .map_err(|e| AdapterError::InvalidParams(e.to_string()))?;
         {
             let mut outgoing = self.outgoing.lock().await;
             outgoing.insert(
-                payment_hash,
+                request.operation_id.clone(),
                 PendingOutgoing {
+                    payment_hash,
                     amount_sat,
+                    amount_msat,
                     locktime: expiry,
-                    conditions: htlc_conditions(&payment_hash.0, expiry, &receiver_pubkey)
-                        .map_err(|e| HtlcError::InvalidParams(e.to_string()))?,
+                    destination: request.target.clone(),
+                    conditions,
                     keyset_id,
                     proofs: Mutex::new(proofs.to_vec()),
                     recipient: recipient.to_hex(),
                 },
             );
         }
-        // Cross-pollinate the incoming map so a same-process
-        // claim_incoming call (legacy test path) can find the
-        // proofs without going through the cross-network
-        // descriptor. The arrival notify wakes any waiting
-        // claimer.
-        let arrival = {
+        // Cross-pollinate the incoming map for same-adapter receive flows.
+        // The arrival notify wakes any waiting claimer.
+        if let Some(receiver) = self.receiver_operation(payment_hash).await {
             let mut incoming = self.incoming.lock().await;
-            if let Some(slot) = incoming.get_mut(&payment_hash) {
+            if let Some(slot) = incoming.get_mut(&receiver) {
                 *slot.proofs.lock().await = Some(proofs.to_vec());
-                Some(slot.arrival.clone())
-            } else {
-                None
+                slot.arrival.notify_one();
             }
-        };
-        if let Some(arrival) = arrival {
-            arrival.notify_one();
         }
 
-        Ok(OutgoingHtlc {
-            payment_hash,
-            amount_msat,
-            expiry,
-            recipient: recipient.to_hex(),
-            network: self.network_id.clone(),
-        })
+        // Hand back the handle built from the state we just recorded,
+        // so a retry can never see a different descriptor.
+        self.funded_outgoing(&request.operation_id)
+            .await
+            .map(|payment| payment.expect("outgoing lock just recorded"))
     }
 
-    /// Claim an incoming HTLC by swapping its locked proofs at
-    /// the mint with `preimage` attached as a witness. The
-    /// locktime is irrelevant on this path (the receiver is
-    /// always allowed to spend per NUT-14).
-    async fn restore_outgoing_htlc(
-        &self,
-        payment: &OutgoingPayment,
-        descriptor: Option<&HtlcDescriptor>,
-    ) -> Result<(), HtlcError> {
-        let proofs = proofs_from_descriptor(descriptor.ok_or(HtlcError::Unimplemented)?)?;
+    /// Re-arm the sender-side watcher for a funded outgoing HTLC.
+    /// Everything needed lives in `payment.descriptor`, so a journal
+    /// replay rebuilds the state without asking the mint.
+    async fn restore_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        let proofs = proofs_from_descriptor(&payment.descriptor)?;
         if proofs.is_empty() {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "empty Cashu HTLC descriptor".into(),
             ));
         }
         let conditions = SpendingConditions::try_from(&proofs[0].secret)
-            .map_err(|e| HtlcError::InvalidParams(format!("decode Cashu conditions: {e}")))?;
+            .map_err(|e| AdapterError::InvalidParams(format!("decode Cashu conditions: {e}")))?;
         let locktime = match &conditions {
             SpendingConditions::HTLCConditions {
                 data,
                 conditions: Some(conditions),
             } => {
                 if data.as_byte_array() != &payment.payment_hash.0 {
-                    return Err(HtlcError::InvalidParams(
+                    return Err(AdapterError::InvalidParams(
                         "Cashu descriptor hash does not match outgoing payment".into(),
                     ));
                 }
                 conditions.locktime.ok_or_else(|| {
-                    HtlcError::InvalidParams("Cashu HTLC has no refund locktime".into())
+                    AdapterError::InvalidParams("Cashu HTLC has no refund locktime".into())
                 })?
             }
             _ => {
-                return Err(HtlcError::InvalidParams(
+                return Err(AdapterError::InvalidParams(
                     "descriptor is not a Cashu HTLC".into(),
                 ))
             }
         };
         let amount_sat: u64 = proofs.iter().map(|proof| u64::from(proof.amount)).sum();
         if amount_sat < payment.amount_msat.div_ceil(1000) {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "Cashu descriptor amount is below outgoing payment".into(),
             ));
         }
-        let keyset_id = proofs[0].keyset_id;
+        // Already tracking this attempt: keep the live proofs rather
+        // than swapping in the journal copy.
+        {
+            let outgoing = self.outgoing.lock().await;
+            if let Some(slot) = outgoing.get(&payment.operation_id) {
+                return if slot.payment_hash == payment.payment_hash {
+                    Ok(())
+                } else {
+                    Err(AdapterError::InvalidParams(
+                        "outgoing operation id is already funding another payment hash".into(),
+                    ))
+                };
+            }
+        }
+        let recipient = match &payment.destination {
+            HtlcTarget::XOnlyPubKey(pubkey) => pubkey.to_hex(),
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
+                return Err(AdapterError::InvalidParams(
+                    "cashu requires a pubkey destination".into(),
+                ))
+            }
+        };
         self.outgoing.lock().await.insert(
-            payment.payment_hash,
+            payment.operation_id.clone(),
             PendingOutgoing {
+                payment_hash: payment.payment_hash,
                 amount_sat,
+                amount_msat: payment.amount_msat,
                 locktime,
+                destination: payment.destination.clone(),
                 conditions,
-                keyset_id,
+                keyset_id: proofs[0].keyset_id,
                 proofs: Mutex::new(proofs),
-                recipient: match &payment.destination {
-                    HtlcTarget::XOnlyPubKey(pubkey) => pubkey.to_hex(),
-                    HtlcTarget::PubKey(_)
-                    | HtlcTarget::LightningInvoice(_)
-                    | HtlcTarget::SparkAddress(_) => {
-                        return Err(HtlcError::InvalidParams(
-                            "cashu requires a pubkey destination".into(),
-                        ))
-                    }
-                },
+                recipient,
             },
         );
-        Ok(())
-    }
-
-    async fn claim_incoming(
-        &self,
-        payment_hash: Bytes32,
-        preimage: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let (arrival, deadline, proofs_slot) = {
-            let incoming = self.incoming.lock().await;
-            match incoming.get(&payment_hash) {
-                Some(s) => (s.arrival.clone(), s.deadline, s.proofs.lock().await.clone()),
-                None => {
-                    return Err(HtlcError::InvalidParams(format!(
-                        "no incoming HTLC registered for {payment_hash:?}"
-                    )));
-                }
-            }
-        };
-        // Block (with a small grace) until the proofs have
-        // landed. The cross-network hop layer populates them
-        // either via create_outgoing_htlc (same-process test
-        // path) or via accept_incoming_htlc (multi-hop path).
-        if proofs_slot.is_none() {
-            let grace = wait_grace_secs(deadline);
-            if tokio::time::timeout(std::time::Duration::from_secs(grace), arrival.notified())
-                .await
-                .is_err()
-            {
-                return Err(HtlcError::Network(
-                    "timed out waiting for HTLC proofs to arrive".into(),
-                ));
-            }
-        }
-
-        // Re-read after the (possible) wait.
-        let locked: Proofs = {
-            let incoming = self.incoming.lock().await;
-            let slot = incoming.get(&payment_hash).ok_or_else(|| {
-                HtlcError::Network(format!("no incoming HTLC for {payment_hash:?}"))
-            })?;
-            let proofs = slot.proofs.lock().await.clone();
-            drop(incoming);
-            proofs.ok_or_else(|| HtlcError::Network("HTLC proofs missing".into()))?
-        };
-        if locked.is_empty() {
-            return Err(HtlcError::Network("HTLC proofs missing".into()));
-        }
-
-        // Sanity check the preimage actually matches the hash
-        // the proofs are locked under. This is the receiver
-        // path of NUT-14 and is what makes the swap at the
-        // mint valid.
-        // This is the point of no return for a payee: adding the
-        // preimage to the witness and swapping at the mint publishes it,
-        // making the whole upstream chain claimable. Log it before it
-        // becomes public knowledge.
-        self.span.in_scope(|| {
-            tracing::info!(
-                target: "cassis_cashu",
-                "revealing preimage to mint for {}: preimage={} ({} proof(s))",
-                payment_hash.short(),
-                preimage,
-                locked.len(),
-            );
-        });
-        let mut proofs = locked;
-        let signing_key = cdk::nuts::nut01::SecretKey::from_slice(&self.secret_key)
-            .map_err(|e| HtlcError::Network(format!("invalid Cashu signing key: {e}")))?;
-        add_preimage_to_proofs(&mut proofs, &preimage.0, &signing_key)
-            .map_err(|e| HtlcError::InvalidParams(e.to_string()))?;
-        verify_proofs_htlc(&proofs).map_err(|e| HtlcError::InvalidParams(e.to_string()))?;
-
-        // Build the swap-to-self: outputs use unrestricted
-        // spending conditions (no HTLC, no P2PK) so the
-        // receiver can spend the resulting ecash directly.
-        let keyset_id = proofs[0].keyset_id;
-        let total_sat: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
-        let keyset = self
-            .ensure_keysets()
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?
-            .iter()
-            .find(|k| k.id == keyset_id)
-            .cloned()
-            .ok_or_else(|| {
-                HtlcError::Network(format!("mint no longer advertises keyset {keyset_id}"))
-            })?;
-        let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
-        let split = Self::split_for_swap(total_sat, &fee_and_amounts)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let keys = self
-            .get_keys(&keyset_id)
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let request = cdk::nuts::nut03::SwapRequest::new(proofs, outputs);
-        let response = self
-            .client
-            .post_swap(request)
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let new_proofs = Self::unblind_response(response, triples, &keys)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        // Add the freshly-minted proofs to the receiver's wallet
-        // store so the adapter can spend them on future hops.
-        self.add_balance(new_proofs)
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        self.span.in_scope(|| {
-            tracing::info!(
-                target: "cassis_cashu",
-                "htlc claimed for {}: {total_sat} sat swapped to unrestricted proofs",
-                payment_hash.short(),
-            );
-        });
-
-        // Drop the receiver's wait registration.
-        let mut incoming = self.incoming.lock().await;
-        incoming.remove(&payment_hash);
         Ok(())
     }
 
@@ -972,22 +1551,31 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// We swap the locked proofs back at the mint with
     /// unrestricted output conditions (no witness). NUT-14
     /// allows the sender path once the locktime is reached.
-    async fn refund_outgoing(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
+    async fn refund_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
         let (proofs, locktime) = {
             let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
+            let slot = outgoing.get(&payment.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no outgoing Cashu lock for operation {}",
+                    payment.operation_id
+                ))
             })?;
+            if slot.payment_hash != payment.payment_hash {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing operation id does not match this payment".into(),
+                ));
+            }
             let proofs = slot.proofs.lock().await.clone();
-            (proofs, slot.locktime)
+            let locktime = slot.locktime;
+            (proofs, locktime)
         };
         if proofs.is_empty() {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "outgoing HTLC has no proofs".into(),
             ));
         }
         if now_unix_secs() <= locktime {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::Retryable(
                 "locktime has not yet passed; cannot refund".into(),
             ));
         }
@@ -996,37 +1584,36 @@ impl NetworkRouterAdapter for CashuAdapter {
         let keyset = self
             .ensure_keysets()
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?
+            .map_err(|e| AdapterError::Network(e.to_string()))?
             .iter()
             .find(|k| k.id == keyset_id)
             .cloned()
             .ok_or_else(|| {
-                HtlcError::Network(format!("mint no longer advertises keyset {keyset_id}"))
+                AdapterError::Network(format!("mint no longer advertises keyset {keyset_id}"))
             })?;
         let fee_and_amounts = Self::build_fee_and_amounts(&keyset);
         let split = Self::split_for_swap(total_sat, &fee_and_amounts)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let keys = self
             .get_keys(&keyset_id)
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let (triples, outputs) = Self::fresh_outputs(split.len(), keyset_id, &split)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let request = cdk::nuts::nut03::SwapRequest::new(proofs, outputs);
         let response = self
             .client
             .post_swap(request)
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         // The refunded proofs are unrestricted ecash we hold again;
         // persist them so the wallet can spend them later.
         let refunded = Self::unblind_response(response, triples, &keys)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         self.add_balance(refunded)
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let mut outgoing = self.outgoing.lock().await;
-        outgoing.remove(&payment_hash);
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
+        self.outgoing.lock().await.remove(&payment.operation_id);
         Ok(())
     }
 
@@ -1035,28 +1622,37 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// any proof is `SPENT`, the receiver has swapped it (with
     /// the preimage witness) and we can read the preimage off
     /// the proof's witness.
-    async fn watch_preimage(
+    async fn watch_outgoing(
         &self,
-        payment_hash: Bytes32,
+        payment: &OutgoingPayment,
         deadline: u64,
-    ) -> Result<Bytes32, WatchError> {
+    ) -> Result<Bytes32, AdapterError> {
         let proofs: Proofs = {
             let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                WatchError::Network(format!("no outgoing HTLC for {payment_hash:?}"))
+            let slot = outgoing.get(&payment.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no outgoing Cashu lock for operation {}",
+                    payment.operation_id
+                ))
             })?;
+            if slot.payment_hash != payment.payment_hash {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing operation id does not match this payment".into(),
+                ));
+            }
             let proofs = slot.proofs.lock().await.clone();
             drop(outgoing);
             proofs
         };
         if proofs.is_empty() {
-            return Err(WatchError::Network("outgoing HTLC has no proofs".into()));
+            return Err(AdapterError::Network("outgoing HTLC has no proofs".into()));
         }
+        let payment_hash = payment.payment_hash;
         let ys: Vec<_> = proofs
             .iter()
             .map(proof_y)
             .collect::<CashuResult<Vec<_>>>()
-            .map_err(|e| WatchError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let req = CheckStateRequest { ys };
 
         let poll_interval = std::time::Duration::from_secs(2);
@@ -1065,7 +1661,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                 .client
                 .post_check_state(req.clone())
                 .await
-                .map_err(|e| WatchError::Network(e.to_string()))?;
+                .map_err(|e| AdapterError::Network(e.to_string()))?;
             let spent = resp
                 .states
                 .iter()
@@ -1075,30 +1671,35 @@ impl NetworkRouterAdapter for CashuAdapter {
                 let preimage_hex = match spent.witness.as_ref() {
                     Some(Witness::HTLCWitness(HTLCWitness { preimage, .. })) => preimage.clone(),
                     _ => {
-                        return Err(WatchError::Network(
+                        return Err(AdapterError::Network(
                             "HTLC spent but no preimage in witness (refund path?)".into(),
                         ));
                     }
                 };
                 let bytes = cdk::util::hex::decode(&preimage_hex)
-                    .map_err(|e| WatchError::Network(format!("decode preimage: {e}")))?;
+                    .map_err(|e| AdapterError::Network(format!("decode preimage: {e}")))?;
                 if bytes.len() != 32 {
-                    return Err(WatchError::Network("preimage wrong length".into()));
+                    return Err(AdapterError::Network("preimage wrong length".into()));
                 }
                 let mut out = [0u8; 32];
                 out.copy_from_slice(&bytes);
                 let preimage = Bytes32(out);
+                if !payment_hash.matches_preimage(&preimage) {
+                    return Err(AdapterError::Network(
+                        "mint revealed a preimage for a different payment hash".into(),
+                    ));
+                }
                 self.span.in_scope(|| {
                     tracing::info!(
                         target: "cassis_cashu",
-                        "preimage revealed in mint witness for {}: preimage={preimage}",
+                        "preimage revealed in mint witness for {}",
                         payment_hash.short(),
                     );
                 });
                 return Ok(preimage);
             }
             if now_unix_secs() >= deadline {
-                return Err(WatchError::DeadlineExceeded);
+                return Err(AdapterError::DeadlineExceeded);
             }
             tokio::time::sleep(poll_interval).await;
         }
@@ -1107,19 +1708,19 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// PREPARE-time check: do we have enough unrestricted ecash
     /// in the wallet store to back an outgoing HTLC of
     /// `amount_msat`? We round up to sats the same way
-    /// [`NetworkRouterAdapter::create_outgoing_htlc`] does, so
+    /// [`NetworkAdapter::create_outgoing`] does, so
     /// a green light here means the actual swap won't fail for
     /// lack of funds.
-    async fn can_route(&self, amount_msat: u64) -> Result<(), HtlcError> {
+    async fn can_route(&self, amount_msat: u64) -> Result<(), AdapterError> {
         let amount_sat = amount_msat.div_ceil(1000).max(1);
         let keyset_id = self
             .active_keyset_id()
             .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         let proofs = self
             .store
             .list_proofs(&self.mint_url_str)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
 
         let total_sat: u64 = proofs
             .iter()
@@ -1127,120 +1728,57 @@ impl NetworkRouterAdapter for CashuAdapter {
             .map(|p| u64::from(p.amount))
             .sum();
         if total_sat < amount_sat {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "insufficient cashu balance: need {amount_sat} sat, have {total_sat} sat"
             )));
         }
         Ok(())
     }
 
-    /// DISPATCH-time verify: does `descriptor` decode to NUT-14
-    /// HTLC proofs locked to `payment_hash`? Caller is the hop's
-    /// *incoming* adapter, called right after the router receives
-    /// a DISPATCH and before it commits an outgoing HTLC.
-    async fn verify_incoming_htlc(
-        &self,
-        descriptor: &HtlcDescriptor,
-        payment_hash: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let proofs = proofs_from_descriptor(descriptor)?;
-        verify_proofs_htlc_locked(&proofs, &payment_hash.0)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+    /// Claiming a Cashu HTLC swaps proofs we already hold for
+    /// unrestricted ones at the mint: the claim costs no balance of
+    /// its own, so there is nothing to pre-check here.
+    async fn can_claim(&self, _amount_msat: u64) -> Result<(), AdapterError> {
         Ok(())
     }
+}
 
-    /// DISPATCH-time accept: store the proofs from `descriptor` in
-    /// the incoming map and notify any waiting claimer. Called
-    /// after [`NetworkRouterAdapter::verify_incoming_htlc`]
-    /// succeeds. The hop is then free to create its outgoing
-    /// HTLC.
-    async fn accept_incoming_htlc(
-        &self,
-        payment_hash: Bytes32,
-        descriptor: &HtlcDescriptor,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
-        let proofs = proofs_from_descriptor(descriptor)?;
-        verify_proofs_htlc_locked(&proofs, &payment_hash.0)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let amount_sat: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
-        let payment_hash_hex = lowercase_hex::encode(payment_hash.0);
-        let mut incoming = self.incoming.lock().await;
-        match incoming.get_mut(&payment_hash) {
-            Some(slot) => {
-                *slot.proofs.lock().await = Some(proofs);
-            }
-            None => {
-                let slot = PendingIncoming {
-                    payment_hash_hex,
-                    amount_sat,
-                    deadline,
-                    proofs: Mutex::new(Some(proofs)),
-                    arrival: Arc::new(Notify::new()),
-                };
-                incoming.insert(payment_hash, slot);
-            }
-        }
-        let arrival = incoming
-            .get(&payment_hash)
-            .map(|s| s.arrival.clone())
-            .ok_or_else(|| HtlcError::Network("incoming slot vanished".into()))?;
-        drop(incoming);
-        arrival.notify_one();
-        Ok(())
+/// Serialize a NUT-14 proof list into the wire descriptor the hop
+/// protocol carries. The reverse direction is
+/// [`proofs_from_descriptor`].
+fn cashu_descriptor(proofs: &Proofs) -> Result<HtlcDescriptor, AdapterError> {
+    if proofs.is_empty() {
+        return Err(AdapterError::Network("outgoing HTLC has no proofs".into()));
     }
-
-    /// DISPATCH-time accessor: serialize the proofs of the
-    /// outgoing HTLC just produced by
-    /// [`NetworkRouterAdapter::create_outgoing_htlc`] as a
-    /// [`HtlcDescriptor::Cashu`] for the hop's reply.
-    async fn outgoing_htlc_descriptor(
-        &self,
-        payment_hash: Bytes32,
-    ) -> Result<HtlcDescriptor, HtlcError> {
-        let proofs: Proofs = {
-            let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
-            })?;
-            let cloned = slot.proofs.lock().await.clone();
-            let _ = slot;
-            let _ = outgoing;
-            cloned
-        };
-        if proofs.is_empty() {
-            return Err(HtlcError::Network("outgoing HTLC has no proofs".into()));
-        }
-        let mut encoded = Vec::with_capacity(proofs.len());
-        for proof in &proofs {
-            let json = serde_json::to_string(proof)
-                .map_err(|e| HtlcError::Network(format!("encode proof: {e}")))?;
-            encoded.push(BASE64.encode(json.as_bytes()));
-        }
-        Ok(HtlcDescriptor::Cashu {
-            proofs_b64: encoded,
-        })
+    let mut encoded = Vec::with_capacity(proofs.len());
+    for proof in proofs {
+        let json = serde_json::to_string(proof)
+            .map_err(|e| AdapterError::Network(format!("encode proof: {e}")))?;
+        encoded.push(BASE64.encode(json.as_bytes()));
     }
+    Ok(HtlcDescriptor::Cashu {
+        proofs_b64: encoded,
+    })
 }
 
 /// Decode the base64-encoded NUT-14 proof list out of a
 /// [`HtlcDescriptor::Cashu`]. Any other variant is a hard error:
 /// cashu is the only network with a populated descriptor today.
-fn proofs_from_descriptor(descriptor: &HtlcDescriptor) -> Result<Proofs, HtlcError> {
+fn proofs_from_descriptor(descriptor: &HtlcDescriptor) -> Result<Proofs, AdapterError> {
     match descriptor {
         HtlcDescriptor::Cashu { proofs_b64 } => {
             let mut out = Vec::with_capacity(proofs_b64.len());
             for s in proofs_b64 {
                 let raw = BASE64
                     .decode(s)
-                    .map_err(|e| HtlcError::Network(format!("base64 decode: {e}")))?;
+                    .map_err(|e| AdapterError::Network(format!("base64 decode: {e}")))?;
                 let proof: Proof = serde_json::from_slice(&raw)
-                    .map_err(|e| HtlcError::Network(format!("decode proof: {e}")))?;
+                    .map_err(|e| AdapterError::Network(format!("decode proof: {e}")))?;
                 out.push(proof);
             }
             Ok(out)
         }
-        other => Err(HtlcError::Network(format!(
+        other => Err(AdapterError::Network(format!(
             "unsupported htlc descriptor for cashu network: {other:?}"
         ))),
     }

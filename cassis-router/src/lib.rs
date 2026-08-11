@@ -15,16 +15,19 @@
 #[cfg(feature = "cashu")]
 use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
-    network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDiscard,
-    HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, HtlcError,
-    NetworkId, NetworkRouterAdapter, WatchError,
+    network_id_for_spec, normalize_network_id, AcceptedIncoming, AdapterError, Bytes32, HopCommit,
+    HopCommitted, HopDiscard, HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared,
+    HtlcDescriptor, HtlcTarget, IncomingRequest, IncomingReservation, NetworkAdapter, NetworkId,
+    OperationId, OutgoingPayment, OutgoingRequest,
 };
 use cassis_iroh::{Frame, IrohError, IrohServer, PublicKey};
 use cassis_keys as keys;
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(feature = "liquid")]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -43,6 +46,11 @@ const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol",
 /// preimage.
 const POLL_INTERVAL_SECS: u64 = 30;
 
+/// Current on-disk router journal format. Bump whenever pending or
+/// dispatched state shape changes; old journals are intentionally not
+/// migrated.
+const ROUTER_JOURNAL_VERSION: u8 = 4;
+
 /// Top-level configuration for [`run_router`].
 #[derive(Clone)]
 pub struct RouterConfig {
@@ -60,6 +68,9 @@ pub struct RouterConfig {
     pub derived_keys: keys::DerivedKeys,
     /// Span identifying node that owns router and its adapter calls.
     pub span: Span,
+    /// Optional durable router journal. Funded outgoing HTLC state is
+    /// written here before the router acknowledges DISPATCH.
+    pub state_path: Option<PathBuf>,
     /// Parent directory for persistent Liquid wallet state.
     /// Each Liquid network gets its own child directory.
     #[cfg(feature = "liquid")]
@@ -83,7 +94,7 @@ pub struct RouterConfig {
     /// wallet state). When an entry's [`NetworkId`] matches a
     /// spec below it is used instead of building a fresh
     /// adapter for that network.
-    pub prebuilt_adapters: Vec<Arc<dyn NetworkRouterAdapter>>,
+    pub prebuilt_adapters: Vec<Arc<dyn NetworkAdapter>>,
     /// Optional hook run before a PREPARE is accepted, so a caller
     /// (e.g. a test) can veto a payment for arbitrary reasons. When it
     /// returns `Some(reason)`, the PREPARE is rejected with that reason;
@@ -113,8 +124,7 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
 
     info!(
         target: "cassis_router",
-        "derived nostr signing key: {} ({})",
-        config.derived_keys.nostr.to_nsec(),
+        "derived nostr signing pubkey: {}",
         config.derived_keys.nostr.pubkey().to_hex()
     );
     for (network_id, sk) in &config.derived_keys.networks {
@@ -183,11 +193,16 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
         config.nostr_relays.clone()
     };
 
-    let router = Arc::new(CassisRouter::new(
+    let router = Arc::new(CassisRouter::new_with_state(
         adapters,
         config.span,
         config.prepare_veto.clone(),
+        config.state_path.clone(),
     ));
+    router
+        .restore_state_from_disk()
+        .await
+        .map_err(|error| format!("restore router state: {error}"))?;
     let handler_router = router.clone();
     let poll_router = router.clone();
     let server_span = router.span.clone();
@@ -250,18 +265,13 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Per-network entry the router tracks. The router holds a
-/// [`NetworkRouterAdapter`] (the low-level HTLC-instrument
-/// trait) and *never* a `NetworkReceiverAdapter` or
-/// `NetworkSenderAdapter` (those are user-facing wrappers
-/// used by `cassis-cli`). `incoming_delta_secs` is read off
-/// the same adapter at construction and cached, so the
-/// router can validate timelocks without ever calling into
-/// any user-facing trait.
+/// Per-network entry the router tracks. Router and client use the same
+/// direct [`NetworkAdapter`] object; no wrapper or separate user-facing
+/// trait exists.
 #[derive(Clone)]
 pub struct NetworkEntry {
     pub network_id: NetworkId,
-    pub adapter: Arc<dyn NetworkRouterAdapter>,
+    pub adapter: Arc<dyn NetworkAdapter>,
     pub incoming_delta_secs: u64,
 }
 
@@ -277,7 +287,8 @@ pub struct NetworkEntry {
     feature = "rootstock",
     feature = "arkade",
     feature = "bitcoin",
-    feature = "liquid"
+    feature = "liquid",
+    feature = "spark"
 ))]
 fn network_sk(derived: &keys::DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32], String> {
     derived
@@ -316,7 +327,7 @@ async fn build_adapter(
             // advertises the matching identity via `claim_pubkey()`, so
             // upstream hops lock proofs to a key we can actually spend.
             let sk = network_sk(derived, &network_id)?;
-            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
+            let adapter: Arc<dyn NetworkAdapter> = Arc::new(
                 cassis_cashu::CashuAdapter::new(
                     network_id.clone(),
                     mint_url,
@@ -357,7 +368,7 @@ async fn build_adapter(
                 "network 'fedimint' requires a fedimint_data_dir in the router config"
                     .to_string()
             })?;
-            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
+            let adapter: Arc<dyn NetworkAdapter> = Arc::new(
                 cassis_fedimint::FedimintAdapter::new(
                     network_id.clone(),
                     invite.to_string(),
@@ -407,7 +418,7 @@ async fn build_adapter(
             cfg.persist_dir = liquid_store_dir.map(|dir| {
                 dir.join(network_id.0.replace("::", "_"))
             });
-            let adapter: Arc<dyn NetworkRouterAdapter> = cassis_liquid::LiquidAdapter::new(cfg)
+            let adapter: Arc<dyn NetworkAdapter> = cassis_liquid::LiquidAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("liquid adapter init failed: {e}"))?;
             let incoming_delta_secs = adapter.incoming_delta_secs();
@@ -445,7 +456,7 @@ async fn build_adapter(
                 derived.invoice.pubkey(),
                 span.clone(),
             );
-            let adapter: Arc<dyn NetworkRouterAdapter> = cassis_arkade::ArkadeAdapter::new(cfg)
+            let adapter: Arc<dyn NetworkAdapter> = cassis_arkade::ArkadeAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("arkade adapter init failed: {e}"))?;
             let incoming_delta_secs = adapter.incoming_delta_secs();
@@ -485,7 +496,7 @@ async fn build_adapter(
                 span.clone(),
             )
             .map_err(|e| format!("bitcoin adapter config: {e}"))?;
-            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
+            let adapter: Arc<dyn NetworkAdapter> = Arc::new(
                 cassis_bitcoin::BitcoinAdapter::new(cfg)
                     .await
                     .map_err(|e| format!("bitcoin adapter init failed: {e}"))?,
@@ -527,7 +538,7 @@ async fn build_adapter(
                 derived.invoice.pubkey(),
                 span.clone(),
             );
-            let adapter: Arc<dyn NetworkRouterAdapter> = cassis_rootstock::RootstockAdapter::new(cfg)
+            let adapter: Arc<dyn NetworkAdapter> = cassis_rootstock::RootstockAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
             let incoming_delta_secs = adapter.incoming_delta_secs();
@@ -544,6 +555,36 @@ async fn build_adapter(
                 .into(),
         ),
 
+        #[cfg(feature = "spark")]
+        "spark" => {
+            if param.is_some() {
+                return Err("network 'spark' does not accept parameters".to_string());
+            }
+            let network_id = NetworkId("spark".to_string());
+            let sk = network_sk(derived, &network_id)?;
+            let adapter = cassis_spark::SparkAdapter::new(
+                network_id.clone(),
+                cassis_spark::SparkConfig::default(),
+                sk,
+                derived.invoice.pubkey(),
+                span.clone(),
+            )
+            .await
+            .map_err(|error| format!("spark adapter init failed: {error}"))?;
+            let adapter: Arc<dyn NetworkAdapter> = adapter;
+            let incoming_delta_secs = adapter.incoming_delta_secs();
+            Ok(NetworkEntry {
+                network_id,
+                adapter,
+                incoming_delta_secs,
+            })
+        }
+        #[cfg(not(feature = "spark"))]
+        "spark" => Err(
+            "network 'spark' requested but cassis-router was not compiled with the 'spark' feature"
+                .into(),
+        ),
+
         #[cfg(feature = "lightning")]
         "lightning" => {
             let config = lnd_config.ok_or_else(|| {
@@ -557,7 +598,7 @@ async fn build_adapter(
             )
             .await
             .map_err(|error| format!("LND adapter init failed: {error}"))?;
-            let adapter: Arc<dyn NetworkRouterAdapter> = adapter;
+            let adapter: Arc<dyn NetworkAdapter> = adapter;
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
@@ -578,14 +619,46 @@ async fn build_adapter(
 /// Per-dispatch state the router retains between DISPATCH
 /// and the eventual claim. `outgoing_deadline` is the
 /// unix-second cutoff the router passes to the adapter's
-/// `watch_preimage`; once exceeded, the dispatch is refunded
+/// `watch_outgoing`; once exceeded, the dispatch is refunded
 /// (outgoing side) and the incoming side is left to expire
 /// on its own.
+#[derive(Clone, Serialize, Deserialize)]
 struct DispatchedHop {
+    operation_id: OperationId,
+    owner: String,
     prepare: HopPrepare,
+    reservation: IncomingReservation,
+    accepted: AcceptedIncoming,
+    outgoing: OutgoingPayment,
     /// Unix seconds; the router stops polling after this and
     /// runs the refund path on the outgoing side.
     outgoing_deadline: u64,
+}
+
+/// Write-ahead state for a DISPATCH whose external side effects have not
+/// all completed yet. The record exists before `accept_incoming` and
+/// `create_outgoing` run, so a crash cannot make a funded outgoing HTLC
+/// unreachable to recovery.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingDispatch {
+    operation_id: OperationId,
+    owner: String,
+    prepare: HopPrepare,
+    reservation: IncomingReservation,
+    incoming_descriptor: HtlcDescriptor,
+    outgoing_target: HtlcTarget,
+    outgoing_operation_id: OperationId,
+    accepted: Option<AcceptedIncoming>,
+    outgoing: Option<OutgoingPayment>,
+    /// In-process guard. Reset on journal restore after a crash.
+    processing: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RouterJournal {
+    version: u8,
+    pending: Vec<PendingDispatch>,
+    dispatched: Vec<DispatchedHop>,
 }
 
 pub struct CassisRouter {
@@ -594,7 +667,11 @@ pub struct CassisRouter {
     /// must be instrumented with this, or its logs lose the node name.
     span: Span,
     prepared: Arc<Mutex<Vec<PreparedEntry>>>,
-    dispatched: Arc<Mutex<HashMap<Bytes32, DispatchedHop>>>,
+    pending: Arc<Mutex<HashMap<OperationId, PendingDispatch>>>,
+    dispatched: Arc<Mutex<HashMap<OperationId, DispatchedHop>>>,
+    state_path: Option<PathBuf>,
+    state_write_lock: Arc<Mutex<()>>,
+    settled: Arc<Mutex<HashMap<OperationId, String>>>,
     /// See [`RouterConfig::prepare_veto`].
     prepare_veto: Option<PrepareVeto>,
 }
@@ -605,13 +682,367 @@ impl CassisRouter {
         span: Span,
         prepare_veto: Option<PrepareVeto>,
     ) -> Self {
+        Self::new_with_state(adapters, span, prepare_veto, None)
+    }
+
+    pub fn new_with_state(
+        adapters: HashMap<NetworkId, NetworkEntry>,
+        span: Span,
+        prepare_veto: Option<PrepareVeto>,
+        state_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             adapters,
             span,
             prepared: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
             dispatched: Arc::new(Mutex::new(HashMap::new())),
+            state_path,
+            state_write_lock: Arc::new(Mutex::new(())),
+            settled: Arc::new(Mutex::new(HashMap::new())),
             prepare_veto,
         }
+    }
+
+    async fn restore_state_from_disk(&self) -> Result<(), String> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let journal: RouterJournal = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("decode {}: {error}", path.display()))?;
+        if journal.version != ROUTER_JOURNAL_VERSION {
+            return Err(format!(
+                "unsupported router state version {} in {}",
+                journal.version,
+                path.display()
+            ));
+        }
+
+        for mut pending in journal.pending {
+            pending.processing = false;
+            if let Some(incoming) = self.adapters.get(&pending.prepare.incoming_network) {
+                if let Err(error) = incoming
+                    .adapter
+                    .restore_incoming_reservation(&pending.reservation)
+                    .await
+                {
+                    warn!(
+                        target: "cassis_router",
+                        "restore pending reservation for operation_id={} failed: {error}; will retry from journal",
+                        pending.operation_id,
+                    );
+                }
+                if let Some(accepted) = pending.accepted.as_ref() {
+                    if let Err(error) = incoming.adapter.restore_incoming(accepted).await {
+                        warn!(
+                            target: "cassis_router",
+                            "restore pending accepted state for operation_id={} failed: {error}; will retry from journal",
+                            pending.operation_id,
+                        );
+                    }
+                }
+            }
+            if let (Some(outgoing), Some(payment)) = (
+                self.adapters.get(&pending.prepare.outgoing_network),
+                pending.outgoing.as_ref(),
+            ) {
+                if let Err(error) = outgoing.adapter.restore_outgoing(payment).await {
+                    warn!(
+                        target: "cassis_router",
+                        "restore pending outgoing state for operation_id={} failed: {error}; will retry from journal",
+                        pending.operation_id,
+                    );
+                }
+            }
+            self.pending
+                .lock()
+                .await
+                .insert(pending.operation_id.clone(), pending);
+        }
+
+        let restored_count = journal.dispatched.len();
+        for hop in journal.dispatched {
+            if let Some(incoming) = self.adapters.get(&hop.prepare.incoming_network) {
+                if let Err(error) = incoming.adapter.restore_incoming(&hop.accepted).await {
+                    warn!(
+                        target: "cassis_router",
+                        "restore incoming state for operation_id={} failed: {error}; will retry from journal",
+                        hop.operation_id,
+                    );
+                }
+            }
+            if let Some(outgoing) = self.adapters.get(&hop.prepare.outgoing_network) {
+                let payment = hop.outgoing.clone();
+                if let Err(error) = outgoing.adapter.restore_outgoing(&payment).await {
+                    warn!(
+                        target: "cassis_router",
+                        "restore outgoing state for operation_id={} failed: {error}; will retry from journal",
+                        hop.operation_id,
+                    );
+                }
+            }
+            self.dispatched
+                .lock()
+                .await
+                .insert(hop.operation_id.clone(), hop);
+        }
+        self.recover_pending_dispatches().await;
+        info!(
+            target: "cassis_router",
+            "restored {} funded dispatch(es) from {}",
+            restored_count,
+            path.display(),
+        );
+        Ok(())
+    }
+
+    async fn persist_state_to_disk(&self) -> Result<(), String> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let _guard = self.state_write_lock.lock().await;
+        let pending = self.pending.lock().await;
+        let dispatched = self.dispatched.lock().await;
+        let journal = RouterJournal {
+            version: ROUTER_JOURNAL_VERSION,
+            pending: pending.values().cloned().collect(),
+            dispatched: dispatched.values().cloned().collect(),
+        };
+        drop(dispatched);
+        drop(pending);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create state directory: {error}"))?;
+        }
+        let encoded = serde_json::to_vec(&journal)
+            .map_err(|error| format!("encode router state: {error}"))?;
+        let temporary = path.with_extension(format!(
+            "{}.tmp",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("state")
+        ));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)
+                .map_err(|error| format!("create router state: {error}"))?;
+            file.write_all(&encoded)
+                .map_err(|error| format!("write router state: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("sync router state: {error}"))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&temporary)
+                .map_err(|error| format!("read router state permissions: {error}"))?
+                .permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&temporary, permissions)
+                .map_err(|error| format!("set router state permissions: {error}"))?;
+        }
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("replace router state: {error}"))?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync router state directory: {error}"))?;
+        }
+        Ok(())
+    }
+
+    async fn store_pending(&self, pending: PendingDispatch) -> Result<(), String> {
+        self.pending
+            .lock()
+            .await
+            .insert(pending.operation_id.clone(), pending);
+        self.persist_state_to_disk().await
+    }
+
+    async fn claim_pending_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<PendingDispatch, String> {
+        let mut pending = self.pending.lock().await;
+        let entry = pending
+            .get_mut(operation_id)
+            .ok_or_else(|| format!("no pending dispatch for operation_id={operation_id}"))?;
+        if entry.processing {
+            return Err(format!(
+                "DISPATCH already processing operation_id={operation_id}"
+            ));
+        }
+        entry.processing = true;
+        Ok(entry.clone())
+    }
+
+    async fn clear_pending_processing(&self, operation_id: &OperationId) {
+        if let Some(entry) = self.pending.lock().await.get_mut(operation_id) {
+            entry.processing = false;
+        }
+    }
+
+    async fn recover_pending_dispatches(&self) {
+        let candidates: Vec<PendingDispatch> = {
+            let pending = self.pending.lock().await;
+            pending
+                .values()
+                .filter(|entry| !entry.processing)
+                .cloned()
+                .collect()
+        };
+        for candidate in candidates {
+            if candidate.prepare.outgoing_expiry <= unix_now() {
+                self.abandon_pending_dispatch(candidate).await;
+                continue;
+            }
+            let mut pending = match self.claim_pending_operation(&candidate.operation_id).await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    warn!(
+                        target: "cassis_router",
+                        "claim pending dispatch {} failed: {error}",
+                        candidate.operation_id,
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = self.resume_pending_dispatch(&mut pending).await {
+                warn!(
+                    target: "cassis_router",
+                    "recover pending dispatch {} failed: {error}",
+                    candidate.operation_id,
+                );
+            }
+        }
+    }
+
+    async fn abandon_pending_dispatch(&self, pending: PendingDispatch) {
+        if let Some(payment) = pending.outgoing.clone() {
+            if let Some(outgoing) = self.adapters.get(&pending.prepare.outgoing_network) {
+                if let Err(error) = outgoing.adapter.refund_outgoing(&payment).await {
+                    warn!(
+                        target: "cassis_router",
+                        "refund abandoned pending dispatch {} failed: {error}; keeping journal record",
+                        pending.operation_id,
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(incoming) = self.adapters.get(&pending.prepare.incoming_network) {
+            if let Err(error) = incoming.adapter.cancel_incoming(&pending.reservation).await {
+                warn!(
+                    target: "cassis_router",
+                    "cancel abandoned incoming reservation {} failed: {error}; keeping journal record",
+                    pending.operation_id,
+                );
+                return;
+            }
+        }
+        self.prepared
+            .lock()
+            .await
+            .retain(|entry| entry.reservation.operation_id != pending.operation_id);
+        self.pending.lock().await.remove(&pending.operation_id);
+        if let Err(error) = self.persist_state_to_disk().await {
+            warn!(
+                target: "cassis_router",
+                "persist abandonment of pending dispatch {} failed: {error}",
+                pending.operation_id,
+            );
+        }
+    }
+
+    async fn resume_pending_dispatch(
+        &self,
+        pending: &mut PendingDispatch,
+    ) -> Result<HopDispatched, String> {
+        let result = self.resume_pending_dispatch_inner(pending).await;
+        if result.is_err() {
+            self.clear_pending_processing(&pending.operation_id).await;
+        }
+        result
+    }
+
+    async fn resume_pending_dispatch_inner(
+        &self,
+        pending: &mut PendingDispatch,
+    ) -> Result<HopDispatched, String> {
+        if pending.accepted.is_none() {
+            let incoming = self
+                .adapters
+                .get(&pending.prepare.incoming_network)
+                .ok_or_else(|| "incoming network unsupported".to_string())?;
+            let accepted = incoming
+                .adapter
+                .accept_incoming(&pending.reservation, &pending.incoming_descriptor)
+                .await
+                .map_err(|error| format!("incoming HTLC not claimable: {error}"))?;
+            pending.accepted = Some(accepted);
+            self.store_pending(pending.clone()).await?;
+        }
+
+        let outgoing = match pending.outgoing.clone() {
+            Some(outgoing) => outgoing,
+            None => {
+                let outgoing_entry = self
+                    .adapters
+                    .get(&pending.prepare.outgoing_network)
+                    .ok_or_else(|| "outgoing network unsupported".to_string())?;
+                let outgoing = outgoing_entry
+                    .adapter
+                    .create_outgoing(OutgoingRequest {
+                        operation_id: pending.outgoing_operation_id.clone(),
+                        payment_hash: pending.prepare.payment_hash,
+                        amount_msat: pending.prepare.outgoing_amount_msat,
+                        expiry: pending.prepare.outgoing_expiry,
+                        target: pending.outgoing_target.clone(),
+                        network: pending.prepare.outgoing_network.clone(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "create_outgoing failed on {}: {error}",
+                            pending.prepare.outgoing_network
+                        )
+                    })?;
+                pending.outgoing = Some(outgoing.clone());
+                self.store_pending(pending.clone()).await?;
+                outgoing
+            }
+        };
+
+        {
+            let mut prepared = self.prepared.lock().await;
+            prepared.retain(|entry| entry.reservation.operation_id != pending.operation_id);
+        }
+        self.dispatched.lock().await.insert(
+            pending.operation_id.clone(),
+            DispatchedHop {
+                operation_id: pending.operation_id.clone(),
+                owner: pending.owner.clone(),
+                prepare: pending.prepare.clone(),
+                reservation: pending.reservation.clone(),
+                accepted: pending
+                    .accepted
+                    .clone()
+                    .ok_or_else(|| "pending dispatch has no accepted state".to_string())?,
+                outgoing: outgoing.clone(),
+                outgoing_deadline: pending.prepare.outgoing_expiry,
+            },
+        );
+        self.pending.lock().await.remove(&pending.operation_id);
+        self.persist_state_to_disk().await?;
+        Ok(HopDispatched {
+            payment_hash: pending.prepare.payment_hash,
+            operation_id: pending.operation_id.clone(),
+            outgoing_descriptor: outgoing.descriptor,
+        })
     }
 
     /// Top-level dispatcher: turn a [`Frame`] into the
@@ -652,10 +1083,8 @@ impl CassisRouter {
             Frame::Dispatch(d) => {
                 info!(
                     target: "cassis_router",
-                    "received DISPATCH: payment_hash={} addressing={:?} incoming_descriptor={:?}",
+                    "received DISPATCH: payment_hash={} addressing=<redacted> incoming_descriptor=<redacted>",
                     d.payment_hash.short(),
-                    d.htlc_target,
-                    d.incoming_descriptor,
                 );
             }
             Frame::Discard(d) => {
@@ -695,7 +1124,7 @@ impl CassisRouter {
                 .map(Frame::Prepared)
                 .map_err(internal),
             Frame::Dispatch(d) => self
-                .handle_dispatch(d)
+                .handle_dispatch(d, remote)
                 .await
                 .map(Frame::Dispatched)
                 .map_err(internal),
@@ -710,7 +1139,7 @@ impl CassisRouter {
                 .map(Frame::Committed)
                 .map_err(internal),
             Frame::Committed(c) => self
-                .handle_committed(c)
+                .handle_committed(c, remote)
                 .await
                 .map(Frame::Committed)
                 .map_err(internal),
@@ -744,16 +1173,15 @@ impl CassisRouter {
             debug!(
                 target: "cassis_router",
                 "canonicalized network ids: incoming {} -> {}, outgoing {} -> {}",
-                incoming_raw, prepare.incoming_network,
-                outgoing_raw, prepare.outgoing_network,
+                incoming_raw,
+                prepare.incoming_network,
+                outgoing_raw,
+                prepare.outgoing_network,
             );
         }
         self.validate_prepare(&prepare)?;
+        self.cleanup_expired_prepared().await;
 
-        // Caller-supplied veto hook: lets a test (or an operator policy)
-        // reject a PREPARE for arbitrary reasons before any reservation
-        // is recorded. Runs after validation so a vetoed request still
-        // has to be well-formed.
         if let Some(veto) = &self.prepare_veto {
             if let Some(reason) = veto(&prepare) {
                 warn!(
@@ -766,6 +1194,7 @@ impl CassisRouter {
                 );
                 return Ok(HopPrepared {
                     payment_hash: prepare.payment_hash,
+                    operation_id: prepare.operation_id.clone(),
                     accepted: false,
                     reason: Some(reason),
                     htlc_target: None,
@@ -773,127 +1202,180 @@ impl CassisRouter {
             }
         }
 
-        // Resolved up front: the reply has to carry the identity the
-        // upstream party must lock our incoming HTLC to.
         let incoming_entry = self
             .adapters
             .get(&prepare.incoming_network)
             .ok_or_else(|| "incoming network unsupported".to_string())?;
-
-        // Funds check on the outgoing side: the adapter must
-        // be able to back the HTLC right now. The default
-        // (cashu) sums the local balance; stub adapters
-        // return Unimplemented and we surface that as a
-        // rejection.
         let outgoing_entry = self
             .adapters
             .get(&prepare.outgoing_network)
             .ok_or_else(|| "outgoing network unsupported".to_string())?;
-        if let Err(e) = outgoing_entry.adapter.can_route(prepare.amount_msat).await {
+
+        // Reject same-hash attempts while any local reservation or funded
+        // dispatch exists. Adapters enforce same invariant in their
+        // operation-keyed state; router check preserves owner/replay
+        // semantics before adapter call.
+        {
+            let prepared = self.prepared.lock().await;
+            if let Some(entry) = prepared.iter().find(|entry| {
+                entry.prepare.payment_hash == prepare.payment_hash
+                    && entry.reservation.operation_id == prepare.operation_id
+                    && entry.owner == remote
+            }) {
+                return Ok(HopPrepared {
+                    payment_hash: prepare.payment_hash,
+                    operation_id: entry.reservation.operation_id.clone(),
+                    accepted: true,
+                    reason: None,
+                    htlc_target: Some(entry.reservation.target.clone()),
+                });
+            }
+            if prepared
+                .iter()
+                .any(|entry| entry.prepare.payment_hash == prepare.payment_hash)
+            {
+                return Ok(HopPrepared {
+                    payment_hash: prepare.payment_hash,
+                    operation_id: prepare.operation_id.clone(),
+                    accepted: false,
+                    reason: Some("payment hash already has an active attempt".into()),
+                    htlc_target: None,
+                });
+            }
+        }
+        {
+            let dispatched = self.dispatched.lock().await;
+            if let Some(hop) = dispatched.get(&prepare.operation_id) {
+                if hop.owner != remote.to_string() {
+                    return Err("operation_id belongs to another peer".to_string());
+                }
+                return Ok(HopPrepared {
+                    payment_hash: prepare.payment_hash,
+                    operation_id: prepare.operation_id.clone(),
+                    accepted: true,
+                    reason: None,
+                    htlc_target: Some(hop.reservation.target.clone()),
+                });
+            }
+            if dispatched
+                .values()
+                .any(|hop| hop.prepare.payment_hash == prepare.payment_hash)
+            {
+                return Ok(HopPrepared {
+                    payment_hash: prepare.payment_hash,
+                    operation_id: prepare.operation_id.clone(),
+                    accepted: false,
+                    reason: Some("payment hash already has a funded dispatch".into()),
+                    htlc_target: None,
+                });
+            }
+        }
+
+        // Check capacity before creating remote resources or adapter state.
+        {
+            let prepared = self.prepared.lock().await;
+            if prepared.len() >= 100 {
+                return Ok(HopPrepared {
+                    payment_hash: prepare.payment_hash,
+                    operation_id: prepare.operation_id.clone(),
+                    accepted: false,
+                    reason: Some("PREPARE capacity exhausted".into()),
+                    htlc_target: None,
+                });
+            }
+        }
+
+        if let Err(error) = outgoing_entry
+            .adapter
+            .can_route(prepare.outgoing_amount_msat)
+            .await
+        {
             warn!(
                 target: "cassis_router",
-                "PREPARE rejected: payment_hash={} reason=can_route failed on {}: {e}",
+                "PREPARE rejected: payment_hash={} reason=can_route failed on {}: {error}",
                 prepare.payment_hash.short(),
                 prepare.outgoing_network,
             );
             return Ok(HopPrepared {
                 payment_hash: prepare.payment_hash,
+                operation_id: prepare.operation_id.clone(),
                 accepted: false,
-                reason: Some(format!("can_route failed: {e}")),
+                reason: Some(format!("can_route failed: {error}")),
                 htlc_target: None,
             });
         }
 
-        // Symmetric check on the incoming side. `can_route` above only
-        // proves we can *fund* the outgoing HTLC; on networks where
-        // claiming costs something itself (rootstock gas) we would
-        // otherwise lock the outgoing HTLC and only then discover we
-        // cannot claim what we are owed — committed downstream,
-        // unclaimable upstream until the timelock expires.
-        if let Err(e) = incoming_entry.adapter.can_claim(prepare.amount_msat).await {
+        if let Err(error) = incoming_entry.adapter.can_claim(prepare.amount_msat).await {
             warn!(
                 target: "cassis_router",
-                "PREPARE rejected: payment_hash={} reason=can_claim failed on {}: {e}",
+                "PREPARE rejected: payment_hash={} reason=can_claim failed on {}: {error}",
                 prepare.payment_hash.short(),
                 prepare.incoming_network,
             );
             return Ok(HopPrepared {
                 payment_hash: prepare.payment_hash,
+                operation_id: prepare.operation_id.clone(),
                 accepted: false,
-                reason: Some(format!("can_claim failed: {e}")),
+                reason: Some(format!("can_claim failed: {error}")),
                 htlc_target: None,
             });
         }
 
-        // Register the incoming HTLC before the payer funds it. Networks
-        // backed by an external Lightning node (LND hold invoices) must
-        // exist before any upstream payment is attempted; other adapters
-        // use the default no-remote-registration path.
-        match incoming_entry
+        let operation_id = prepare.operation_id.clone();
+        let reservation = match incoming_entry
             .adapter
-            .register_incoming_htlc(
-                prepare.payment_hash,
-                prepare.amount_msat,
-                prepare.incoming_deadline,
-            )
+            .reserve_incoming(IncomingRequest {
+                operation_id: operation_id.clone(),
+                payment_hash: prepare.payment_hash,
+                amount_msat: prepare.amount_msat,
+                deadline: prepare.incoming_deadline,
+                preimage: None,
+            })
             .await
         {
-            Ok(_) => {}
+            Ok(reservation) => reservation,
             Err(error) => {
                 warn!(
                     target: "cassis_router",
-                    "PREPARE rejected: payment_hash={} reason=register_incoming failed on {}: {error}",
+                    "PREPARE rejected: payment_hash={} reason=reserve_incoming failed on {}: {error}",
                     prepare.payment_hash.short(),
                     prepare.incoming_network,
                 );
                 return Ok(HopPrepared {
                     payment_hash: prepare.payment_hash,
+                    operation_id: prepare.operation_id.clone(),
                     accepted: false,
-                    reason: Some(format!("register_incoming failed: {error}")),
+                    reason: Some(format!("reserve_incoming failed: {error}")),
                     htlc_target: None,
                 });
             }
         };
 
-        let mut prepared = self.prepared.lock().await;
-        let now = unix_now();
-        prepared.retain(|entry| entry.expires_at > now);
-        if prepared.len() >= 100 {
-            incoming_entry
-                .adapter
-                .cancel_incoming_htlc(prepare.payment_hash)
-                .await
-                .ok();
-            return Ok(HopPrepared {
-                payment_hash: prepare.payment_hash,
-                accepted: false,
-                reason: Some("PREPARE capacity exhausted".into()),
-                htlc_target: None,
-            });
-        }
-        prepared.push(PreparedEntry {
+        let expires_at = unix_now().saturating_add(600);
+        self.prepared.lock().await.push(PreparedEntry {
             prepare: prepare.clone(),
-            expires_at: now.saturating_add(600),
+            reservation: reservation.clone(),
+            outgoing_operation_id: OperationId::random(),
+            expires_at,
+            processing: false,
             owner: remote,
         });
+
         info!(
             target: "cassis_router",
-            "PREPARE accepted: payment_hash={} amount_msat={} {} -> {}",
+            "PREPARE accepted: payment_hash={} operation_id={} amount_msat={} {} -> {}",
             prepare.payment_hash.short(),
+            reservation.operation_id,
             prepare.amount_msat,
             prepare.incoming_network,
             prepare.outgoing_network,
         );
-        let htlc_target = incoming_entry
-            .adapter
-            .htlc_target(prepare.payment_hash)
-            .await
-            .map_err(|error| format!("htlc_target failed: {error}"))?;
         Ok(HopPrepared {
             payment_hash: prepare.payment_hash,
+            operation_id: reservation.operation_id,
             accepted: true,
             reason: None,
-            htlc_target: Some(htlc_target),
+            htlc_target: Some(reservation.target),
         })
     }
 
@@ -901,122 +1383,174 @@ impl CassisRouter {
     /// claimable on the hop's incoming adapter, then create
     /// the outgoing HTLC on the outgoing adapter and stash
     /// state for the poll loop.
-    async fn handle_dispatch(&self, dispatch: HopDispatch) -> Result<HopDispatched, String> {
-        // Look up the matching PREPARE; the sender must have
-        // PREPAREd us first.
-        let prepare = {
+    async fn handle_dispatch(
+        &self,
+        dispatch: HopDispatch,
+        remote: PublicKey,
+    ) -> Result<HopDispatched, String> {
+        self.cleanup_expired_prepared().await;
+        if let Some(existing) = self
+            .dispatched
+            .lock()
+            .await
+            .get(&dispatch.operation_id)
+            .cloned()
+        {
+            if existing.owner != remote.to_string() {
+                return Err("operation_id belongs to another peer".to_string());
+            }
+            if existing.prepare.payment_hash != dispatch.payment_hash {
+                return Err("DISPATCH payment hash does not match operation".to_string());
+            }
+            return Ok(HopDispatched {
+                payment_hash: dispatch.payment_hash,
+                operation_id: dispatch.operation_id,
+                outgoing_descriptor: existing.outgoing.descriptor,
+            });
+        }
+        if let Some(existing) = self
+            .pending
+            .lock()
+            .await
+            .get(&dispatch.operation_id)
+            .cloned()
+        {
+            if existing.owner != remote.to_string() {
+                return Err("operation_id belongs to another peer".to_string());
+            }
+            if existing.prepare.payment_hash != dispatch.payment_hash
+                || existing.incoming_descriptor != dispatch.incoming_descriptor
+                || existing.outgoing_target != dispatch.htlc_target
+            {
+                return Err("DISPATCH does not match pending operation state".to_string());
+            }
+            let mut pending = self.claim_pending_operation(&dispatch.operation_id).await?;
+            return self.resume_pending_dispatch(&mut pending).await;
+        }
+
+        let entry = {
             let mut prepared = self.prepared.lock().await;
-            let now = unix_now();
-            prepared.retain(|entry| entry.expires_at > now);
             let index = prepared
                 .iter()
-                .position(|entry| entry.prepare.payment_hash == dispatch.payment_hash)
-                .ok_or(format!(
-                    "no matching PREPARE for payment_hash={:?}",
-                    dispatch.payment_hash
-                ))?;
-            prepared.remove(index).prepare
-        };
-        let incoming_entry = self
-            .adapters
-            .get(&prepare.incoming_network)
-            .ok_or_else(|| "incoming network unsupported".to_string())?;
-        let outgoing_entry = self
-            .adapters
-            .get(&prepare.outgoing_network)
-            .ok_or_else(|| "outgoing network unsupported".to_string())?;
-
-        if let Err(e) = incoming_entry
-            .adapter
-            .verify_incoming_htlc(&dispatch.incoming_descriptor, prepare.payment_hash)
-            .await
-        {
-            return Err(format!("incoming HTLC not claimable: {e}"));
-        }
-
-        // Stash the incoming descriptor so a later
-        // claim_incoming can find it after the preimage is
-        // known.
-        if let Err(e) = incoming_entry
-            .adapter
-            .accept_incoming_htlc(
-                prepare.payment_hash,
-                &dispatch.incoming_descriptor,
-                prepare.incoming_deadline,
-            )
-            .await
-        {
-            return Err(format!("accept_incoming_htlc failed: {e}"));
-        }
-
-        // Addressing parameters come from downstream PREPARE data.
-        match outgoing_entry
-            .adapter
-            .create_outgoing_htlc(
-                prepare.payment_hash,
-                prepare.amount_msat,
-                prepare.outgoing_expiry,
-                &dispatch.htlc_target,
-            )
-            .await
-        {
-            Ok(htlc) => {
-                info!(
-                    target: "cassis_router",
-                    "  outgoing HTLC on {} for {} ({} msat)",
-                    htlc.network, htlc.recipient, htlc.amount_msat,
-                );
-            }
-            Err(err) => {
-                incoming_entry
-                    .adapter
-                    .cancel_incoming_htlc(prepare.payment_hash)
-                    .await
-                    .ok();
+                .position(|entry| entry.reservation.operation_id == dispatch.operation_id)
+                .ok_or_else(|| {
+                    format!(
+                        "no matching PREPARE for operation_id={}",
+                        dispatch.operation_id
+                    )
+                })?;
+            if prepared[index].owner != remote {
                 return Err(format!(
-                    "create_outgoing_htlc failed on {}: {err}",
-                    prepare.outgoing_network
+                    "DISPATCH denied: operation_id={} reserved by {} but request came from {remote}",
+                    dispatch.operation_id, prepared[index].owner
                 ));
             }
-        };
-
-        let outgoing_descriptor: HtlcDescriptor = match outgoing_entry
-            .adapter
-            .outgoing_htlc_descriptor(prepare.payment_hash)
-            .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(format!("outgoing_htlc_descriptor failed: {e}"));
+            if prepared[index].processing {
+                return Err(format!(
+                    "DISPATCH already processing operation_id={}",
+                    dispatch.operation_id
+                ));
             }
+            if prepared[index].prepare.payment_hash != dispatch.payment_hash {
+                return Err("DISPATCH payment hash does not match reservation".to_string());
+            }
+            prepared[index].processing = true;
+            prepared[index].clone()
         };
 
-        // Record dispatched state for the poll loop.
-        {
-            let mut dispatched = self.dispatched.lock().await;
-            dispatched.insert(
-                dispatch.payment_hash,
-                DispatchedHop {
-                    prepare: prepare.clone(),
-                    outgoing_deadline: prepare.outgoing_expiry,
-                },
+        let prepare = entry.prepare.clone();
+        if !self.adapters.contains_key(&prepare.incoming_network) {
+            self.clear_processing(&dispatch.operation_id).await;
+            return Err("incoming network unsupported".to_string());
+        }
+        if !self.adapters.contains_key(&prepare.outgoing_network) {
+            self.clear_processing(&dispatch.operation_id).await;
+            return Err("outgoing network unsupported".to_string());
+        }
+
+        let mut pending = PendingDispatch {
+            operation_id: dispatch.operation_id.clone(),
+            owner: remote.to_string(),
+            prepare: prepare.clone(),
+            reservation: entry.reservation,
+            incoming_descriptor: dispatch.incoming_descriptor.clone(),
+            outgoing_target: dispatch.htlc_target.clone(),
+            outgoing_operation_id: entry.outgoing_operation_id,
+            accepted: None,
+            outgoing: None,
+            processing: true,
+        };
+        self.pending
+            .lock()
+            .await
+            .insert(pending.operation_id.clone(), pending.clone());
+        if let Err(error) = self.persist_state_to_disk().await {
+            self.pending.lock().await.remove(&pending.operation_id);
+            self.clear_processing(&dispatch.operation_id).await;
+            return Err(format!("persist pending dispatch: {error}"));
+        }
+        let outgoing_operation_id = pending.outgoing_operation_id.clone();
+        let result = self.resume_pending_dispatch(&mut pending).await;
+        if result.is_ok() {
+            info!(
+                target: "cassis_router",
+                "DISPATCH done: payment_hash={} operation_id={} outgoing_operation_id={} amount_msat={} {} -> {}",
+                prepare.payment_hash.short(),
+                pending.operation_id,
+                outgoing_operation_id,
+                prepare.amount_msat,
+                prepare.incoming_network,
+                prepare.outgoing_network,
             );
         }
-        info!(
-            target: "cassis_router",
-             "DISPATCH done: payment_hash={} amount_msat={} {} -> {} via {:?} \
-             outgoing_descriptor={:?}",
-            prepare.payment_hash.short(),
-            prepare.amount_msat,
-            prepare.incoming_network,
-            prepare.outgoing_network,
-            dispatch.htlc_target,
-            outgoing_descriptor,
-        );
-        Ok(HopDispatched {
-            payment_hash: dispatch.payment_hash,
-            outgoing_descriptor,
-        })
+        result
+    }
+
+    async fn clear_processing(&self, operation_id: &OperationId) {
+        let mut prepared = self.prepared.lock().await;
+        if let Some(entry) = prepared
+            .iter_mut()
+            .find(|entry| &entry.reservation.operation_id == operation_id)
+        {
+            entry.processing = false;
+        }
+    }
+
+    async fn cleanup_expired_prepared(&self) {
+        let now = unix_now();
+        let expired: Vec<PreparedEntry> = {
+            let mut prepared = self.prepared.lock().await;
+            let mut expired = Vec::new();
+            let mut retained = Vec::with_capacity(prepared.len());
+            for entry in prepared.drain(..) {
+                if entry.expires_at <= now && !entry.processing {
+                    expired.push(entry);
+                } else {
+                    retained.push(entry);
+                }
+            }
+            *prepared = retained;
+            expired
+        };
+        for mut entry in expired {
+            let Some(adapter) = self.adapters.get(&entry.prepare.incoming_network) else {
+                continue;
+            };
+            match adapter.adapter.cancel_incoming(&entry.reservation).await {
+                Ok(()) => {}
+                Err(error) if error.is_retryable() => {
+                    entry.expires_at = unix_now().saturating_add(30);
+                    self.prepared.lock().await.push(entry);
+                }
+                Err(error) => {
+                    warn!(
+                        target: "cassis_router",
+                        "dropping expired reservation operation_id={} after cancel error: {error}",
+                        entry.reservation.operation_id,
+                    );
+                }
+            }
+        }
     }
 
     /// DISCARD handler: release a PREPARE reservation that will never
@@ -1034,48 +1568,97 @@ impl CassisRouter {
         discard: HopDiscard,
         remote: PublicKey,
     ) -> Result<HopDiscarded, String> {
-        let released = {
+        if !discard.operation_id.is_valid() {
+            return Err("DISCARD operation_id must be 32 hexadecimal characters".to_string());
+        }
+        self.cleanup_expired_prepared().await;
+        let entry = {
             let mut prepared = self.prepared.lock().await;
-            let now = unix_now();
-            prepared.retain(|entry| entry.expires_at > now);
-            match prepared
+            let Some(index) = prepared
                 .iter()
-                .position(|entry| entry.prepare.payment_hash == discard.payment_hash)
-            {
-                None => false,
-                Some(index) => {
-                    if prepared[index].owner != remote {
-                        warn!(
-                            target: "cassis_router",
-                            "DISCARD denied: payment_hash={} reserved by {} \
-                             but request came from {remote}",
-                            discard.payment_hash.short(),
-                            prepared[index].owner,
-                        );
-                        false
-                    } else {
-                        let entry = prepared.remove(index);
-                        if let Some(adapter) = self.adapters.get(&entry.prepare.incoming_network) {
-                            adapter
-                                .adapter
-                                .cancel_incoming_htlc(entry.prepare.payment_hash)
-                                .await
-                                .ok();
-                        }
-                        true
-                    }
-                }
+                .position(|entry| entry.reservation.operation_id == discard.operation_id)
+            else {
+                return Ok(HopDiscarded {
+                    payment_hash: discard.payment_hash,
+                    operation_id: discard.operation_id,
+                    released: false,
+                });
+            };
+            if prepared[index].processing {
+                return Ok(HopDiscarded {
+                    payment_hash: discard.payment_hash,
+                    operation_id: discard.operation_id,
+                    released: false,
+                });
             }
+            if prepared[index].owner != remote {
+                warn!(
+                    target: "cassis_router",
+                    "DISCARD denied: operation_id={} reserved by {} but request came from {remote}",
+                    discard.operation_id, prepared[index].owner,
+                );
+                return Ok(HopDiscarded {
+                    payment_hash: discard.payment_hash,
+                    operation_id: discard.operation_id,
+                    released: false,
+                });
+            }
+            prepared[index].processing = true;
+            prepared[index].clone()
         };
-        info!(
-            target: "cassis_router",
-            "DISCARD processed: payment_hash={} peer={remote} released={released}",
-            discard.payment_hash.short(),
-        );
-        Ok(HopDiscarded {
-            payment_hash: discard.payment_hash,
-            released,
-        })
+
+        let cancel_result =
+            if let Some(adapter) = self.adapters.get(&entry.prepare.incoming_network) {
+                adapter.adapter.cancel_incoming(&entry.reservation).await
+            } else {
+                Ok(())
+            };
+        match cancel_result {
+            Ok(()) => {
+                self.prepared.lock().await.retain(|candidate| {
+                    candidate.reservation.operation_id != entry.reservation.operation_id
+                });
+                info!(
+                    target: "cassis_router",
+                    "DISCARD processed: payment_hash={} operation_id={} peer={remote} released=true",
+                    discard.payment_hash.short(),
+                    entry.reservation.operation_id,
+                );
+                Ok(HopDiscarded {
+                    payment_hash: discard.payment_hash,
+                    operation_id: entry.reservation.operation_id,
+                    released: true,
+                })
+            }
+            Err(error) if error.is_retryable() => {
+                self.clear_processing(&entry.reservation.operation_id).await;
+                warn!(
+                    target: "cassis_router",
+                    "DISCARD deferred for operation_id={}: {error}",
+                    entry.reservation.operation_id,
+                );
+                Ok(HopDiscarded {
+                    payment_hash: discard.payment_hash,
+                    operation_id: entry.reservation.operation_id,
+                    released: false,
+                })
+            }
+            Err(error) => {
+                self.prepared.lock().await.retain(|candidate| {
+                    candidate.reservation.operation_id != entry.reservation.operation_id
+                });
+                warn!(
+                    target: "cassis_router",
+                    "DISCARD cleanup permanently failed for operation_id={}: {error}",
+                    entry.reservation.operation_id,
+                );
+                Ok(HopDiscarded {
+                    payment_hash: discard.payment_hash,
+                    operation_id: entry.reservation.operation_id,
+                    released: false,
+                })
+            }
+        }
     }
 
     /// COMMIT handler. Routers don't normally receive COMMIT
@@ -1085,6 +1668,9 @@ impl CassisRouter {
     /// loops back through us. In that case we just
     /// acknowledge the payment hash.
     async fn handle_commit(&self, commit: HopCommit) -> Result<HopCommitted, String> {
+        if !commit.operation_id.is_valid() {
+            return Err("COMMIT operation_id must be 32 hexadecimal characters".to_string());
+        }
         info!(
             target: "cassis_router",
             "COMMIT (received by router, unusual): payment_hash={} amount_msat={} network={}",
@@ -1099,6 +1685,7 @@ impl CassisRouter {
         // path skips routers entirely for COMMIT.
         Ok(HopCommitted {
             payment_hash: commit.payment_hash,
+            operation_id: commit.operation_id,
             preimage: Bytes32([0u8; 32]),
         })
     }
@@ -1111,35 +1698,53 @@ impl CassisRouter {
     /// attempted, so a bogus fanout cannot burn the hop's dispatch
     /// state; the poll loop remains the fallback when the fanout never
     /// arrives.
-    async fn handle_committed(&self, committed: HopCommitted) -> Result<HopCommitted, String> {
-        let prepare = {
-            let dispatched = self.dispatched.lock().await;
-            dispatched
-                .get(&committed.payment_hash)
-                .map(|hop| hop.prepare.clone())
+    async fn handle_committed(
+        &self,
+        committed: HopCommitted,
+        remote: PublicKey,
+    ) -> Result<HopCommitted, String> {
+        if !committed.operation_id.is_valid() {
+            return Err("COMMITTED operation_id must be 32 hexadecimal characters".to_string());
         }
-        .ok_or_else(|| {
-            format!(
-                "no dispatched hop for payment_hash={:?}",
-                committed.payment_hash
-            )
-        })?;
-
+        let operation_id = committed.operation_id.clone();
         if !committed.payment_hash.matches_preimage(&committed.preimage) {
             return Err(format!(
                 "preimage does not hash to payment_hash={}",
                 committed.payment_hash
             ));
         }
-
-        info!(
-            target: "cassis_router",
-            "preimage fanout: claiming incoming HTLC for {} on {}",
-            committed.payment_hash.short(),
-            prepare.incoming_network,
-        );
-        self.claim_incoming(committed.payment_hash, &prepare, committed.preimage)
-            .await;
+        if let Some(owner) = self.settled.lock().await.get(&operation_id) {
+            if owner != &remote.to_string() {
+                return Err("COMMITTED operation_id belongs to another peer".to_string());
+            }
+            return Ok(committed);
+        }
+        let hop = {
+            let dispatched = self.dispatched.lock().await;
+            dispatched.get(&operation_id).cloned()
+        }
+        .ok_or_else(|| {
+            format!(
+                "no dispatched hop for operation_id={} payment_hash={}",
+                operation_id, committed.payment_hash
+            )
+        })?;
+        if hop.owner != remote.to_string() {
+            return Err(format!(
+                "COMMITTED denied: operation_id={} belongs to another peer",
+                operation_id
+            ));
+        }
+        if hop.prepare.payment_hash != committed.payment_hash {
+            return Err("COMMITTED payment hash does not match operation".to_string());
+        }
+        if let Err(error) = self.claim_incoming(&hop, committed.preimage).await {
+            warn!(
+                target: "cassis_router",
+                "preimage fanout claim deferred for operation_id={}: {error}",
+                operation_id,
+            );
+        }
         Ok(committed)
     }
 
@@ -1162,72 +1767,90 @@ impl CassisRouter {
     }
 
     async fn poll_once(&self) -> Result<(), String> {
-        self.prepared
-            .lock()
-            .await
-            .retain(|entry| entry.expires_at > unix_now());
+        self.cleanup_expired_prepared().await;
+        self.recover_pending_dispatches().await;
 
-        // Snapshot the payment hashes under the lock, then
-        // drop it before doing network work.
-        let snapshot: Vec<(Bytes32, HopPrepare, u64)> = {
+        let snapshot: Vec<DispatchedHop> = {
             let dispatched = self.dispatched.lock().await;
-            dispatched
-                .iter()
-                .map(|(ph, d)| (*ph, d.prepare.clone(), d.outgoing_deadline))
-                .collect()
+            dispatched.values().cloned().collect()
         };
         let now = unix_now();
-        for (payment_hash, prepare, outgoing_deadline) in snapshot {
-            if now >= outgoing_deadline {
+        for hop in snapshot {
+            if now >= hop.outgoing_deadline {
                 warn!(
                     target: "cassis_router",
-                    "  outgoing deadline exceeded for {payment_hash}, refunding"
+                    "outgoing deadline exceeded for operation_id={}, refunding",
+                    hop.operation_id,
                 );
-                self.refund_dispatched(payment_hash, &prepare).await;
+                self.refund_dispatched(&hop).await;
                 continue;
             }
-            let outgoing_entry = match self.adapters.get(&prepare.outgoing_network) {
-                Some(e) => e,
-                None => {
-                    self.drop_dispatched(payment_hash).await;
-                    continue;
-                }
+            let Some(outgoing_entry) = self.adapters.get(&hop.prepare.outgoing_network) else {
+                warn!(
+                    target: "cassis_router",
+                    "outgoing adapter missing for operation_id={}",
+                    hop.operation_id,
+                );
+                continue;
             };
-            // Watch preimage until the outgoing HTLC's actual expiry.
-            // Cap the short poll window there so an adapter cannot
-            // keep us past the point where refund focus must begin.
-            let poll_deadline = outgoing_deadline.min(now.saturating_add(POLL_INTERVAL_SECS));
+            let payment = hop.outgoing.clone();
+            let poll_deadline = hop
+                .outgoing_deadline
+                .min(now.saturating_add(POLL_INTERVAL_SECS));
             match outgoing_entry
                 .adapter
-                .watch_preimage(payment_hash, poll_deadline)
+                .watch_outgoing(&payment, poll_deadline)
                 .await
             {
                 Ok(preimage) => {
+                    if !hop.prepare.payment_hash.matches_preimage(&preimage) {
+                        warn!(
+                            target: "cassis_router",
+                            "preimage hash mismatch for operation_id={}",
+                            hop.operation_id,
+                        );
+                        continue;
+                    }
                     info!(
                         target: "cassis_router",
-                        "  preimage revealed by downstream on {} for {}: preimage={}",
-                        prepare.outgoing_network,
-                        payment_hash.short(),
-                        preimage,
+                        "preimage revealed by downstream on {} for operation_id={}",
+                        hop.prepare.outgoing_network,
+                        hop.operation_id,
                     );
-                    self.claim_incoming(payment_hash, &prepare, preimage).await;
+                    if let Err(error) = self.claim_incoming(&hop, preimage).await {
+                        warn!(
+                            target: "cassis_router",
+                            "claim deferred for operation_id={}: {error}",
+                            hop.operation_id,
+                        );
+                    }
                 }
-                Err(WatchError::DeadlineExceeded) => {
+                Err(AdapterError::DeadlineExceeded) => {
                     debug!(
                         target: "cassis_router",
-                        "  poll for {payment_hash}: no preimage yet"
+                        "poll for operation_id={}: no preimage yet",
+                        hop.operation_id,
                     );
                 }
-                Err(WatchError::Network(err)) => {
+                Err(AdapterError::Network(err)) | Err(AdapterError::Retryable(err)) => {
                     warn!(
                         target: "cassis_router",
-                        "  poll for {payment_hash} network error: {err}"
+                        "poll for operation_id={} retryable error: {err}",
+                        hop.operation_id,
                     );
                 }
-                Err(WatchError::Unimplemented) => {
-                    debug!(
+                Err(AdapterError::Unimplemented) => {
+                    warn!(
                         target: "cassis_router",
-                        "  poll for {payment_hash}: adapter watch_preimage unimplemented"
+                        "poll for operation_id={} unsupported by adapter",
+                        hop.operation_id,
+                    );
+                }
+                Err(AdapterError::InvalidParams(error)) | Err(AdapterError::NotFound(error)) => {
+                    warn!(
+                        target: "cassis_router",
+                        "poll for operation_id={} state error: {error}",
+                        hop.operation_id,
                     );
                 }
             }
@@ -1235,74 +1858,84 @@ impl CassisRouter {
         Ok(())
     }
 
-    async fn claim_incoming(&self, payment_hash: Bytes32, prepare: &HopPrepare, preimage: Bytes32) {
-        let incoming_entry = match self.adapters.get(&prepare.incoming_network) {
-            Some(e) => e,
-            None => {
-                self.drop_dispatched(payment_hash).await;
-                return;
-            }
-        };
+    async fn claim_incoming(&self, hop: &DispatchedHop, preimage: Bytes32) -> Result<(), String> {
+        let incoming_entry = self
+            .adapters
+            .get(&hop.prepare.incoming_network)
+            .ok_or_else(|| "incoming network unsupported".to_string())?;
+        incoming_entry
+            .adapter
+            .claim_incoming(&hop.accepted, preimage)
+            .await
+            .map_err(|error| error.to_string())?;
         info!(
             target: "cassis_router",
-            "  claiming incoming HTLC for {} on {} with preimage={}",
-            payment_hash.short(),
-            prepare.incoming_network,
-            preimage,
+            "incoming HTLC claimed on {} for operation_id={}",
+            hop.prepare.incoming_network,
+            hop.operation_id,
         );
-        match incoming_entry
-            .adapter
-            .claim_incoming(payment_hash, preimage)
+        self.settled
+            .lock()
             .await
-        {
-            Ok(()) => {
-                info!(
-                    target: "cassis_router",
-                    "  incoming HTLC claimed on {} for {}",
-                    prepare.incoming_network,
-                    payment_hash.short(),
-                );
-            }
-            Err(err) => {
-                error!(
-                    target: "cassis_router",
-                    "  claim_incoming failed for {} on {} with preimage={preimage}: {err}",
-                    payment_hash.short(),
-                    prepare.incoming_network,
-                );
-            }
-        }
-        self.drop_dispatched(payment_hash).await;
+            .insert(hop.operation_id.clone(), hop.owner.clone());
+        self.drop_dispatched(&hop.operation_id).await;
+        Ok(())
     }
 
-    async fn refund_dispatched(&self, payment_hash: Bytes32, prepare: &HopPrepare) {
-        if let Some(entry) = self.adapters.get(&prepare.outgoing_network) {
-            if let Err(e) = entry.adapter.refund_outgoing(payment_hash).await {
+    async fn refund_dispatched(&self, hop: &DispatchedHop) {
+        let Some(entry) = self.adapters.get(&hop.prepare.outgoing_network) else {
+            return;
+        };
+        let payment = hop.outgoing.clone();
+        if let Err(error) = entry.adapter.refund_outgoing(&payment).await {
+            warn!(
+                target: "cassis_router",
+                "refund failed for operation_id={}: {error}",
+                hop.operation_id,
+            );
+            if error.is_retryable() {
+                return;
+            }
+        }
+        self.drop_dispatched(&hop.operation_id).await;
+    }
+
+    async fn drop_dispatched(&self, operation_id: &OperationId) {
+        let removed = {
+            let mut dispatched = self.dispatched.lock().await;
+            dispatched.remove(operation_id).is_some()
+        };
+        if removed {
+            if let Err(error) = self.persist_state_to_disk().await {
                 warn!(
                     target: "cassis_router",
-                    "  refund_outgoing failed for {payment_hash}: {e}"
+                    "persist router state after dropping operation_id={} failed: {error}",
+                    operation_id,
                 );
-                if matches!(e, HtlcError::Network(_)) {
-                    return; // keep the dispatch row; retried next tick
-                }
             }
         }
-        self.drop_dispatched(payment_hash).await;
-    }
-
-    async fn drop_dispatched(&self, payment_hash: Bytes32) {
-        let mut dispatched = self.dispatched.lock().await;
-        dispatched.remove(&payment_hash);
     }
 
     fn validate_prepare(&self, prepare: &HopPrepare) -> Result<(), String> {
         if prepare.payment_hash.0.iter().all(|byte| *byte == 0) {
             return Err("zero payment hash".to_string());
         }
+        if !prepare.operation_id.is_valid() {
+            return Err("operation_id must be 32 hexadecimal characters".to_string());
+        }
         if prepare.amount_msat == 0 {
             return Err(format!(
-                "amount must be positive, got {}",
+                "incoming amount must be positive, got {}",
                 prepare.amount_msat
+            ));
+        }
+        if prepare.outgoing_amount_msat == 0 {
+            return Err("outgoing amount must be positive".to_string());
+        }
+        if prepare.outgoing_amount_msat > prepare.amount_msat {
+            return Err(format!(
+                "outgoing amount {} exceeds incoming amount {}",
+                prepare.outgoing_amount_msat, prepare.amount_msat
             ));
         }
         let incoming = self
@@ -1323,6 +1956,18 @@ impl CassisRouter {
             ));
         }
         let now = unix_now();
+        if prepare.outgoing_expiry <= now {
+            return Err(format!(
+                "outgoing expiry must be in the future, got {} (now {now})",
+                prepare.outgoing_expiry
+            ));
+        }
+        if prepare.outgoing_expiry >= prepare.incoming_deadline {
+            return Err(format!(
+                "outgoing expiry {} must precede incoming deadline {}",
+                prepare.outgoing_expiry, prepare.incoming_deadline
+            ));
+        }
         let required_delta = incoming.incoming_delta_secs;
         let min_deadline = now.saturating_add(required_delta);
         if prepare.incoming_deadline < min_deadline {
@@ -1335,9 +1980,15 @@ impl CassisRouter {
     }
 }
 
+#[derive(Clone)]
 struct PreparedEntry {
     prepare: HopPrepare,
+    reservation: IncomingReservation,
+    /// Stable outgoing attempt identity. Replayed DISPATCH reuses it
+    /// instead of funding same payment under new operation id.
+    outgoing_operation_id: OperationId,
     expires_at: u64,
+    processing: bool,
     /// Authenticated iroh identity of the peer that sent the PREPARE.
     /// Only this peer may free the reservation via DISCARD; a DISCARD
     /// from anyone else is refused (logged, reported as
@@ -1360,6 +2011,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Spark adapter has asymmetric HTLC addressing: LND can pay its
+/// Lightning invoice, but Spark cannot originate a generic pubkey HTLC.
+/// Publish only bridge edge where role combination is executable.
+fn route_pair_supported(from: &NetworkId, to: &NetworkId) -> bool {
+    if from.0 == "spark" {
+        return false;
+    }
+    if to.0 == "spark" {
+        return from.0 == "lightning";
+    }
+    true
+}
+
 async fn publish_route_announcements(
     adapters: &HashMap<NetworkId, NetworkEntry>,
     relay_urls: Vec<String>,
@@ -1378,7 +2042,7 @@ async fn publish_route_announcements(
     let pairs: Vec<(NetworkId, NetworkId)> = network_ids
         .iter()
         .flat_map(|from| network_ids.iter().map(move |to| (from.clone(), to.clone())))
-        .filter(|(from, to)| from != to)
+        .filter(|(from, to)| from != to && route_pair_supported(from, to))
         .collect();
 
     let fee_base_msat: u64 = 1000;
@@ -1388,6 +2052,10 @@ async fn publish_route_announcements(
     let events: Vec<(String, ritualistic::Event)> = pairs
         .iter()
         .map(|(from, to)| {
+            let incoming_delta_secs = adapters
+                .get(from)
+                .map(|entry| entry.incoming_delta_secs)
+                .unwrap_or_else(|| from.default_incoming_delta());
             let d_tag = format!("{from}->{to}");
             let template = EventTemplate {
                 created_at: Timestamp::now(),
@@ -1401,6 +2069,10 @@ async fn publish_route_announcements(
                     ],
                     vec!["fee_base_msat".to_string(), fee_base_msat.to_string()],
                     vec!["fee_ppm".to_string(), fee_ppm.to_string()],
+                    vec![
+                        "incoming_delta_secs".to_string(),
+                        incoming_delta_secs.to_string(),
+                    ],
                     vec![
                         "transit_slack_secs".to_string(),
                         transit_slack_secs.to_string(),

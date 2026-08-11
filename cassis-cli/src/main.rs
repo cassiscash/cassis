@@ -9,18 +9,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cassis_client::adapters::{
-    build_receivers_with_config, build_senders_with_config, AdapterConfig,
-};
+use cassis_client::adapters::{build_adapters_with_config, AdapterConfig};
 use cassis_client::netspec::NetSpec;
 use cassis_client::ops::{
-    create_invoice_for_with_config, node_store_path, start_receive_with_config, unix_now,
+    create_invoice_with_adapter, node_store_path, start_receive_with_config, unix_now,
 };
 use cassis_client::paths::{cassis_home, set_home_override, store_path};
 use cassis_client::seed_store::{read_mnemonic, seed_path, write_mnemonic};
 use cassis_client::store::{InvoiceStatus, Store};
 use cassis_client::CassisClient;
-use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter};
+use cassis_core::{Bytes32, Invoice, NetworkAdapter, NetworkId};
 use cassis_keys as keys;
 use clap::Parser;
 use tracing::{error, info, info_span};
@@ -306,28 +304,28 @@ async fn cmd_pay(
     let invoice_struct: Invoice =
         serde_json::from_str(&invoice).map_err(|e| format!("invalid invoice JSON: {e}"))?;
     let sender_network = NetworkId(from.clone());
-    let dest_network = invoice_struct
-        .networks
-        .first()
-        .cloned()
-        .ok_or_else(|| "invoice has no network hints".to_string())?;
+    if invoice_struct.networks.is_empty() {
+        return Err("invoice has no network hints".to_string());
+    }
     let relays = if nostr_relay.is_empty() {
         cli::default_nostr_relays()
     } else {
         nostr_relay
     };
-    let net_spec = NetSpec::parse(&dest_network.0)?;
+    // Build sender adapter from --from, not invoice destination. Cross-network
+    // routes need sender network available locally.
+    let sender_spec = NetSpec::parse(&from)?;
     let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, std::slice::from_ref(&net_spec))?;
-    let senders = build_senders_with_config(
-        &[net_spec],
+    let derived = derive_for(&mnemonic, std::slice::from_ref(&sender_spec))?;
+    let adapters = build_adapters_with_config(
+        &[sender_spec],
         &derived,
         &node_store_path(&node_home()),
         info_span!("node", node = "cassis-cli"),
         adapter_config,
     )
     .await?;
-    let client = CassisClient::with_store_path(senders, relays, store_path()).await;
+    let client = CassisClient::with_store_path(adapters, relays, store_path()).await;
     info!(
         "paying {} msat via '{}' route",
         invoice_struct.amount_msat, from
@@ -366,7 +364,7 @@ async fn cmd_watch(adapter_config: &AdapterConfig) -> Result<(), String> {
     }
     let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, &specs)?;
-    let senders = build_senders_with_config(
+    let adapters = build_adapters_with_config(
         &specs,
         &derived,
         &node_store_path(&node_home()),
@@ -375,7 +373,7 @@ async fn cmd_watch(adapter_config: &AdapterConfig) -> Result<(), String> {
     )
     .await?;
     let client =
-        CassisClient::with_store_path(senders, cli::default_nostr_relays(), store_path()).await;
+        CassisClient::with_store_path(adapters, cli::default_nostr_relays(), store_path()).await;
     client.watch_pending().await
 }
 
@@ -397,14 +395,29 @@ async fn cmd_invoice(
     let spec = NetSpec::parse(&network)?;
     let network_id = spec.network_id();
     let expiry = expires_at.unwrap_or(unix_now() + 600);
-    let (invoice, payment_hash, preimage) = create_invoice_for_with_config(
-        &node_home(),
-        network_id.clone(),
-        spec.clone(),
-        amount,
+    let mnemonic = read_or_init_mnemonic()?;
+    let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
+    let adapters = build_adapters_with_config(
+        std::slice::from_ref(&spec),
+        &derived,
+        &node_store_path(&node_home()),
+        info_span!("node", node = "cassis-cli"),
         adapter_config,
     )
     .await?;
+    let adapter = adapters
+        .get(&network_id)
+        .cloned()
+        .ok_or_else(|| format!("network adapter missing for {network_id}"))?;
+    let (invoice, payment_hash, preimage) = create_invoice_with_adapter(
+        &node_home(),
+        adapter.as_ref(),
+        network_id.clone(),
+        amount,
+        expiry,
+    )
+    .await?;
+    let adapter_map: Arc<HashMap<NetworkId, Arc<dyn NetworkAdapter>>> = Arc::new(adapters);
     println!("payment_hash: {payment_hash}");
     println!("preimage:     {}", lowercase_hex::encode(preimage));
     println!("network:      {network_id}");
@@ -420,27 +433,41 @@ async fn cmd_invoice(
     info!("waiting for COMMIT or upstream fund (timeout={timeout}s)...");
     let now = unix_now();
     let deadline = now.saturating_add(timeout);
-    let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let receivers = build_receivers_with_config(
-        std::slice::from_ref(&spec),
-        &derived,
-        &node_store_path(&node_home()),
-        info_span!("node", node = "cassis-cli"),
-        adapter_config,
-    )
-    .await?;
-    let receiver_map: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>> =
-        Arc::new(receivers);
-    if let Some(rv) = receiver_map.get(&network_id) {
-        if let Ok(preimage_seen) = rv.watch_incoming(payment_hash, deadline).await {
-            let _ = rv.claim_incoming(payment_hash, preimage_seen).await;
-            let _ = payee;
-            let mut store = open_store()?;
-            store
-                .mark_status(&payment_hash, InvoiceStatus::Claimed)
-                .map_err(|e| e.to_string())?;
-            println!("status:       claimed");
+    let Some(adapter) = adapter_map.get(&network_id) else {
+        return Ok(());
+    };
+    let handle = {
+        let mut store = open_store()?;
+        store
+            .list_invoice_handles()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|handle| handle.invoice.payment_hash == payment_hash)
+    };
+    if let Some(handle) = handle {
+        if adapter
+            .watch_incoming(&handle.reservation, deadline)
+            .await
+            .is_ok()
+        {
+            match adapter
+                .claim_reserved_incoming(&handle.reservation, Bytes32(preimage))
+                .await
+            {
+                Ok(()) => {
+                    let _ = payee;
+                    let mut store = open_store()?;
+                    store
+                        .mark_status(&payment_hash, InvoiceStatus::Claimed)
+                        .map_err(|e| e.to_string())?;
+                    println!("status:       claimed");
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "reservation claim unavailable; use receive daemon/COMMIT: {error}"
+                    ));
+                }
+            }
         }
     }
     Ok(())

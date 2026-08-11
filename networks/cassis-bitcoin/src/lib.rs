@@ -75,14 +75,18 @@ use bitcoin::TxIn;
 use bitcoin::TxOut;
 use bitcoin::Witness;
 use cassis_core::split_spec;
+use cassis_core::AcceptedIncoming;
+use cassis_core::AdapterError;
 use cassis_core::Bytes32;
 use cassis_core::HtlcDescriptor;
-use cassis_core::HtlcError;
 use cassis_core::HtlcTarget;
+use cassis_core::IncomingRequest;
+use cassis_core::IncomingReservation;
+use cassis_core::NetworkAdapter;
 use cassis_core::NetworkId;
-use cassis_core::NetworkRouterAdapter;
-use cassis_core::OutgoingHtlc;
-use cassis_core::WatchError;
+use cassis_core::OperationId;
+use cassis_core::OutgoingPayment;
+use cassis_core::OutgoingRequest;
 use cassis_core::XOnlyPubKey;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -133,11 +137,11 @@ pub enum Error {
     Client(String),
 }
 
-impl From<Error> for HtlcError {
-    fn from(e: Error) -> HtlcError {
+impl From<Error> for AdapterError {
+    fn from(e: Error) -> AdapterError {
         match e {
-            Error::InvalidParams(s) => HtlcError::InvalidParams(s),
-            other => HtlcError::Network(other.to_string()),
+            Error::InvalidParams(s) => AdapterError::InvalidParams(s),
+            other => AdapterError::Network(other.to_string()),
         }
     }
 }
@@ -232,9 +236,9 @@ fn htlc_script(
 }
 
 /// Core x-only key -> bitcoin crate x-only key.
-fn b_xonly(pk: &XOnlyPubKey) -> Result<XOnlyPublicKey, HtlcError> {
+fn b_xonly(pk: &XOnlyPubKey) -> Result<XOnlyPublicKey, AdapterError> {
     XOnlyPublicKey::from_slice(pk.as_bytes())
-        .map_err(|e| HtlcError::InvalidParams(format!("x-only key: {e}")))
+        .map_err(|e| AdapterError::InvalidParams(format!("x-only key: {e}")))
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -282,12 +286,12 @@ impl HtlcOptions {
     fn spend_info(
         &self,
         secp: &Secp256k1<bitcoin::secp256k1::VerifyOnly>,
-    ) -> Result<bitcoin::taproot::TaprootSpendInfo, HtlcError> {
+    ) -> Result<bitcoin::taproot::TaprootSpendInfo, AdapterError> {
         TaprootBuilder::new()
             .add_leaf(0, self.witness_script())
-            .map_err(|_| HtlcError::Network("taproot leaf insert failed".into()))?
+            .map_err(|_| AdapterError::Network("taproot leaf insert failed".into()))?
             .finalize(secp, nums_internal_key())
-            .map_err(|_| HtlcError::Network("taproot tree finalize failed".into()))
+            .map_err(|_| AdapterError::Network("taproot tree finalize failed".into()))
     }
 
     fn taproot_spk(&self, secp: &Secp256k1<bitcoin::secp256k1::VerifyOnly>) -> ScriptBuf {
@@ -301,7 +305,7 @@ impl HtlcOptions {
         descriptor: &HtlcDescriptor,
         payment_hash: Bytes32,
         our_claim_pk: &XOnlyPublicKey,
-    ) -> Result<Self, HtlcError> {
+    ) -> Result<Self, AdapterError> {
         let HtlcDescriptor::Bitcoin {
             lockup_txid,
             lockup_vout,
@@ -311,28 +315,28 @@ impl HtlcOptions {
             refund_locktime,
         } = descriptor
         else {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "descriptor is not a bitcoin on-chain HTLC".into(),
             ));
         };
         let expected = ripemd160::Hash::hash(payment_hash.as_ref());
         let got = ripemd160::Hash::from_str(payment_hash160)
-            .map_err(|e| HtlcError::InvalidParams(format!("bad payment_hash160: {e}")))?;
+            .map_err(|e| AdapterError::InvalidParams(format!("bad payment_hash160: {e}")))?;
         if got != expected {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "descriptor hash160 does not match the route payment hash".into(),
             ));
         }
         if *refund_locktime < MIN_TIMESTAMP_LOCKTIME {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "refund locktime {refund_locktime} is a block height; \
                  on-chain HTLCs use unix timestamps"
             )));
         }
         let lockup_txid = bitcoin::Txid::from_str(lockup_txid)
-            .map_err(|e| HtlcError::InvalidParams(format!("bad lockup_txid: {e}")))?;
+            .map_err(|e| AdapterError::InvalidParams(format!("bad lockup_txid: {e}")))?;
         if internal_key.as_bytes() != NUMS_INTERNAL_KEY.as_slice() {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "bitcoin HTLC internal key is not the BIP-341 NUMS point".into(),
             ));
         }
@@ -342,31 +346,70 @@ impl HtlcOptions {
             lockup_vout: u32::from(*lockup_vout),
             claim_pubkey: *our_claim_pk,
             refund_pubkey: XOnlyPublicKey::from_slice(refund_pubkey.as_bytes())
-                .map_err(|e| HtlcError::InvalidParams(format!("refund pubkey: {e}")))?,
+                .map_err(|e| AdapterError::InvalidParams(format!("refund pubkey: {e}")))?,
             refund_locktime: *refund_locktime,
+        })
+    }
+
+    fn descriptor(&self) -> Result<HtlcDescriptor, AdapterError> {
+        Ok(HtlcDescriptor::Bitcoin {
+            lockup_txid: self.lockup_txid.to_string(),
+            lockup_vout: self.lockup_vout as u8,
+            payment_hash160: lower_hex(&self.payment_hash160.to_byte_array()),
+            internal_key: XOnlyPubKey::from_bytes(nums_internal_key().serialize())
+                .map_err(|e| AdapterError::Network(format!("internal key: {e}")))?,
+            refund_pubkey: XOnlyPubKey::from_bytes(self.refund_pubkey.serialize())
+                .map_err(|e| AdapterError::Network(format!("refund pubkey: {e}")))?,
+            refund_locktime: self.refund_locktime,
         })
     }
 }
 
 #[derive(Clone, Debug)]
 struct PendingOutgoing {
+    payment_hash: Bytes32,
+    payment: OutgoingPayment,
     options: HtlcOptions,
-    lockup_txid: bitcoin::Txid,
-    lockup_vout: u32,
-    #[allow(dead_code)] // introspection/debugging on the running node
-    value_sat: u64,
-    #[allow(dead_code)] // OutgoingHtlc recall value; kept alongside value_sat
-    amount_msat: u64,
-    #[allow(dead_code)] // introspection/debugging on the running node
-    recipient_xonly: XOnlyPubKey,
 }
 
 #[derive(Clone, Debug)]
 struct PendingIncoming {
-    options: Option<HtlcOptions>,
-    #[allow(dead_code)] // guard for future claim-window checks
-    deadline: u64,
+    payment_hash: Bytes32,
+    reservation: IncomingReservation,
+    accepted: Option<AcceptedIncoming>,
     expected_sat: u64,
+}
+
+fn incoming_reservation_matches(
+    pending: &PendingIncoming,
+    reservation: &IncomingReservation,
+) -> bool {
+    pending.payment_hash == reservation.payment_hash && &pending.reservation == reservation
+}
+
+fn accepted_incoming_matches(left: &AcceptedIncoming, right: &AcceptedIncoming) -> bool {
+    left.reservation == right.reservation
+        && left.descriptor == right.descriptor
+        && left.amount_msat == right.amount_msat
+}
+
+fn outgoing_request_matches(pending: &PendingOutgoing, request: &OutgoingRequest) -> bool {
+    pending.payment_hash == request.payment_hash
+        && pending.payment.operation_id == request.operation_id
+        && pending.payment.amount_msat == request.amount_msat
+        && pending.payment.destination == request.target
+        && pending.payment.destination_network == request.network
+        && pending.payment.expiry == request.expiry
+}
+
+fn outgoing_payment_matches(pending: &PendingOutgoing, payment: &OutgoingPayment) -> bool {
+    pending.payment_hash == payment.payment_hash
+        && pending.payment.operation_id == payment.operation_id
+        && pending.payment.amount_msat == payment.amount_msat
+        && pending.payment.destination == payment.destination
+        && pending.payment.destination_network == payment.destination_network
+        && pending.payment.expiry == payment.expiry
+        && pending.payment.descriptor == payment.descriptor
 }
 
 pub struct BitcoinAdapter {
@@ -387,8 +430,8 @@ pub struct BitcoinAdapter {
     funding_address: Address,
     client: Arc<esplora_client::AsyncClient>,
     span: Span,
-    incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
-    outgoing: Mutex<HashMap<Bytes32, PendingOutgoing>>,
+    incoming: Mutex<HashMap<OperationId, PendingIncoming>>,
+    outgoing: Mutex<HashMap<OperationId, PendingOutgoing>>,
 }
 
 impl BitcoinAdapter {
@@ -434,6 +477,119 @@ impl BitcoinAdapter {
             .as_secs()
     }
 
+    /// Validate reservation binding and every descriptor-controlled script
+    /// property. NUMS assertion remains inside descriptor parsing.
+    fn validate_incoming_descriptor(
+        &self,
+        reservation: &IncomingReservation,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<HtlcOptions, AdapterError> {
+        if reservation.network != self.network_id {
+            return Err(AdapterError::InvalidParams(format!(
+                "reservation targets {}, not {}",
+                reservation.network, self.network_id
+            )));
+        }
+        if reservation.target != HtlcTarget::XOnlyPubKey(self.claim_pubkey()) {
+            return Err(AdapterError::InvalidParams(
+                "incoming reservation has wrong Bitcoin claim target".into(),
+            ));
+        }
+        let options = HtlcOptions::parse_descriptor(
+            descriptor,
+            reservation.payment_hash,
+            &b_xonly(&self.claim_pubkey())?,
+        )?;
+        if options.claim_pubkey != self.key_xonly {
+            return Err(AdapterError::InvalidParams(format!(
+                "incoming HTLC is locked to {}, which this node cannot claim; \
+                 upstream hop locked to the wrong claim key",
+                options.claim_pubkey
+            )));
+        }
+        if u64::from(options.refund_locktime) < reservation.deadline {
+            return Err(AdapterError::InvalidParams(format!(
+                "refund locktime {} precedes the claim deadline {}; the \
+                 sender could race our claim",
+                options.refund_locktime, reservation.deadline
+            )));
+        }
+        Ok(options)
+    }
+
+    /// Confirm exact lockup outpoint is unspent and covers reservation.
+    async fn observe_incoming_amount(
+        &self,
+        options: &HtlcOptions,
+        expected_sat: u64,
+    ) -> Result<u64, AdapterError> {
+        let spk = options.taproot_spk(&Secp256k1::verification_only());
+        let utxos = self.scan_unspent(&spk).await?;
+        let value = utxos
+            .iter()
+            .find(|(outpoint, _)| {
+                outpoint.txid == options.lockup_txid && outpoint.vout == options.lockup_vout
+            })
+            .map(|(_, value)| *value)
+            .ok_or_else(|| {
+                AdapterError::Network(format!(
+                    "HTLC outpoint {}:{} is not unspent at its P2TR address",
+                    options.lockup_txid, options.lockup_vout
+                ))
+            })?;
+        if value.to_sat() < expected_sat {
+            return Err(AdapterError::InvalidParams(format!(
+                "Bitcoin HTLC amount {} sat below reserved {expected_sat} sat",
+                value.to_sat()
+            )));
+        }
+        value.to_sat().checked_mul(MSAT_PER_SAT).ok_or_else(|| {
+            AdapterError::Network("observed Bitcoin amount overflows u64 millisatoshis".into())
+        })
+    }
+
+    /// Parse complete outgoing recovery state using destination claim key.
+    /// The fixed NUMS internal key is asserted by descriptor parsing.
+    fn validate_outgoing_payment(
+        &self,
+        payment: &OutgoingPayment,
+    ) -> Result<(HtlcOptions, XOnlyPubKey), AdapterError> {
+        if payment.destination_network != self.network_id {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing payment targets {}, not {}",
+                payment.destination_network, self.network_id
+            )));
+        }
+        let recipient = match &payment.destination {
+            HtlcTarget::XOnlyPubKey(key) => *key,
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
+                return Err(AdapterError::InvalidParams(
+                    "Bitcoin requires an x-only destination".into(),
+                ))
+            }
+        };
+        let options = HtlcOptions::parse_descriptor(
+            &payment.descriptor,
+            payment.payment_hash,
+            &b_xonly(&recipient)?,
+        )?;
+        if options.refund_pubkey != self.key_xonly {
+            return Err(AdapterError::InvalidParams(
+                "Bitcoin descriptor refund key is not this adapter".into(),
+            ));
+        }
+        let expiry = u32::try_from(payment.expiry)
+            .map_err(|_| AdapterError::InvalidParams("outgoing expiry overflows u32".into()))?;
+        if options.refund_locktime != expiry {
+            return Err(AdapterError::InvalidParams(
+                "Bitcoin descriptor refund locktime does not match outgoing expiry".into(),
+            ));
+        }
+        Ok((options, recipient))
+    }
+
     /// The address test coins must be sent to so the wallet has
     /// spendable cash (also where change and claims return to).
     pub fn deposit_address(&self) -> String {
@@ -441,7 +597,7 @@ impl BitcoinAdapter {
     }
 
     /// Spendable wallet cash, in msat (sats * 1000).
-    pub async fn balance_msat(&self) -> Result<u64, HtlcError> {
+    pub async fn balance_msat(&self) -> Result<u64, AdapterError> {
         let funding_spk = self.funding_address.script_pubkey();
         self.scan_unspent(&funding_spk).await.map(|utxos| {
             utxos
@@ -459,22 +615,24 @@ impl BitcoinAdapter {
         &self,
         address: &str,
         amount_msat: u64,
-    ) -> Result<bitcoin::Txid, HtlcError> {
+    ) -> Result<bitcoin::Txid, AdapterError> {
         if !amount_msat.is_multiple_of(MSAT_PER_SAT) {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "amount {amount_msat} msat is not a whole number of satoshis"
             )));
         }
         let amount_sat = amount_msat / MSAT_PER_SAT;
         if amount_sat < DUST_SATS {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "amount {amount_sat} sats is below the dust limit of {DUST_SATS} sats"
             )));
         }
         let destination = Address::from_str(address)
-            .map_err(|e| HtlcError::InvalidParams(format!("bad destination address: {e}")))?
+            .map_err(|e| AdapterError::InvalidParams(format!("bad destination address: {e}")))?
             .require_network(self.network)
-            .map_err(|e| HtlcError::InvalidParams(format!("wrong network for destination: {e}")))?;
+            .map_err(|e| {
+                AdapterError::InvalidParams(format!("wrong network for destination: {e}"))
+            })?;
 
         let funding_spk = self.funding_address.script_pubkey();
         let mut utxos = self.scan_unspent(&funding_spk).await?;
@@ -502,7 +660,7 @@ impl BitcoinAdapter {
             }
         }
         if gathered < amount_sat + fee {
-            return Err(HtlcError::Network(format!(
+            return Err(AdapterError::Network(format!(
                 "insufficient balance: sending {} sats needs {} sats with fee, wallet holds {gathered}",
                 amount_sat,
                 amount_sat + fee
@@ -555,7 +713,7 @@ impl BitcoinAdapter {
                     &bitcoin::sighash::Prevouts::All(&prevouts),
                     TapSighashType::Default,
                 )
-                .map_err(|e| HtlcError::Network(format!("taproot sighash: {e}")))?;
+                .map_err(|e| AdapterError::Network(format!("taproot sighash: {e}")))?;
             let msg = bitcoin::secp256k1::Message::from_digest(*sh.as_ref());
             sigs.push(
                 secp.sign_schnorr_no_aux_rand(&msg, tweaked_pair.as_keypair())
@@ -569,14 +727,17 @@ impl BitcoinAdapter {
     }
 
     /// All unspent `(outpoint, value)` at `script`.
-    async fn scan_unspent(&self, script: &ScriptBuf) -> Result<Vec<(OutPoint, Amount)>, HtlcError> {
+    async fn scan_unspent(
+        &self,
+        script: &ScriptBuf,
+    ) -> Result<Vec<(OutPoint, Amount)>, AdapterError> {
         let txs = tokio::time::timeout(
             Duration::from_secs(RPC_TIMEOUT_SECS),
             self.client.scripthash_txs(script, None),
         )
         .await
-        .map_err(|_| HtlcError::Network("scripthash_txs timed out".into()))?
-        .map_err(|e| HtlcError::Network(format!("scripthash_txs: {e}")))?;
+        .map_err(|_| AdapterError::Network("scripthash_txs timed out".into()))?
+        .map_err(|e| AdapterError::Network(format!("scripthash_txs: {e}")))?;
         let spent: std::collections::HashSet<OutPoint> = txs
             .iter()
             .flat_map(|tx| {
@@ -609,38 +770,38 @@ impl BitcoinAdapter {
             .collect())
     }
 
-    async fn tip_time(&self) -> Result<u64, HtlcError> {
+    async fn tip_time(&self) -> Result<u64, AdapterError> {
         let height = tokio::time::timeout(
             Duration::from_secs(RPC_TIMEOUT_SECS),
             self.client.get_height(),
         )
         .await
-        .map_err(|_| HtlcError::Network("get_height timed out".into()))?
-        .map_err(|e| HtlcError::Network(format!("get_height: {e}")))?;
+        .map_err(|_| AdapterError::Network("get_height timed out".into()))?
+        .map_err(|e| AdapterError::Network(format!("get_height: {e}")))?;
         let hash = self
             .client
             .get_block_hash(height)
             .await
-            .map_err(|e| HtlcError::Network(format!("get_block_hash: {e}")))?;
+            .map_err(|e| AdapterError::Network(format!("get_block_hash: {e}")))?;
         let block = self
             .client
             .get_block_by_hash(&hash)
             .await
-            .map_err(|e| HtlcError::Network(format!("get_block_by_hash: {e}")))?
+            .map_err(|e| AdapterError::Network(format!("get_block_by_hash: {e}")))?
             .ok_or_else(|| {
-                HtlcError::Network(format!("tip block {height} missing from explorer"))
+                AdapterError::Network(format!("tip block {height} missing from explorer"))
             })?;
         Ok(u64::from(block.header.time))
     }
 
-    async fn broadcast(&self, tx: &Transaction, what: &str) -> Result<bitcoin::Txid, HtlcError> {
+    async fn broadcast(&self, tx: &Transaction, what: &str) -> Result<bitcoin::Txid, AdapterError> {
         tokio::time::timeout(
             Duration::from_secs(RPC_TIMEOUT_SECS),
             self.client.broadcast(tx),
         )
         .await
-        .map_err(|_| HtlcError::Network("broadcast timed out".into()))?
-        .map_err(|e| HtlcError::Network(format!("broadcast failed: {e}")))?;
+        .map_err(|_| AdapterError::Network("broadcast timed out".into()))?
+        .map_err(|e| AdapterError::Network(format!("broadcast failed: {e}")))?;
         let txid = tx.compute_txid();
         self.span.in_scope(|| {
             debug!(target: "cassis_bitcoin", "{what}: txid={txid}");
@@ -672,14 +833,14 @@ impl BitcoinAdapter {
     /// funding address. Returns the resulting outpoint slot.
     async fn lock_htlc(
         &self,
-        payment_hash: Bytes32,
+        request: &OutgoingRequest,
         options: HtlcOptions,
         amount_sat: u64,
         recipient_xonly: XOnlyPubKey,
-        amount_msat: u64,
-    ) -> Result<OutgoingHtlc, HtlcError> {
+    ) -> Result<PendingOutgoing, AdapterError> {
         let funding_spk = self.funding_address.script_pubkey();
         let refund_locktime = options.refund_locktime;
+        let payment_hash = request.payment_hash;
         let mut utxos = self.scan_unspent(&funding_spk).await?;
         utxos.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
         let mut selected: Vec<(OutPoint, Amount)> = Vec::new();
@@ -698,7 +859,7 @@ impl BitcoinAdapter {
             change_expected = gathered >= amount_sat + fee + DUST_SATS;
         }
         if gathered < amount_sat + fee {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "insufficient bitcoin balance on {}: HTLC needs {} sats (with fee), \
                  wallet holds {gathered} sats",
                 self.network_id,
@@ -756,7 +917,7 @@ impl BitcoinAdapter {
                         &bitcoin::sighash::Prevouts::All(&prevouts),
                         TapSighashType::Default,
                     )
-                    .map_err(|e| HtlcError::Network(format!("taproot sighash: {e}")))?;
+                    .map_err(|e| AdapterError::Network(format!("taproot sighash: {e}")))?;
                 let msg = bitcoin::secp256k1::Message::from_digest(*sh.as_ref());
                 sigs.push(
                     secp.sign_schnorr_no_aux_rand(&msg, tweaked_pair.as_keypair())
@@ -776,28 +937,23 @@ impl BitcoinAdapter {
                 payment_hash.short()
             );
         });
-        self.outgoing.lock().await.insert(
+        let mut stored_options = options;
+        stored_options.lockup_txid = txid;
+        stored_options.lockup_vout = 0;
+        let descriptor = stored_options.descriptor()?;
+        let payment = OutgoingPayment {
+            operation_id: request.operation_id.clone(),
             payment_hash,
-            PendingOutgoing {
-                options: {
-                    let mut stored = options.clone();
-                    stored.lockup_txid = txid;
-                    stored.lockup_vout = 0;
-                    stored
-                },
-                lockup_txid: txid,
-                lockup_vout: 0,
-                value_sat: amount_sat,
-                amount_msat,
-                recipient_xonly,
-            },
-        );
-        Ok(OutgoingHtlc {
+            amount_msat: request.amount_msat,
+            destination: HtlcTarget::XOnlyPubKey(recipient_xonly),
+            destination_network: request.network.clone(),
+            expiry: request.expiry,
+            descriptor,
+        };
+        Ok(PendingOutgoing {
             payment_hash,
-            amount_msat,
-            expiry: u64::from(refund_locktime),
-            recipient: recipient_xonly.to_hex(),
-            network: self.network_id.clone(),
+            payment,
+            options: stored_options,
         })
     }
 
@@ -807,7 +963,17 @@ impl BitcoinAdapter {
         options: &HtlcOptions,
         preimage: Option<Bytes32>,
         destination: Address,
-    ) -> Result<bitcoin::Txid, HtlcError> {
+    ) -> Result<bitcoin::Txid, AdapterError> {
+        if let Some(preimage) = preimage {
+            let computed = ripemd160::Hash::hash(
+                bitcoin::hashes::sha256::Hash::hash(preimage.as_ref()).as_ref(),
+            );
+            if computed != options.payment_hash160 {
+                return Err(AdapterError::InvalidParams(
+                    "preimage does not match the HTLC payment hash".into(),
+                ));
+            }
+        }
         let witness_script = options.witness_script();
         let verify_secp = Secp256k1::verification_only();
         let spk = options.taproot_spk(&verify_secp);
@@ -817,7 +983,7 @@ impl BitcoinAdapter {
             .find(|(o, _)| o.txid == options.lockup_txid && o.vout == options.lockup_vout)
             .copied()
             .ok_or_else(|| {
-                HtlcError::Network(format!(
+                AdapterError::Network(format!(
                     "HTLC outpoint {}:{} not found unspent at its script address",
                     options.lockup_txid, options.lockup_vout
                 ))
@@ -826,7 +992,7 @@ impl BitcoinAdapter {
         if preimage.is_none() {
             let tip_time = self.tip_time().await?;
             if u64::from(options.refund_locktime) > tip_time {
-                return Err(HtlcError::InvalidParams(format!(
+                return Err(AdapterError::Retryable(format!(
                     "timelock not reached: tip_time={tip_time} refund_locktime={}",
                     options.refund_locktime
                 )));
@@ -835,7 +1001,7 @@ impl BitcoinAdapter {
 
         let fee = self.fee_for(Self::vsize_for(0, 1, 1, 0));
         if value <= fee + Amount::from_sat(DUST_SATS) {
-            return Err(HtlcError::Network(format!(
+            return Err(AdapterError::Network(format!(
                 "HTLC value {} sats cannot cover a {} sat claim fee plus dust",
                 value.to_sat(),
                 fee.to_sat()
@@ -865,7 +1031,7 @@ impl BitcoinAdapter {
         };
         let tree_info = options
             .spend_info(&verify_secp)
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
+            .map_err(|e| AdapterError::Network(e.to_string()))?;
         // BIP342 semantics: script-path signatures are made with the
         // leaf pubkey tweaked on its own (no branch commitment); the
         // tweaking is keypair-local, a signing ctx suffices. The claim
@@ -876,7 +1042,7 @@ impl BitcoinAdapter {
         let wallet_pair = Keypair::from_secret_key(&signing_secp, &self.wallet_sk);
         let control_block = tree_info
             .control_block(&(witness_script.clone(), LeafVersion::TapScript))
-            .ok_or_else(|| HtlcError::Network("control block missing for spend leaf".into()))?;
+            .ok_or_else(|| AdapterError::Network("control block missing for spend leaf".into()))?;
         let leaf_hash = TapLeafHash::from_script(&witness_script, LeafVersion::TapScript);
         let prevouts = [TxOut {
             value,
@@ -891,7 +1057,7 @@ impl BitcoinAdapter {
                     leaf_hash,
                     TapSighashType::Default,
                 )
-                .map_err(|e| HtlcError::Network(format!("taproot sighash: {e}")))?
+                .map_err(|e| AdapterError::Network(format!("taproot sighash: {e}")))?
         };
         // BIP342: a script-path CHECKSIG signs with the leaf key
         // tweaked on its own (no branch commitment).
@@ -931,15 +1097,15 @@ impl BitcoinAdapter {
     async fn scan_spend_preimage(
         &self,
         options: &HtlcOptions,
-    ) -> Result<Option<(Bytes32, bitcoin::Txid)>, HtlcError> {
+    ) -> Result<Option<(Bytes32, bitcoin::Txid)>, AdapterError> {
         let spk = options.taproot_spk(&Secp256k1::verification_only());
         let txs = tokio::time::timeout(
             Duration::from_secs(RPC_TIMEOUT_SECS),
             self.client.scripthash_txs(&spk, None),
         )
         .await
-        .map_err(|_| HtlcError::Network("scripthash_txs timed out".into()))?
-        .map_err(|e| HtlcError::Network(format!("scripthash_txs: {e}")))?;
+        .map_err(|_| AdapterError::Network("scripthash_txs timed out".into()))?
+        .map_err(|e| AdapterError::Network(format!("scripthash_txs: {e}")))?;
         for spend_tx in &txs {
             for vin in &spend_tx.vin {
                 let Some(prevout) = &vin.prevout else {
@@ -978,14 +1144,14 @@ impl BitcoinAdapter {
         })
     }
 
-    async fn get_tx(&self, txid: bitcoin::Txid) -> Result<Option<Transaction>, HtlcError> {
+    async fn get_tx(&self, txid: bitcoin::Txid) -> Result<Option<Transaction>, AdapterError> {
         tokio::time::timeout(
             Duration::from_secs(RPC_TIMEOUT_SECS),
             self.client.get_tx(&txid),
         )
         .await
-        .map_err(|_| HtlcError::Network("get_tx timed out".into()))?
-        .map_err(|e| HtlcError::Network(format!("get_tx: {e}")))
+        .map_err(|_| AdapterError::Network("get_tx timed out".into()))?
+        .map_err(|e| AdapterError::Network(format!("get_tx: {e}")))
     }
 }
 
@@ -994,55 +1160,604 @@ impl BitcoinAdapter {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl NetworkRouterAdapter for BitcoinAdapter {
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
-    }
-
-    /// Claim identity: the x-only half of the per-network key; the
-    /// taproot claim leaf embeds this key directly (BIP342 x-only
-    /// pubkeys), so counterparties lock to it unchanged.
-    fn claim_pubkey(&self) -> XOnlyPubKey {
-        XOnlyPubKey::from_bytes(self.key_xonly.serialize()).expect("32 bytes is a valid x-only key")
-    }
-
+impl NetworkAdapter for BitcoinAdapter {
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }
 
-    /// On-chain money lands block-granular: give the router 300 s of
-    /// slack between locking and claim.
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
+        self.invoice_pubkey
+    }
+
+    /// Claim identity: x-only half of per-network key. Taproot claim leaf
+    /// embeds this key directly, so counterparties lock to it unchanged.
+    fn claim_pubkey(&self) -> XOnlyPubKey {
+        XOnlyPubKey::from_bytes(self.key_xonly.serialize()).expect("32 bytes is a valid x-only key")
+    }
+
+    /// On-chain money lands block-granular. Give router 300 s between
+    /// locking and claim.
     fn incoming_delta_secs(&self) -> u64 {
         300
     }
 
-    async fn register_incoming_htlc(
+    async fn reserve_incoming(
         &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
-        if deadline <= Self::unix_now() {
-            return Err(HtlcError::InvalidParams("deadline in the past".into()));
+        request: IncomingRequest,
+    ) -> Result<IncomingReservation, AdapterError> {
+        if let Some(preimage) = request.preimage {
+            if !request.payment_hash.matches_preimage(&preimage) {
+                return Err(AdapterError::InvalidParams(
+                    "incoming preimage does not match payment hash".into(),
+                ));
+            }
         }
-        self.incoming
-            .lock()
-            .await
-            .entry(payment_hash)
-            .or_insert(PendingIncoming {
-                options: None,
-                deadline,
-                expected_sat: min_amount_msat / MSAT_PER_SAT,
-            });
+
+        let mut incoming = self.incoming.lock().await;
+        if let Some(existing) = incoming.get(&request.operation_id) {
+            if existing.payment_hash != request.payment_hash
+                || existing.reservation.amount_msat != request.amount_msat
+                || existing.reservation.deadline != request.deadline
+            {
+                return Err(AdapterError::InvalidParams(
+                    "operation ID is already bound to different incoming state".into(),
+                ));
+            }
+            return Ok(existing.reservation.clone());
+        }
+        if incoming
+            .values()
+            .any(|pending| pending.payment_hash == request.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Bitcoin payment hash already has an active operation".into(),
+            ));
+        }
+        if request.deadline <= Self::unix_now() {
+            return Err(AdapterError::InvalidParams("deadline in the past".into()));
+        }
+        let expected_sat = request.amount_msat.div_ceil(MSAT_PER_SAT).max(1);
+        let reservation = IncomingReservation {
+            operation_id: request.operation_id,
+            payment_hash: request.payment_hash,
+            network: self.network_id.clone(),
+            amount_msat: request.amount_msat,
+            deadline: request.deadline,
+            target: HtlcTarget::XOnlyPubKey(self.claim_pubkey()),
+        };
+        incoming.insert(
+            reservation.operation_id.clone(),
+            PendingIncoming {
+                payment_hash: reservation.payment_hash,
+                reservation: reservation.clone(),
+                accepted: None,
+                expected_sat,
+            },
+        );
+        Ok(reservation)
+    }
+
+    async fn cancel_incoming(&self, reservation: &IncomingReservation) -> Result<(), AdapterError> {
+        let mut incoming = self.incoming.lock().await;
+        let Some(pending) = incoming.get(&reservation.operation_id) else {
+            // Cancellation retry after success is a no-op.
+            return Ok(());
+        };
+        if !incoming_reservation_matches(pending, reservation) {
+            return Err(AdapterError::InvalidParams(
+                "incoming reservation does not match stored operation state".into(),
+            ));
+        }
+        if pending.accepted.is_some() {
+            return Err(AdapterError::InvalidParams(
+                "cannot cancel an accepted incoming HTLC".into(),
+            ));
+        }
+        incoming.remove(&reservation.operation_id);
         Ok(())
     }
 
-    async fn can_route(&self, amount_msat: u64) -> Result<(), HtlcError> {
+    async fn accept_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<AcceptedIncoming, AdapterError> {
+        let expected_sat = {
+            let incoming = self.incoming.lock().await;
+            let pending = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            if !incoming_reservation_matches(pending, reservation) {
+                return Err(AdapterError::InvalidParams(
+                    "incoming reservation does not match stored operation state".into(),
+                ));
+            }
+            if let Some(accepted) = &pending.accepted {
+                if &accepted.reservation == reservation && accepted.descriptor == *descriptor {
+                    return Ok(accepted.clone());
+                }
+                return Err(AdapterError::InvalidParams(
+                    "incoming operation is already accepted with different state".into(),
+                ));
+            }
+            pending.expected_sat
+        };
+
+        let options = self.validate_incoming_descriptor(reservation, descriptor)?;
+        let amount_msat = self.observe_incoming_amount(&options, expected_sat).await?;
+        if amount_msat < reservation.amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "Bitcoin HTLC amount {amount_msat} msat below reserved {} msat",
+                reservation.amount_msat
+            )));
+        }
+        let accepted = AcceptedIncoming {
+            reservation: reservation.clone(),
+            descriptor: descriptor.clone(),
+            amount_msat,
+        };
+
+        let mut incoming = self.incoming.lock().await;
+        let pending = incoming.get_mut(&reservation.operation_id).ok_or_else(|| {
+            AdapterError::NotFound(format!(
+                "incoming operation {} disappeared during acceptance",
+                reservation.operation_id
+            ))
+        })?;
+        if !incoming_reservation_matches(pending, reservation) {
+            return Err(AdapterError::InvalidParams(
+                "incoming reservation changed during acceptance".into(),
+            ));
+        }
+        if let Some(existing) = &pending.accepted {
+            if accepted_incoming_matches(existing, &accepted) {
+                return Ok(existing.clone());
+            }
+            return Err(AdapterError::InvalidParams(
+                "incoming operation is already accepted with different state".into(),
+            ));
+        }
+        pending.accepted = Some(accepted.clone());
+        Ok(accepted)
+    }
+
+    async fn restore_incoming(&self, accepted: &AcceptedIncoming) -> Result<(), AdapterError> {
+        {
+            let incoming = self.incoming.lock().await;
+            if let Some(existing) = incoming.get(&accepted.reservation.operation_id) {
+                if !incoming_reservation_matches(existing, &accepted.reservation) {
+                    return Err(AdapterError::InvalidParams(
+                        "operation ID is already bound to different incoming state".into(),
+                    ));
+                }
+                if let Some(stored) = &existing.accepted {
+                    if accepted_incoming_matches(stored, accepted) {
+                        return Ok(());
+                    }
+                    return Err(AdapterError::InvalidParams(
+                        "operation ID is already bound to different accepted state".into(),
+                    ));
+                }
+            }
+        }
+        let options =
+            self.validate_incoming_descriptor(&accepted.reservation, &accepted.descriptor)?;
+        let expected_sat = accepted
+            .reservation
+            .amount_msat
+            .div_ceil(MSAT_PER_SAT)
+            .max(1);
+        let expected_msat = expected_sat.checked_mul(MSAT_PER_SAT).ok_or_else(|| {
+            AdapterError::InvalidParams("reserved Bitcoin amount overflows u64".into())
+        })?;
+        if accepted.amount_msat < accepted.reservation.amount_msat
+            || accepted.amount_msat < expected_msat
+        {
+            return Err(AdapterError::InvalidParams(
+                "accepted incoming amount is below reservation amount".into(),
+            ));
+        }
+        let observed_msat = self.observe_incoming_amount(&options, expected_sat).await?;
+        if observed_msat != accepted.amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "restored incoming amount {observed_msat} msat does not match accepted {} msat",
+                accepted.amount_msat
+            )));
+        }
+
+        let mut incoming = self.incoming.lock().await;
+        if let Some(existing) = incoming.get(&accepted.reservation.operation_id) {
+            if !incoming_reservation_matches(existing, &accepted.reservation) {
+                return Err(AdapterError::InvalidParams(
+                    "operation ID is already bound to different incoming state".into(),
+                ));
+            }
+            if let Some(stored) = &existing.accepted {
+                if accepted_incoming_matches(stored, accepted) {
+                    return Ok(());
+                }
+                return Err(AdapterError::InvalidParams(
+                    "operation ID is already bound to different accepted state".into(),
+                ));
+            }
+        } else if incoming
+            .values()
+            .any(|pending| pending.payment_hash == accepted.reservation.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Bitcoin payment hash already has an active operation".into(),
+            ));
+        }
+        incoming.insert(
+            accepted.reservation.operation_id.clone(),
+            PendingIncoming {
+                payment_hash: accepted.reservation.payment_hash,
+                reservation: accepted.reservation.clone(),
+                accepted: Some(accepted.clone()),
+                expected_sat,
+            },
+        );
+        Ok(())
+    }
+
+    async fn watch_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        deadline: u64,
+    ) -> Result<(), AdapterError> {
+        let effective_deadline = deadline.min(reservation.deadline);
+        loop {
+            {
+                let incoming = self.incoming.lock().await;
+                let pending = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                    AdapterError::NotFound(format!(
+                        "no incoming reservation for operation {}",
+                        reservation.operation_id
+                    ))
+                })?;
+                if !incoming_reservation_matches(pending, reservation) {
+                    return Err(AdapterError::InvalidParams(
+                        "incoming reservation does not match stored operation state".into(),
+                    ));
+                }
+                if pending.accepted.is_some() {
+                    return Ok(());
+                }
+            }
+            if Self::unix_now() >= effective_deadline {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+    }
+
+    async fn claim_incoming(
+        &self,
+        accepted: &AcceptedIncoming,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let options =
+            self.validate_incoming_descriptor(&accepted.reservation, &accepted.descriptor)?;
+        let expected_sat = accepted
+            .reservation
+            .amount_msat
+            .div_ceil(MSAT_PER_SAT)
+            .max(1);
+        let expected_msat = expected_sat.checked_mul(MSAT_PER_SAT).ok_or_else(|| {
+            AdapterError::InvalidParams("reserved Bitcoin amount overflows u64".into())
+        })?;
+        if accepted.amount_msat < expected_msat {
+            return Err(AdapterError::InvalidParams(
+                "accepted incoming amount is below reservation amount".into(),
+            ));
+        }
+        if !accepted
+            .reservation
+            .payment_hash
+            .matches_preimage(&preimage)
+        {
+            return Err(AdapterError::InvalidParams(
+                "preimage does not match the payment hash".into(),
+            ));
+        }
+        {
+            let incoming = self.incoming.lock().await;
+            let Some(pending) = incoming.get(&accepted.reservation.operation_id) else {
+                // Successful claim already removed state. Same-handle retry
+                // is complete.
+                return Ok(());
+            };
+            let stored = pending.accepted.as_ref().ok_or_else(|| {
+                AdapterError::InvalidParams(format!(
+                    "incoming operation {} is not accepted",
+                    accepted.reservation.operation_id
+                ))
+            })?;
+            if !incoming_reservation_matches(pending, &accepted.reservation)
+                || !accepted_incoming_matches(stored, accepted)
+            {
+                return Err(AdapterError::InvalidParams(
+                    "accepted incoming state does not match reservation".into(),
+                ));
+            }
+        }
+        let txid = self
+            .spend_htlc(&options, Some(preimage), self.funding_address.clone())
+            .await?;
+        self.span.in_scope(|| {
+            info!(target: "cassis_bitcoin",
+                "incoming htlc claimed {}: tx={txid}",
+                accepted.reservation.payment_hash.short());
+        });
+        self.incoming
+            .lock()
+            .await
+            .remove(&accepted.reservation.operation_id);
+        Ok(())
+    }
+
+    async fn claim_reserved_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let accepted = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming Bitcoin reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            slot.accepted.clone().ok_or(AdapterError::Unimplemented)
+        }?;
+        self.claim_incoming(&accepted, preimage).await
+    }
+
+    async fn create_outgoing(
+        &self,
+        request: OutgoingRequest,
+    ) -> Result<OutgoingPayment, AdapterError> {
+        // Keep lock through external funding. Concurrent retries for one
+        // operation must not broadcast two HTLCs.
+        let mut outgoing = self.outgoing.lock().await;
+        if let Some(existing) = outgoing.get(&request.operation_id) {
+            if outgoing_request_matches(existing, &request) {
+                return Ok(existing.payment.clone());
+            }
+            return Err(AdapterError::InvalidParams(
+                "operation ID is already bound to different outgoing state".into(),
+            ));
+        }
+        if outgoing
+            .values()
+            .any(|pending| pending.payment_hash == request.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Bitcoin payment hash already has an active operation".into(),
+            ));
+        }
+        if request.network != self.network_id {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing payment targets {}, not {}",
+                request.network, self.network_id
+            )));
+        }
+        let recipient_xonly = match &request.target {
+            HtlcTarget::XOnlyPubKey(key) => *key,
+            HtlcTarget::PubKey(_)
+            | HtlcTarget::LightningInvoice(_)
+            | HtlcTarget::SparkAddress(_) => {
+                return Err(AdapterError::InvalidParams(
+                    "bitcoin requires a pubkey target".into(),
+                ))
+            }
+        };
+        if !request.amount_msat.is_multiple_of(MSAT_PER_SAT) {
+            return Err(AdapterError::InvalidParams(format!(
+                "amount {} msat is not a whole number of satoshis",
+                request.amount_msat
+            )));
+        }
+        let amount_sat = request.amount_msat / MSAT_PER_SAT;
+        if amount_sat < DUST_SATS {
+            return Err(AdapterError::InvalidParams(format!(
+                "amount {amount_sat} sats is below the dust limit of {DUST_SATS} sats"
+            )));
+        }
+        if request.expiry < u64::from(MIN_TIMESTAMP_LOCKTIME) {
+            return Err(AdapterError::InvalidParams(format!(
+                "expiry {} looks like a block height; on-chain HTLCs use \
+                 unix timestamps (>= {MIN_TIMESTAMP_LOCKTIME})",
+                request.expiry
+            )));
+        }
+        if request.expiry <= Self::unix_now() {
+            return Err(AdapterError::InvalidParams(format!(
+                "expiry {} is in the past",
+                request.expiry
+            )));
+        }
+        let refund_locktime = u32::try_from(request.expiry).map_err(|error| {
+            AdapterError::InvalidParams(format!("expiry overflows u32: {error}"))
+        })?;
+        let options = HtlcOptions {
+            payment_hash160: HtlcOptions::payment_hash160(&request.payment_hash),
+            // Placeholder never crosses wire. Broadcast path replaces it
+            // with real lockup outpoint before descriptor creation.
+            lockup_txid: bitcoin::Txid::from_slice(&[0u8; 32]).expect("all-zero txid"),
+            lockup_vout: 0,
+            claim_pubkey: b_xonly(&recipient_xonly)?,
+            refund_pubkey: self.key_xonly,
+            refund_locktime,
+        };
+        let pending = self
+            .lock_htlc(&request, options, amount_sat, recipient_xonly)
+            .await?;
+        let payment = pending.payment.clone();
+        outgoing.insert(payment.operation_id.clone(), pending);
+        Ok(payment)
+    }
+
+    async fn watch_outgoing(
+        &self,
+        payment: &OutgoingPayment,
+        deadline: u64,
+    ) -> Result<Bytes32, AdapterError> {
+        let options = {
+            let outgoing = self.outgoing.lock().await;
+            let pending = outgoing.get(&payment.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!("no outgoing operation {}", payment.operation_id))
+            })?;
+            if !outgoing_payment_matches(pending, payment) {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing payment does not match stored operation state".into(),
+                ));
+            }
+            pending.options.clone()
+        };
+        loop {
+            if Self::unix_now() >= deadline {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            match self.scan_spend_preimage(&options).await {
+                Ok(Some((preimage, spend_txid))) => {
+                    if !payment.payment_hash.matches_preimage(&preimage) {
+                        return Err(AdapterError::Network(
+                            "observed preimage does not match outgoing payment hash".into(),
+                        ));
+                    }
+                    self.span.in_scope(|| {
+                        info!(target: "cassis_bitcoin",
+                            "preimage observed for {}: spend={spend_txid}",
+                            payment.payment_hash.short());
+                    });
+                    return Ok(preimage);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.span.in_scope(|| {
+                        warn!(target: "cassis_bitcoin", "outgoing settlement poll failed: {error}");
+                    });
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+    }
+
+    async fn refund_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        self.validate_outgoing_payment(payment)?;
+        let options = {
+            let outgoing = self.outgoing.lock().await;
+            let Some(pending) = outgoing.get(&payment.operation_id) else {
+                // Successful refund already removed state. Same-handle retry
+                // is complete.
+                return Ok(());
+            };
+            if !outgoing_payment_matches(pending, payment) {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing payment does not match stored operation state".into(),
+                ));
+            }
+            pending.options.clone()
+        };
+        let txid = self
+            .spend_htlc(&options, None, self.funding_address.clone())
+            .await?;
+        self.span.in_scope(|| {
+            info!(target: "cassis_bitcoin",
+                "outgoing htlc refunded {}: tx={txid}",
+                payment.payment_hash.short());
+        });
+        self.outgoing.lock().await.remove(&payment.operation_id);
+        Ok(())
+    }
+
+    async fn restore_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        let mut outgoing = self.outgoing.lock().await;
+        if let Some(existing) = outgoing.get(&payment.operation_id) {
+            if outgoing_payment_matches(existing, payment) {
+                return Ok(());
+            }
+            return Err(AdapterError::InvalidParams(
+                "operation ID is already bound to different outgoing state".into(),
+            ));
+        }
+        if outgoing
+            .values()
+            .any(|pending| pending.payment_hash == payment.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Bitcoin payment hash already has an active operation".into(),
+            ));
+        }
+        let (options, _recipient) = self.validate_outgoing_payment(payment)?;
+        let spk = options.taproot_spk(&Secp256k1::verification_only());
+        let utxos = self.scan_unspent(&spk).await?;
+        let value = utxos
+            .iter()
+            .find(|(outpoint, _)| {
+                outpoint.txid == options.lockup_txid && outpoint.vout == options.lockup_vout
+            })
+            .map(|(_, value)| *value)
+            .ok_or_else(|| {
+                AdapterError::Network(format!(
+                    "Bitcoin HTLC outpoint {}:{} is not unspent during recovery",
+                    options.lockup_txid, options.lockup_vout
+                ))
+            })?;
+        let value_msat = value.to_sat().checked_mul(MSAT_PER_SAT).ok_or_else(|| {
+            AdapterError::Network("recovered Bitcoin amount overflows u64".into())
+        })?;
+        if value_msat < payment.amount_msat {
+            return Err(AdapterError::InvalidParams(
+                "Bitcoin recovered HTLC amount is below payment amount".into(),
+            ));
+        }
+        outgoing.insert(
+            payment.operation_id.clone(),
+            PendingOutgoing {
+                payment_hash: payment.payment_hash,
+                payment: payment.clone(),
+                options,
+            },
+        );
+        Ok(())
+    }
+
+    async fn restore_incoming_reservation(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        let restored = self
+            .reserve_incoming(IncomingRequest {
+                operation_id: reservation.operation_id.clone(),
+                payment_hash: reservation.payment_hash,
+                amount_msat: reservation.amount_msat,
+                deadline: reservation.deadline,
+                preimage: None,
+            })
+            .await?;
+        if restored == *reservation {
+            Ok(())
+        } else {
+            Err(AdapterError::InvalidParams(
+                "restored Bitcoin reservation differs from persisted state".into(),
+            ))
+        }
+    }
+
+    async fn can_route(&self, amount_msat: u64) -> Result<(), AdapterError> {
         let funding_spk = self.funding_address.script_pubkey();
         let utxos = self.scan_unspent(&funding_spk).await?;
-        let available = utxos.iter().map(|(_, v)| v.to_sat()).sum::<u64>();
-        if available * MSAT_PER_SAT < amount_msat {
-            return Err(HtlcError::InvalidParams(format!(
+        let available = utxos.iter().fold(0u64, |total, (_, value)| {
+            total.saturating_add(value.to_sat())
+        });
+        if available.saturating_mul(MSAT_PER_SAT) < amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
                 "insufficient bitcoin balance on {}: need {amount_msat} msat, \
                  wallet holds {available} sats",
                 self.network_id
@@ -1051,240 +1766,10 @@ impl NetworkRouterAdapter for BitcoinAdapter {
         Ok(())
     }
 
-    async fn create_outgoing_htlc(
-        &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-        htlc_target: &HtlcTarget,
-    ) -> Result<OutgoingHtlc, HtlcError> {
-        let recipient_xonly = match htlc_target {
-            HtlcTarget::XOnlyPubKey(pk) => *pk,
-            HtlcTarget::PubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
-                return Err(HtlcError::InvalidParams(
-                    "bitcoin requires a pubkey target".into(),
-                ))
-            }
-        };
-        if !amount_msat.is_multiple_of(MSAT_PER_SAT) {
-            return Err(HtlcError::InvalidParams(format!(
-                "amount {amount_msat} msat is not a whole number of satoshis"
-            )));
-        }
-        let amount_sat = amount_msat / MSAT_PER_SAT;
-        if amount_sat < DUST_SATS {
-            return Err(HtlcError::InvalidParams(format!(
-                "amount {amount_sat} sats is below the dust limit of {DUST_SATS} sats"
-            )));
-        }
-        if expiry < u64::from(MIN_TIMESTAMP_LOCKTIME) {
-            return Err(HtlcError::InvalidParams(format!(
-                "expiry {expiry} looks like a block height; on-chain HTLCs use \
-                 unix timestamps (>= {MIN_TIMESTAMP_LOCKTIME})"
-            )));
-        }
-        if expiry <= Self::unix_now() {
-            return Err(HtlcError::InvalidParams(format!(
-                "expiry {expiry} is in the past"
-            )));
-        }
-        let refund_locktime = u32::try_from(expiry)
-            .map_err(|e| HtlcError::InvalidParams(format!("expiry overflows u32: {e}")))?;
-        // The lockup outpoint is stamped in by lock_htlc after the
-        // broadcast; the placeholder never crosses the wire.
-        let options = HtlcOptions {
-            payment_hash160: HtlcOptions::payment_hash160(&payment_hash),
-            lockup_txid: bitcoin::Txid::from_slice(&[0u8; 32]).expect("all-zero txid"),
-            lockup_vout: 0,
-            claim_pubkey: b_xonly(&recipient_xonly)?,
-            refund_pubkey: self.key_xonly,
-            refund_locktime,
-        };
-        self.lock_htlc(
-            payment_hash,
-            options,
-            amount_sat,
-            recipient_xonly,
-            amount_msat,
-        )
-        .await
-    }
-
-    async fn outgoing_htlc_descriptor(
-        &self,
-        payment_hash: Bytes32,
-    ) -> Result<HtlcDescriptor, HtlcError> {
-        let slot = self
-            .outgoing
-            .lock()
-            .await
-            .get(&payment_hash)
-            .cloned()
-            .ok_or_else(|| {
-                HtlcError::InvalidParams(format!("no outgoing bitcoin HTLC for {payment_hash:?}"))
-            })?;
-        Ok(HtlcDescriptor::Bitcoin {
-            lockup_txid: slot.lockup_txid.to_string(),
-            lockup_vout: slot.lockup_vout as u8,
-            payment_hash160: lower_hex(&slot.options.payment_hash160.to_byte_array()),
-            internal_key: XOnlyPubKey::from_bytes(nums_internal_key().serialize())
-                .map_err(|e| HtlcError::Network(format!("internal key: {e}")))?,
-            refund_pubkey: XOnlyPubKey::from_bytes(slot.options.refund_pubkey.serialize())
-                .map_err(|e| HtlcError::Network(format!("refund pubkey: {e}")))?,
-            refund_locktime: slot.options.refund_locktime,
-        })
-    }
-
-    async fn verify_incoming_htlc(
-        &self,
-        descriptor: &HtlcDescriptor,
-        payment_hash: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let options = HtlcOptions::parse_descriptor(
-            descriptor,
-            payment_hash,
-            &b_xonly(&self.claim_pubkey())?,
-        )?;
-        let spk = options.taproot_spk(&Secp256k1::verification_only());
-        let utxos = self.scan_unspent(&spk).await?;
-        let found = utxos.iter().any(|(outpoint, _)| {
-            outpoint.txid == options.lockup_txid && outpoint.vout == options.lockup_vout
-        });
-        if !found {
-            return Err(HtlcError::Network(format!(
-                "HTLC outpoint {}:{} unspent at its P2WSH address; upstream lock not \
-                 (yet) on chain",
-                options.lockup_txid, options.lockup_vout
-            )));
-        }
+    /// Claim output comes entirely from incoming HTLC, including fee money;
+    /// no separate wallet balance is required.
+    async fn can_claim(&self, _amount_msat: u64) -> Result<(), AdapterError> {
         Ok(())
-    }
-
-    async fn accept_incoming_htlc(
-        &self,
-        payment_hash: Bytes32,
-        descriptor: &HtlcDescriptor,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
-        self.verify_incoming_htlc(descriptor, payment_hash).await?;
-        let options = HtlcOptions::parse_descriptor(
-            descriptor,
-            payment_hash,
-            &b_xonly(&self.claim_pubkey())?,
-        )?;
-        if options.claim_pubkey != self.key_xonly {
-            return Err(HtlcError::InvalidParams(format!(
-                "incoming HTLC is locked to {}, which this node cannot claim; \
-                 upstream hop locked to the wrong claim key",
-                options.claim_pubkey
-            )));
-        }
-        if u64::from(options.refund_locktime) < deadline {
-            return Err(HtlcError::InvalidParams(format!(
-                "refund locktime {} precedes the claim deadline {deadline}; the \
-                 sender could race our claim",
-                options.refund_locktime
-            )));
-        }
-        let mut incoming = self.incoming.lock().await;
-        let expected_sat = incoming
-            .get(&payment_hash)
-            .map(|slot| slot.expected_sat)
-            .unwrap_or(0);
-        incoming.insert(
-            payment_hash,
-            PendingIncoming {
-                options: Some(options),
-                deadline,
-                expected_sat,
-            },
-        );
-        Ok(())
-    }
-
-    async fn claim_incoming(
-        &self,
-        payment_hash: Bytes32,
-        preimage: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let options = self
-            .incoming
-            .lock()
-            .await
-            .get(&payment_hash)
-            .filter(|slot| slot.options.is_some())
-            .map(|slot| slot.options.as_ref().expect("checked is_some").clone())
-            .ok_or_else(|| {
-                HtlcError::InvalidParams(format!("no accepted incoming HTLC for {payment_hash:?}"))
-            })?;
-        let txid = self
-            .spend_htlc(&options, Some(preimage), self.funding_address.clone())
-            .await?;
-        self.span.in_scope(|| {
-            info!(target: "cassis_bitcoin", "incoming htlc claimed {}: tx={txid}",
-                payment_hash.short());
-        });
-        self.incoming.lock().await.remove(&payment_hash);
-        Ok(())
-    }
-
-    async fn refund_outgoing(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
-        let options = self
-            .outgoing
-            .lock()
-            .await
-            .get(&payment_hash)
-            .map(|slot| slot.options.clone())
-            .ok_or_else(|| {
-                HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
-            })?;
-        let txid = self
-            .spend_htlc(&options, None, self.funding_address.clone())
-            .await?;
-        self.span.in_scope(|| {
-            info!(target: "cassis_bitcoin", "outgoing htlc refunded {}: tx={txid}",
-                payment_hash.short());
-        });
-        self.outgoing.lock().await.remove(&payment_hash);
-        Ok(())
-    }
-
-    async fn watch_preimage(
-        &self,
-        payment_hash: Bytes32,
-        deadline: u64,
-    ) -> Result<Bytes32, WatchError> {
-        let options = self
-            .outgoing
-            .lock()
-            .await
-            .get(&payment_hash)
-            .map(|slot| slot.options.clone())
-            .ok_or_else(|| WatchError::Network(format!("no outgoing HTLC for {payment_hash:?}")))?;
-        loop {
-            if Self::unix_now() >= deadline {
-                return Err(WatchError::DeadlineExceeded);
-            }
-            match self.scan_spend_preimage(&options).await {
-                Ok(Some((preimage, spend_txid))) => {
-                    self.span.in_scope(|| {
-                        info!(target: "cassis_bitcoin",
-                            "preimage observed for {}: spend={spend_txid}",
-                            payment_hash.short());
-                    });
-                    return Ok(preimage);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    self.span.in_scope(|| {
-                        warn!(target: "cassis_bitcoin", "watch_preimage poll failed: {e}");
-                    });
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
-        }
     }
 }
 

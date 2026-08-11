@@ -6,13 +6,22 @@
 //! Outgoing payments always use the downstream BOLT11 request carried by the
 //! Cassis HTLC descriptor; raw hash-only sends are deliberately rejected
 //! because modern LND invoices require their payment secret.
+//!
+//! Both sides key their state by [`OperationId`]: an operation is one
+//! authenticated attempt, a payment hash is the intent it serves. The
+//! payment hash therefore lives inside every entry, so a caller holding the
+//! wrong handle can never fund, accept or claim another operation's
+//! contract. A retry of the same operation is answered from the state
+//! already on record; a second operation claiming a live payment hash is
+//! refused.
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, WatchError, XOnlyPubKey,
+    AcceptedIncoming, AdapterError, Bytes32, HtlcDescriptor, HtlcTarget, IncomingRequest,
+    IncomingReservation, NetworkAdapter, NetworkId, OperationId, OutgoingPayment, OutgoingRequest,
+    XOnlyPubKey,
 };
 use lightning_invoice::Bolt11Invoice;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -27,10 +36,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, Span};
+use tracing::{debug, info, Span};
 
 const DEFAULT_INCOMING_DELTA_SECS: u64 = 30;
 const SEND_TIMEOUT_SECS: i32 = 60;
+const MSAT_PER_SAT: u64 = 1000;
 
 #[derive(Clone, Debug)]
 pub struct LndConfig {
@@ -67,35 +77,56 @@ pub enum Error {
     Http(String),
     #[error("LND API error: {0}")]
     Api(String),
-    #[error("no incoming HTLC for {0}")]
-    NoIncoming(String),
-    #[error("no outgoing HTLC for {0}")]
-    NoOutgoing(String),
 }
 
-impl From<Error> for HtlcError {
+impl From<Error> for AdapterError {
     fn from(error: Error) -> Self {
         match error {
-            Error::InvalidParams(message)
-            | Error::NoIncoming(message)
-            | Error::NoOutgoing(message) => HtlcError::InvalidParams(message),
-            other => HtlcError::Network(other.to_string()),
+            Error::InvalidParams(message) => AdapterError::InvalidParams(message),
+            other => AdapterError::Network(other.to_string()),
         }
     }
 }
 
-impl From<Error> for WatchError {
-    fn from(error: Error) -> Self {
-        WatchError::Network(error.to_string())
-    }
+/// Receiver-side state for a reserved LND hold invoice, keyed by the
+/// operation that reserved it in [`LndAdapter::incoming`].
+#[derive(Clone, Debug)]
+struct PendingIncoming {
+    /// Route payment hash this reservation is for. Kept next to the
+    /// operation id so a caller holding the wrong reservation can never
+    /// accept or claim another operation's invoice.
+    payment_hash: Bytes32,
+    amount_msat: u64,
+    /// Unix deadline after which the receiver stops waiting for the
+    /// sender to fund the invoice.
+    deadline: u64,
+    /// The exact hold invoice LND registered for `payment_hash`. This is
+    /// also the hop's `HtlcTarget`: the upstream party must pay this
+    /// payment request, not one of its own, so the payment secret that
+    /// makes the invoice holdable is preserved.
+    payment_request: String,
+    /// Amount LND confirmed the invoice is holding, set once
+    /// [`NetworkAdapter::accept_incoming`] has verified the funding.
+    /// `None` while the invoice is still unfunded.
+    accepted_amount_msat: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct PendingIncoming {
+/// Sender-side state for an outgoing LND payment, keyed by the operation
+/// that funded it in [`LndAdapter::outgoing`].
+#[derive(Clone)]
+struct PendingOutgoing {
+    /// Route payment hash this payment is for, so an operation-keyed
+    /// lookup can reject a mismatched [`OutgoingPayment`].
+    payment_hash: Bytes32,
     amount_msat: u64,
-    deadline: u64,
+    expiry: u64,
+    /// The BOLT11 request LND was asked to pay. It is both the
+    /// destination and the wire descriptor, so recovery never needs a
+    /// second map lookup.
     payment_request: String,
+    state: Arc<Mutex<OutgoingState>>,
+    changed: Arc<Notify>,
+    cancel: Arc<Notify>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,25 +137,21 @@ enum OutgoingState {
     Cancelled,
 }
 
-#[derive(Clone)]
-#[allow(dead_code)]
-struct PendingOutgoing {
-    amount_msat: u64,
-    expiry: u64,
-    payment_request: String,
-    state: Arc<Mutex<OutgoingState>>,
-    changed: Arc<Notify>,
-    cancel: Arc<Notify>,
-}
-
 pub struct LndAdapter {
     config: LndConfig,
     network_id: NetworkId,
     invoice_pubkey: XOnlyPubKey,
     client: reqwest::Client,
     span: Span,
-    incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
-    outgoing: Mutex<HashMap<Bytes32, PendingOutgoing>>,
+    /// Hold invoices we are expecting payment for, keyed by the operation
+    /// that reserved them. The payment hash lives inside the entry so a
+    /// second operation cannot quietly take over a published invoice.
+    incoming: Arc<Mutex<HashMap<OperationId, PendingIncoming>>>,
+    /// Outgoing payments we have asked LND to make, keyed by the
+    /// operation that funded them.
+    outgoing: Arc<Mutex<HashMap<OperationId, PendingOutgoing>>>,
+    /// Serializes external LND payment starts for one adapter.
+    outgoing_creation_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for LndAdapter {
@@ -154,6 +181,13 @@ struct InvoiceLookup {
     settled: Option<bool>,
     state: Option<String>,
     value_msat: Option<Value>,
+}
+
+/// `GET /v1/balance/channels`; LND string-encodes sat amounts, but older
+/// builds answer with a number, so both shapes are accepted.
+#[derive(Deserialize)]
+struct ChannelBalanceResponse {
+    balance: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,8 +263,9 @@ impl LndAdapter {
             invoice_pubkey: XOnlyPubKey([0u8; 32]),
             client,
             span: cassis_core::network_span(&span, &network_id),
-            incoming: Mutex::new(HashMap::new()),
-            outgoing: Mutex::new(HashMap::new()),
+            incoming: Arc::new(Mutex::new(HashMap::new())),
+            outgoing: Arc::new(Mutex::new(HashMap::new())),
+            outgoing_creation_lock: Arc::new(Mutex::new(())),
         };
         let info: GetInfoResponse = adapter.get_json("v1/getinfo").await?;
         let pubkey_bytes = decode_hex_exact::<33>(&info.identity_pubkey).map_err(|error| {
@@ -257,6 +292,25 @@ impl LndAdapter {
             );
         });
         Ok(adapter)
+    }
+
+    /// Handle for a spawned send/track task.
+    ///
+    /// The task only drives the shared HTTP client, but it also updates
+    /// the payment state the watcher reads, so it gets the very same
+    /// operation maps rather than a detached copy: a copy would strand
+    /// every watcher on a state nothing ever moves.
+    fn clone_for_task(&self) -> Arc<Self> {
+        Arc::new(Self {
+            config: self.config.clone(),
+            network_id: self.network_id.clone(),
+            invoice_pubkey: self.invoice_pubkey,
+            client: self.client.clone(),
+            span: self.span.clone(),
+            incoming: self.incoming.clone(),
+            outgoing: self.outgoing.clone(),
+            outgoing_creation_lock: self.outgoing_creation_lock.clone(),
+        })
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -333,23 +387,18 @@ impl LndAdapter {
         Ok(response.payment_request)
     }
 
+    /// The BOLT11 request LND is holding for `payment_hash`: the invoice
+    /// an earlier process already registered, or a freshly created hold
+    /// invoice. Adopting the open one is what makes a retry after a
+    /// restart safe — the hop has already published that payment request
+    /// to its upstream peer.
     async fn ensure_incoming(
         &self,
         payment_hash: Bytes32,
         amount_msat: u64,
         deadline: u64,
     ) -> Result<String, Error> {
-        if let Some(existing) = self.incoming.lock().await.get(&payment_hash).cloned() {
-            if existing.amount_msat < amount_msat {
-                return Err(Error::InvalidParams(format!(
-                    "existing incoming invoice is only {} msat, need {amount_msat}",
-                    existing.amount_msat
-                )));
-            }
-            return Ok(existing.payment_request);
-        }
-
-        let payment_request = match self.lookup_invoice(payment_hash).await? {
+        Ok(match self.lookup_invoice(payment_hash).await? {
             Some(invoice) => {
                 if invoice.settled == Some(true)
                     || invoice
@@ -369,56 +418,213 @@ impl LndAdapter {
                         "LND invoice is only {value} msat, need {amount_msat}"
                     )));
                 }
-                invoice
-                    .payment_request
-                    .ok_or_else(|| Error::Api("LND invoice has no payment request".into()))?
+                match invoice.payment_request {
+                    Some(request) => request,
+                    None => {
+                        return Err(Error::Api("LND invoice has no payment request".into()));
+                    }
+                }
             }
             None => {
                 self.add_hold_invoice(payment_hash, amount_msat, deadline)
                     .await?
             }
-        };
-
-        self.incoming.lock().await.insert(
-            payment_hash,
-            PendingIncoming {
-                amount_msat,
-                deadline,
-                payment_request: payment_request.clone(),
-            },
-        );
-        Ok(payment_request)
+        })
     }
 
-    fn parse_target(
+    /// Amount LND is holding for a funded, still-open invoice.
+    ///
+    /// `OPEN` means nobody paid the hold invoice yet, which is a normal
+    /// race between funding and the COMMIT frame rather than a failure,
+    /// so it is reported as retryable.
+    async fn accepted_incoming_amount(
         &self,
-        descriptor: &HtlcDescriptor,
         payment_hash: Bytes32,
-        amount_msat: u64,
-    ) -> Result<String, Error> {
-        let HtlcDescriptor::Lightning { payment_request } = descriptor else {
-            return Err(Error::InvalidParams(
-                "LND outgoing payment requires a Lightning invoice descriptor".into(),
-            ));
-        };
-        let invoice = Bolt11Invoice::from_str(payment_request)
-            .map_err(|error| Error::InvalidParams(format!("invalid BOLT11 invoice: {error}")))?;
-        if invoice.payment_hash().as_ref() != payment_hash.0 {
-            return Err(Error::InvalidParams(
-                "Lightning invoice hash does not match the route payment hash".into(),
+        floor_msat: u64,
+    ) -> Result<u64, AdapterError> {
+        let invoice = self.lookup_invoice(payment_hash).await?.ok_or_else(|| {
+            AdapterError::NotFound(format!("LND hold invoice for {payment_hash} not found"))
+        })?;
+        let state = invoice.state.as_deref().unwrap_or("").to_ascii_uppercase();
+        if invoice.settled == Some(true) || state == "CANCELED" {
+            return Err(AdapterError::InvalidParams(
+                "LND invoice is not open".into(),
             ));
         }
-        if let Some(invoice_amount) = invoice.amount_milli_satoshis() {
-            if invoice_amount < amount_msat {
-                return Err(Error::InvalidParams(format!(
-                    "Lightning invoice is only {invoice_amount} msat, need {amount_msat}"
-                )));
-            }
+        if state != "ACCEPTED" {
+            return Err(AdapterError::Retryable(
+                "LND hold invoice is not funded/accepted yet".into(),
+            ));
         }
-        Ok(payment_request.clone())
+        // LND does not always echo the amount; the reserved floor is the
+        // amount we know is locked either way.
+        let amount_msat = invoice
+            .value_msat
+            .as_ref()
+            .and_then(value_as_u64)
+            .unwrap_or(floor_msat);
+        if amount_msat < floor_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "LND invoice amount {amount_msat} msat below reserved {floor_msat} msat"
+            )));
+        }
+        Ok(amount_msat)
     }
 
-    async fn start_payment(&self, payment_hash: Bytes32, pending: PendingOutgoing) {
+    /// The handle for a parked incoming entry. Both the fresh and the
+    /// retry path of [`NetworkAdapter::reserve_incoming`] build it here,
+    /// so one operation can never be answered with two reservations.
+    fn incoming_reservation(
+        &self,
+        operation_id: &OperationId,
+        slot: &PendingIncoming,
+    ) -> IncomingReservation {
+        IncomingReservation {
+            operation_id: operation_id.clone(),
+            payment_hash: slot.payment_hash,
+            network: self.network_id.clone(),
+            amount_msat: slot.amount_msat,
+            deadline: slot.deadline,
+            target: HtlcTarget::LightningInvoice(slot.payment_request.clone()),
+        }
+    }
+
+    /// Resolve the entry `reservation` names, rejecting a handle whose
+    /// payment hash does not match the operation that owns it.
+    async fn incoming_slot(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<PendingIncoming, AdapterError> {
+        let slot = self
+            .incoming
+            .lock()
+            .await
+            .get(&reservation.operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming LND reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+        if slot.payment_hash != reservation.payment_hash {
+            return Err(AdapterError::InvalidParams(
+                "LND reservation operation id does not match this payment".into(),
+            ));
+        }
+        Ok(slot)
+    }
+
+    /// Decide whether `request` may park an entry in
+    /// [`LndAdapter::incoming`].
+    ///
+    /// `Ok(Some(reservation))` means this exact operation is already
+    /// reserved and the caller must hand that handle back unchanged;
+    /// `Ok(None)` means the caller may register it now. The incoming map
+    /// is keyed by operation, so the payment-hash scan is what keeps two
+    /// operations from competing for one published hold invoice.
+    fn existing_reservation(
+        &self,
+        incoming: &HashMap<OperationId, PendingIncoming>,
+        operation_id: &OperationId,
+        payment_hash: Bytes32,
+    ) -> Result<Option<IncomingReservation>, AdapterError> {
+        if let Some(slot) = incoming.get(operation_id) {
+            if slot.payment_hash != payment_hash {
+                return Err(AdapterError::InvalidParams(
+                    "LND operation id is already reserved for another payment hash".into(),
+                ));
+            }
+            return Ok(Some(self.incoming_reservation(operation_id, slot)));
+        }
+        if incoming
+            .values()
+            .any(|slot| slot.payment_hash == payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "LND payment hash already has an active hold invoice".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    /// The [`AcceptedIncoming`] already committed for `reservation`, or
+    /// `None` while the invoice is still unfunded. Makes a repeated
+    /// [`NetworkAdapter::accept_incoming`] idempotent: the amount
+    /// verified the first time stays authoritative and the descriptor is
+    /// rebuilt from the hold invoice on record, so a caller's journal
+    /// never records a payload other than the one that was checked.
+    async fn accepted_incoming(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<Option<AcceptedIncoming>, AdapterError> {
+        let slot = self.incoming_slot(reservation).await?;
+        let Some(amount_msat) = slot.accepted_amount_msat else {
+            return Ok(None);
+        };
+        Ok(Some(AcceptedIncoming {
+            reservation: reservation.clone(),
+            descriptor: HtlcDescriptor::Lightning {
+                payment_request: slot.payment_request,
+            },
+            amount_msat,
+        }))
+    }
+
+    /// The handle for an outgoing payment this adapter already funded.
+    /// A retry of the same operation is answered from here so the sender
+    /// never pays the same invoice twice.
+    fn outgoing_payment(
+        &self,
+        operation_id: &OperationId,
+        slot: &PendingOutgoing,
+    ) -> OutgoingPayment {
+        OutgoingPayment {
+            operation_id: operation_id.clone(),
+            payment_hash: slot.payment_hash,
+            amount_msat: slot.amount_msat,
+            destination: HtlcTarget::LightningInvoice(slot.payment_request.clone()),
+            destination_network: self.network_id.clone(),
+            expiry: slot.expiry,
+            // The invoice LND was asked to pay rides along with the
+            // handle, so `restore_outgoing` can rebuild the watcher from
+            // the payment alone.
+            descriptor: HtlcDescriptor::Lightning {
+                payment_request: slot.payment_request.clone(),
+            },
+        }
+    }
+
+    /// Resolve the entry `payment` names, rejecting a handle whose
+    /// payment hash does not match the operation that owns it.
+    async fn outgoing_slot(
+        &self,
+        payment: &OutgoingPayment,
+    ) -> Result<PendingOutgoing, AdapterError> {
+        let slot = self
+            .outgoing
+            .lock()
+            .await
+            .get(&payment.operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no outgoing LND payment for operation {}",
+                    payment.operation_id
+                ))
+            })?;
+        if slot.payment_hash != payment.payment_hash {
+            return Err(AdapterError::InvalidParams(
+                "outgoing operation id does not match this payment".into(),
+            ));
+        }
+        Ok(slot)
+    }
+
+    /// Ask LND to pay `payment_request` and record the terminal state.
+    /// Runs on a spawned task so the caller gets its handle back without
+    /// waiting for a route.
+    async fn start_payment(&self, pending: PendingOutgoing) {
         let request = SendPaymentRequest {
             payment_request: &pending.payment_request,
             fee_limit_msat: ((pending.amount_msat / 100).max(1_000)).to_string(),
@@ -435,7 +641,7 @@ impl LndAdapter {
                 .await
                 .map_err(|error| Error::Http(error.to_string()))?;
             let body = ensure_success_body(response).await?;
-            parse_payment_stream(&body, payment_hash)
+            parse_payment_stream(&body, pending.payment_hash)
         };
 
         let result = tokio::select! {
@@ -451,16 +657,19 @@ impl LndAdapter {
         pending.changed.notify_waiters();
     }
 
-    async fn track_payment(&self, payment_hash: Bytes32, pending: PendingOutgoing) {
+    /// Re-attach to a payment LND is already making, without sending it
+    /// again: after a restart the payment record outlives the process, so
+    /// the preimage is read back off LND's own stream.
+    async fn track_payment(&self, pending: PendingOutgoing) {
         let result = async {
             let response = self
                 .client
-                .get(self.endpoint(&format!("v2/router/track/{payment_hash}")))
+                .get(self.endpoint(&format!("v2/router/track/{}", pending.payment_hash)))
                 .send()
                 .await
                 .map_err(|error| Error::Http(error.to_string()))?;
             let body = ensure_success_body(response).await?;
-            parse_payment_stream(&body, payment_hash)
+            parse_payment_stream(&body, pending.payment_hash)
         }
         .await;
         let state = match result {
@@ -473,7 +682,7 @@ impl LndAdapter {
 }
 
 #[async_trait]
-impl NetworkRouterAdapter for LndAdapter {
+impl NetworkAdapter for LndAdapter {
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }
@@ -482,83 +691,533 @@ impl NetworkRouterAdapter for LndAdapter {
         self.invoice_pubkey
     }
 
+    /// LND holds the funds itself, so its node identity is both the
+    /// invoice identity and the key the hold is settled from.
     fn claim_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey
     }
 
+    /// Hold invoices are funded by the first hop within seconds, so 30 s
+    /// is enough margin to claim before the outgoing expiry bites.
     fn incoming_delta_secs(&self) -> u64 {
         DEFAULT_INCOMING_DELTA_SECS
     }
 
-    async fn register_incoming_htlc(
+    /// Register a hold invoice for `request.payment_hash` and publish it
+    /// as the hop's `HtlcTarget`.
+    ///
+    /// LND's incoming target *is* the hold invoice, so this call is what
+    /// makes the reservation usable: the upstream party pays the exact
+    /// payment request LND registered, and the invoice stays held until
+    /// [`NetworkAdapter::claim_incoming`] reveals the preimage.
+    ///
+    /// A retry of the same operation returns the reservation already on
+    /// record (re-adopting the invoice LND still holds, if this is a
+    /// replay after a restart). A *different* operation claiming a live
+    /// payment hash is rejected: a payment hash identifies intent, and one
+    /// intent must never be reservable — or claimable — twice.
+    async fn reserve_incoming(
         &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
-        if deadline <= unix_now() {
-            return Err(HtlcError::InvalidParams("deadline in the past".into()));
+        request: IncomingRequest,
+    ) -> Result<IncomingReservation, AdapterError> {
+        if request.deadline <= unix_now() {
+            return Err(AdapterError::InvalidParams(
+                "incoming deadline is in the past".into(),
+            ));
         }
-        self.ensure_incoming(payment_hash, min_amount_msat, deadline)
-            .await
-            .map_err(HtlcError::from)?;
+        {
+            let incoming = self.incoming.lock().await;
+            if let Some(reservation) =
+                self.existing_reservation(&incoming, &request.operation_id, request.payment_hash)?
+            {
+                return Ok(reservation);
+            }
+        }
+        // Registration is a round trip to LND, so it happens with the
+        // map unlocked; the checks below run again afterwards to close
+        // the window a concurrent reservation would have opened.
+        let payment_request = self
+            .ensure_incoming(request.payment_hash, request.amount_msat, request.deadline)
+            .await?;
+        let mut incoming = self.incoming.lock().await;
+        if let Some(reservation) =
+            self.existing_reservation(&incoming, &request.operation_id, request.payment_hash)?
+        {
+            return Ok(reservation);
+        }
+        incoming.insert(
+            request.operation_id.clone(),
+            PendingIncoming {
+                payment_hash: request.payment_hash,
+                amount_msat: request.amount_msat,
+                deadline: request.deadline,
+                payment_request,
+                accepted_amount_msat: None,
+            },
+        );
+        Ok(self.incoming_reservation(
+            &request.operation_id,
+            incoming
+                .get(&request.operation_id)
+                .expect("reservation just inserted"),
+        ))
+    }
+
+    async fn restore_incoming_reservation(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        let HtlcTarget::LightningInvoice(payment_request) = &reservation.target else {
+            return Err(AdapterError::InvalidParams(
+                "LND reservation target must be a Lightning invoice".into(),
+            ));
+        };
+        if reservation.network != self.network_id {
+            return Err(AdapterError::InvalidParams(
+                "LND reservation belongs to another network".into(),
+            ));
+        }
+        let mut incoming = self.incoming.lock().await;
+        if let Some(existing) = incoming.get(&reservation.operation_id) {
+            return if existing.payment_hash == reservation.payment_hash
+                && existing.amount_msat == reservation.amount_msat
+                && existing.deadline == reservation.deadline
+                && existing.payment_request == *payment_request
+            {
+                Ok(())
+            } else {
+                Err(AdapterError::InvalidParams(
+                    "LND reservation operation is bound to different state".into(),
+                ))
+            };
+        }
+        if incoming
+            .values()
+            .any(|slot| slot.payment_hash == reservation.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "LND payment hash already has an active reservation".into(),
+            ));
+        }
+        incoming.insert(
+            reservation.operation_id.clone(),
+            PendingIncoming {
+                payment_hash: reservation.payment_hash,
+                amount_msat: reservation.amount_msat,
+                deadline: reservation.deadline,
+                payment_request: payment_request.clone(),
+                accepted_amount_msat: None,
+            },
+        );
         Ok(())
     }
 
-    async fn htlc_target(&self, payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
-        let payment_request = self
-            .incoming
-            .lock()
-            .await
-            .get(&payment_hash)
-            .map(|pending| pending.payment_request.clone())
-            .ok_or_else(|| Error::NoIncoming(payment_hash.to_string()))
-            .map_err(HtlcError::from)?;
-        Ok(HtlcTarget::LightningInvoice(payment_request))
-    }
-
-    async fn cancel_incoming_htlc(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
+    /// Cancel the hold invoice backing an unfunded reservation. LND only
+    /// drops an `OPEN` hold invoice; a funded one is released by
+    /// [`NetworkAdapter::claim_incoming`] instead.
+    ///
+    /// An operation this adapter no longer holds — never reserved,
+    /// already cancelled, or already claimed — is a no-op: none of those
+    /// races can move money, and the hold invoice is gone either way.
+    async fn cancel_incoming(&self, reservation: &IncomingReservation) -> Result<(), AdapterError> {
+        // The entry stays parked until LND confirms the cancel, so a
+        // retry that races this call still cancels instead of reporting
+        // an invoice nobody holds.
+        let payment_hash = {
+            let incoming = self.incoming.lock().await;
+            match incoming.get(&reservation.operation_id) {
+                Some(slot) if slot.payment_hash == reservation.payment_hash => slot.payment_hash,
+                Some(_) => {
+                    return Err(AdapterError::InvalidParams(
+                        "LND reservation operation id does not match this payment".into(),
+                    ))
+                }
+                None => return Ok(()),
+            }
+        };
         let request = HashRequest {
             payment_hash: BASE64.encode(payment_hash.0),
         };
-        self.post_empty("v2/invoices/cancel", &request)
-            .await
-            .map_err(HtlcError::from)?;
-        self.incoming.lock().await.remove(&payment_hash);
+        self.post_empty("v2/invoices/cancel", &request).await?;
+        self.incoming.lock().await.remove(&reservation.operation_id);
         Ok(())
     }
 
-    async fn create_outgoing_htlc(
+    /// Verify that the incoming HTLC the upstream hop committed is the
+    /// hold invoice this operation reserved, and that LND is holding it
+    /// for at least the reserved amount.
+    ///
+    /// The descriptor is compared verbatim against the reserved payment
+    /// request: LND can only hold *its own* invoice against the route
+    /// hash, so a re-encoded or self-made BOLT11 would settle a payment
+    /// that was never locked. Hash and amount are re-checked as well, so
+    /// a descriptor that merely looks like a Lightning invoice is still
+    /// refused.
+    async fn accept_incoming(
         &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-        htlc_target: &HtlcTarget,
-    ) -> Result<OutgoingHtlc, HtlcError> {
-        let payment_request = match htlc_target {
-            HtlcTarget::LightningInvoice(invoice) => invoice.clone(),
-            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::PubKey(_) | HtlcTarget::SparkAddress(_) => {
-                return Err(HtlcError::InvalidParams(
-                    "lightning requires a hold invoice target".into(),
+        reservation: &IncomingReservation,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<AcceptedIncoming, AdapterError> {
+        // Re-accept of an operation we already committed: hand back the
+        // payload we verified the first time. LND now reports the invoice
+        // `SETTLED`, which would turn a harmless retry into a failure.
+        if let Some(accepted) = self.accepted_incoming(reservation).await? {
+            return Ok(accepted);
+        }
+        let slot = self.incoming_slot(reservation).await?;
+        let payment_request = lightning_request(descriptor)?;
+        parse_invoice(payment_request, reservation.payment_hash)?;
+        if payment_request != slot.payment_request {
+            return Err(AdapterError::InvalidParams(
+                "Lightning descriptor is not the reserved LND hold invoice".into(),
+            ));
+        }
+        let amount_msat = self
+            .accepted_incoming_amount(reservation.payment_hash, slot.amount_msat)
+            .await?;
+        {
+            let mut incoming = self.incoming.lock().await;
+            let stored = incoming.get_mut(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming LND reservation for operation {}",
+                    reservation.operation_id
                 ))
+            })?;
+            if stored.payment_hash != reservation.payment_hash {
+                return Err(AdapterError::InvalidParams(
+                    "LND reservation operation id does not match this payment".into(),
+                ));
             }
+            stored.accepted_amount_msat = Some(amount_msat);
+        }
+        Ok(AcceptedIncoming {
+            reservation: reservation.clone(),
+            descriptor: descriptor.clone(),
+            amount_msat,
+        })
+    }
+
+    /// Rebuild the receiver-side state from a journal replay.
+    ///
+    /// Only local checks run here: LND was already consulted when the
+    /// invoice was accepted, and a restart must not turn into a network
+    /// round trip that can fail while funds sit locked and claimable. The
+    /// descriptor is re-parsed against the route hash and must still
+    /// cover the reservation.
+    async fn restore_incoming(&self, accepted: &AcceptedIncoming) -> Result<(), AdapterError> {
+        let reservation = &accepted.reservation;
+        let payment_request = lightning_request(&accepted.descriptor)?;
+        parse_invoice(payment_request, reservation.payment_hash)?;
+        if accepted.amount_msat < reservation.amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "accepted LND amount {} msat below reserved {} msat",
+                accepted.amount_msat, reservation.amount_msat
+            )));
+        }
+        let mut incoming = self.incoming.lock().await;
+        if let Some(slot) = incoming.get(&reservation.operation_id) {
+            // Live state wins over the journal copy, but the operation
+            // must not be pointed at a different payment.
+            return if slot.payment_hash == reservation.payment_hash {
+                Ok(())
+            } else {
+                Err(AdapterError::InvalidParams(
+                    "incoming operation id is already reserved for another payment hash".into(),
+                ))
+            };
+        }
+        incoming.insert(
+            reservation.operation_id.clone(),
+            PendingIncoming {
+                payment_hash: reservation.payment_hash,
+                amount_msat: reservation.amount_msat,
+                deadline: reservation.deadline,
+                payment_request: payment_request.to_string(),
+                accepted_amount_msat: Some(accepted.amount_msat),
+            },
+        );
+        Ok(())
+    }
+
+    /// Wait until the sender has funded the hold invoice. LND flips the
+    /// invoice to `ACCEPTED` once the HTLC is on its way, and a hop that
+    /// cancels before funding shows up as `CANCELED`.
+    async fn watch_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        deadline: u64,
+    ) -> Result<(), AdapterError> {
+        let slot = self.incoming_slot(reservation).await?;
+        if slot.accepted_amount_msat.is_some() {
+            return Ok(());
+        }
+        let payment_hash = slot.payment_hash;
+        let limit = deadline.min(slot.deadline);
+        loop {
+            if unix_now() >= limit {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            if let Some(invoice) = self.lookup_invoice(payment_hash).await? {
+                let state = invoice.state.as_deref().unwrap_or("").to_ascii_uppercase();
+                if invoice.settled == Some(true) || state == "ACCEPTED" || state == "SETTLED" {
+                    return Ok(());
+                }
+                if state == "CANCELED" {
+                    return Err(AdapterError::Network(
+                        "LND invoice was canceled before funding".to_string(),
+                    ));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Settle the hold invoice with `preimage`, releasing the funds LND
+    /// has been holding. This is the point of no return for the payee:
+    /// the preimage is published to every upstream hop, so it must hash
+    /// to the invoice we actually hold and the operation must be the one
+    /// that reserved it.
+    async fn claim_incoming(
+        &self,
+        accepted: &AcceptedIncoming,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let reservation = &accepted.reservation;
+        let payment_hash = reservation.payment_hash;
+        if !payment_hash.matches_preimage(&preimage) {
+            return Err(AdapterError::InvalidParams(
+                "preimage does not match the payment hash".into(),
+            ));
+        }
+        // LND is the authority on which invoices it holds and what they
+        // are worth, so a replayed handle that lost its local entry can
+        // still settle; it must never settle another operation's hash.
+        if let Some(slot) = self
+            .incoming
+            .lock()
+            .await
+            .get(&reservation.operation_id)
+            .cloned()
+        {
+            if slot.payment_hash != payment_hash {
+                return Err(AdapterError::InvalidParams(
+                    "LND reservation operation id does not match this payment".into(),
+                ));
+            }
+        }
+        let request = PreimageRequest {
+            preimage: BASE64.encode(preimage.0),
         };
-        if expiry <= unix_now() {
-            return Err(HtlcError::InvalidParams(
+        self.span.in_scope(|| {
+            info!(
+                target: "cassis_lnd",
+                "revealing preimage to LND for {}",
+                payment_hash.short(),
+            );
+        });
+        self.post_empty("v2/invoices/settle", &request).await?;
+        self.incoming.lock().await.remove(&reservation.operation_id);
+        Ok(())
+    }
+
+    /// Claim straight from reservation state, for the native receive path
+    /// where the caller only kept the reservation handle. A funded LND
+    /// hold invoice is claimed by its payment request and the preimage,
+    /// so this rebuilds the accepted handle and takes the normal route.
+    async fn claim_reserved_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let accepted = self.accepted_incoming(reservation).await?.ok_or_else(|| {
+            AdapterError::Retryable(format!(
+                "LND reservation {} is not funded yet",
+                reservation.operation_id
+            ))
+        })?;
+        self.claim_incoming(&accepted, preimage).await
+    }
+
+    /// Ask LND to pay the hop's BOLT11 invoice.
+    ///
+    /// A modern LND invoice carries its own payment secret, so a payment
+    /// can only be made by handing LND the exact request the receiver
+    /// published; hash-only sends are refused rather than silently
+    /// producing an unpayable HTLC.
+    async fn create_outgoing(
+        &self,
+        request: OutgoingRequest,
+    ) -> Result<OutgoingPayment, AdapterError> {
+        let _creation_guard = self.outgoing_creation_lock.lock().await;
+        if request.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams("amount must be > 0".into()));
+        }
+        if request.expiry <= unix_now() {
+            return Err(AdapterError::InvalidParams(
                 "outgoing expiry is in the past".into(),
             ));
         }
-        self.parse_target(
-            &HtlcDescriptor::Lightning {
-                payment_request: payment_request.clone(),
-            },
-            payment_hash,
-            amount_msat,
-        )
-        .map_err(HtlcError::from)?;
+        let payment_request = match &request.target {
+            HtlcTarget::LightningInvoice(invoice) => invoice.clone(),
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::PubKey(_) | HtlcTarget::SparkAddress(_) => {
+                return Err(AdapterError::InvalidParams(
+                    "lightning requires a BOLT11 invoice target".into(),
+                ))
+            }
+        };
+        validate_outgoing_invoice(&payment_request, request.payment_hash, request.amount_msat)?;
+        {
+            let outgoing = self.outgoing.lock().await;
+            // Retry of an attempt we already paid: hand back the very
+            // same payment rather than paying the invoice a second time.
+            if let Some(slot) = outgoing.get(&request.operation_id) {
+                if slot.payment_hash != request.payment_hash
+                    || slot.amount_msat != request.amount_msat
+                    || slot.payment_request != payment_request
+                {
+                    return Err(AdapterError::InvalidParams(
+                        "outgoing retry does not match the operation already in flight".into(),
+                    ));
+                }
+                return Ok(self.outgoing_payment(&request.operation_id, slot));
+            }
+            if outgoing
+                .values()
+                .any(|slot| slot.payment_hash == request.payment_hash)
+            {
+                return Err(AdapterError::Retryable(
+                    "LND payment hash already has a live outgoing payment".into(),
+                ));
+            }
+        }
         let pending = PendingOutgoing {
-            amount_msat,
-            expiry,
+            payment_hash: request.payment_hash,
+            amount_msat: request.amount_msat,
+            expiry: request.expiry,
+            payment_request,
+            state: Arc::new(Mutex::new(OutgoingState::Pending)),
+            changed: Arc::new(Notify::new()),
+            cancel: Arc::new(Notify::new()),
+        };
+        let payment = {
+            let mut outgoing = self.outgoing.lock().await;
+            outgoing.insert(request.operation_id.clone(), pending.clone());
+            self.outgoing_payment(
+                &request.operation_id,
+                outgoing
+                    .get(&request.operation_id)
+                    .expect("outgoing payment just recorded"),
+            )
+        };
+        let adapter = self.clone_for_task();
+        tokio::spawn(async move { adapter.start_payment(pending).await });
+        Ok(payment)
+    }
+
+    /// Wait for the receiver to reveal the preimage. The send task
+    /// records the terminal state and wakes every watcher.
+    async fn watch_outgoing(
+        &self,
+        payment: &OutgoingPayment,
+        deadline: u64,
+    ) -> Result<Bytes32, AdapterError> {
+        let pending = self.outgoing_slot(payment).await?;
+        loop {
+            let state = pending.state.lock().await;
+            match &*state {
+                OutgoingState::Pending => {}
+                OutgoingState::Succeeded(preimage) => return Ok(*preimage),
+                OutgoingState::Failed(reason) => return Err(AdapterError::Network(reason.clone())),
+                OutgoingState::Cancelled => {
+                    return Err(AdapterError::Network("outgoing payment cancelled".into()))
+                }
+            }
+            // Registered while the state lock is still held, so a send
+            // task that settles right now cannot slip through unmissed.
+            let settled = pending.changed.notified();
+            drop(state);
+            if unix_now() >= deadline {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            // Wake on the terminal state, and poll regardless so a
+            // watcher is never stranded by a missed notification.
+            let _ = tokio::time::timeout(Duration::from_millis(250), settled).await;
+        }
+    }
+
+    /// Give up on an outgoing payment. Lightning has no refund path for a
+    /// payment the receiver already holds: the send is abandoned, LND's
+    /// in-flight HTLC is dropped, and the watcher is released. A payment
+    /// the receiver claims afterwards can only be resolved with the
+    /// preimage, which is what [`NetworkAdapter::watch_outgoing`] is for.
+    async fn refund_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        let pending = self.outgoing_slot(payment).await?;
+        {
+            let mut state = pending.state.lock().await;
+            // A payment that already reached a terminal state keeps it:
+            // overwriting a success here would throw away a preimage the
+            // upstream hops are still waiting to learn.
+            if !matches!(&*state, OutgoingState::Pending) {
+                return Ok(());
+            }
+            *state = OutgoingState::Cancelled;
+        }
+        pending.cancel.notify_waiters();
+        pending.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Re-arm the watcher for a payment LND may still be making.
+    ///
+    /// Everything needed is in `payment.descriptor`: the BOLT11 request
+    /// LND was asked to pay, which is re-checked against the route hash
+    /// and the destination before it is trusted. The payment is tracked,
+    /// never re-sent, so a restart cannot pay an invoice twice.
+    async fn restore_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        if payment.destination_network != self.network_id {
+            return Err(AdapterError::InvalidParams(format!(
+                "outgoing payment targets {}, not {}",
+                payment.destination_network, self.network_id
+            )));
+        }
+        let HtlcDescriptor::Lightning { payment_request } = &payment.descriptor else {
+            return Err(AdapterError::InvalidParams(
+                "LND outgoing payment requires a Lightning invoice descriptor".into(),
+            ));
+        };
+        // The destination is what the sender was told to pay; it must be
+        // the very request the descriptor carries, or the payment on
+        // record is not the one that was committed.
+        match &payment.destination {
+            HtlcTarget::LightningInvoice(request) if request == payment_request => {}
+            _ => {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing destination is not the descriptor's BOLT11 invoice".into(),
+                ))
+            }
+        }
+        validate_outgoing_invoice(payment_request, payment.payment_hash, payment.amount_msat)?;
+        // Already tracking this attempt: keep the live watcher rather
+        // than swapping in the journal copy and arming a second one.
+        if let Some(slot) = self
+            .outgoing
+            .lock()
+            .await
+            .get(&payment.operation_id)
+            .cloned()
+        {
+            return if slot.payment_hash == payment.payment_hash {
+                Ok(())
+            } else {
+                Err(AdapterError::InvalidParams(
+                    "outgoing operation id is already funding another payment hash".into(),
+                ))
+            };
+        }
+        let pending = PendingOutgoing {
+            payment_hash: payment.payment_hash,
+            amount_msat: payment.amount_msat,
+            expiry: payment.expiry,
             payment_request: payment_request.clone(),
             state: Arc::new(Mutex::new(OutgoingState::Pending)),
             changed: Arc::new(Notify::new()),
@@ -567,208 +1226,87 @@ impl NetworkRouterAdapter for LndAdapter {
         self.outgoing
             .lock()
             .await
-            .insert(payment_hash, pending.clone());
+            .insert(payment.operation_id.clone(), pending.clone());
         let adapter = self.clone_for_task();
-        tokio::spawn(async move { adapter.start_payment(payment_hash, pending).await });
-        Ok(OutgoingHtlc {
-            payment_hash,
-            amount_msat,
-            expiry,
-            recipient: payment_request,
-            network: self.network_id.clone(),
-        })
-    }
-
-    async fn restore_outgoing_htlc(
-        &self,
-        payment: &OutgoingPayment,
-        descriptor: Option<&HtlcDescriptor>,
-    ) -> Result<(), HtlcError> {
-        let payment_request = self
-            .parse_target(
-                descriptor.ok_or(HtlcError::Unimplemented)?,
-                payment.payment_hash,
-                payment.amount_msat,
-            )
-            .map_err(HtlcError::from)?;
-        let pending = PendingOutgoing {
-            amount_msat: payment.amount_msat,
-            expiry: payment.expiry,
-            payment_request,
-            state: Arc::new(Mutex::new(OutgoingState::Pending)),
-            changed: Arc::new(Notify::new()),
-            cancel: Arc::new(Notify::new()),
-        };
-        let payment_hash = payment.payment_hash;
-        self.outgoing
-            .lock()
-            .await
-            .insert(payment_hash, pending.clone());
-        let adapter = self.clone_for_task();
-        tokio::spawn(async move { adapter.track_payment(payment_hash, pending).await });
+        tokio::spawn(async move { adapter.track_payment(pending).await });
         Ok(())
     }
 
-    async fn claim_incoming(
-        &self,
-        payment_hash: Bytes32,
-        preimage: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let digest = Sha256::digest(preimage.0);
-        if digest.as_slice() != payment_hash.0 {
-            return Err(HtlcError::InvalidParams(
-                "preimage does not match the payment hash".into(),
-            ));
+    /// PREPARE-time check: can we fund `amount_msat` right now? An LND
+    /// node pays from its own channel balance, so the local (outbound)
+    /// side of the channels has to cover the amount.
+    async fn can_route(&self, amount_msat: u64) -> Result<(), AdapterError> {
+        if amount_msat == 0 {
+            return Err(AdapterError::InvalidParams("amount must be > 0".into()));
         }
-        let request = PreimageRequest {
-            preimage: BASE64.encode(preimage.0),
-        };
-        self.post_empty("v2/invoices/settle", &request)
-            .await
-            .map_err(HtlcError::from)?;
-        self.incoming.lock().await.remove(&payment_hash);
-        Ok(())
-    }
-
-    async fn refund_outgoing(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
-        let pending = self
-            .outgoing
-            .lock()
-            .await
-            .get(&payment_hash)
-            .cloned()
-            .ok_or_else(|| Error::NoOutgoing(payment_hash.to_string()))
-            .map_err(HtlcError::from)?;
-        pending.cancel.notify_waiters();
-        *pending.state.lock().await = OutgoingState::Cancelled;
-        pending.changed.notify_waiters();
-        Ok(())
-    }
-
-    async fn watch_preimage(
-        &self,
-        payment_hash: Bytes32,
-        deadline: u64,
-    ) -> Result<Bytes32, WatchError> {
-        let pending = self
-            .outgoing
-            .lock()
-            .await
-            .get(&payment_hash)
-            .cloned()
-            .ok_or_else(|| Error::NoOutgoing(payment_hash.to_string()))
-            .map_err(WatchError::from)?;
-        loop {
-            match &*pending.state.lock().await {
-                OutgoingState::Pending => {}
-                OutgoingState::Succeeded(preimage) => return Ok(*preimage),
-                OutgoingState::Failed(error) => return Err(WatchError::Network(error.clone())),
-                OutgoingState::Cancelled => {
-                    return Err(WatchError::Network("outgoing payment cancelled".into()))
-                }
-            }
-            if unix_now() >= deadline {
-                return Err(WatchError::DeadlineExceeded);
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-
-    async fn verify_incoming_htlc(
-        &self,
-        descriptor: &HtlcDescriptor,
-        payment_hash: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let payment_request = match descriptor {
-            HtlcDescriptor::Lightning { payment_request } => payment_request,
-            _ => {
-                return Err(HtlcError::InvalidParams(
-                    "expected a Lightning invoice descriptor".into(),
-                ))
-            }
-        };
-        let invoice = Bolt11Invoice::from_str(payment_request).map_err(|error| {
-            HtlcError::InvalidParams(format!("invalid BOLT11 invoice: {error}"))
-        })?;
-        if invoice.payment_hash().as_ref() != payment_hash.0 {
-            return Err(HtlcError::InvalidParams(
-                "invoice hash does not match the route payment hash".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn accept_incoming_htlc(
-        &self,
-        payment_hash: Bytes32,
-        descriptor: &HtlcDescriptor,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
-        self.verify_incoming_htlc(descriptor, payment_hash).await?;
-        let payment_request = match descriptor {
-            HtlcDescriptor::Lightning { payment_request } => payment_request.clone(),
-            _ => unreachable!(),
-        };
-        let invoice = self
-            .lookup_invoice(payment_hash)
-            .await
-            .map_err(HtlcError::from)?
-            .ok_or_else(|| HtlcError::InvalidParams("LND hold invoice not found".into()))?;
-        if invoice.settled == Some(true)
-            || invoice
-                .state
-                .as_deref()
-                .is_some_and(|state| state.eq_ignore_ascii_case("CANCELED"))
-        {
-            return Err(HtlcError::InvalidParams("LND invoice is not open".into()));
-        }
-        let amount_msat = invoice
-            .value_msat
+        let response: ChannelBalanceResponse = self.get_json("v1/balance/channels").await?;
+        let available_msat = response
+            .balance
             .as_ref()
             .and_then(value_as_u64)
-            .unwrap_or(0);
-        self.incoming.lock().await.insert(
-            payment_hash,
-            PendingIncoming {
-                amount_msat,
-                deadline,
-                payment_request,
-            },
-        );
+            .unwrap_or(0)
+            .saturating_mul(MSAT_PER_SAT);
+        if available_msat < amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "insufficient lightning outbound liquidity on {}: need {amount_msat} msat, \
+                 LND channels hold {available_msat} msat",
+                self.network_id
+            )));
+        }
         Ok(())
     }
 
-    async fn outgoing_htlc_descriptor(
-        &self,
-        payment_hash: Bytes32,
-    ) -> Result<HtlcDescriptor, HtlcError> {
-        let payment_request = self
-            .outgoing
-            .lock()
-            .await
-            .get(&payment_hash)
-            .map(|pending| pending.payment_request.clone())
-            .ok_or_else(|| Error::NoOutgoing(payment_hash.to_string()))
-            .map_err(HtlcError::from)?;
-        Ok(HtlcDescriptor::Lightning { payment_request })
+    /// Claiming releases funds LND is already holding, so the adapter
+    /// needs no balance of its own to settle a hold invoice.
+    async fn can_claim(&self, _amount_msat: u64) -> Result<(), AdapterError> {
+        Ok(())
     }
 }
 
-impl LndAdapter {
-    fn clone_for_task(&self) -> Arc<Self> {
-        // The task only needs the shared HTTP client and endpoint helpers. A
-        // lightweight Arc clone keeps the request alive without duplicating
-        // any mutable payment maps.
-        Arc::new(Self {
-            config: self.config.clone(),
-            network_id: self.network_id.clone(),
-            invoice_pubkey: self.invoice_pubkey,
-            client: self.client.clone(),
-            span: self.span.clone(),
-            incoming: Mutex::new(HashMap::new()),
-            outgoing: Mutex::new(HashMap::new()),
-        })
+/// The BOLT11 request carried by a Lightning descriptor. Every LND
+/// descriptor check starts here, so a descriptor of another kind is a
+/// hard error rather than a silently ignored payload.
+fn lightning_request(descriptor: &HtlcDescriptor) -> Result<&str, AdapterError> {
+    let HtlcDescriptor::Lightning { payment_request } = descriptor else {
+        return Err(AdapterError::InvalidParams(
+            "LND HTLC requires a Lightning invoice descriptor".into(),
+        ));
+    };
+    Ok(payment_request)
+}
+
+/// Parse a BOLT11 request and pin it to the route payment hash.
+fn parse_invoice(
+    payment_request: &str,
+    payment_hash: Bytes32,
+) -> Result<Bolt11Invoice, AdapterError> {
+    let invoice = Bolt11Invoice::from_str(payment_request)
+        .map_err(|error| AdapterError::InvalidParams(format!("invalid BOLT11 invoice: {error}")))?;
+    if invoice.payment_hash().as_ref() != payment_hash.0 {
+        return Err(AdapterError::InvalidParams(
+            "Lightning invoice hash does not match the route payment hash".into(),
+        ));
     }
+    Ok(invoice)
+}
+
+/// Checks an outgoing invoice before LND is asked to pay it: it must be
+/// the invoice for this payment hash, and worth at least the amount
+/// being routed.
+fn validate_outgoing_invoice(
+    payment_request: &str,
+    payment_hash: Bytes32,
+    amount_msat: u64,
+) -> Result<(), AdapterError> {
+    let invoice = parse_invoice(payment_request, payment_hash)?;
+    if let Some(invoice_amount) = invoice.amount_milli_satoshis() {
+        if invoice_amount < amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "Lightning invoice is only {invoice_amount} msat, need {amount_msat}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn decode_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, Error> {

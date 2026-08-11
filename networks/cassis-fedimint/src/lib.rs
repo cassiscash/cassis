@@ -5,7 +5,7 @@
 //! (guardian endpoint URLs of the form `iroh://<node-id>` in the
 //! federation's `ClientConfig`).
 //!
-//! The adapter implements [`cassis_core::NetworkRouterAdapter`] on top
+//! The adapter implements [`cassis_core::NetworkAdapter`] on top
 //! of LNv2's *direct HTLC* API (fedimint PR #8913): a raw
 //! `OutgoingContract` funded between two federation clients, with no
 //! gateway involved. This is what lets fedimint honor an
@@ -15,26 +15,24 @@
 //!
 //! Method mapping (cassis method → LNv2 direct-HTLC operation):
 //!
-//! | cassis method                 | LNv2 operation                                        |
-//! |-------------------------------+-------------------------------------------------------|
-//! | `register_incoming_htlc`      | Park the hash; return a descriptor carrying our claim |
-//! |                               | public key. The funder locks the contract to it.      |
-//! | `accept_incoming_htlc`        | Decode the funding descriptor (outpoint + contract),  |
-//! |                               | verify the payment image and claim key, store it.     |
-//! | `claim_incoming`              | `LightningClientModule::claim_htlc` with the route    |
-//! |                               | preimage + our claim keypair, then await settlement.  |
-//! | `create_outgoing_htlc`        | `create_htlc` — fund a contract locked to the         |
-//! |                               | recipient's claim key with `PaymentImage::Hash`.      |
-//! | `outgoing_htlc_descriptor`    | Serialize (outpoint, contract) for the next hop.      |
-//! | `watch_preimage`              | `await_htlc_resolution` — the federation returns the  |
-//! |                               | preimage once the recipient claims.                   |
-//! | `refund_outgoing`             | `refund_htlc` after expiration (+ settle).            |
-//! | `can_route`                   | Client ecash balance check.                           |
+//! | cassis method          | LNv2 operation                                        |
+//! |------------------------+-------------------------------------------------------|
+//! | `reserve_incoming`     | Park operation state and return our claim public key. |
+//! | `accept_incoming`      | Decode the funding descriptor (outpoint + contract),  |
+//! |                        | verify the payment image and claim key, store it.     |
+//! | `claim_incoming`       | `claim_htlc` with the route preimage + our claim      |
+//! |                        | keypair, then await settlement.                       |
+//! | `create_outgoing`      | `create_htlc` — fund a contract locked to the         |
+//! |                        | recipient's claim key with `PaymentImage::Hash`.      |
+//! | `watch_outgoing`       | `await_htlc_resolution` — the federation returns the  |
+//! |                        | preimage once the recipient claims.                   |
+//! | `refund_outgoing`      | `refund_htlc` after expiration (+ settle).            |
+//! | `can_route`            | Client ecash balance check.                           |
 //!
 //! Identity: the adapter derives one even-parity (0x02-prefixed)
 //! claim keypair from its per-network secret at construction and
 //! self-reports the x-only half via
-//! [`NetworkRouterAdapter::claim_pubkey`]. Every counterparty that
+//! [`NetworkAdapter::claim_pubkey`]. Every counterparty that
 //! locks a contract to us reconstructs the compressed key as
 //! `0x02 || x-only`, so lock and claim agree by construction; the
 //! descriptors additionally pin the full compressed key.
@@ -43,7 +41,7 @@
 //! federation's consensus block count. Cassis deadlines are absolute
 //! unix seconds; [`SECS_PER_BLOCK`] converts. `refund_htlc` only
 //! succeeds once the federation's block count passes the contract's
-//! expiration, so [`NetworkRouterAdapter::refund_outgoing`] retries
+//! expiration, so [`NetworkAdapter::refund_outgoing`] retries
 //! briefly while consensus catches up.
 
 use std::collections::HashMap;
@@ -56,7 +54,7 @@ use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
-use fedimint_core::core::OperationId;
+use fedimint_core::core::OperationId as FedimintOperationId;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleRegistry;
@@ -76,8 +74,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter,
-    OutgoingPayment, PubKey, WatchError, XOnlyPubKey,
+    AcceptedIncoming, AdapterError, Bytes32, HtlcDescriptor, HtlcTarget, IncomingRequest,
+    IncomingReservation, NetworkAdapter, NetworkId, OperationId, OutgoingPayment, OutgoingRequest,
+    PubKey, XOnlyPubKey,
 };
 
 /// Per-hop delta the routing layer gets on fedimint legs. Contract
@@ -111,57 +110,70 @@ const SECS_PER_BLOCK: u64 = 600;
 /// COMMIT.
 const FUNDING_GRACE: Duration = Duration::from_secs(60);
 
-/// How long [`NetworkRouterAdapter::refund_outgoing`] retries while
+/// How long [`NetworkAdapter::refund_outgoing`] retries while
 /// the federation's consensus block count has not yet passed the
 /// contract's expiration.
 const REFUND_RETRY: Duration = Duration::from_secs(120);
 
-/// An incoming HTLC registered at PREPARE time (via
-/// [`NetworkRouterAdapter::register_incoming_htlc`]) or at
-/// DISPATCH time via `accept_incoming_htlc`.
+/// Incoming operation state. Operation id is map key; payment hash stays
+/// inside reservation so duplicate-hash attempts can be rejected without
+/// treating hash as attempt identity.
+#[derive(Clone)]
 struct PendingIncoming {
-    /// Floor the funding contract's amount must meet.
-    min_amount_msat: u64,
-    /// Unix seconds the routing layer gave us for this hop.
-    deadline: u64,
-    /// Filled in by `accept_incoming_htlc` once the funder's
-    /// DISPATCH tells us where the contract lives.
+    /// Payment intent identity, retained separately from operation map key.
+    payment_hash: Bytes32,
+    reservation: IncomingReservation,
+    /// Durable accepted state returned to caller.
+    accepted: Option<AcceptedIncoming>,
+    /// Filled in by `accept_incoming` once funder's dispatch identifies
+    /// funded contract.
     funded: Option<FundedContract>,
-    /// The claim spend submitted by a previous
-    /// [`NetworkRouterAdapter::claim_incoming`] call, if any. Set
-    /// before its settlement is awaited so a retry settles the
-    /// existing operation instead of resubmitting it (which the
-    /// federation rejects as a duplicate operation).
-    claim_op: Option<OperationId>,
+    /// Claim spend submitted by previous call, if any. Recorded before
+    /// settlement wait so retry never submits same on-chain action twice.
+    claim_op: Option<FedimintOperationId>,
+    /// Preimage bound to `claim_op`. Different preimage under same
+    /// operation is protocol error, not retry.
+    claim_preimage: Option<Bytes32>,
+    /// Terminal success marker retained so repeated claims stay idempotent.
+    claimed: bool,
+    /// Serializes claim submission for this operation while allowing other
+    /// operation ids to make progress.
+    action_lock: Arc<Mutex<()>>,
 }
 
-/// The funded incoming contract: where it lives and what it says.
+/// Funded incoming contract: where it lives and what it says.
 #[derive(Clone)]
 struct FundedContract {
     outpoint: OutPoint,
     contract: OutgoingContract,
 }
 
-/// An outgoing HTLC we funded via `create_htlc`, keyed by the cassis
-/// payment hash used for the hop. The same `payment_hash` may appear
-/// on both the incoming and outgoing side of a hop (cassis's
-/// atomic-routing invariant), hence the two maps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefundState {
+    Active,
+    Refunded,
+    ContractGone,
+}
+
+/// Outgoing operation state. Map key is cassis operation id. Native
+/// Fedimint operation ids are retained separately for claim/refund recovery.
 #[derive(Clone)]
 struct OutgoingSlot {
-    /// The operation `create_htlc` submitted the funding under.
-    /// Unused today — `await_htlc_resolution` observes claims via the
-    /// federation API directly — but kept so diagnostics can map a
-    /// funding outpoint back to its operation.
+    payment: OutgoingPayment,
+    /// Explicit hash state retained after moving map keys to operation ids.
+    payment_hash: Bytes32,
+    /// Native operation under which `create_htlc` submitted funding.
     #[allow(dead_code)]
-    operation_id: OperationId,
+    funding_op: FedimintOperationId,
     outpoint: OutPoint,
     contract: OutgoingContract,
-    /// The refund spend submitted by a previous
-    /// [`NetworkRouterAdapter::refund_outgoing`] call, if any. Set
-    /// before its settlement is awaited so a retry settles the
-    /// existing operation instead of resubmitting it (which the
-    /// federation rejects as a duplicate operation).
-    refund_op: Option<OperationId>,
+    /// Refund spend submitted by previous call, recorded before settlement.
+    refund_op: Option<FedimintOperationId>,
+    /// Cached successful resolution makes repeated watches idempotent.
+    resolution: Option<Bytes32>,
+    refund_state: RefundState,
+    /// Serializes refund submission for this operation.
+    action_lock: Arc<Mutex<()>>,
 }
 
 /// Fedimint network adapter.
@@ -186,8 +198,8 @@ pub struct FedimintAdapter {
     /// which only carries the x-only half — round-trips losslessly.
     claim_keypair: secp256k1::Keypair,
     claim_pk: secp256k1::PublicKey,
-    incoming: Mutex<HashMap<Bytes32, PendingIncoming>>,
-    outgoing: Mutex<HashMap<Bytes32, OutgoingSlot>>,
+    incoming: Mutex<HashMap<OperationId, PendingIncoming>>,
+    outgoing: Mutex<HashMap<OperationId, OutgoingSlot>>,
 }
 
 impl FedimintAdapter {
@@ -439,7 +451,7 @@ impl FedimintAdapter {
     /// [`Self::await_deposit`]. Note the caveats attached to peg-ins in
     /// fedimint: transactions funding the address must stay under
     /// ~40 kB and honor any federation-wide minimum peg-in amount.
-    pub async fn deposit_address(&self) -> Result<(String, OperationId), String> {
+    pub async fn deposit_address(&self) -> Result<(String, FedimintOperationId), String> {
         let wallet = self.wallet_module()?;
         let info = wallet
             .allocate_deposit_address_expert_only(serde_json::Value::Null)
@@ -453,7 +465,7 @@ impl FedimintAdapter {
     /// (`Ok(amount_sat)`) or fails. `timeout_secs` caps the total wait.
     pub async fn await_deposit(
         &self,
-        operation_id: OperationId,
+        operation_id: FedimintOperationId,
         timeout_secs: u64,
     ) -> Result<u64, String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -552,20 +564,20 @@ impl FedimintAdapter {
 
     /// Convert a cassis absolute unix expiry into an LNv2 expiration
     /// delta in consensus blocks. Refuses expiries in the past.
-    fn expiration_delta(expiry: u64) -> Result<u64, HtlcError> {
+    fn expiration_delta(expiry: u64) -> Result<u64, AdapterError> {
         let now = unix_now_secs();
         if expiry <= now {
-            return Err(HtlcError::InvalidParams("expiry in the past".into()));
+            return Err(AdapterError::InvalidParams("expiry in the past".into()));
         }
         Ok(expiry.saturating_sub(now).div_ceil(SECS_PER_BLOCK).max(1))
     }
 
-    fn claim_pk_from_cassis(recipient: XOnlyPubKey) -> Result<secp256k1::PublicKey, HtlcError> {
+    fn claim_pk_from_cassis(recipient: XOnlyPubKey) -> Result<secp256k1::PublicKey, AdapterError> {
         let mut compressed = [0u8; 33];
         compressed[0] = 0x02;
         compressed[1..].copy_from_slice(recipient.as_bytes());
         secp256k1::PublicKey::from_slice(&compressed)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid recipient pubkey: {e}")))
+            .map_err(|e| AdapterError::InvalidParams(format!("invalid recipient pubkey: {e}")))
     }
 
     /// Validate a funding descriptor against this adapter: right
@@ -576,7 +588,7 @@ impl FedimintAdapter {
         &self,
         descriptor: &HtlcDescriptor,
         payment_hash: Bytes32,
-    ) -> Result<(OutPoint, OutgoingContract), HtlcError> {
+    ) -> Result<(OutPoint, OutgoingContract), AdapterError> {
         let (claim_pubkey, funding_txid, funding_out_idx, contract_json) = match descriptor {
             HtlcDescriptor::Fedimint {
                 claim_pubkey,
@@ -585,48 +597,271 @@ impl FedimintAdapter {
                 contract,
             } => (claim_pubkey, funding_txid, funding_out_idx, contract),
             other => {
-                return Err(HtlcError::InvalidParams(format!(
+                return Err(AdapterError::InvalidParams(format!(
                     "unsupported htlc descriptor for fedimint network: {other:?}"
                 )))
             }
         };
         let txid_hex = funding_txid.as_deref().ok_or_else(|| {
-            HtlcError::InvalidParams("fedimint descriptor has no funding txid".into())
+            AdapterError::InvalidParams("fedimint descriptor has no funding txid".into())
         })?;
         let out_idx = funding_out_idx.ok_or_else(|| {
-            HtlcError::InvalidParams("fedimint descriptor has no funding out idx".into())
+            AdapterError::InvalidParams("fedimint descriptor has no funding out idx".into())
         })?;
         let contract_json = contract_json.as_deref().ok_or_else(|| {
-            HtlcError::InvalidParams("fedimint descriptor has no contract".into())
+            AdapterError::InvalidParams("fedimint descriptor has no contract".into())
         })?;
 
         let claim_pk = secp256k1::PublicKey::from_slice(claim_pubkey.as_bytes())
-            .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
+            .map_err(|e| AdapterError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
         if claim_pk != self.claim_pk {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "descriptor claim pubkey is not ours".into(),
             ));
         }
 
         let txid = TransactionId::from_str(txid_hex)
-            .map_err(|e| HtlcError::InvalidParams(format!("descriptor txid: {e}")))?;
+            .map_err(|e| AdapterError::InvalidParams(format!("descriptor txid: {e}")))?;
         let contract: OutgoingContract = serde_json::from_str(contract_json)
-            .map_err(|e| HtlcError::InvalidParams(format!("descriptor contract: {e}")))?;
+            .map_err(|e| AdapterError::InvalidParams(format!("descriptor contract: {e}")))?;
 
         if contract.payment_image
             != PaymentImage::Hash(sha256::Hash::from_byte_array(payment_hash.0))
         {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "contract payment image does not match the route payment hash".into(),
             ));
         }
         if contract.claim_pk != self.claim_pk {
-            return Err(HtlcError::InvalidParams(
+            return Err(AdapterError::InvalidParams(
                 "contract is not locked to our claim key".into(),
             ));
         }
 
         Ok((OutPoint { txid, out_idx }, contract))
+    }
+
+    fn xonly_claim_pubkey(&self) -> XOnlyPubKey {
+        let compressed = self.claim_pk.serialize();
+        let mut xonly = [0u8; 32];
+        xonly.copy_from_slice(&compressed[1..]);
+        XOnlyPubKey(xonly)
+    }
+
+    fn incoming_reservation(
+        &self,
+        request: &IncomingRequest,
+    ) -> Result<IncomingReservation, AdapterError> {
+        if !request.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "incoming operation id is invalid".into(),
+            ));
+        }
+        if request.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams(
+                "incoming amount must be > 0".into(),
+            ));
+        }
+        if request.deadline <= unix_now_secs() {
+            return Err(AdapterError::InvalidParams(
+                "incoming deadline is in the past".into(),
+            ));
+        }
+        if request
+            .preimage
+            .is_some_and(|preimage| !request.payment_hash.matches_preimage(&preimage))
+        {
+            return Err(AdapterError::InvalidParams(
+                "incoming preimage does not match payment hash".into(),
+            ));
+        }
+
+        Ok(IncomingReservation {
+            operation_id: request.operation_id.clone(),
+            payment_hash: request.payment_hash,
+            network: self.network_id.clone(),
+            amount_msat: request.amount_msat,
+            deadline: request.deadline,
+            target: HtlcTarget::XOnlyPubKey(self.xonly_claim_pubkey()),
+        })
+    }
+
+    fn validate_incoming_reservation(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        if !reservation.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "incoming operation id is invalid".into(),
+            ));
+        }
+        if reservation.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams(
+                "incoming amount must be > 0".into(),
+            ));
+        }
+        if reservation.network != self.network_id {
+            return Err(AdapterError::InvalidParams(
+                "incoming reservation targets another network".into(),
+            ));
+        }
+        if reservation.target != HtlcTarget::XOnlyPubKey(self.xonly_claim_pubkey()) {
+            return Err(AdapterError::InvalidParams(
+                "incoming reservation has wrong claim target".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_outgoing_request(
+        &self,
+        request: &OutgoingRequest,
+    ) -> Result<XOnlyPubKey, AdapterError> {
+        if !request.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "outgoing operation id is invalid".into(),
+            ));
+        }
+        if request.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams("amount must be > 0".into()));
+        }
+        if request.network != self.network_id {
+            return Err(AdapterError::InvalidParams(
+                "outgoing request targets another network".into(),
+            ));
+        }
+        let HtlcTarget::XOnlyPubKey(recipient) = &request.target else {
+            return Err(AdapterError::InvalidParams(
+                "fedimint requires an x-only pubkey target".into(),
+            ));
+        };
+        Self::claim_pk_from_cassis(*recipient)?;
+        Self::expiration_delta(request.expiry)?;
+        Ok(*recipient)
+    }
+
+    fn outgoing_request_matches(payment: &OutgoingPayment, request: &OutgoingRequest) -> bool {
+        payment.operation_id == request.operation_id
+            && payment.payment_hash == request.payment_hash
+            && payment.amount_msat == request.amount_msat
+            && payment.destination == request.target
+            && payment.destination_network == request.network
+            && payment.expiry == request.expiry
+    }
+
+    fn outgoing_payments_match(left: &OutgoingPayment, right: &OutgoingPayment) -> bool {
+        left.operation_id == right.operation_id
+            && left.payment_hash == right.payment_hash
+            && left.amount_msat == right.amount_msat
+            && left.destination == right.destination
+            && left.destination_network == right.destination_network
+            && left.expiry == right.expiry
+            && left.descriptor == right.descriptor
+    }
+
+    fn accepted_incoming_matches(left: &AcceptedIncoming, right: &AcceptedIncoming) -> bool {
+        left.reservation == right.reservation
+            && left.descriptor == right.descriptor
+            && left.amount_msat == right.amount_msat
+    }
+
+    /// Decode and validate sender-owned funding descriptor. Unlike incoming
+    /// decode, claim key belongs to recipient and therefore cannot be compared
+    /// with this adapter's key.
+    fn decode_outgoing_funding(
+        &self,
+        payment: &OutgoingPayment,
+    ) -> Result<(OutPoint, OutgoingContract), AdapterError> {
+        if !payment.operation_id.is_valid() {
+            return Err(AdapterError::InvalidParams(
+                "outgoing operation id is invalid".into(),
+            ));
+        }
+        if payment.amount_msat == 0 {
+            return Err(AdapterError::InvalidParams(
+                "outgoing amount must be > 0".into(),
+            ));
+        }
+        if payment.destination_network != self.network_id {
+            return Err(AdapterError::InvalidParams(
+                "outgoing payment targets another network".into(),
+            ));
+        }
+        let HtlcTarget::XOnlyPubKey(recipient) = &payment.destination else {
+            return Err(AdapterError::InvalidParams(
+                "fedimint requires an x-only destination".into(),
+            ));
+        };
+
+        let HtlcDescriptor::Fedimint {
+            claim_pubkey,
+            funding_txid,
+            funding_out_idx,
+            contract: contract_json,
+        } = &payment.descriptor
+        else {
+            return Err(AdapterError::InvalidParams(
+                "not a fedimint descriptor".into(),
+            ));
+        };
+        let descriptor_claim_pk = secp256k1::PublicKey::from_slice(claim_pubkey.as_bytes())
+            .map_err(|e| AdapterError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
+        let expected_claim_pk = Self::claim_pk_from_cassis(*recipient)?;
+        if descriptor_claim_pk != expected_claim_pk {
+            return Err(AdapterError::InvalidParams(
+                "descriptor claim pubkey does not match outgoing destination".into(),
+            ));
+        }
+        let txid = TransactionId::from_str(funding_txid.as_deref().ok_or_else(|| {
+            AdapterError::InvalidParams("fedimint descriptor has no funding txid".into())
+        })?)
+        .map_err(|e| AdapterError::InvalidParams(format!("descriptor txid: {e}")))?;
+        let out_idx = funding_out_idx.ok_or_else(|| {
+            AdapterError::InvalidParams("fedimint descriptor has no funding out idx".into())
+        })?;
+        let contract: OutgoingContract =
+            serde_json::from_str(contract_json.as_deref().ok_or_else(|| {
+                AdapterError::InvalidParams("fedimint descriptor has no contract".into())
+            })?)
+            .map_err(|e| AdapterError::InvalidParams(format!("descriptor contract: {e}")))?;
+
+        if contract.claim_pk != descriptor_claim_pk
+            || contract.payment_image
+                != PaymentImage::Hash(sha256::Hash::from_byte_array(payment.payment_hash.0))
+            || contract.amount.msats != payment.amount_msat
+        {
+            return Err(AdapterError::InvalidParams(
+                "fedimint descriptor does not match outgoing payment".into(),
+            ));
+        }
+
+        Ok((OutPoint { txid, out_idx }, contract))
+    }
+
+    fn funding_descriptor(
+        outpoint: OutPoint,
+        contract: &OutgoingContract,
+    ) -> Result<HtlcDescriptor, AdapterError> {
+        Ok(HtlcDescriptor::Fedimint {
+            claim_pubkey: PubKey::from_bytes(contract.claim_pk.serialize()).map_err(|e| {
+                AdapterError::InvalidParams(format!("descriptor claim pubkey: {e}"))
+            })?,
+            funding_txid: Some(outpoint.txid.to_string()),
+            funding_out_idx: Some(outpoint.out_idx),
+            contract: Some(
+                serde_json::to_string(contract).map_err(|e| {
+                    AdapterError::Network(format!("serialize outgoing contract: {e}"))
+                })?,
+            ),
+        })
+    }
+
+    fn claim_operation(outpoint: OutPoint) -> FedimintOperationId {
+        FedimintOperationId::from_encodable(&("lnv2-htlc-claim", outpoint))
+    }
+
+    fn refund_operation(outpoint: OutPoint) -> FedimintOperationId {
+        FedimintOperationId::from_encodable(&("lnv2-htlc-refund", outpoint))
     }
 }
 
@@ -637,324 +872,532 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn ln_err(e: LnHtlcError) -> HtlcError {
-    HtlcError::Network(e.to_string())
+fn ln_err(e: LnHtlcError) -> AdapterError {
+    AdapterError::Network(e.to_string())
 }
 
 #[async_trait]
-impl NetworkRouterAdapter for FedimintAdapter {
+impl NetworkAdapter for FedimintAdapter {
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }
 
-    /// Advertised identity: the x-only half of the static even-parity
-    /// claim key. Doubles as the trait's `invoice_pubkey`; the trait's
-    /// default `claim_pubkey` (which forwards to this) then equals the
-    /// key we actually sign claims with, and any funder reconstructs
-    /// the compressed form as `0x02 || this`.
+    /// Invoice identity and claim identity are same x-only half of static
+    /// even-parity key. Funder reconstructs compressed key as `0x02 || x`.
     fn invoice_pubkey(&self) -> XOnlyPubKey {
-        let compressed = self.claim_pk.serialize();
-        let mut xonly = [0u8; 32];
-        xonly.copy_from_slice(&compressed[1..]);
-        XOnlyPubKey(xonly)
+        self.xonly_claim_pubkey()
+    }
+
+    fn claim_pubkey(&self) -> XOnlyPubKey {
+        self.xonly_claim_pubkey()
     }
 
     fn incoming_delta_secs(&self) -> u64 {
         INCOMING_DELTA_SECS
     }
 
-    /// Register an expected incoming HTLC. Fedimint has no notion of
-    /// "publishing" an incoming contract — the receiver just parks
-    /// the payment hash and waits for the funder's DISPATCH to tell
-    /// it where the contract lives. Returns a descriptor carrying
-    /// our claim public key so the funder knows what to lock to.
-    async fn register_incoming_htlc(
+    /// Reserve operation before upstream funding starts. Same operation and
+    /// request returns original reservation; same hash under another operation
+    /// is rejected.
+    async fn reserve_incoming(
         &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
-    ) -> Result<(), HtlcError> {
+        request: IncomingRequest,
+    ) -> Result<IncomingReservation, AdapterError> {
+        let reservation = self.incoming_reservation(&request)?;
         let mut incoming = self.incoming.lock().await;
-        incoming
-            .entry(payment_hash)
-            .or_insert_with(|| PendingIncoming {
-                min_amount_msat,
-                deadline,
+
+        if let Some(existing) = incoming.get(&request.operation_id) {
+            if existing.payment_hash != request.payment_hash || existing.reservation != reservation
+            {
+                return Err(AdapterError::InvalidParams(
+                    "incoming operation id was reused with different request".into(),
+                ));
+            }
+            return Ok(existing.reservation.clone());
+        }
+        if incoming
+            .values()
+            .any(|slot| slot.payment_hash == request.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Fedimint payment hash already belongs to another incoming operation".into(),
+            ));
+        }
+
+        debug!(
+            operation_id = %request.operation_id,
+            payment_hash = ?request.payment_hash,
+            amount_msat = request.amount_msat,
+            "fedimint incoming operation reserved"
+        );
+        incoming.insert(
+            request.operation_id,
+            PendingIncoming {
+                payment_hash: request.payment_hash,
+                reservation: reservation.clone(),
+                accepted: None,
                 funded: None,
                 claim_op: None,
-            });
-        debug!(
-            ?payment_hash,
-            min_amount_msat, "fedimint incoming HTLC registered"
+                claim_preimage: None,
+                claimed: false,
+                action_lock: Arc::new(Mutex::new(())),
+            },
         );
-        Ok(())
+        Ok(reservation)
     }
 
-    /// The descriptor a payer needs to fund a previously registered
-    /// incoming HTLC: our claim public key.
-    async fn htlc_target(&self, _payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
-        Ok(HtlcTarget::XOnlyPubKey(self.invoice_pubkey()))
-    }
-
-    /// Drop a PREPARE-time registration that will never be funded.
-    async fn cancel_incoming_htlc(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
-        self.incoming.lock().await.remove(&payment_hash);
-        Ok(())
-    }
-
-    /// DISPATCH-time verify: does `descriptor` decode to a contract
-    /// funded for `payment_hash`, locked to our claim key?
-    async fn verify_incoming_htlc(
-        &self,
-        descriptor: &HtlcDescriptor,
-        payment_hash: Bytes32,
-    ) -> Result<(), HtlcError> {
-        self.decode_funding(descriptor, payment_hash).map(|_| ())
-    }
-
-    /// DISPATCH-time accept: store the funded contract so the later
-    /// [`NetworkRouterAdapter::claim_incoming`] call can find it,
-    /// checking the locked amount covers the registered floor.
-    async fn accept_incoming_htlc(
-        &self,
-        payment_hash: Bytes32,
-        descriptor: &HtlcDescriptor,
-        _deadline: u64,
-    ) -> Result<(), HtlcError> {
-        let (outpoint, contract) = self.decode_funding(descriptor, payment_hash)?;
-        let amount_msat = contract.amount.msats;
+    /// Cancel unfunded reservation. Missing operation is successful retry and
+    /// never cancels another operation owning same payment hash.
+    async fn cancel_incoming(&self, reservation: &IncomingReservation) -> Result<(), AdapterError> {
+        self.validate_incoming_reservation(reservation)?;
         let mut incoming = self.incoming.lock().await;
-        let slot = incoming.get_mut(&payment_hash).ok_or_else(|| {
-            HtlcError::InvalidParams(format!("no incoming HTLC registered for {payment_hash:?}"))
-        })?;
-        if amount_msat < slot.min_amount_msat {
-            return Err(HtlcError::InvalidParams(format!(
-                "incoming contract amount {amount_msat} msat below registered \
-                 floor {} msat",
-                slot.min_amount_msat
+        let Some(slot) = incoming.get(&reservation.operation_id) else {
+            return Ok(());
+        };
+        if &slot.reservation != reservation {
+            return Err(AdapterError::InvalidParams(
+                "incoming reservation does not match operation state".into(),
+            ));
+        }
+        if slot.accepted.is_some()
+            || slot.funded.is_some()
+            || slot.claim_op.is_some()
+            || slot.claimed
+        {
+            return Err(AdapterError::InvalidParams(
+                "cannot cancel accepted or claimed incoming operation".into(),
+            ));
+        }
+        incoming.remove(&reservation.operation_id);
+        Ok(())
+    }
+
+    /// Verify and atomically bind funded contract to reservation.
+    async fn accept_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<AcceptedIncoming, AdapterError> {
+        self.validate_incoming_reservation(reservation)?;
+        let (outpoint, contract) = self.decode_funding(descriptor, reservation.payment_hash)?;
+        let amount_msat = contract.amount.msats;
+        if amount_msat < reservation.amount_msat {
+            return Err(AdapterError::InvalidParams(format!(
+                "incoming contract amount {amount_msat} msat below reserved floor {} msat",
+                reservation.amount_msat
             )));
         }
+        let accepted = AcceptedIncoming {
+            reservation: reservation.clone(),
+            descriptor: descriptor.clone(),
+            amount_msat,
+        };
+
+        let mut incoming = self.incoming.lock().await;
+        {
+            let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            if &slot.reservation != reservation {
+                return Err(AdapterError::InvalidParams(
+                    "incoming reservation does not match operation state".into(),
+                ));
+            }
+            if let Some(existing) = &slot.accepted {
+                if Self::accepted_incoming_matches(existing, &accepted) {
+                    return Ok(existing.clone());
+                }
+                return Err(AdapterError::InvalidParams(
+                    "incoming operation already accepted different funding".into(),
+                ));
+            }
+        }
+        if incoming.iter().any(|(operation_id, candidate)| {
+            operation_id != &reservation.operation_id
+                && candidate.payment_hash == reservation.payment_hash
+        }) {
+            return Err(AdapterError::Retryable(
+                "Fedimint payment hash already belongs to another incoming operation".into(),
+            ));
+        }
+
+        let slot = incoming
+            .get_mut(&reservation.operation_id)
+            .expect("incoming operation checked above");
         slot.funded = Some(FundedContract { outpoint, contract });
+        slot.accepted = Some(accepted.clone());
         debug!(
-            ?payment_hash,
-            amount_msat, "fedimint incoming HTLC accepted"
+            operation_id = %reservation.operation_id,
+            payment_hash = ?reservation.payment_hash,
+            amount_msat, "fedimint incoming contract accepted"
         );
+        Ok(accepted)
+    }
+
+    /// Restore accepted operation after process restart. Native claim state is
+    /// reconstructed lazily; duplicate restores and same-operation retries are
+    /// idempotent.
+    async fn restore_incoming(&self, accepted: &AcceptedIncoming) -> Result<(), AdapterError> {
+        self.validate_incoming_reservation(&accepted.reservation)?;
+        let (outpoint, contract) =
+            self.decode_funding(&accepted.descriptor, accepted.reservation.payment_hash)?;
+        let amount_msat = contract.amount.msats;
+        if amount_msat < accepted.reservation.amount_msat || accepted.amount_msat != amount_msat {
+            return Err(AdapterError::InvalidParams(
+                "restored incoming amount does not match contract or reservation".into(),
+            ));
+        }
+
+        let mut incoming = self.incoming.lock().await;
+        if let Some(slot) = incoming.get(&accepted.reservation.operation_id) {
+            if slot.payment_hash != accepted.reservation.payment_hash
+                || slot.reservation != accepted.reservation
+            {
+                return Err(AdapterError::InvalidParams(
+                    "incoming operation id restored with different reservation".into(),
+                ));
+            }
+            if let Some(existing) = &slot.accepted {
+                if Self::accepted_incoming_matches(existing, accepted) {
+                    return Ok(());
+                }
+                return Err(AdapterError::InvalidParams(
+                    "incoming operation already restored with different funding".into(),
+                ));
+            }
+        }
+        if incoming.iter().any(|(operation_id, candidate)| {
+            operation_id != &accepted.reservation.operation_id
+                && candidate.payment_hash == accepted.reservation.payment_hash
+        }) {
+            return Err(AdapterError::Retryable(
+                "Fedimint payment hash already belongs to another incoming operation".into(),
+            ));
+        }
+
+        if let Some(slot) = incoming.get_mut(&accepted.reservation.operation_id) {
+            slot.accepted = Some(accepted.clone());
+            slot.funded = Some(FundedContract { outpoint, contract });
+        } else {
+            incoming.insert(
+                accepted.reservation.operation_id.clone(),
+                PendingIncoming {
+                    payment_hash: accepted.reservation.payment_hash,
+                    reservation: accepted.reservation.clone(),
+                    accepted: Some(accepted.clone()),
+                    funded: Some(FundedContract { outpoint, contract }),
+                    claim_op: None,
+                    claim_preimage: None,
+                    claimed: false,
+                    action_lock: Arc::new(Mutex::new(())),
+                },
+            );
+        }
         Ok(())
     }
 
-    /// Fund a direct HTLC: lock `amount_msat` of ecash into an
-    /// `OutgoingContract` behind `payment_hash`, claimable by
-    /// `recipient` until `expiry`. With a fedimint descriptor target
-    /// the exact claim key from the descriptor is used; otherwise the
-    /// recipient's x-only key is parity-normalized (0x02 prefix).
-    async fn create_outgoing_htlc(
+    /// Wait for accepted descriptor's contract to appear on federation. Before
+    /// acceptance, poll local operation state until deadline.
+    async fn watch_incoming(
         &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-        htlc_target: &HtlcTarget,
-    ) -> Result<cassis_core::OutgoingHtlc, HtlcError> {
-        if amount_msat == 0 {
-            return Err(HtlcError::InvalidParams("amount must be > 0".into()));
-        }
-        let recipient = match htlc_target {
-            HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
-                return Err(HtlcError::InvalidParams(
-                    "fedimint requires a pubkey target".into(),
-                ))
-            }
-        };
-        let claim_pk = Self::claim_pk_from_cassis(recipient)?;
-
+        reservation: &IncomingReservation,
+        deadline: u64,
+    ) -> Result<(), AdapterError> {
+        self.validate_incoming_reservation(reservation)?;
+        let deadline = deadline.min(reservation.deadline);
         let ln = Self::ln_module(&self.client)
-            .map_err(|e| HtlcError::Network(format!("LNv2 module not available: {e}")))?;
-        let expiration_delta = Self::expiration_delta(expiry)?;
-        let (operation_id, outpoint, contract) = ln
+            .map_err(|e| AdapterError::Network(format!("LNv2 module not available: {e}")))?;
+
+        loop {
+            let (funded, claimed) = {
+                let incoming = self.incoming.lock().await;
+                let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                    AdapterError::NotFound(format!(
+                        "no incoming reservation for operation {}",
+                        reservation.operation_id
+                    ))
+                })?;
+                if &slot.reservation != reservation {
+                    return Err(AdapterError::InvalidParams(
+                        "incoming reservation does not match operation state".into(),
+                    ));
+                }
+                (slot.funded.clone(), slot.claimed)
+            };
+            if claimed {
+                return Ok(());
+            }
+            if let Some(funded) = funded {
+                let wait = deadline.saturating_sub(unix_now_secs());
+                if wait == 0 {
+                    return Err(AdapterError::DeadlineExceeded);
+                }
+                return tokio::time::timeout(
+                    Duration::from_secs(wait),
+                    ln.await_htlc_funded(funded.outpoint, &funded.contract),
+                )
+                .await
+                .map_err(|_| AdapterError::DeadlineExceeded)?
+                .map(|_| ())
+                .map_err(ln_err);
+            }
+            if unix_now_secs() >= deadline {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Fund direct HTLC and return complete operation recovery state. Map
+    /// mutex remains held through native submission so concurrent retries
+    /// cannot fund same operation twice.
+    async fn claim_reserved_incoming(
+        &self,
+        reservation: &IncomingReservation,
+        preimage: Bytes32,
+    ) -> Result<(), AdapterError> {
+        let accepted = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "no incoming Fedimint reservation for operation {}",
+                    reservation.operation_id
+                ))
+            })?;
+            slot.accepted.clone().ok_or(AdapterError::Unimplemented)
+        }?;
+        self.claim_incoming(&accepted, preimage).await
+    }
+
+    async fn create_outgoing(
+        &self,
+        request: OutgoingRequest,
+    ) -> Result<OutgoingPayment, AdapterError> {
+        let recipient = self.validate_outgoing_request(&request)?;
+        let claim_pk = Self::claim_pk_from_cassis(recipient)?;
+        let expiration_delta = Self::expiration_delta(request.expiry)?;
+        let ln = Self::ln_module(&self.client)
+            .map_err(|e| AdapterError::Network(format!("LNv2 module not available: {e}")))?;
+        let mut outgoing = self.outgoing.lock().await;
+
+        if let Some(existing) = outgoing.get(&request.operation_id) {
+            if Self::outgoing_request_matches(&existing.payment, &request) {
+                return Ok(existing.payment.clone());
+            }
+            return Err(AdapterError::InvalidParams(
+                "outgoing operation id was reused with different request".into(),
+            ));
+        }
+        if outgoing
+            .values()
+            .any(|slot| slot.payment_hash == request.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Fedimint payment hash already belongs to another outgoing operation".into(),
+            ));
+        }
+
+        let (funding_op, outpoint, contract) = ln
             .create_htlc(
-                Amount::from_msats(amount_msat),
-                PaymentImage::Hash(sha256::Hash::from_byte_array(payment_hash.0)),
+                Amount::from_msats(request.amount_msat),
+                PaymentImage::Hash(sha256::Hash::from_byte_array(request.payment_hash.0)),
                 claim_pk,
                 expiration_delta,
                 serde_json::Value::Null,
             )
             .await
             .map_err(ln_err)?;
-
+        let descriptor = Self::funding_descriptor(outpoint, &contract)?;
+        let payment = OutgoingPayment {
+            operation_id: request.operation_id.clone(),
+            payment_hash: request.payment_hash,
+            amount_msat: request.amount_msat,
+            destination: request.target,
+            destination_network: request.network,
+            expiry: request.expiry,
+            descriptor,
+        };
         info!(
-            ?payment_hash,
-            amount_msat,
+            operation_id = %request.operation_id,
+            payment_hash = ?request.payment_hash,
+            amount_msat = request.amount_msat,
             expiration = contract.expiration,
             "fedimint outgoing HTLC funded"
         );
-
-        self.outgoing.lock().await.insert(
-            payment_hash,
+        outgoing.insert(
+            request.operation_id,
             OutgoingSlot {
-                operation_id,
+                payment: payment.clone(),
+                payment_hash: request.payment_hash,
+                funding_op,
                 outpoint,
                 contract,
                 refund_op: None,
+                resolution: None,
+                refund_state: RefundState::Active,
+                action_lock: Arc::new(Mutex::new(())),
             },
         );
-
-        Ok(cassis_core::OutgoingHtlc {
-            payment_hash,
-            amount_msat,
-            expiry,
-            recipient: recipient.to_hex(),
-            network: self.network_id.clone(),
-        })
+        Ok(payment)
     }
 
-    /// DISPATCH-time accessor: serialize the funded contract and its
-    /// outpoint for the next hop's `accept_incoming_htlc`.
-    async fn outgoing_htlc_descriptor(
-        &self,
-        payment_hash: Bytes32,
-    ) -> Result<HtlcDescriptor, HtlcError> {
-        let slot = self
-            .outgoing
-            .lock()
-            .await
-            .get(&payment_hash)
-            .cloned()
-            .ok_or_else(|| {
-                HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
-            })?;
-        Ok(HtlcDescriptor::Fedimint {
-            claim_pubkey: PubKey::from_bytes(slot.contract.claim_pk.serialize())
-                .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?,
-            funding_txid: Some(slot.outpoint.txid.to_string()),
-            funding_out_idx: Some(slot.outpoint.out_idx),
-            contract: Some(
-                serde_json::to_string(&slot.contract)
-                    .map_err(|e| HtlcError::Network(format!("serialize outgoing contract: {e}")))?,
-            ),
-        })
-    }
+    /// Restore watcher/refund state from payment's embedded descriptor.
+    async fn restore_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        let (outpoint, contract) = self.decode_outgoing_funding(payment)?;
+        let funding_op =
+            FedimintOperationId::from_encodable(&("lnv2-htlc-create", contract.clone()));
+        let mut outgoing = self.outgoing.lock().await;
 
-    async fn restore_outgoing_htlc(
-        &self,
-        payment: &OutgoingPayment,
-        descriptor: Option<&HtlcDescriptor>,
-    ) -> Result<(), HtlcError> {
-        let descriptor = descriptor.ok_or(HtlcError::Unimplemented)?;
-        let (claim_pubkey, funding_txid, funding_out_idx, contract_json) = match descriptor {
-            HtlcDescriptor::Fedimint {
-                claim_pubkey,
-                funding_txid,
-                funding_out_idx,
-                contract,
-            } => (claim_pubkey, funding_txid, funding_out_idx, contract),
-            _ => return Err(HtlcError::InvalidParams("not a fedimint descriptor".into())),
-        };
-        let claim_pk = secp256k1::PublicKey::from_slice(claim_pubkey.as_bytes())
-            .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
-        let txid = TransactionId::from_str(funding_txid.as_deref().ok_or_else(|| {
-            HtlcError::InvalidParams("fedimint descriptor has no funding txid".into())
-        })?)
-        .map_err(|e| HtlcError::InvalidParams(format!("descriptor txid: {e}")))?;
-        let contract: OutgoingContract =
-            serde_json::from_str(contract_json.as_deref().ok_or_else(|| {
-                HtlcError::InvalidParams("fedimint descriptor has no contract".into())
-            })?)
-            .map_err(|e| HtlcError::InvalidParams(format!("descriptor contract: {e}")))?;
-        if contract.claim_pk != claim_pk
-            || contract.payment_image
-                != PaymentImage::Hash(sha256::Hash::from_byte_array(payment.payment_hash.0))
-            || contract.amount.msats != payment.amount_msat
-        {
-            return Err(HtlcError::InvalidParams(
-                "fedimint descriptor does not match outgoing payment".into(),
+        if let Some(existing) = outgoing.get(&payment.operation_id) {
+            if Self::outgoing_payments_match(&existing.payment, payment)
+                && existing.outpoint == outpoint
+                && existing.contract == contract
+            {
+                return Ok(());
+            }
+            return Err(AdapterError::InvalidParams(
+                "outgoing operation already restored with different payment".into(),
             ));
         }
-        let operation_id = OperationId::from_encodable(&("lnv2-htlc-create", contract.clone()));
-        self.outgoing.lock().await.insert(
-            payment.payment_hash,
+        if outgoing
+            .values()
+            .any(|slot| slot.payment_hash == payment.payment_hash)
+        {
+            return Err(AdapterError::Retryable(
+                "Fedimint payment hash already belongs to another outgoing operation".into(),
+            ));
+        }
+
+        outgoing.insert(
+            payment.operation_id.clone(),
             OutgoingSlot {
-                operation_id,
-                outpoint: OutPoint {
-                    txid,
-                    out_idx: funding_out_idx.ok_or_else(|| {
-                        HtlcError::InvalidParams(
-                            "fedimint descriptor has no funding out idx".into(),
-                        )
-                    })?,
-                },
+                payment: payment.clone(),
+                payment_hash: payment.payment_hash,
+                funding_op,
+                outpoint,
                 contract,
                 refund_op: None,
+                resolution: None,
+                refund_state: RefundState::Active,
+                action_lock: Arc::new(Mutex::new(())),
             },
         );
         Ok(())
     }
 
-    /// Claim the incoming HTLC with the route preimage. Waits (bounded)
-    /// for the funding to be observed, submits the claim with our
-    /// claim keypair, and blocks until the federation has accepted the
-    /// claim transaction and minted the ecash to our wallet.
+    /// Claim accepted incoming operation. Per-operation action lock and native
+    /// operation marker make concurrent/repeated calls settle one submission.
     async fn claim_incoming(
         &self,
-        payment_hash: Bytes32,
+        accepted: &AcceptedIncoming,
         preimage: Bytes32,
-    ) -> Result<(), HtlcError> {
-        let ln = Self::ln_module(&self.client)
-            .map_err(|e| HtlcError::Network(format!("LNv2 module not available: {e}")))?;
-        let (FundedContract { outpoint, contract }, claim_op, funding_wait) = {
+    ) -> Result<(), AdapterError> {
+        if !accepted
+            .reservation
+            .payment_hash
+            .matches_preimage(&preimage)
+        {
+            return Err(AdapterError::InvalidParams(
+                "preimage does not match incoming payment hash".into(),
+            ));
+        }
+        let operation_key = accepted.reservation.operation_id.clone();
+        let action_lock = {
             let incoming = self.incoming.lock().await;
-            let slot = incoming.get(&payment_hash).ok_or_else(|| {
-                HtlcError::InvalidParams(format!(
-                    "no incoming HTLC registered for {payment_hash:?}"
+            let slot = incoming.get(&operation_key).ok_or_else(|| {
+                AdapterError::NotFound(format!("no accepted incoming operation {operation_key}"))
+            })?;
+            let stored = slot.accepted.as_ref().ok_or_else(|| {
+                AdapterError::NotFound(format!("incoming operation {operation_key} not accepted"))
+            })?;
+            if !Self::accepted_incoming_matches(stored, accepted) {
+                return Err(AdapterError::InvalidParams(
+                    "accepted incoming state does not match operation".into(),
+                ));
+            }
+            if slot.claimed {
+                return Ok(());
+            }
+            if slot
+                .claim_preimage
+                .is_some_and(|recorded| recorded != preimage)
+            {
+                return Err(AdapterError::InvalidParams(
+                    "incoming operation was already submitted with different preimage".into(),
+                ));
+            }
+            slot.action_lock.clone()
+        };
+        let _action_guard = action_lock.lock().await;
+
+        let (funded, mut claim_op) = {
+            let incoming = self.incoming.lock().await;
+            let slot = incoming.get(&operation_key).ok_or_else(|| {
+                AdapterError::NotFound(format!("no accepted incoming operation {operation_key}"))
+            })?;
+            let stored = slot.accepted.as_ref().ok_or_else(|| {
+                AdapterError::NotFound(format!("incoming operation {operation_key} not accepted"))
+            })?;
+            if !Self::accepted_incoming_matches(stored, accepted) {
+                return Err(AdapterError::InvalidParams(
+                    "accepted incoming state does not match operation".into(),
+                ));
+            }
+            if slot.claimed {
+                return Ok(());
+            }
+            if slot
+                .claim_preimage
+                .is_some_and(|recorded| recorded != preimage)
+            {
+                return Err(AdapterError::InvalidParams(
+                    "incoming operation was already submitted with different preimage".into(),
+                ));
+            }
+            let funded = slot.funded.clone().ok_or_else(|| {
+                AdapterError::NotFound(format!(
+                    "incoming operation {operation_key} has no funded contract"
                 ))
             })?;
-            // Clone, don't take: a failed claim must leave the handle
-            // in place so the contract stays claimable on retry. The
-            // slot entry is only removed after a successful claim
-            // below.
-            let funded = slot.funded.clone().ok_or_else(|| {
-                HtlcError::Network(format!("incoming HTLC for {payment_hash:?} never funded"))
-            })?;
-            // Cap the funding wait by the hop's own deadline when it
-            // still lies in the future; otherwise use the default
-            // grace.
+            (funded, slot.claim_op)
+        };
+
+        let FundedContract { outpoint, contract } = funded;
+        let ln = Self::ln_module(&self.client)
+            .map_err(|e| AdapterError::Network(format!("LNv2 module not available: {e}")))?;
+        if claim_op.is_none() {
             let now = unix_now_secs();
-            let wait = if slot.deadline > now {
-                FUNDING_GRACE.min(Duration::from_secs(slot.deadline - now))
+            let funding_wait = if accepted.reservation.deadline > now {
+                FUNDING_GRACE.min(Duration::from_secs(accepted.reservation.deadline - now))
             } else {
                 FUNDING_GRACE
             };
-            (funded, slot.claim_op, wait)
-        };
-
-        // The claim transaction reveals the preimage; before the
-        // first submission, make sure the contract is really funded
-        // so we don't burn the reveal on a phantom HTLC. A retry
-        // (claim op already submitted) skips this — the first
-        // attempt already confirmed the funding.
-        if claim_op.is_none() {
             let remaining =
                 tokio::time::timeout(funding_wait, ln.await_htlc_funded(outpoint, &contract))
                     .await
                     .map_err(|_| {
-                        HtlcError::Network(format!(
-                            "incoming HTLC for {payment_hash:?} not funded after {}s",
+                        AdapterError::Network(format!(
+                            "incoming operation {operation_key} not funded after {}s",
                             funding_wait.as_secs()
                         ))
                     })?
                     .map_err(ln_err)?;
             debug!(
-                ?payment_hash,
+                operation_id = %operation_key,
+                payment_hash = ?accepted.reservation.payment_hash,
                 remaining_blocks = remaining,
                 "fedimint incoming HTLC confirmed funded; claiming"
             );
         }
 
-        let operation_id = match claim_op {
-            Some(operation_id) => operation_id,
-            None => {
-                let operation_id = ln
+        if claim_op.is_none() {
+            let ln = Self::ln_module(&self.client)
+                .map_err(|e| AdapterError::Network(format!("LNv2 module not available: {e}")))?;
+            claim_op = Some(
+                match ln
                     .claim_htlc(
                         outpoint,
                         contract,
@@ -963,142 +1406,221 @@ impl NetworkRouterAdapter for FedimintAdapter {
                         serde_json::Value::Null,
                     )
                     .await
-                    .map_err(ln_err)?;
-                // Record the submitted claim before awaiting its
-                // settlement, so a failed settle retries the settle —
-                // never the submission (which the federation would
-                // reject as a duplicate operation).
-                if let Some(slot) = self.incoming.lock().await.get_mut(&payment_hash) {
-                    slot.claim_op = Some(operation_id);
-                }
-                operation_id
-            }
-        };
+                {
+                    Ok(operation_id) => operation_id,
+                    Err(LnHtlcError::DuplicateOperation(operation_id)) => operation_id,
+                    Err(error @ LnHtlcError::ContractNotFound) => {
+                        // Process may have restarted after native submission but
+                        // before local marker reached journal. Native claim id is
+                        // deterministic, so recover terminal success from it.
+                        let expected = Self::claim_operation(outpoint);
+                        if ln.await_htlc_operation_settled(expected).await.is_ok() {
+                            if let Some(slot) = self.incoming.lock().await.get_mut(&operation_key) {
+                                slot.claim_op = Some(expected);
+                                slot.claim_preimage = Some(preimage);
+                                slot.claimed = true;
+                            }
+                            return Ok(());
+                        }
+                        return Err(ln_err(error));
+                    }
+                    Err(error) => return Err(ln_err(error)),
+                },
+            );
 
-        ln.await_htlc_operation_settled(operation_id)
+            // Record before settlement wait. Retry after interrupted wait
+            // resumes this native operation instead of submitting again.
+            if let Some(slot) = self.incoming.lock().await.get_mut(&operation_key) {
+                slot.claim_op = claim_op;
+                slot.claim_preimage = Some(preimage);
+            }
+        }
+
+        let ln = Self::ln_module(&self.client)
+            .map_err(|e| AdapterError::Network(format!("LNv2 module not available: {e}")))?;
+        ln.await_htlc_operation_settled(claim_op.expect("claim operation recorded"))
             .await
             .map_err(ln_err)?;
-
-        info!(?payment_hash, "fedimint incoming HTLC claimed");
-        self.incoming.lock().await.remove(&payment_hash);
+        if let Some(slot) = self.incoming.lock().await.get_mut(&operation_key) {
+            slot.claimed = true;
+        }
+        info!(
+            operation_id = %operation_key,
+            payment_hash = ?accepted.reservation.payment_hash,
+            "fedimint incoming HTLC claimed"
+        );
         Ok(())
     }
 
-    /// Refund an outgoing HTLC after its expiration. `refund_htlc`
-    /// refuses while the federation's consensus block count has not
-    /// yet passed the contract expiration, so retry briefly; the
-    /// router calls this right after the unix deadline, and consensus
-    /// only needs to catch up.
-    async fn refund_outgoing(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
-        let ln = Self::ln_module(&self.client)
-            .map_err(|e| HtlcError::Network(format!("LNv2 module not available: {e}")))?;
-        let (outpoint, contract, refund_op) = {
+    /// Refund operation after expiry. Per-operation lock prevents duplicate
+    /// submissions; native refund id is retained across interrupted waits.
+    async fn refund_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
+        let action_lock = {
             let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
+            let slot = outgoing.get(&payment.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!("no outgoing operation {}", payment.operation_id))
             })?;
+            if !Self::outgoing_payments_match(&slot.payment, payment) {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing payment does not match operation state".into(),
+                ));
+            }
+            if slot.refund_state != RefundState::Active {
+                return Ok(());
+            }
+            if slot.resolution.is_some() {
+                return Ok(());
+            }
+            slot.action_lock.clone()
+        };
+        let _action_guard = action_lock.lock().await;
+
+        let (outpoint, contract, stored_refund_op) = {
+            let outgoing = self.outgoing.lock().await;
+            let slot = outgoing.get(&payment.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!("no outgoing operation {}", payment.operation_id))
+            })?;
+            if !Self::outgoing_payments_match(&slot.payment, payment) {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing payment does not match operation state".into(),
+                ));
+            }
+            if slot.refund_state != RefundState::Active || slot.resolution.is_some() {
+                return Ok(());
+            }
             (slot.outpoint, slot.contract.clone(), slot.refund_op)
         };
 
-        let operation_id = match refund_op {
-            // A previous attempt already submitted the refund spend;
-            // just wait for its settlement again instead of
-            // resubmitting (which the federation rejects as a
-            // duplicate operation).
-            Some(operation_id) => operation_id,
-            None => {
-                let started = tokio::time::Instant::now();
-                let operation_id = loop {
-                    match ln
-                        .refund_htlc(outpoint, contract.clone(), serde_json::Value::Null)
-                        .await
-                    {
-                        Ok(operation_id) => {
-                            // Record the submitted refund before
-                            // awaiting its settlement, so a failed
-                            // settle retries the settle — never the
-                            // submission.
-                            if let Some(slot) = self.outgoing.lock().await.get_mut(&payment_hash) {
-                                slot.refund_op = Some(operation_id);
-                            }
-                            break operation_id;
+        let ln = Self::ln_module(&self.client)
+            .map_err(|e| AdapterError::Network(format!("LNv2 module not available: {e}")))?;
+        let operation_id = if let Some(operation_id) = stored_refund_op {
+            operation_id
+        } else {
+            let started = tokio::time::Instant::now();
+            loop {
+                match ln
+                    .refund_htlc(outpoint, contract.clone(), serde_json::Value::Null)
+                    .await
+                {
+                    Ok(operation_id) => break operation_id,
+                    Err(LnHtlcError::DuplicateOperation(operation_id)) => break operation_id,
+                    Err(LnHtlcError::NotExpired(missing)) => {
+                        if started.elapsed() >= REFUND_RETRY {
+                            return Err(AdapterError::Retryable(format!(
+                                "contract still not expired on consensus \
+                                 ({missing} blocks to go); retry later"
+                            )));
                         }
-                        Err(LnHtlcError::NotExpired(missing)) => {
-                            if started.elapsed() >= REFUND_RETRY {
-                                return Err(HtlcError::Network(format!(
-                                    "contract still not expired on consensus \
-                                     ({missing} blocks to go); retry later"
-                                )));
-                            }
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                        Err(LnHtlcError::ContractNotFound) => {
-                            // Nothing is funded at this outpoint
-                            // anymore: the recipient claimed (happy
-                            // path) or the contract was already spent.
-                            // There is nothing left to refund —
-                            // terminal.
-                            warn!(
-                                ?payment_hash,
-                                "fedimint outgoing HTLC gone before refund; dropping"
-                            );
-                            self.outgoing.lock().await.remove(&payment_hash);
-                            return Ok(());
-                        }
-                        Err(e) => return Err(ln_err(e)),
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
-                };
-                operation_id
+                    Err(LnHtlcError::ContractNotFound) => {
+                        // Native refund id is deterministic. If process restarted
+                        // after submission, recover terminal refund from Fedimint
+                        // operation log; otherwise contract was claimed/spent.
+                        let expected = Self::refund_operation(outpoint);
+                        let refunded = ln.await_htlc_operation_settled(expected).await.is_ok();
+                        warn!(
+                            operation_id = %payment.operation_id,
+                            payment_hash = ?payment.payment_hash,
+                            refunded,
+                            "fedimint outgoing contract gone; refund terminal"
+                        );
+                        if let Some(slot) =
+                            self.outgoing.lock().await.get_mut(&payment.operation_id)
+                        {
+                            slot.refund_op = refunded.then_some(expected);
+                            slot.refund_state = if refunded {
+                                RefundState::Refunded
+                            } else {
+                                RefundState::ContractGone
+                            };
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(ln_err(error)),
+                }
             }
         };
 
+        if let Some(slot) = self.outgoing.lock().await.get_mut(&payment.operation_id) {
+            slot.refund_op = Some(operation_id);
+        }
         ln.await_htlc_operation_settled(operation_id)
             .await
             .map_err(ln_err)?;
-
-        info!(?payment_hash, "fedimint outgoing HTLC refunded");
-        self.outgoing.lock().await.remove(&payment_hash);
+        if let Some(slot) = self.outgoing.lock().await.get_mut(&payment.operation_id) {
+            slot.refund_state = RefundState::Refunded;
+        }
+        info!(
+            operation_id = %payment.operation_id,
+            payment_hash = ?payment.payment_hash,
+            "fedimint outgoing HTLC refunded"
+        );
         Ok(())
     }
 
-    /// Wait for the recipient of our outgoing HTLC to claim. The
-    /// federation returns the preimage to the funder once the claim
-    /// transaction is accepted; `None` means the contract expired
-    /// unclaimed, which maps to cassis's deadline-exceeded.
-    async fn watch_preimage(
+    /// Wait for recipient claim and return preimage. Successful result is
+    /// cached in operation state so repeated watches never depend on polling
+    /// federation state again.
+    async fn watch_outgoing(
         &self,
-        payment_hash: Bytes32,
+        payment: &OutgoingPayment,
         deadline: u64,
-    ) -> Result<Bytes32, WatchError> {
-        let ln = Self::ln_module(&self.client)
-            .map_err(|e| WatchError::Network(format!("LNv2 module not available: {e}")))?;
-        let (outpoint, contract) = {
+    ) -> Result<Bytes32, AdapterError> {
+        let (outpoint, contract, cached) = {
             let outgoing = self.outgoing.lock().await;
-            let slot = outgoing.get(&payment_hash).ok_or_else(|| {
-                WatchError::Network(format!("no outgoing HTLC for {payment_hash:?}"))
+            let slot = outgoing.get(&payment.operation_id).ok_or_else(|| {
+                AdapterError::NotFound(format!("no outgoing operation {}", payment.operation_id))
             })?;
-            (slot.outpoint, slot.contract.clone())
+            if !Self::outgoing_payments_match(&slot.payment, payment) {
+                return Err(AdapterError::InvalidParams(
+                    "outgoing payment does not match operation state".into(),
+                ));
+            }
+            if slot.refund_state == RefundState::Refunded {
+                return Err(AdapterError::DeadlineExceeded);
+            }
+            (slot.outpoint, slot.contract.clone(), slot.resolution)
         };
+        if let Some(preimage) = cached {
+            return Ok(preimage);
+        }
 
+        let ln = Self::ln_module(&self.client)
+            .map_err(|e| AdapterError::Network(format!("LNv2 module not available: {e}")))?;
         let resolution = tokio::time::timeout(
             Self::deadline_to_timeout(deadline),
             ln.await_htlc_resolution(outpoint, &contract),
         )
         .await
-        .map_err(|_| WatchError::DeadlineExceeded)?
-        .map_err(|e| WatchError::Network(e.to_string()))?;
+        .map_err(|_| AdapterError::DeadlineExceeded)?
+        .map_err(ln_err)?;
 
         match resolution {
             Some(preimage) => {
+                let preimage = Bytes32(preimage);
+                if !payment.payment_hash.matches_preimage(&preimage) {
+                    return Err(AdapterError::Network(
+                        "federation returned preimage for different payment hash".into(),
+                    ));
+                }
+                if let Some(slot) = self.outgoing.lock().await.get_mut(&payment.operation_id) {
+                    slot.resolution = Some(preimage);
+                }
                 info!(
-                    ?payment_hash,
+                    operation_id = %payment.operation_id,
+                    payment_hash = ?payment.payment_hash,
                     "fedimint outgoing HTLC claimed; preimage revealed"
                 );
-                Ok(Bytes32(preimage))
+                Ok(preimage)
             }
             None => {
-                warn!(?payment_hash, "fedimint outgoing HTLC expired unclaimed");
-                Err(WatchError::DeadlineExceeded)
+                warn!(
+                    operation_id = %payment.operation_id,
+                    payment_hash = ?payment.payment_hash,
+                    "fedimint outgoing HTLC expired unclaimed"
+                );
+                Err(AdapterError::DeadlineExceeded)
             }
         }
     }
@@ -1106,19 +1628,50 @@ impl NetworkRouterAdapter for FedimintAdapter {
     /// PREPARE-time check: does the client hold enough ecash to fund
     /// an outgoing HTLC of `amount_msat`? Outgoing contracts are paid
     /// from the wallet's bitcoin-denominated balance.
-    async fn can_route(&self, amount_msat: u64) -> Result<(), HtlcError> {
+    async fn restore_incoming_reservation(
+        &self,
+        reservation: &IncomingReservation,
+    ) -> Result<(), AdapterError> {
+        let restored = self
+            .reserve_incoming(IncomingRequest {
+                operation_id: reservation.operation_id.clone(),
+                payment_hash: reservation.payment_hash,
+                amount_msat: reservation.amount_msat,
+                deadline: reservation.deadline,
+                preimage: None,
+            })
+            .await?;
+        if restored == *reservation {
+            Ok(())
+        } else {
+            Err(AdapterError::InvalidParams(
+                "restored Fedimint reservation differs from persisted state".into(),
+            ))
+        }
+    }
+
+    async fn can_route(&self, amount_msat: u64) -> Result<(), AdapterError> {
+        if amount_msat == 0 {
+            return Err(AdapterError::InvalidParams("amount must be > 0".into()));
+        }
         let balance = self
             .client
             .get_balance_for_btc()
             .await
-            .map_err(|e| HtlcError::Network(format!("balance request failed: {e}")))?;
+            .map_err(|e| AdapterError::Network(format!("balance request failed: {e}")))?;
         let needed = Amount::from_msats(amount_msat);
         if balance < needed {
-            return Err(HtlcError::InvalidParams(format!(
+            return Err(AdapterError::InvalidParams(format!(
                 "insufficient fedimint balance: need {} msat, have {} msat",
                 amount_msat, balance.msats
             )));
         }
+        Ok(())
+    }
+
+    /// Claiming direct HTLC releases funds to this client, so it needs no
+    /// upfront balance or gas reserve.
+    async fn can_claim(&self, _amount_msat: u64) -> Result<(), AdapterError> {
         Ok(())
     }
 }

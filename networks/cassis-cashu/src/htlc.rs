@@ -20,9 +20,11 @@ use cdk::nuts::nut00::{BlindedMessage, PreMint, Proof, Proofs};
 use cdk::nuts::nut01::{PublicKey, SecretKey as P2pkSecretKey};
 use cdk::nuts::nut10::{Secret as Nut10Secret, SpendingConditions};
 use cdk::nuts::{Conditions, Id as KeysetId, Witness};
+use cdk::secp256k1::hashes::Hash as _;
 use cdk::secret::Secret;
 use cdk::util::unix_time;
 use cdk::Amount;
+use std::collections::HashSet;
 
 use crate::errors::{CashuError, CashuResult};
 
@@ -206,6 +208,60 @@ pub fn verify_proofs_htlc_locked(proofs: &[Proof], payment_hash: &[u8; 32]) -> C
             return Err(CashuError::Nuts(format!(
                 "proof HTLC hash mismatch: expected {expected}, got {data}"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Verify structural HTLC terms plus recipient key. Structural checks
+/// alone do not prove mint issued proof or that it is locked to this hop.
+pub fn verify_proofs_htlc_locked_for_recipient(
+    proofs: &[Proof],
+    payment_hash: &[u8; 32],
+    recipient: &PublicKey,
+) -> CashuResult<()> {
+    if proofs.is_empty() {
+        return Err(CashuError::Nuts("empty Cashu proof set".into()));
+    }
+    let expected = lowercase_hex::encode(payment_hash);
+    let mut secrets = HashSet::new();
+    let mut keyset = None;
+    for proof in proofs {
+        if !secrets.insert(proof.secret.to_string()) {
+            return Err(CashuError::Nuts("duplicate Cashu proof secret".into()));
+        }
+        if let Some(first) = keyset {
+            if first != proof.keyset_id {
+                return Err(CashuError::Nuts(
+                    "Cashu HTLC proof set mixes keysets".into(),
+                ));
+            }
+        } else {
+            keyset = Some(proof.keyset_id);
+        }
+        let conditions = SpendingConditions::try_from(&proof.secret)
+            .map_err(|e| CashuError::Nuts(format!("decode HTLC conditions: {e}")))?;
+        let SpendingConditions::HTLCConditions {
+            data,
+            conditions: Some(terms),
+        } = conditions
+        else {
+            return Err(CashuError::Nuts(
+                "Cashu proof is not an HTLC with explicit terms".into(),
+            ));
+        };
+        if data.as_byte_array() != payment_hash {
+            return Err(CashuError::Nuts(format!(
+                "proof HTLC hash mismatch: expected {expected}, got {data}"
+            )));
+        }
+        let recipient_keys = terms.pubkeys.as_ref().ok_or_else(|| {
+            CashuError::Nuts("Cashu HTLC has no receiver pubkey condition".into())
+        })?;
+        if !recipient_keys.iter().any(|key| key == recipient) {
+            return Err(CashuError::Nuts(
+                "Cashu HTLC locked to wrong recipient".into(),
+            ));
         }
     }
     Ok(())
@@ -428,6 +484,40 @@ mod tests {
             .collect();
         let other = random_payment_hash();
         assert!(verify_proofs_htlc_locked(&proofs, &other).is_err());
+    }
+
+    #[test]
+    fn verify_proofs_htlc_locked_rejects_wrong_recipient() {
+        let hash = random_payment_hash();
+        let locktime = unix_time() + 60;
+        let keyset_id = KeysetId::from_str("009a1f293253e41e").unwrap();
+        let recipient = PublicKey::from_str(
+            "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        let out = build_htlc_outputs(1, keyset_id, &hash, locktime, &recipient).unwrap();
+        let proofs: Proofs = out
+            .premints
+            .into_iter()
+            .map(|pm| Proof {
+                amount: pm.amount,
+                keyset_id,
+                secret: pm.secret,
+                c: cdk::nuts::nut01::PublicKey::from_str(
+                    "02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+                )
+                .unwrap(),
+                witness: None,
+                dleq: None,
+                p2pk_e: None,
+            })
+            .collect();
+        let wrong = PublicKey::from_str(
+            "03bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea",
+        )
+        .unwrap();
+        assert!(verify_proofs_htlc_locked_for_recipient(&proofs, &hash, &recipient).is_ok());
+        assert!(verify_proofs_htlc_locked_for_recipient(&proofs, &hash, &wrong).is_err());
     }
 
     #[test]
