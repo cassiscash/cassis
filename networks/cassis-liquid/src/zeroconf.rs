@@ -19,7 +19,7 @@
 //!   coverage is reached, so no polling is involved.
 //! * [`check_coverage`] — used by the node that *receives* an HTLC.
 //!   A single REST lookup whose answer is treated as final: the
-//!   sender only dispatches after waiting for coverage itself, so by
+//!   sender only executes after waiting for coverage itself, so by
 //!   the time the receiver asks, the coverage must already be there.
 
 use futures::{SinkExt as _, StreamExt as _};
@@ -40,7 +40,7 @@ const REQUIRED_NUM: u64 = 4;
 const REQUIRED_DEN: u64 = 5;
 /// Sender-side budget for mempool propagation. Coverage normally
 /// arrives within seconds of broadcast; one Liquid block interval of
-/// slack is generous without stalling the DISPATCH round forever.
+/// slack is generous without stalling the EXECUTE round forever.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Delay before reconnecting after a websocket failure.
 const RETRY_DELAY: Duration = Duration::from_secs(2);

@@ -105,7 +105,7 @@ impl NetworkId {
     }
 }
 
-/// Opaque operation identifier used to bind reservations and dispatches
+/// Opaque operation identifier used to bind reservations and executions
 /// to one authenticated peer. Payment hashes identify payment intent;
 /// operation IDs identify one protocol attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -519,7 +519,7 @@ pub struct OutgoingRequest {
 /// basic invariants (non-zero hash, positive amount, supported
 /// networks, timelock defaults, funds on the outgoing side) and
 /// replies with [`HopPrepared`]. The actual HTLCs are only created
-/// after a matching DISPATCH message arrives.
+/// after a matching EXECUTE message arrives.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HopPrepare {
     pub payment_hash: Bytes32,
@@ -537,7 +537,7 @@ pub struct HopPrepare {
 }
 
 /// Reply to [`HopPrepare`]. `accepted=true` means the hop has
-/// reserved capacity and is ready to receive a matching DISPATCH.
+/// reserved capacity and is ready to receive a matching EXECUTE.
 /// `accepted=false` carries a human-readable reason; the sender is
 /// expected to abort the whole payment if any hop rejects.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -564,15 +564,15 @@ pub struct HopPrepared {
     pub htlc_target: Option<HtlcTarget>,
 }
 
-/// DISPATCH message (sender -> router): tells a hop that a real
+/// EXECUTE message (sender -> router): tells a hop that a real
 /// incoming HTLC matching its previous PREPARE has been deployed on
 /// the hop's incoming network. The descriptor is the network-specific
 /// payload the receiver of the HTLC needs to claim it (e.g. for
 /// cashu: a list of base64-encoded NUT-14 proofs). The router
 /// verifies the HTLC is really claimable, then creates an outgoing
-/// HTLC and replies with its descriptor in [`HopDispatched`].
+/// HTLC and replies with its descriptor in [`HopExecuted`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HopDispatch {
+pub struct HopExecute {
     pub payment_hash: Bytes32,
     /// Reservation returned by this hop's PREPARE.
     pub operation_id: OperationId,
@@ -585,20 +585,20 @@ pub struct HopDispatch {
     /// claim key to lock the outgoing HTLC to; for lightning it is
     /// the downstream hold invoice to pay.
     ///
-    /// This travels in DISPATCH rather than PREPARE because the payer
+    /// This travels in EXECUTE rather than PREPARE because the payer
     /// PREPAREs every hop *concurrently*, so when hop `i`'s PREPARE is
     /// built the reply from hop `i+1` — and therefore its addressing
-    /// parameters — is not known yet. DISPATCH is sequential and
+    /// parameters — is not known yet. EXECUTE is sequential and
     /// happens strictly after every PREPARE has been answered, so by
     /// then the downstream parameters are always available.
     pub htlc_target: HtlcTarget,
 }
 
-/// Reply to [`HopDispatch`]. Carries the descriptor of the outgoing
+/// Reply to [`HopExecute`]. Carries the descriptor of the outgoing
 /// HTLC the router has just created on its outgoing network. The
-/// sender passes it to the next hop's DISPATCH.
+/// sender passes it to the next hop's EXECUTE.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HopDispatched {
+pub struct HopExecuted {
     pub payment_hash: Bytes32,
     /// Incoming reservation consumed by this hop.
     pub operation_id: OperationId,
@@ -606,11 +606,11 @@ pub struct HopDispatched {
 }
 
 /// DISCARD message (sender -> router): abandon a reservation made by an
-/// earlier [`HopPrepare`] that will never be followed by a DISPATCH.
+/// earlier [`HopPrepare`] that will never be followed by an EXECUTE.
 ///
 /// The payer sends this to every hop still holding a reservation as
 /// soon as it knows the payment cannot proceed — a hop rejected its
-/// PREPARE, the payer could not fund the first HTLC, or a DISPATCH
+/// PREPARE, the payer could not fund the first HTLC, or an EXECUTE
 /// failed part-way down the route. Without it a failed attempt leaves
 /// capacity pinned on every hop that *did* accept until the
 /// reservation ages out, so a payer retrying over an overlapping route
@@ -618,8 +618,8 @@ pub struct HopDispatched {
 ///
 /// This can only ever free a reservation, never affect money: a hop
 /// drops its [`HopPrepare`] record the moment it acts on the matching
-/// DISPATCH, so by the time any HTLC exists there is nothing here left
-/// to match. A DISCARD that arrives after DISPATCH finds no record and
+/// EXECUTE, so by the time any HTLC exists there is nothing here left
+/// to match. A DISCARD that arrives after EXECUTE finds no record and
 /// is reported as `released: false` rather than unwinding anything;
 /// funded HTLCs are left to the normal preimage-or-timelock path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -635,7 +635,7 @@ pub struct HopDiscard {
 ///
 /// `released: false` is a normal, non-error outcome: the reservation
 /// may have already aged out, the PREPARE may have been rejected (in
-/// which case nothing was ever reserved), or a DISPATCH may have
+/// which case nothing was ever reserved), or an EXECUTE may have
 /// already consumed it. The payer sends DISCARD as a best-effort
 /// cleanup and does not fail a payment over the answer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -722,7 +722,7 @@ pub enum HtlcDescriptor {
     /// locktime; the claim side it rebuilds from its own claim pubkey
     /// and the route's payment hash. The sender broadcasts the lockup
     /// non-RBF and
-    /// only dispatches after Blockstream's 0-conf observation service
+    /// only executes after Blockstream's 0-conf observation service
     /// reports enough functionary coverage; the receiver re-checks
     /// the same service and fetches the tx from esplora by this txid
     /// instead of scanning the lockup address.

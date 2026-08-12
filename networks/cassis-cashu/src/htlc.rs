@@ -190,7 +190,7 @@ pub fn verify_proofs_htlc(proofs: &[Proof]) -> CashuResult<()> {
 /// locktime. Each proof's secret must decode to a NUT-10 secret of
 /// HTLC kind whose `data` field is the payment hash. This is the
 /// check the sender runs right after a swap, and the mid-hop receiver
-/// runs at DISPATCH time, when the proofs are freshly locked and no
+/// runs at EXECUTE time, when the proofs are freshly locked and no
 /// witness is available yet.
 pub fn verify_proofs_htlc_locked(proofs: &[Proof], payment_hash: &[u8; 32]) -> CashuResult<()> {
     let expected = lowercase_hex::encode(payment_hash);

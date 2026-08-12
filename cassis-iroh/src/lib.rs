@@ -1,5 +1,5 @@
 use cassis_core::{
-    Bytes32, HopCommit, HopCommitted, HopDiscard, HopDiscarded, HopDispatch, HopDispatched,
+    Bytes32, HopCommit, HopCommitted, HopDiscard, HopDiscarded, HopExecute, HopExecuted,
     HopPrepare, HopPrepared, HtlcDescriptor, NetworkId, OperationId,
 };
 use iroh::endpoint::presets;
@@ -36,16 +36,16 @@ pub enum IrohError {
 /// Every message the hop protocol carries on the wire. The
 /// `Direction` tag discriminates sender vs receiver roles; the
 /// router (intermediate hop) handles `Prepare`, `Prepared`,
-/// `Dispatch`, `Dispatched`, `Discard`, `Discarded` and the
+/// `Execute`, `Executed`, `Discard`, `Discarded` and the
 /// `Committed` preimage fanout; the payee (final hop) handles
 /// `Commit` and replies `Committed`. Both peers run the same
-/// [`IrohServer`] and dispatch by the tag.
+/// [`IrohServer`] and route by the tag.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
     Prepare(HopPrepare),
     Prepared(HopPrepared),
-    Dispatch(HopDispatch),
-    Dispatched(HopDispatched),
+    Execute(HopExecute),
+    Executed(HopExecuted),
     Commit(HopCommit),
     Committed(HopCommitted),
     Discard(HopDiscard),
@@ -63,8 +63,8 @@ impl Frame {
         match self {
             Frame::Prepare(m) => m.operation_id.clone(),
             Frame::Prepared(m) => m.operation_id.clone(),
-            Frame::Dispatch(m) => m.operation_id.clone(),
-            Frame::Dispatched(m) => m.operation_id.clone(),
+            Frame::Execute(m) => m.operation_id.clone(),
+            Frame::Executed(m) => m.operation_id.clone(),
             Frame::Commit(m) => m.operation_id.clone(),
             Frame::Committed(m) => m.operation_id.clone(),
             Frame::Discard(m) => m.operation_id.clone(),
@@ -77,8 +77,8 @@ impl Frame {
         match self {
             Frame::Prepare(m) => m.payment_hash,
             Frame::Prepared(m) => m.payment_hash,
-            Frame::Dispatch(m) => m.payment_hash,
-            Frame::Dispatched(m) => m.payment_hash,
+            Frame::Execute(m) => m.payment_hash,
+            Frame::Executed(m) => m.payment_hash,
             Frame::Commit(m) => m.payment_hash,
             Frame::Committed(m) => m.payment_hash,
             Frame::Discard(m) => m.payment_hash,
@@ -293,29 +293,29 @@ impl IrohClient {
         }
     }
 
-    pub async fn send_dispatch(
+    pub async fn send_execute(
         &self,
         addr: EndpointAddr,
-        dispatch: HopDispatch,
-    ) -> Result<HopDispatched, IrohError> {
-        let expected_hash = dispatch.payment_hash;
-        let expected_operation = dispatch.operation_id.clone();
+        execute: HopExecute,
+    ) -> Result<HopExecuted, IrohError> {
+        let expected_hash = execute.payment_hash;
+        let expected_operation = execute.operation_id.clone();
         let reply = self
-            .round_trip(addr, Frame::Dispatch(dispatch), "send_dispatch")
+            .round_trip(addr, Frame::Execute(execute), "send_execute")
             .await?;
         match reply {
-            Frame::Dispatched(m)
+            Frame::Executed(m)
                 if m.payment_hash == expected_hash && m.operation_id == expected_operation =>
             {
                 Ok(m)
             }
-            Frame::Dispatched(m) => Err(IrohError::Protocol(format!(
-                "send_dispatch: response correlation mismatch: expected {expected_hash}/{}, got {}/{}",
+            Frame::Executed(m) => Err(IrohError::Protocol(format!(
+                "send_execute: response correlation mismatch: expected {expected_hash}/{}, got {}/{}",
                 expected_operation, m.payment_hash, m.operation_id
             ))),
             Frame::Error { message, retryable, operation_id, .. } => Err(IrohError::Remote { message, retryable, operation_id }),
             other => Err(IrohError::Protocol(format!(
-                "send_dispatch: unexpected reply frame {other:?}"
+                "send_execute: unexpected reply frame {other:?}"
             ))),
         }
     }
@@ -569,7 +569,7 @@ async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), Ir
         serde_json::from_slice(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
     debug!(
         target: "iroh_server",
-        "decoded frame, dispatching to handler (payment_hash={})",
+        "decoded frame, routing to handler (payment_hash={})",
         frame.payment_hash()
     );
     let payment_hash = frame.payment_hash();
@@ -635,15 +635,15 @@ mod tests {
     use cassis_core::{HtlcTarget, OperationId};
 
     #[test]
-    fn dispatch_frame_with_cashu_descriptor_round_trips_through_json() {
+    fn execute_frame_with_cashu_descriptor_round_trips_through_json() {
         // Regression: HtlcDescriptor used to be internally-tagged
         // (#[serde(tag, content)]), which postcard cannot
-        // deserialize (it needs deserialize_any). DISPATCH frames
+        // deserialize (it needs deserialize_any). EXECUTE frames
         // carry a descriptor, so any multi-hop pay would fail to
         // decode on the router with postcard's WontImplement error
         // and the connection would drop. External tagging round-trips
         // fine (and now over JSON).
-        let dispatch = Frame::Dispatch(HopDispatch {
+        let execute = Frame::Execute(HopExecute {
             payment_hash: Bytes32([0x42u8; 32]),
             operation_id: OperationId("test-operation".into()),
             incoming_descriptor: HtlcDescriptor::Cashu {
@@ -651,10 +651,10 @@ mod tests {
             },
             htlc_target: HtlcTarget::LightningInvoice("lnbc...".into()),
         });
-        let bytes = serde_json::to_vec(&dispatch).expect("encode dispatch");
-        let decoded: Frame = serde_json::from_slice(&bytes).expect("decode dispatch");
+        let bytes = serde_json::to_vec(&execute).expect("encode execute");
+        let decoded: Frame = serde_json::from_slice(&bytes).expect("decode execute");
         match decoded {
-            Frame::Dispatch(d) => {
+            Frame::Execute(d) => {
                 assert_eq!(
                     d.htlc_target,
                     HtlcTarget::LightningInvoice("lnbc...".into())

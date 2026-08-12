@@ -50,7 +50,7 @@
 //! 0-conf: lockups are broadcast non-RBF, and the sender only reports
 //! an outgoing HTLC as deployed once Blockstream's 0-conf observation
 //! service (see the `zeroconf` module) shows at least 4/5 of the functionaries
-//! have the tx in their mempool. The descriptor sent in DISPATCH pins
+//! have the tx in their mempool. The descriptor sent in EXECUTE pins
 //! the lockup txid and output, so the receiver re-checks the same
 //! service with one REST call and verifies the pinned output via
 //! esplora before accepting. The service only observes mainnet, so on
@@ -636,7 +636,7 @@ impl LiquidAdapter {
         Ok(status.confirmed)
     }
 
-    /// Rebuild the spec a dispatched descriptor must match: the
+    /// Rebuild the spec an executed descriptor must match: the
     /// refund parameters come from the wire, the claim side from this
     /// node's own claim key and the route's payment hash.
     fn incoming_spec(
@@ -668,11 +668,11 @@ impl LiquidAdapter {
         Ok((spec, OutPoint::new(txid, u32::from(*lockup_vout))))
     }
 
-    /// Receiver-side verification of a dispatched HTLC:
+    /// Receiver-side verification of an executed HTLC:
     ///
     /// 1. on mainnet, unless the lockup already confirmed, a one-shot
     ///    0-conf check on the pinned lockup txid, whose answer is
-    ///    final: the sender only dispatched after waiting for
+    ///    final: the sender only executed after waiting for
     ///    coverage itself, so a shortfall here rejects the HTLC (a
     ///    confirmed lockup is past mempool policy and may already
     ///    have been dropped from the 0-conf service's memory; the

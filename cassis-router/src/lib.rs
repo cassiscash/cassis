@@ -16,7 +16,7 @@
 use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
     network_id_for_spec, normalize_network_id, AcceptedIncoming, AdapterError, Bytes32, HopCommit,
-    HopCommitted, HopDiscard, HopDiscarded, HopDispatch, HopDispatched, HopPrepare, HopPrepared,
+    HopCommitted, HopDiscard, HopDiscarded, HopExecute, HopExecuted, HopPrepare, HopPrepared,
     HtlcDescriptor, HtlcTarget, IncomingRequest, IncomingReservation, NetworkAdapter, NetworkId,
     OperationId, OutgoingPayment, OutgoingRequest,
 };
@@ -41,13 +41,13 @@ pub type PrepareVeto = Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>;
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
 
-/// How often the per-dispatch poll task wakes up to check
+/// How often the per-execution poll task wakes up to check
 /// whether the receiver of an outgoing HTLC has revealed the
 /// preimage.
 const POLL_INTERVAL_SECS: u64 = 30;
 
 /// Current on-disk router journal format. Bump whenever pending or
-/// dispatched state shape changes; old journals are intentionally not
+/// executed state shape changes; old journals are intentionally not
 /// migrated.
 const ROUTER_JOURNAL_VERSION: u8 = 4;
 
@@ -69,7 +69,7 @@ pub struct RouterConfig {
     /// Span identifying node that owns router and its adapter calls.
     pub span: Span,
     /// Optional durable router journal. Funded outgoing HTLC state is
-    /// written here before the router acknowledges DISPATCH.
+    /// written here before the router acknowledges EXECUTE.
     pub state_path: Option<PathBuf>,
     /// Parent directory for persistent Liquid wallet state.
     /// Each Liquid network gets its own child directory.
@@ -616,14 +616,14 @@ async fn build_adapter(
     }
 }
 
-/// Per-dispatch state the router retains between DISPATCH
+/// Per-execution state the router retains between EXECUTE
 /// and the eventual claim. `outgoing_deadline` is the
 /// unix-second cutoff the router passes to the adapter's
-/// `watch_outgoing`; once exceeded, the dispatch is refunded
+/// `watch_outgoing`; once exceeded, the execution is refunded
 /// (outgoing side) and the incoming side is left to expire
 /// on its own.
 #[derive(Clone, Serialize, Deserialize)]
-struct DispatchedHop {
+struct ExecutedHop {
     operation_id: OperationId,
     owner: String,
     prepare: HopPrepare,
@@ -635,12 +635,12 @@ struct DispatchedHop {
     outgoing_deadline: u64,
 }
 
-/// Write-ahead state for a DISPATCH whose external side effects have not
+/// Write-ahead state for an EXECUTE whose external side effects have not
 /// all completed yet. The record exists before `accept_incoming` and
 /// `create_outgoing` run, so a crash cannot make a funded outgoing HTLC
 /// unreachable to recovery.
 #[derive(Clone, Serialize, Deserialize)]
-struct PendingDispatch {
+struct PendingExecute {
     operation_id: OperationId,
     owner: String,
     prepare: HopPrepare,
@@ -657,8 +657,8 @@ struct PendingDispatch {
 #[derive(Serialize, Deserialize)]
 struct RouterJournal {
     version: u8,
-    pending: Vec<PendingDispatch>,
-    dispatched: Vec<DispatchedHop>,
+    pending: Vec<PendingExecute>,
+    executed: Vec<ExecutedHop>,
 }
 
 pub struct CassisRouter {
@@ -667,8 +667,8 @@ pub struct CassisRouter {
     /// must be instrumented with this, or its logs lose the node name.
     span: Span,
     prepared: Arc<Mutex<Vec<PreparedEntry>>>,
-    pending: Arc<Mutex<HashMap<OperationId, PendingDispatch>>>,
-    dispatched: Arc<Mutex<HashMap<OperationId, DispatchedHop>>>,
+    pending: Arc<Mutex<HashMap<OperationId, PendingExecute>>>,
+    executed: Arc<Mutex<HashMap<OperationId, ExecutedHop>>>,
     state_path: Option<PathBuf>,
     state_write_lock: Arc<Mutex<()>>,
     settled: Arc<Mutex<HashMap<OperationId, String>>>,
@@ -696,7 +696,7 @@ impl CassisRouter {
             span,
             prepared: Arc::new(Mutex::new(Vec::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            dispatched: Arc::new(Mutex::new(HashMap::new())),
+            executed: Arc::new(Mutex::new(HashMap::new())),
             state_path,
             state_write_lock: Arc::new(Mutex::new(())),
             settled: Arc::new(Mutex::new(HashMap::new())),
@@ -765,8 +765,8 @@ impl CassisRouter {
                 .insert(pending.operation_id.clone(), pending);
         }
 
-        let restored_count = journal.dispatched.len();
-        for hop in journal.dispatched {
+        let restored_count = journal.executed.len();
+        for hop in journal.executed {
             if let Some(incoming) = self.adapters.get(&hop.prepare.incoming_network) {
                 if let Err(error) = incoming.adapter.restore_incoming(&hop.accepted).await {
                     warn!(
@@ -786,15 +786,15 @@ impl CassisRouter {
                     );
                 }
             }
-            self.dispatched
+            self.executed
                 .lock()
                 .await
                 .insert(hop.operation_id.clone(), hop);
         }
-        self.recover_pending_dispatches().await;
+        self.recover_pending_executees().await;
         info!(
             target: "cassis_router",
-            "restored {} funded dispatch(es) from {}",
+            "restored {} funded execute(es) from {}",
             restored_count,
             path.display(),
         );
@@ -807,13 +807,13 @@ impl CassisRouter {
         };
         let _guard = self.state_write_lock.lock().await;
         let pending = self.pending.lock().await;
-        let dispatched = self.dispatched.lock().await;
+        let executed = self.executed.lock().await;
         let journal = RouterJournal {
             version: ROUTER_JOURNAL_VERSION,
             pending: pending.values().cloned().collect(),
-            dispatched: dispatched.values().cloned().collect(),
+            executed: executed.values().cloned().collect(),
         };
-        drop(dispatched);
+        drop(executed);
         drop(pending);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -855,7 +855,7 @@ impl CassisRouter {
         Ok(())
     }
 
-    async fn store_pending(&self, pending: PendingDispatch) -> Result<(), String> {
+    async fn store_pending(&self, pending: PendingExecute) -> Result<(), String> {
         self.pending
             .lock()
             .await
@@ -866,14 +866,14 @@ impl CassisRouter {
     async fn claim_pending_operation(
         &self,
         operation_id: &OperationId,
-    ) -> Result<PendingDispatch, String> {
+    ) -> Result<PendingExecute, String> {
         let mut pending = self.pending.lock().await;
         let entry = pending
             .get_mut(operation_id)
-            .ok_or_else(|| format!("no pending dispatch for operation_id={operation_id}"))?;
+            .ok_or_else(|| format!("no pending execute for operation_id={operation_id}"))?;
         if entry.processing {
             return Err(format!(
-                "DISPATCH already processing operation_id={operation_id}"
+                "EXECUTE already processing operation_id={operation_id}"
             ));
         }
         entry.processing = true;
@@ -886,8 +886,8 @@ impl CassisRouter {
         }
     }
 
-    async fn recover_pending_dispatches(&self) {
-        let candidates: Vec<PendingDispatch> = {
+    async fn recover_pending_executees(&self) {
+        let candidates: Vec<PendingExecute> = {
             let pending = self.pending.lock().await;
             pending
                 .values()
@@ -897,7 +897,7 @@ impl CassisRouter {
         };
         for candidate in candidates {
             if candidate.prepare.outgoing_expiry <= unix_now() {
-                self.abandon_pending_dispatch(candidate).await;
+                self.abandon_pending_execute(candidate).await;
                 continue;
             }
             let mut pending = match self.claim_pending_operation(&candidate.operation_id).await {
@@ -905,29 +905,29 @@ impl CassisRouter {
                 Err(error) => {
                     warn!(
                         target: "cassis_router",
-                        "claim pending dispatch {} failed: {error}",
+                        "claim pending execute {} failed: {error}",
                         candidate.operation_id,
                     );
                     continue;
                 }
             };
-            if let Err(error) = self.resume_pending_dispatch(&mut pending).await {
+            if let Err(error) = self.resume_pending_execute(&mut pending).await {
                 warn!(
                     target: "cassis_router",
-                    "recover pending dispatch {} failed: {error}",
+                    "recover pending execute {} failed: {error}",
                     candidate.operation_id,
                 );
             }
         }
     }
 
-    async fn abandon_pending_dispatch(&self, pending: PendingDispatch) {
+    async fn abandon_pending_execute(&self, pending: PendingExecute) {
         if let Some(payment) = pending.outgoing.clone() {
             if let Some(outgoing) = self.adapters.get(&pending.prepare.outgoing_network) {
                 if let Err(error) = outgoing.adapter.refund_outgoing(&payment).await {
                     warn!(
                         target: "cassis_router",
-                        "refund abandoned pending dispatch {} failed: {error}; keeping journal record",
+                        "refund abandoned pending execute {} failed: {error}; keeping journal record",
                         pending.operation_id,
                     );
                     return;
@@ -952,27 +952,27 @@ impl CassisRouter {
         if let Err(error) = self.persist_state_to_disk().await {
             warn!(
                 target: "cassis_router",
-                "persist abandonment of pending dispatch {} failed: {error}",
+                "persist abandonment of pending execute {} failed: {error}",
                 pending.operation_id,
             );
         }
     }
 
-    async fn resume_pending_dispatch(
+    async fn resume_pending_execute(
         &self,
-        pending: &mut PendingDispatch,
-    ) -> Result<HopDispatched, String> {
-        let result = self.resume_pending_dispatch_inner(pending).await;
+        pending: &mut PendingExecute,
+    ) -> Result<HopExecuted, String> {
+        let result = self.resume_pending_execute_inner(pending).await;
         if result.is_err() {
             self.clear_pending_processing(&pending.operation_id).await;
         }
         result
     }
 
-    async fn resume_pending_dispatch_inner(
+    async fn resume_pending_execute_inner(
         &self,
-        pending: &mut PendingDispatch,
-    ) -> Result<HopDispatched, String> {
+        pending: &mut PendingExecute,
+    ) -> Result<HopExecuted, String> {
         if pending.accepted.is_none() {
             let incoming = self
                 .adapters
@@ -1021,9 +1021,9 @@ impl CassisRouter {
             let mut prepared = self.prepared.lock().await;
             prepared.retain(|entry| entry.reservation.operation_id != pending.operation_id);
         }
-        self.dispatched.lock().await.insert(
+        self.executed.lock().await.insert(
             pending.operation_id.clone(),
-            DispatchedHop {
+            ExecutedHop {
                 operation_id: pending.operation_id.clone(),
                 owner: pending.owner.clone(),
                 prepare: pending.prepare.clone(),
@@ -1031,23 +1031,23 @@ impl CassisRouter {
                 accepted: pending
                     .accepted
                     .clone()
-                    .ok_or_else(|| "pending dispatch has no accepted state".to_string())?,
+                    .ok_or_else(|| "pending execute has no accepted state".to_string())?,
                 outgoing: outgoing.clone(),
                 outgoing_deadline: pending.prepare.outgoing_expiry,
             },
         );
         self.pending.lock().await.remove(&pending.operation_id);
         self.persist_state_to_disk().await?;
-        Ok(HopDispatched {
+        Ok(HopExecuted {
             payment_hash: pending.prepare.payment_hash,
             operation_id: pending.operation_id.clone(),
             outgoing_descriptor: outgoing.descriptor,
         })
     }
 
-    /// Top-level dispatcher: turn a [`Frame`] into the
+    /// Top-level executor: turn a [`Frame`] into the
     /// matching reply [`Frame`]. The router only handles
-    /// Prepare / Prepared / Dispatch / Dispatched / Discard /
+    /// Prepare / Prepared / Execute / Executed / Discard /
     /// Discarded; Commit / Committed flow directly from sender to
     /// receiver (payee's `cassis-cli`) without crossing a router hop.
     ///
@@ -1080,10 +1080,10 @@ impl CassisRouter {
                     p.outgoing_expiry,
                 );
             }
-            Frame::Dispatch(d) => {
+            Frame::Execute(d) => {
                 info!(
                     target: "cassis_router",
-                    "received DISPATCH: payment_hash={} addressing=<redacted> incoming_descriptor=<redacted>",
+                    "received EXECUTE: payment_hash={} addressing=<redacted> incoming_descriptor=<redacted>",
                     d.payment_hash.short(),
                 );
             }
@@ -1123,10 +1123,10 @@ impl CassisRouter {
                 .await
                 .map(Frame::Prepared)
                 .map_err(internal),
-            Frame::Dispatch(d) => self
-                .handle_dispatch(d, remote)
+            Frame::Execute(d) => self
+                .handle_execute(d, remote)
                 .await
-                .map(Frame::Dispatched)
+                .map(Frame::Executed)
                 .map_err(internal),
             Frame::Discard(d) => self
                 .handle_discard(d, remote)
@@ -1158,7 +1158,7 @@ impl CassisRouter {
     /// the PREPARE is the only peer allowed to release it later with
     /// a DISCARD. This closes the cheap DoS where anyone who learns a
     /// payment_hash could otherwise free someone else's reservation
-    /// and strand their DISPATCH with "no matching PREPARE". No funds
+    /// and strand their EXECUTE with "no matching PREPARE". No funds
     /// are ever at risk — a reservation is bookkeeping, not money.
     async fn handle_prepare(
         &self,
@@ -1211,8 +1211,8 @@ impl CassisRouter {
             .get(&prepare.outgoing_network)
             .ok_or_else(|| "outgoing network unsupported".to_string())?;
 
-        // Reject same-hash attempts while any local reservation or funded
-        // dispatch exists. Adapters enforce same invariant in their
+        // Reject same-hash attempts while any local reservation or
+        // funded execution exists. Adapters enforce same invariant in their
         // operation-keyed state; router check preserves owner/replay
         // semantics before adapter call.
         {
@@ -1244,8 +1244,8 @@ impl CassisRouter {
             }
         }
         {
-            let dispatched = self.dispatched.lock().await;
-            if let Some(hop) = dispatched.get(&prepare.operation_id) {
+            let executed = self.executed.lock().await;
+            if let Some(hop) = executed.get(&prepare.operation_id) {
                 if hop.owner != remote.to_string() {
                     return Err("operation_id belongs to another peer".to_string());
                 }
@@ -1257,7 +1257,7 @@ impl CassisRouter {
                     htlc_target: Some(hop.reservation.target.clone()),
                 });
             }
-            if dispatched
+            if executed
                 .values()
                 .any(|hop| hop.prepare.payment_hash == prepare.payment_hash)
             {
@@ -1265,7 +1265,7 @@ impl CassisRouter {
                     payment_hash: prepare.payment_hash,
                     operation_id: prepare.operation_id.clone(),
                     accepted: false,
-                    reason: Some("payment hash already has a funded dispatch".into()),
+                    reason: Some("payment hash already has a funded execute".into()),
                     htlc_target: None,
                 });
             }
@@ -1379,32 +1379,32 @@ impl CassisRouter {
         })
     }
 
-    /// DISPATCH handler: verify the incoming HTLC is
+    /// EXECUTE handler: verify the incoming HTLC is
     /// claimable on the hop's incoming adapter, then create
     /// the outgoing HTLC on the outgoing adapter and stash
     /// state for the poll loop.
-    async fn handle_dispatch(
+    async fn handle_execute(
         &self,
-        dispatch: HopDispatch,
+        execute: HopExecute,
         remote: PublicKey,
-    ) -> Result<HopDispatched, String> {
+    ) -> Result<HopExecuted, String> {
         self.cleanup_expired_prepared().await;
         if let Some(existing) = self
-            .dispatched
+            .executed
             .lock()
             .await
-            .get(&dispatch.operation_id)
+            .get(&execute.operation_id)
             .cloned()
         {
             if existing.owner != remote.to_string() {
                 return Err("operation_id belongs to another peer".to_string());
             }
-            if existing.prepare.payment_hash != dispatch.payment_hash {
-                return Err("DISPATCH payment hash does not match operation".to_string());
+            if existing.prepare.payment_hash != execute.payment_hash {
+                return Err("EXECUTE payment hash does not match operation".to_string());
             }
-            return Ok(HopDispatched {
-                payment_hash: dispatch.payment_hash,
-                operation_id: dispatch.operation_id,
+            return Ok(HopExecuted {
+                payment_hash: execute.payment_hash,
+                operation_id: execute.operation_id,
                 outgoing_descriptor: existing.outgoing.descriptor,
             });
         }
@@ -1412,47 +1412,47 @@ impl CassisRouter {
             .pending
             .lock()
             .await
-            .get(&dispatch.operation_id)
+            .get(&execute.operation_id)
             .cloned()
         {
             if existing.owner != remote.to_string() {
                 return Err("operation_id belongs to another peer".to_string());
             }
-            if existing.prepare.payment_hash != dispatch.payment_hash
-                || existing.incoming_descriptor != dispatch.incoming_descriptor
-                || existing.outgoing_target != dispatch.htlc_target
+            if existing.prepare.payment_hash != execute.payment_hash
+                || existing.incoming_descriptor != execute.incoming_descriptor
+                || existing.outgoing_target != execute.htlc_target
             {
-                return Err("DISPATCH does not match pending operation state".to_string());
+                return Err("EXECUTE does not match pending operation state".to_string());
             }
-            let mut pending = self.claim_pending_operation(&dispatch.operation_id).await?;
-            return self.resume_pending_dispatch(&mut pending).await;
+            let mut pending = self.claim_pending_operation(&execute.operation_id).await?;
+            return self.resume_pending_execute(&mut pending).await;
         }
 
         let entry = {
             let mut prepared = self.prepared.lock().await;
             let index = prepared
                 .iter()
-                .position(|entry| entry.reservation.operation_id == dispatch.operation_id)
+                .position(|entry| entry.reservation.operation_id == execute.operation_id)
                 .ok_or_else(|| {
                     format!(
                         "no matching PREPARE for operation_id={}",
-                        dispatch.operation_id
+                        execute.operation_id
                     )
                 })?;
             if prepared[index].owner != remote {
                 return Err(format!(
-                    "DISPATCH denied: operation_id={} reserved by {} but request came from {remote}",
-                    dispatch.operation_id, prepared[index].owner
+                    "EXECUTE denied: operation_id={} reserved by {} but request came from {remote}",
+                    execute.operation_id, prepared[index].owner
                 ));
             }
             if prepared[index].processing {
                 return Err(format!(
-                    "DISPATCH already processing operation_id={}",
-                    dispatch.operation_id
+                    "EXECUTE already processing operation_id={}",
+                    execute.operation_id
                 ));
             }
-            if prepared[index].prepare.payment_hash != dispatch.payment_hash {
-                return Err("DISPATCH payment hash does not match reservation".to_string());
+            if prepared[index].prepare.payment_hash != execute.payment_hash {
+                return Err("EXECUTE payment hash does not match reservation".to_string());
             }
             prepared[index].processing = true;
             prepared[index].clone()
@@ -1460,21 +1460,21 @@ impl CassisRouter {
 
         let prepare = entry.prepare.clone();
         if !self.adapters.contains_key(&prepare.incoming_network) {
-            self.clear_processing(&dispatch.operation_id).await;
+            self.clear_processing(&execute.operation_id).await;
             return Err("incoming network unsupported".to_string());
         }
         if !self.adapters.contains_key(&prepare.outgoing_network) {
-            self.clear_processing(&dispatch.operation_id).await;
+            self.clear_processing(&execute.operation_id).await;
             return Err("outgoing network unsupported".to_string());
         }
 
-        let mut pending = PendingDispatch {
-            operation_id: dispatch.operation_id.clone(),
+        let mut pending = PendingExecute {
+            operation_id: execute.operation_id.clone(),
             owner: remote.to_string(),
             prepare: prepare.clone(),
             reservation: entry.reservation,
-            incoming_descriptor: dispatch.incoming_descriptor.clone(),
-            outgoing_target: dispatch.htlc_target.clone(),
+            incoming_descriptor: execute.incoming_descriptor.clone(),
+            outgoing_target: execute.htlc_target.clone(),
             outgoing_operation_id: entry.outgoing_operation_id,
             accepted: None,
             outgoing: None,
@@ -1486,15 +1486,15 @@ impl CassisRouter {
             .insert(pending.operation_id.clone(), pending.clone());
         if let Err(error) = self.persist_state_to_disk().await {
             self.pending.lock().await.remove(&pending.operation_id);
-            self.clear_processing(&dispatch.operation_id).await;
-            return Err(format!("persist pending dispatch: {error}"));
+            self.clear_processing(&execute.operation_id).await;
+            return Err(format!("persist pending execute: {error}"));
         }
         let outgoing_operation_id = pending.outgoing_operation_id.clone();
-        let result = self.resume_pending_dispatch(&mut pending).await;
+        let result = self.resume_pending_execute(&mut pending).await;
         if result.is_ok() {
             info!(
                 target: "cassis_router",
-                "DISPATCH done: payment_hash={} operation_id={} outgoing_operation_id={} amount_msat={} {} -> {}",
+                "EXECUTE done: payment_hash={} operation_id={} outgoing_operation_id={} amount_msat={} {} -> {}",
                 prepare.payment_hash.short(),
                 pending.operation_id,
                 outgoing_operation_id,
@@ -1554,10 +1554,10 @@ impl CassisRouter {
     }
 
     /// DISCARD handler: release a PREPARE reservation that will never
-    /// be followed by a DISPATCH.
+    /// be followed by an EXECUTE.
     ///
     /// Only the peer that created the reservation may release it, and
-    /// only while it still exists: `handle_dispatch` removes the entry
+    /// only while it still exists: `handle_execute` removes the entry
     /// before creating any HTLC, so a DISCARD can never unwind funded
     /// money — it either frees pure bookkeeping or finds nothing. Both
     /// "already consumed" and "never existed" report `released: false`
@@ -1695,7 +1695,7 @@ impl CassisRouter {
     /// its incoming HTLC immediately instead of waiting for the poll
     /// loop to observe the preimage on the downstream network. The
     /// preimage is validated against the route hash before any claim is
-    /// attempted, so a bogus fanout cannot burn the hop's dispatch
+    /// attempted, so a bogus fanout cannot burn the hop's executed
     /// state; the poll loop remains the fallback when the fanout never
     /// arrives.
     async fn handle_committed(
@@ -1720,12 +1720,12 @@ impl CassisRouter {
             return Ok(committed);
         }
         let hop = {
-            let dispatched = self.dispatched.lock().await;
-            dispatched.get(&operation_id).cloned()
+            let executed = self.executed.lock().await;
+            executed.get(&operation_id).cloned()
         }
         .ok_or_else(|| {
             format!(
-                "no dispatched hop for operation_id={} payment_hash={}",
+                "no executed hop for operation_id={} payment_hash={}",
                 operation_id, committed.payment_hash
             )
         })?;
@@ -1749,11 +1749,11 @@ impl CassisRouter {
     }
 
     /// Background task: every [`POLL_INTERVAL_SECS`] seconds,
-    /// walk the dispatched table and poll each outgoing HTLC
+    /// walk the executed table and poll each outgoing HTLC
     /// for the preimage. When the preimage is known, claim
     /// the incoming HTLC on the incoming adapter with the
     /// same preimage. On deadline, refund the outgoing side
-    /// and drop the dispatch row.
+    /// and drop the execute row from it.
     async fn run_poll_loop(self: Arc<Self>) {
         let interval = Duration::from_secs(POLL_INTERVAL_SECS);
         let mut ticker = tokio::time::interval(interval);
@@ -1768,11 +1768,11 @@ impl CassisRouter {
 
     async fn poll_once(&self) -> Result<(), String> {
         self.cleanup_expired_prepared().await;
-        self.recover_pending_dispatches().await;
+        self.recover_pending_executees().await;
 
-        let snapshot: Vec<DispatchedHop> = {
-            let dispatched = self.dispatched.lock().await;
-            dispatched.values().cloned().collect()
+        let snapshot: Vec<ExecutedHop> = {
+            let executed = self.executed.lock().await;
+            executed.values().cloned().collect()
         };
         let now = unix_now();
         for hop in snapshot {
@@ -1782,7 +1782,7 @@ impl CassisRouter {
                     "outgoing deadline exceeded for operation_id={}, refunding",
                     hop.operation_id,
                 );
-                self.refund_dispatched(&hop).await;
+                self.refund_executeed(&hop).await;
                 continue;
             }
             let Some(outgoing_entry) = self.adapters.get(&hop.prepare.outgoing_network) else {
@@ -1858,7 +1858,7 @@ impl CassisRouter {
         Ok(())
     }
 
-    async fn claim_incoming(&self, hop: &DispatchedHop, preimage: Bytes32) -> Result<(), String> {
+    async fn claim_incoming(&self, hop: &ExecutedHop, preimage: Bytes32) -> Result<(), String> {
         let incoming_entry = self
             .adapters
             .get(&hop.prepare.incoming_network)
@@ -1878,11 +1878,11 @@ impl CassisRouter {
             .lock()
             .await
             .insert(hop.operation_id.clone(), hop.owner.clone());
-        self.drop_dispatched(&hop.operation_id).await;
+        self.drop_executeed(&hop.operation_id).await;
         Ok(())
     }
 
-    async fn refund_dispatched(&self, hop: &DispatchedHop) {
+    async fn refund_executeed(&self, hop: &ExecutedHop) {
         let Some(entry) = self.adapters.get(&hop.prepare.outgoing_network) else {
             return;
         };
@@ -1897,13 +1897,13 @@ impl CassisRouter {
                 return;
             }
         }
-        self.drop_dispatched(&hop.operation_id).await;
+        self.drop_executeed(&hop.operation_id).await;
     }
 
-    async fn drop_dispatched(&self, operation_id: &OperationId) {
+    async fn drop_executeed(&self, operation_id: &OperationId) {
         let removed = {
-            let mut dispatched = self.dispatched.lock().await;
-            dispatched.remove(operation_id).is_some()
+            let mut executed = self.executed.lock().await;
+            executed.remove(operation_id).is_some()
         };
         if removed {
             if let Err(error) = self.persist_state_to_disk().await {
@@ -1984,7 +1984,7 @@ impl CassisRouter {
 struct PreparedEntry {
     prepare: HopPrepare,
     reservation: IncomingReservation,
-    /// Stable outgoing attempt identity. Replayed DISPATCH reuses it
+    /// Stable outgoing attempt identity. Replayed EXECUTE reuses it
     /// instead of funding same payment under new operation id.
     outgoing_operation_id: OperationId,
     expires_at: u64,

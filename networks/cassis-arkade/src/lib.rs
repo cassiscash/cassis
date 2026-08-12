@@ -218,7 +218,7 @@ struct PendingIncoming {
     payment_hash: Bytes32,
     reservation: IncomingReservation,
     /// Set only after a descriptor has been verified and atomically
-    /// accepted via DISPATCH or COMMIT.
+    /// accepted via EXECUTE or COMMIT.
     accepted: Option<AcceptedIncoming>,
     expected_sat: bitcoin::Amount,
 }

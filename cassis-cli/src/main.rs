@@ -1,6 +1,6 @@
 //! Thin CLI over `cassis-client`. Each command delegates the heavy
 //! lifting (adapter building, invoice persistence, route lookup, pay
-//! dispatch, receive daemon) to `cassis-client` so the GUI and the
+//! payment execution, receive daemon) to `cassis-client` so the GUI and the
 //! CLI share exactly the same logic. The seed is generated on first
 //! use: any command that needs keys initializes the home directory's
 //! seed automatically when it is missing.

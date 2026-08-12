@@ -104,7 +104,7 @@ const SECS_PER_BLOCK: u64 = 600;
 
 /// How long `claim_incoming` waits for the funding transaction to be
 /// observed at the descriptor's outpoint before giving up. The
-/// funding is submitted by the upstream hop right before DISPATCH,
+/// funding is submitted by the upstream hop right before EXECUTE,
 /// so by the time a preimage arrives it is long since accepted; this
 /// only covers the race where a payee claims immediately after
 /// COMMIT.
@@ -125,7 +125,7 @@ struct PendingIncoming {
     reservation: IncomingReservation,
     /// Durable accepted state returned to caller.
     accepted: Option<AcceptedIncoming>,
-    /// Filled in by `accept_incoming` once funder's dispatch identifies
+    /// Filled in by `accept_incoming` once funder's execution identifies
     /// funded contract.
     funded: Option<FundedContract>,
     /// Claim spend submitted by previous call, if any. Recorded before

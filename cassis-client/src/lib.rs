@@ -6,7 +6,7 @@ pub mod seed_store;
 pub mod store;
 
 use cassis_core::{
-    AdapterError, Bytes32, HopCommit, HopCommitted, HopDiscard, HopDispatch, HopPrepare,
+    AdapterError, Bytes32, HopCommit, HopCommitted, HopDiscard, HopExecute, HopPrepare,
     HtlcDescriptor, HtlcTarget, Invoice, InvoiceHandle, NetworkAdapter, NetworkId, OperationId,
     OutgoingPayment, OutgoingRequest, PaymentResult, PaymentStatus, RouteHop,
 };
@@ -157,8 +157,8 @@ async fn create_outgoing_payment(
 }
 
 /// Keep payer-owned outgoing HTLC alive until it resolves. Routers have
-/// the same responsibility for their dispatched outgoing HTLCs; the
-/// payer's first HTLC is not present in any router's dispatch table.
+/// the same responsibility for the outgoing HTLCs they executed; the
+/// payer's first HTLC is not present in any router's execute table.
 fn spawn_payment_guard(
     sender: Arc<dyn NetworkAdapter>,
     payment: OutgoingPayment,
@@ -363,12 +363,12 @@ impl CassisClient {
         Ok(())
     }
 
-    /// Drive the multi-hop PREPARE / DISPATCH / COMMIT protocol
+    /// Drive the multi-hop PREPARE / EXECUTE / COMMIT protocol
     /// described in the user-facing docs:
     ///
     /// 1. PREPARE every router hop in order; abort if any rejects.
     /// 2. Create first outgoing HTLC on sender adapter.
-    /// 3. Walk route: DISPATCH to hop `i` with descriptor returned by
+    /// 3. Walk route: EXECUTE to hop `i` with descriptor returned by
     ///    hop `i-1` (or first outgoing payment).
     /// 4. After the last router, COMMIT directly to the payee's
     ///    iroh endpoint with the final descriptor and wait for
@@ -557,7 +557,7 @@ impl CassisClient {
         // HTLC funding hop `i` must be locked to, and `recipients[len]`
         // is the payee's.
         //
-        // This is why `recipient` rides on DISPATCH rather than
+        // This is why `recipient` rides on EXECUTE rather than
         // PREPARE: the PREPAREs above run concurrently, so hop `i+1`'s
         // reply does not exist yet while hop `i`'s PREPARE is built.
         // Deriving it here, after every reply is in, also makes the
@@ -572,7 +572,7 @@ impl CassisClient {
                 Some(target) => htlc_targets.push(target),
                 None => {
                     // Every hop accepted, so every hop is holding a
-                    // reservation; none was DISPATCHed yet.
+                    // reservation; none was executed yet.
                     self.discard_reservations(
                         &addrs,
                         invoice.payment_hash,
@@ -663,7 +663,7 @@ impl CassisClient {
         // HTLC info for the *incoming* side of the next hop.
         let mut descriptor = first_descriptor;
         for (i, hop) in route.iter().enumerate() {
-            let dispatch = HopDispatch {
+            let execute = HopExecute {
                 payment_hash: invoice.payment_hash,
                 operation_id: reservation_ids[i].clone(),
                 incoming_descriptor: descriptor,
@@ -673,7 +673,7 @@ impl CassisClient {
             let addr = addrs[i].clone();
             info!(
             target: "cassis_client",
-             "DISPATCH hop {}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+             "EXECUTE hop {}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
               amount_msat={} incoming_deadline={} outgoing_expiry={} addressing=<redacted> \
              payment_hash={} incoming_descriptor=<redacted>",
             i+1,
@@ -683,24 +683,24 @@ impl CassisClient {
             invoice.amount_msat,
             expiries[i],
             expiries[i + 1],
-            dispatch.payment_hash,
+            execute.payment_hash,
                         );
             debug!(
                 target: "cassis_client",
-                "  DISPATCH hop {}: in={} out={} amount={} msat",
+                "  EXECUTE hop {}: in={} out={} amount={} msat",
                 i+1,
                 hop.incoming, hop.outgoing, invoice.amount_msat
             );
-            let reply = match self.iroh_client.send_dispatch(addr, dispatch).await {
+            let reply = match self.iroh_client.send_execute(addr, execute).await {
                 Ok(r) => r,
                 Err(e) => {
                     info!(
                         target: "cassis_client",
-                        "DISPATCH hop {}/{}: peer={peer} error={e}",
+                        "EXECUTE hop {}/{}: peer={peer} error={e}",
                         i+1,
                         route.len(),
                     );
-                    // Hops 0..i were DISPATCHed successfully (their
+                    // Hops 0..i executed successfully (their
                     // reservations became funded HTLCs; DISCARD is a
                     // no-op there and is not sent). This hop may have
                     // consumed its reservation before failing — or not
@@ -727,13 +727,13 @@ impl CassisClient {
                 )
                 .await;
                 return Err(PayError::Io(format!(
-                    "DISPATCH response correlation mismatch at hop {}",
+                    "EXECUTE response correlation mismatch at hop {}",
                     i + 1
                 )));
             }
             info!(
                 target: "cassis_client",
-                "DISPATCH hop {}/{}: peer={peer} outgoing_descriptor=<redacted>",
+                "EXECUTE hop {}/{}: peer={peer} outgoing_descriptor=<redacted>",
                 i + 1,
                 route.len(),
             );
@@ -841,7 +841,7 @@ impl CassisClient {
     }
 
     /// Same-network shortcut: payer and payee share a network, so there
-    /// are no router hops to PREPARE/DISPATCH. Create the HTLC directly
+    /// are no router hops to PREPARE/EXECUTE. Create the HTLC directly
     /// on that network, COMMIT straight to the payee, and settle on the
     /// returned preimage. Mirrors steps 2/4/5 of [`Self::pay`] without
     /// the route walk.

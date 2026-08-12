@@ -75,7 +75,7 @@ struct PendingIncoming {
     invoice_id: Option<String>,
     /// Preimage supplied for a locally-created invoice, if any.
     preimage: Option<Bytes32>,
-    /// Descriptor accepted by the protocol, if funding was dispatched.
+    /// Descriptor accepted by the protocol, if funding was executed.
     accepted: Option<AcceptedIncoming>,
     /// Set after `claim_htlc` succeeds. Keeping the state makes a retry
     /// idempotent and preserves the operation's audit trail.
