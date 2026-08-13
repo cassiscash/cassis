@@ -11,7 +11,6 @@ arkade = ["dep:cassis-arkade", "cassis-client/arkade", "cassis-router/arkade", "
 liquid = ["dep:cassis-liquid", "cassis-client/liquid", "cassis-router/liquid", "cassis-core/liquid"]
 rootstock = ["dep:cassis-rootstock", "cassis-router/rootstock", "cassis-core/rootstock"]
 lightning = ["dep:cassis-lnd", "cassis-client/lightning", "cassis-router/lightning", "cassis-core/lightning"]
-spark = ["dep:cassis-spark", "cassis-client/spark", "cassis-router/spark", "cassis-core/spark"]
 
 [dependencies]
 cassis-client = { workspace = true }
@@ -62,9 +61,5 @@ workspace = true
 optional = true
 
 [dependencies.cassis-lnd]
-workspace = true
-optional = true
-
-[dependencies.cassis-spark]
 workspace = true
 optional = true

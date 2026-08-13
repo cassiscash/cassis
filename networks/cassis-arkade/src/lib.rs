@@ -591,9 +591,7 @@ impl ArkadeAdapter {
         }
         let recipient = match &payment.destination {
             HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
                 return Err(AdapterError::InvalidParams(
                     "arkade requires an x-only destination".into(),
                 ))
@@ -1404,9 +1402,7 @@ impl NetworkAdapter for ArkadeAdapter {
         }
         let recipient = match &request.target {
             HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
                 return Err(AdapterError::InvalidParams(
                     "arkade requires a pubkey target".into(),
                 ))

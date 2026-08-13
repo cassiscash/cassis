@@ -1267,11 +1267,6 @@ fn validate_route_networks(
 ) -> Result<(), PayError> {
     // Callers reject empty routes before reaching here.
     let first = &route[0];
-    if first.incoming.0 == "spark" {
-        return Err(PayError::Route(
-            "Spark can be used as destination bridge, not route source".to_string(),
-        ));
-    }
     if &first.incoming != sender_network {
         return Err(PayError::Route(format!(
             "first hop receives on {} but we are sending on {sender_network}",
@@ -1279,14 +1274,6 @@ fn validate_route_networks(
         )));
     }
     for (idx, pair) in route.windows(2).enumerate() {
-        if pair[0].outgoing.0 == "spark" || pair[1].incoming.0 == "spark" {
-            return Err(PayError::Route(format!(
-                "Spark route leg {} has unsupported role direction: {} -> {}",
-                idx + 1,
-                pair[0].outgoing,
-                pair[1].incoming,
-            )));
-        }
         if pair[0].outgoing != pair[1].incoming {
             return Err(PayError::Route(format!(
                 "discontiguous route: hop {} sends on {} but hop {} receives on {}",

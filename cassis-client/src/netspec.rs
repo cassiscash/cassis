@@ -13,7 +13,6 @@ pub enum NetSpec {
     Rootstock { testnet: bool },
     Fedimint { address: String },
     Lightning,
-    Spark,
 }
 
 impl NetSpec {
@@ -65,12 +64,6 @@ impl NetSpec {
                     "network 'lightning' does not accept a parameter, got '{other}'"
                 )),
             },
-            "spark" => match param {
-                None => Ok(NetSpec::Spark),
-                Some(other) => Err(format!(
-                    "network 'spark' does not accept a parameter, got '{other}'"
-                )),
-            },
             "arkade" => match param {
                 None => Ok(NetSpec::Arkade { mutinynet: false }),
                 Some("mutinynet") => Ok(NetSpec::Arkade { mutinynet: true }),
@@ -107,7 +100,6 @@ impl NetSpec {
             NetSpec::Rootstock { .. } => "rootstock",
             NetSpec::Fedimint { .. } => "fedimint",
             NetSpec::Lightning => "lightning",
-            NetSpec::Spark => "spark",
         }
     }
 
@@ -136,7 +128,6 @@ impl NetSpec {
             }),
             NetSpec::Fedimint { address } => NetworkId(format!("fedimint::{address}")),
             NetSpec::Lightning => NetworkId("lightning".to_string()),
-            NetSpec::Spark => NetworkId("spark".to_string()),
         }
     }
 }

@@ -557,9 +557,7 @@ impl BitcoinAdapter {
         }
         let recipient = match &payment.destination {
             HtlcTarget::XOnlyPubKey(key) => *key,
-            HtlcTarget::PubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
                 return Err(AdapterError::InvalidParams(
                     "Bitcoin requires an x-only destination".into(),
                 ))
@@ -1539,9 +1537,7 @@ impl NetworkAdapter for BitcoinAdapter {
         }
         let recipient_xonly = match &request.target {
             HtlcTarget::XOnlyPubKey(key) => *key,
-            HtlcTarget::PubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
                 return Err(AdapterError::InvalidParams(
                     "bitcoin requires a pubkey target".into(),
                 ))

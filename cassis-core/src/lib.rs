@@ -99,7 +99,6 @@ impl NetworkId {
             "liquid" | "liquid::testnet" => 300,
             "rootstock" | "rootstock::testnet" => 600,
             "lightning" => 30,
-            "spark" => 60,
             _ => 30,
         }
     }
@@ -207,7 +206,6 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
         || id.0 == "rootstock"
         || id.0 == "rootstock::testnet"
         || id.0 == "lightning"
-        || id.0 == "spark"
     {
         return id.clone();
     }
@@ -344,19 +342,6 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
                 .to_string(),
         ),
 
-        #[cfg(feature = "spark")]
-        "spark" => match param {
-            None => Ok(NetworkId("spark".to_string())),
-            Some(other) => Err(format!(
-                "network 'spark' does not accept a parameter, got '{other}'"
-            )),
-        },
-        #[cfg(not(feature = "spark"))]
-        "spark" => Err(
-            "network 'spark' requested but cassis-core was not compiled with the 'spark' feature"
-                .to_string(),
-        ),
-
         _ => Err(format!("unsupported network kind '{kind}'")),
     }
 }
@@ -421,7 +406,7 @@ pub struct Invoice {
 /// One payable network on an [`Invoice`], paired with the target the
 /// payer addresses there. Networks that address by claim key carry an
 /// [`HtlcTarget::XOnlyPubKey`]/[`HtlcTarget::PubKey`], Lightning carries a
-/// BOLT11 hold invoice, Spark carries a Spark address.
+/// BOLT11 hold invoice.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InvoiceNetwork {
     pub network: NetworkId,
@@ -484,9 +469,6 @@ pub enum HtlcTarget {
     PubKey(PubKey),
     /// BOLT11 hold invoice the upstream party must pay (lightning).
     LightningInvoice(String),
-    /// Spark address (`spark:...`/`sp1...`) the upstream party sends a
-    /// Spark HTLC transfer to (spark).
-    SparkAddress(String),
 }
 
 /// Receiver-side invoice handle. Keeps secret preimage outside wire
@@ -878,19 +860,6 @@ pub enum HtlcDescriptor {
     /// against the route payment hash; the sender must pay this exact
     /// request so the payment secret is preserved.
     Lightning { payment_request: String },
-    /// Spark HTLC transfer. `address` is the Spark address the sender
-    /// locked the HTLC to (the receiver's address; the receiver claims
-    /// it with `claim_htlc` + preimage, keyed by the payment hash the
-    /// descriptor travels with). `expiry_secs` is the HTLC expiry
-    /// duration the sender passed, so the receiver can tell how long
-    /// it has left. `transfer_id` is the Spark transfer id the sender
-    /// can be re-polled by after a restart (`None` only when the
-    /// sender sent without keeping the id).
-    Spark {
-        address: String,
-        expiry_secs: u64,
-        transfer_id: Option<String>,
-    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1142,7 +1111,6 @@ mod tests {
             ("rootstock", 600),
             ("rootstock::testnet", 600),
             ("lightning", 30),
-            ("spark", 60),
         ] {
             assert_eq!(NetworkId(network.into()).default_incoming_delta(), expected);
         }

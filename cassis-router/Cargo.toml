@@ -49,10 +49,6 @@ optional = true
 workspace = true
 optional = true
 
-[dependencies.cassis-spark]
-workspace = true
-optional = true
-
 [features]
 arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
 bitcoin = ["dep:cassis-bitcoin", "cassis-core/bitcoin"]
@@ -61,4 +57,3 @@ fedimint = ["dep:cassis-fedimint"]
 liquid = ["dep:cassis-liquid", "cassis-core/liquid"]
 rootstock = ["dep:cassis-rootstock", "cassis-core/rootstock"]
 lightning = ["dep:cassis-lnd", "cassis-core/lightning"]
-spark = ["dep:cassis-spark", "cassis-core/spark"]

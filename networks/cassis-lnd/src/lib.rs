@@ -1055,7 +1055,7 @@ impl NetworkAdapter for LndAdapter {
         }
         let payment_request = match &request.target {
             HtlcTarget::LightningInvoice(invoice) => invoice.clone(),
-            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::PubKey(_) | HtlcTarget::SparkAddress(_) => {
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::PubKey(_) => {
                 return Err(AdapterError::InvalidParams(
                     "lightning requires a BOLT11 invoice target".into(),
                 ))

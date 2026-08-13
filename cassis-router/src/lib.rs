@@ -288,7 +288,6 @@ pub struct NetworkEntry {
     feature = "arkade",
     feature = "bitcoin",
     feature = "liquid",
-    feature = "spark"
 ))]
 fn network_sk(derived: &keys::DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32], String> {
     derived
@@ -547,36 +546,6 @@ async fn build_adapter(
         #[cfg(not(feature = "rootstock"))]
         "rootstock" => Err(
             "network 'rootstock' requested but cassis-router was not compiled with the 'rootstock' feature"
-                .into(),
-        ),
-
-        #[cfg(feature = "spark")]
-        "spark" => {
-            if param.is_some() {
-                return Err("network 'spark' does not accept parameters".to_string());
-            }
-            let network_id = NetworkId("spark".to_string());
-            let sk = network_sk(derived, &network_id)?;
-            let adapter = cassis_spark::SparkAdapter::new(
-                network_id.clone(),
-                cassis_spark::SparkConfig::default(),
-                sk,
-                derived.node.pubkey(),
-                span.clone(),
-            )
-            .await
-            .map_err(|error| format!("spark adapter init failed: {error}"))?;
-            let adapter: Arc<dyn NetworkAdapter> = adapter;
-            let incoming_delta_secs = adapter.incoming_delta_secs();
-            Ok(NetworkEntry {
-                network_id,
-                adapter,
-                incoming_delta_secs,
-            })
-        }
-        #[cfg(not(feature = "spark"))]
-        "spark" => Err(
-            "network 'spark' requested but cassis-router was not compiled with the 'spark' feature"
                 .into(),
         ),
 
@@ -2006,19 +1975,6 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Spark adapter has asymmetric HTLC addressing: LND can pay its
-/// Lightning invoice, but Spark cannot originate a generic pubkey HTLC.
-/// Publish only bridge edge where role combination is executable.
-fn route_pair_supported(from: &NetworkId, to: &NetworkId) -> bool {
-    if from.0 == "spark" {
-        return false;
-    }
-    if to.0 == "spark" {
-        return from.0 == "lightning";
-    }
-    true
-}
-
 async fn publish_route_announcements(
     adapters: &HashMap<NetworkId, NetworkEntry>,
     relay_urls: Vec<String>,
@@ -2037,7 +1993,7 @@ async fn publish_route_announcements(
     let pairs: Vec<(NetworkId, NetworkId)> = network_ids
         .iter()
         .flat_map(|from| network_ids.iter().map(move |to| (from.clone(), to.clone())))
-        .filter(|(from, to)| from != to && route_pair_supported(from, to))
+        .filter(|(from, to)| from != to)
         .collect();
 
     let fee_base_msat: u64 = 1000;

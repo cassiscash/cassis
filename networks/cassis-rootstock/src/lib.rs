@@ -640,11 +640,9 @@ impl RootstockAdapter {
         }
         match request.target {
             HtlcTarget::PubKey(pubkey) => Ok(pubkey),
-            HtlcTarget::XOnlyPubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => Err(AdapterError::InvalidParams(
-                "rootstock requires a full pubkey target".into(),
-            )),
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => Err(
+                AdapterError::InvalidParams("rootstock requires a full pubkey target".into()),
+            ),
         }
     }
 
@@ -672,9 +670,7 @@ impl RootstockAdapter {
         }
         let recipient = match payment.destination {
             HtlcTarget::PubKey(pubkey) => pubkey,
-            HtlcTarget::XOnlyPubKey(_)
-            | HtlcTarget::LightningInvoice(_)
-            | HtlcTarget::SparkAddress(_) => {
+            HtlcTarget::XOnlyPubKey(_) | HtlcTarget::LightningInvoice(_) => {
                 return Err(AdapterError::InvalidParams(
                     "rootstock requires a full pubkey destination".into(),
                 ))
