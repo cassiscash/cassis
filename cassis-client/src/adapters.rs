@@ -84,8 +84,7 @@ async fn build_one(
                 cassis_cashu::CashuAdapter::new(
                     network_id.clone(),
                     mint_url.clone(),
-                    *derived.invoice.as_bytes(),
-                    derived.invoice.pubkey(),
+                    network_sk(derived, &network_id)?,
                     store,
                     span.clone(),
                 )
@@ -101,7 +100,6 @@ async fn build_one(
             let mut cfg = cassis_liquid::default_config(
                 network_id.clone(),
                 network_sk(derived, &network_id)?,
-                derived.invoice.pubkey(),
                 span.clone(),
             );
             let persist_dir = store_path
@@ -122,7 +120,6 @@ async fn build_one(
             let cfg = cassis_rootstock::default_config(
                 network_id.clone(),
                 network_sk(derived, &network_id)?,
-                derived.invoice.pubkey(),
                 span.clone(),
             );
             let adapter = cassis_rootstock::RootstockAdapter::new(cfg)
@@ -154,7 +151,7 @@ async fn build_one(
                 network_id.clone(),
                 spark,
                 network_sk(derived, &network_id)?,
-                derived.invoice.pubkey(),
+                derived.node.pubkey(),
                 span,
             )
             .await
@@ -169,7 +166,6 @@ async fn build_one(
             let cfg = cassis_arkade::default_config(
                 network_id.clone(),
                 network_sk(derived, &network_id)?,
-                derived.invoice.pubkey(),
                 span.clone(),
             );
             let adapter = cassis_arkade::ArkadeAdapter::new(cfg)
@@ -185,7 +181,6 @@ async fn build_one(
             let cfg = cassis_bitcoin::default_config(
                 network_id.clone(),
                 network_sk(derived, &network_id)?,
-                derived.invoice.pubkey(),
                 span.clone(),
             )
             .map_err(|e| format!("bitcoin adapter config: {e}"))?;
@@ -267,16 +262,9 @@ pub async fn build_cashu_adapter(
     let sk = network_sk(derived, &network_id)?;
     let store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path.to_path_buf()));
-    cassis_cashu::CashuAdapter::new(
-        network_id,
-        mint_url.clone(),
-        sk,
-        derived.invoice.pubkey(),
-        store,
-        span,
-    )
-    .map(Arc::new)
-    .map_err(|e| format!("cashu adapter init failed: {e}"))
+    cassis_cashu::CashuAdapter::new(network_id, mint_url.clone(), sk, store, span)
+        .map(Arc::new)
+        .map_err(|e| format!("cashu adapter init failed: {e}"))
 }
 
 /// Build a concrete `cassis_liquid::LiquidAdapter` for a liquid
@@ -294,7 +282,7 @@ pub async fn build_liquid_adapter(
     };
     let network_id = spec.network_id();
     let sk = network_sk(derived, &network_id)?;
-    let mut cfg = cassis_liquid::default_config(network_id, sk, derived.invoice.pubkey(), span);
+    let mut cfg = cassis_liquid::default_config(network_id, sk, span);
     let persist_dir = store_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -348,7 +336,7 @@ pub async fn build_rootstock_adapter(
     };
     let network_id = spec.network_id();
     let sk = network_sk(derived, &network_id)?;
-    let cfg = cassis_rootstock::default_config(network_id, sk, derived.invoice.pubkey(), span);
+    let cfg = cassis_rootstock::default_config(network_id, sk, span);
     cassis_rootstock::RootstockAdapter::new(cfg)
         .await
         .map_err(|e| format!("rootstock adapter init failed: {e}"))
@@ -368,7 +356,7 @@ pub async fn build_arkade_adapter(
     };
     let network_id = spec.network_id();
     let sk = network_sk(derived, &network_id)?;
-    let cfg = cassis_arkade::default_config(network_id, sk, derived.invoice.pubkey(), span);
+    let cfg = cassis_arkade::default_config(network_id, sk, span);
     cassis_arkade::ArkadeAdapter::new(cfg)
         .await
         .map_err(|e| format!("arkade adapter init failed: {e}"))
@@ -387,8 +375,7 @@ pub async fn build_bitcoin_adapter(
     };
     let network_id = spec.network_id();
     let sk = network_sk(derived, &network_id)?;
-    let cfg = cassis_bitcoin::default_config(network_id, sk, derived.invoice.pubkey(), span)
-        .map_err(|e| e.to_string())?;
+    let cfg = cassis_bitcoin::default_config(network_id, sk, span).map_err(|e| e.to_string())?;
     cassis_bitcoin::BitcoinAdapter::new(cfg)
         .await
         .map(Arc::new)
@@ -407,26 +394,20 @@ pub async fn build_cashu_adapter_from_url(
     let host = mint_url_to_host(mint_url)?;
     let network_id = cassis_core::cashu_network_id(&host);
     // The mint here comes from the *token*, which may well be a mint
-    // the caller never derived a key for, so fall back to the invoice
-    // key rather than to an all-zero key. Redeeming a token only swaps
+    // the caller never derived a key for, so fall back to the node key
+    // rather than to an all-zero key. Redeeming a token only swaps
     // unrestricted proofs and needs no HTLC signing key, but the
     // adapter still requires a usable one to derive its claim identity.
     let sk = derived
         .networks
         .get(&network_id)
         .map(|k| *k.as_bytes())
-        .unwrap_or(*derived.invoice.as_bytes());
+        .unwrap_or(*derived.node.as_bytes());
     let store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path.to_path_buf()));
-    let adapter = cassis_cashu::CashuAdapter::new(
-        network_id.clone(),
-        mint_url.to_string(),
-        sk,
-        derived.invoice.pubkey(),
-        store,
-        span,
-    )
-    .map_err(|e| format!("cashu adapter init failed: {e}"))?;
+    let adapter =
+        cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.to_string(), sk, store, span)
+            .map_err(|e| format!("cashu adapter init failed: {e}"))?;
     let canonical = cassis_core::cashu_mint_url(&network_id)
         .map_err(|e| format!("canonicalize mint url: {e}"))?;
     let spec = NetSpec::Cashu {

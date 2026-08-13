@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     preimage     BLOB NOT NULL,
     amount_msat  INTEGER NOT NULL,
     network_id   TEXT NOT NULL,
-    payee        TEXT,
+    node_pubkey  TEXT,
     description  TEXT,
     expires_at   INTEGER NOT NULL,
     status       TEXT NOT NULL,
@@ -133,7 +133,7 @@ pub struct InvoiceRow {
     pub preimage: [u8; 32],
     pub amount_msat: u64,
     pub network_id: NetworkId,
-    pub payee: Option<String>,
+    pub node_pubkey: Option<String>,
     pub description: Option<String>,
     pub expires_at: u64,
     pub status: InvoiceStatus,
@@ -210,14 +210,14 @@ impl Store {
     pub fn insert_invoice(&mut self, row: &InvoiceRow) -> Result<(), StoreError> {
         let sql = format!(
             "INSERT INTO invoices \
-             (payment_hash, preimage, amount_msat, network_id, payee, description, \
+             (payment_hash, preimage, amount_msat, network_id, node_pubkey, description, \
               expires_at, status, created_at, claimed_at) \
              VALUES ('{}', X'{}', {}, {}, {}, {}, {}, '{}', {}, {});",
             row.payment_hash,
             hex::encode(row.preimage),
             row.amount_msat,
             escape_sql_string(&row.network_id.0),
-            option_sql_string(&row.payee),
+            option_sql_string(&row.node_pubkey),
             option_sql_string(&row.description),
             row.expires_at,
             row.status.as_str(),
@@ -364,7 +364,7 @@ impl Store {
         }
         if handle.invoice.networks.len() != 1
             || handle.reservation.payment_hash != handle.invoice.payment_hash
-            || handle.reservation.network != handle.invoice.networks[0]
+            || handle.reservation.network != handle.invoice.networks[0].network
         {
             return Err(StoreError::Invalid(
                 "invoice handle reservation does not match invoice".into(),
@@ -492,7 +492,7 @@ impl Store {
 
     pub fn get(&mut self, payment_hash: &Bytes32) -> Result<InvoiceRow, StoreError> {
         let result = self.conn.query(&format!(
-            "SELECT payment_hash, preimage, amount_msat, network_id, payee, description, \
+            "SELECT payment_hash, preimage, amount_msat, network_id, node_pubkey, description, \
                     expires_at, status, created_at, claimed_at \
              FROM invoices WHERE payment_hash='{}';",
             payment_hash
@@ -510,7 +510,7 @@ impl Store {
             None => String::new(),
         };
         let result = self.conn.query(&format!(
-            "SELECT payment_hash, preimage, amount_msat, network_id, payee, description, \
+            "SELECT payment_hash, preimage, amount_msat, network_id, node_pubkey, description, \
                     expires_at, status, created_at, claimed_at \
              FROM invoices {} ORDER BY created_at DESC;",
             where_clause
@@ -530,7 +530,7 @@ fn row_from_values(row: &[Value]) -> Result<InvoiceRow, StoreError> {
     let preimage = blob_at(row, 1, "preimage")?;
     let amount_msat = int_at(row, 2, "amount_msat")? as u64;
     let network_id = NetworkId(text_at(row, 3, "network_id")?);
-    let payee = optional_text_at(row, 4, "payee")?;
+    let node_pubkey = optional_text_at(row, 4, "node_pubkey")?;
     let description = optional_text_at(row, 5, "description")?;
     let expires_at = int_at(row, 6, "expires_at")? as u64;
     let status_str = text_at(row, 7, "status")?;
@@ -547,7 +547,7 @@ fn row_from_values(row: &[Value]) -> Result<InvoiceRow, StoreError> {
         preimage,
         amount_msat,
         network_id,
-        payee,
+        node_pubkey,
         description,
         expires_at,
         status,
@@ -913,9 +913,12 @@ mod store_tests {
             amount_msat: 1_000,
             payee: test_key(),
             expires_at: 2_000,
-            networks: vec![NetworkId("cashu".into())],
-            address: HtlcTarget::XOnlyPubKey(test_key()),
+            networks: vec![cassis_core::InvoiceNetwork {
+                network: NetworkId("cashu".into()),
+                target: HtlcTarget::XOnlyPubKey(test_key()),
+            }],
             description: None,
+            autocommit: false,
             iroh_peer_id: None,
             iroh_relay: None,
         }

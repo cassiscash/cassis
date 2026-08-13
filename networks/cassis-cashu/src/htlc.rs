@@ -33,7 +33,7 @@ use crate::errors::{CashuError, CashuResult};
 /// HTLC proofs to for this key to be able to claim them.
 ///
 /// Used by `CashuAdapter::claim_pubkey` to advertise the key it really
-/// signs witnesses with, instead of assuming that is the invoice key.
+/// signs witnesses with, rather than any separately-tracked identity.
 pub fn claim_pubkey_from_secret(secret_key: &[u8; 32]) -> CashuResult<cassis_core::XOnlyPubKey> {
     let secret = P2pkSecretKey::from_slice(secret_key)
         .map_err(|e| CashuError::Nuts(format!("invalid signing key: {e}")))?;

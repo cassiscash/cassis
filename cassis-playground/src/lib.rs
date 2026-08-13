@@ -174,7 +174,7 @@ impl NodeWallet {
 struct NodeState {
     id: String,
     span: Span,
-    nostr_pubkey: String,
+    node_pubkey: String,
     iroh_id: String,
     memberships: Vec<String>,
     status: Status,
@@ -436,19 +436,19 @@ impl Playground {
             .collect::<Result<Vec<_>, _>>()?;
         let mut nodes = HashMap::new();
         let mut iroh_ids = HashSet::new();
-        let mut nostr_pubkeys = HashSet::new();
+        let mut node_pubkeys = HashSet::new();
         for (idx, id) in NODE_NAMES.iter().enumerate() {
             let home = node_home(&root, id);
             init_node_home(&home)?;
             let keys = load_and_derive(&home, network_ids.clone())?;
-            let nostr_pubkey = keys.nostr.pubkey().to_hex();
+            let node_pubkey = keys.node.pubkey().to_hex();
             let iroh_id = keys.iroh.public().to_string();
             if !iroh_ids.insert(iroh_id.clone()) {
                 return Err(format!("duplicate iroh identity for node {id}: {iroh_id}"));
             }
-            if !nostr_pubkeys.insert(nostr_pubkey.clone()) {
+            if !node_pubkeys.insert(node_pubkey.clone()) {
                 return Err(format!(
-                    "duplicate nostr identity for node {id}: {nostr_pubkey}"
+                    "duplicate node identity for node {id}: {node_pubkey}"
                 ));
             }
             nodes.insert(
@@ -456,7 +456,7 @@ impl Playground {
                 NodeState {
                     id: (*id).to_string(),
                     span: info_span!("node", node = *id),
-                    nostr_pubkey,
+                    node_pubkey,
                     iroh_id,
                     memberships: Vec::new(),
                     status: Status::Idle,
@@ -558,7 +558,7 @@ impl Playground {
             output.push_str(&format!(
                 "{} [pub:…{} iroh:…{}]\n",
                 colored_node_name(&node.id),
-                identity_suffix(&node.nostr_pubkey),
+                identity_suffix(&node.node_pubkey),
                 identity_suffix(&node.iroh_id),
             ));
         }
@@ -759,7 +759,6 @@ impl Playground {
                         network_id.clone(),
                         mint_url.clone(),
                         sk,
-                        derived.invoice.pubkey(),
                         store,
                         span,
                     )
@@ -1446,7 +1445,7 @@ async fn route_node_name(playground: &Playground, pubkey: ritualistic::PubKey) -
     let nodes = playground.nodes.lock().await;
     nodes
         .values()
-        .find(|node| node.nostr_pubkey == hex)
+        .find(|node| node.node_pubkey == hex)
         .map(|node| node.id.clone())
         .unwrap_or_else(|| hex[..8].to_string())
 }

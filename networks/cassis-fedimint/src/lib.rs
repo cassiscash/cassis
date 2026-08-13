@@ -882,12 +882,6 @@ impl NetworkAdapter for FedimintAdapter {
         self.network_id.clone()
     }
 
-    /// Invoice identity and claim identity are same x-only half of static
-    /// even-parity key. Funder reconstructs compressed key as `0x02 || x`.
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.xonly_claim_pubkey()
-    }
-
     fn claim_pubkey(&self) -> XOnlyPubKey {
         self.xonly_claim_pubkey()
     }

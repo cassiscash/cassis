@@ -124,8 +124,8 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
 
     info!(
         target: "cassis_router",
-        "derived nostr signing pubkey: {}",
-        config.derived_keys.nostr.pubkey().to_hex()
+        "derived node pubkey: {}",
+        config.derived_keys.node.pubkey().to_hex()
     );
     for (network_id, sk) in &config.derived_keys.networks {
         info!(
@@ -254,7 +254,7 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
     publish_route_announcements(
         &router.adapters,
         relay_urls,
-        &config.derived_keys.nostr,
+        &config.derived_keys.node,
         &iroh_peer_id.to_string(),
         &iroh_relay,
     )
@@ -332,7 +332,6 @@ async fn build_adapter(
                     network_id.clone(),
                     mint_url,
                     sk,
-                    derived.invoice.pubkey(),
                     cashu_store.clone(),
                     span.clone(),
                 )
@@ -411,7 +410,6 @@ async fn build_adapter(
             let cfg = cassis_liquid::default_config(
                 network_id.clone(),
                 sk,
-                derived.invoice.pubkey(),
                 span.clone(),
             );
             let mut cfg = cfg;
@@ -453,7 +451,6 @@ async fn build_adapter(
             let cfg = cassis_arkade::default_config(
                 network_id.clone(),
                 sk,
-                derived.invoice.pubkey(),
                 span.clone(),
             );
             let adapter: Arc<dyn NetworkAdapter> = cassis_arkade::ArkadeAdapter::new(cfg)
@@ -492,7 +489,6 @@ async fn build_adapter(
             let cfg = cassis_bitcoin::default_config(
                 network_id.clone(),
                 sk,
-                derived.invoice.pubkey(),
                 span.clone(),
             )
             .map_err(|e| format!("bitcoin adapter config: {e}"))?;
@@ -528,14 +524,13 @@ async fn build_adapter(
             };
             let sk = network_sk(derived, &network_id)?;
             // Rootstock claims are signed by a dedicated per-network
-            // EVM account, not by the invoice key. The adapter
+            // EVM account. The adapter
             // advertises the matching identity via `claim_pubkey()` so
             // upstream hops lock to an address we can actually claim
             // from.
             let cfg = cassis_rootstock::default_config(
                 network_id.clone(),
                 sk,
-                derived.invoice.pubkey(),
                 span.clone(),
             );
             let adapter: Arc<dyn NetworkAdapter> = cassis_rootstock::RootstockAdapter::new(cfg)
@@ -566,7 +561,7 @@ async fn build_adapter(
                 network_id.clone(),
                 cassis_spark::SparkConfig::default(),
                 sk,
-                derived.invoice.pubkey(),
+                derived.node.pubkey(),
                 span.clone(),
             )
             .await
@@ -2027,7 +2022,7 @@ fn route_pair_supported(from: &NetworkId, to: &NetworkId) -> bool {
 async fn publish_route_announcements(
     adapters: &HashMap<NetworkId, NetworkEntry>,
     relay_urls: Vec<String>,
-    secret_key: &ritualistic::SecretKey,
+    node_key: &ritualistic::SecretKey,
     iroh_peer_id: &str,
     iroh_relay: &str,
 ) {
@@ -2080,7 +2075,7 @@ async fn publish_route_announcements(
                 ]),
                 content: String::new(),
             };
-            (d_tag, template.finalize(secret_key))
+            (d_tag, template.finalize(node_key))
         })
         .collect();
 
@@ -2091,7 +2086,7 @@ async fn publish_route_announcements(
         NOSTR_KIND_ROUTE_ANNOUNCEMENT,
         transit_slack_secs,
         relay_urls.len(),
-        secret_key.pubkey().to_hex()
+        node_key.pubkey().to_hex()
     );
 
     let mut pool = Network::new();

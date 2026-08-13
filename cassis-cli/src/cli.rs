@@ -39,8 +39,6 @@ pub enum Commands {
         #[arg(long)]
         network: String,
         #[arg(long)]
-        payee: Option<String>,
-        #[arg(long)]
         description: Option<String>,
         #[arg(long)]
         expires_at: Option<u64>,
@@ -169,8 +167,6 @@ pub enum LndCommands {
         amount: u64,
         #[arg(long, default_value = "lightning")]
         network: String,
-        #[arg(long)]
-        payee: Option<String>,
         #[arg(long)]
         description: Option<String>,
         #[arg(long)]

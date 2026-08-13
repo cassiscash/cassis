@@ -140,25 +140,18 @@ pub struct ArkadeConfig {
     /// 32-byte secret key derived from `cassis/network/<network_id>`.
     /// The adapter claims incoming VHTLCs with its x-only pubkey.
     pub sk: [u8; 32],
-    pub invoice_pubkey: XOnlyPubKey,
     pub span: Span,
 }
 
 /// Canonical config for `arkade` (mainnet) or `arkade::mutinynet`
 /// (mutinynet). Callers may override any field before constructing.
-pub fn default_config(
-    network_id: NetworkId,
-    sk: [u8; 32],
-    invoice_pubkey: XOnlyPubKey,
-    span: Span,
-) -> ArkadeConfig {
+pub fn default_config(network_id: NetworkId, sk: [u8; 32], span: Span) -> ArkadeConfig {
     match network_id.0.as_str() {
         "arkade::mutinynet" => ArkadeConfig {
             network_id,
             server_url: TESTNET_SERVER_URL.to_string(),
             esplora_url: TESTNET_ESPLORA_URL.to_string(),
             sk,
-            invoice_pubkey,
             span: span.clone(),
         },
         _ => ArkadeConfig {
@@ -166,7 +159,6 @@ pub fn default_config(
             server_url: MAINNET_SERVER_URL.to_string(),
             esplora_url: MAINNET_ESPLORA_URL.to_string(),
             sk,
-            invoice_pubkey,
             span,
         },
     }
@@ -270,7 +262,6 @@ struct UnspentVtxo {
 
 pub struct ArkadeAdapter {
     network_id: NetworkId,
-    invoice_pubkey: XOnlyPubKey,
     span: Span,
     /// The operator rejects scripts whose smallest exit (CSV) delay is
     /// shorter than its advertised unilateral exit delay, measured via
@@ -362,7 +353,6 @@ impl ArkadeAdapter {
 
         Ok(Arc::new(Self {
             network_id: config.network_id.clone(),
-            invoice_pubkey: config.invoice_pubkey,
             span,
             exit_delay_floor_secs,
             keypair,
@@ -1099,11 +1089,7 @@ impl NetworkAdapter for ArkadeAdapter {
         self.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
-    }
-
-    /// Claims happen with dedicated per-network key, not invoice key.
+    /// Claims happen with a dedicated per-network key.
     fn claim_pubkey(&self) -> XOnlyPubKey {
         self.claim_pubkey
     }

@@ -143,7 +143,6 @@ pub struct CashuAdapter {
     /// x-only, so the `0x02` prefix `pubkey_from_cassis` re-applies is
     /// never checked against the signature.
     claim_pubkey: XOnlyPubKey,
-    invoice_pubkey: XOnlyPubKey,
     /// The caller's node span with this adapter's `network` field
     /// attached, entered around every log below so each line carries
     /// both the owning node and the network. Built once in
@@ -183,7 +182,6 @@ impl CashuAdapter {
         network_id: NetworkId,
         mint_url: String,
         secret_key: [u8; 32],
-        invoice_pubkey: XOnlyPubKey,
         store: Arc<dyn CashuProofStore>,
         span: Span,
     ) -> CashuResult<Self> {
@@ -211,7 +209,6 @@ impl CashuAdapter {
             client,
             secret_key,
             claim_pubkey,
-            invoice_pubkey,
             span,
             keysets: Arc::new(Mutex::new(Vec::new())),
             outgoing: Mutex::new(HashMap::new()),
@@ -731,16 +728,12 @@ impl NetworkAdapter for CashuAdapter {
         self.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
-    }
-
     /// Report the key we actually sign NUT-14 witnesses with, which is
-    /// `self.secret_key` — not necessarily the invoice key. Callers
-    /// construct this adapter with different keys depending on the role
-    /// (the payee uses its invoice key; a routing hop uses its
-    /// per-network key), so deriving the identity from the signing key
-    /// keeps the advertised identity truthful either way.
+    /// `self.secret_key`. Callers construct this adapter with different
+    /// keys depending on the role (the payee uses its node key; a
+    /// routing hop uses its per-network key), so deriving the identity
+    /// from the signing key keeps the advertised identity truthful
+    /// either way.
     ///
     /// Computed once in [`CashuAdapter::new`], so an unusable signing
     /// key fails loudly at construction rather than silently
@@ -1804,19 +1797,12 @@ mod tests {
         Arc::new(InMemoryProofStore::new())
     }
 
-    fn test_invoice_pubkey() -> XOnlyPubKey {
-        "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
-            .parse()
-            .unwrap()
-    }
-
     #[test]
     fn new_accepts_a_valid_mint_url() {
         let adapter = CashuAdapter::new(
             NetworkId("mint.example.com".to_string()),
             "https://mint.example.com".to_string(),
             [1u8; 32],
-            test_invoice_pubkey(),
             test_store(),
             Span::none(),
         );
@@ -1829,7 +1815,6 @@ mod tests {
             NetworkId("not a url".to_string()),
             "not a url".to_string(),
             [1u8; 32],
-            test_invoice_pubkey(),
             test_store(),
             Span::none(),
         );
@@ -1845,7 +1830,6 @@ mod tests {
             NetworkId("".to_string()),
             "".to_string(),
             [1u8; 32],
-            test_invoice_pubkey(),
             test_store(),
             Span::none(),
         );

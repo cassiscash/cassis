@@ -110,10 +110,9 @@ pub struct SparkConfig {
 pub struct SparkAdapter {
     network_id: NetworkId,
     wallet: SparkWallet,
-    /// Node identity advertised via [`NetworkAdapter::invoice_pubkey`].
-    /// Spark has no separate x-only claim identity; this invoice key is
-    /// also the valid fallback claim identity for the adapter API.
-    invoice_pubkey: XOnlyPubKey,
+    /// Claim identity for this adapter. Spark has no separate x-only
+    /// claim identity, so callers pass the node key here.
+    claim_pubkey: XOnlyPubKey,
     incoming: Mutex<HashMap<OperationId, PendingIncoming>>,
     outgoing: Mutex<HashMap<OperationId, PendingOutgoing>>,
     span: Span,
@@ -192,7 +191,7 @@ impl SparkAdapter {
         network_id: NetworkId,
         _config: SparkConfig,
         secret: [u8; 32],
-        invoice_pubkey: XOnlyPubKey,
+        claim_pubkey: XOnlyPubKey,
         span: Span,
     ) -> Result<Arc<Self>, Error> {
         if network_id.0 != "spark" {
@@ -214,7 +213,7 @@ impl SparkAdapter {
         Ok(Arc::new(Self {
             network_id,
             wallet,
-            invoice_pubkey,
+            claim_pubkey,
             incoming: Mutex::new(HashMap::new()),
             outgoing: Mutex::new(HashMap::new()),
             span,
@@ -612,15 +611,10 @@ impl NetworkAdapter for SparkAdapter {
         self.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
-    }
-
-    /// Spark has no separate x-only claim key. The invoice identity is
-    /// the node identity used for route announcements and is a valid
-    /// fallback claim identity for the single-trait API.
+    /// Spark has no separate x-only claim key, so the node identity is
+    /// also the valid fallback claim identity for the single-trait API.
     fn claim_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
+        self.claim_pubkey
     }
 
     fn incoming_delta_secs(&self) -> u64 {

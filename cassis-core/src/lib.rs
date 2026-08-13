@@ -392,11 +392,19 @@ pub struct RouteAnnouncement {
 pub struct Invoice {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
+    /// Node key of the payee. Identifies the destination node itself,
+    /// independent of any per-network addressing in [`Invoice::networks`].
     pub payee: XOnlyPubKey,
     pub expires_at: u64,
-    pub networks: Vec<NetworkId>,
-    pub address: HtlcTarget,
+    /// Networks this invoice can be paid on, each with the target the
+    /// payer must address on that network.
+    pub networks: Vec<InvoiceNetwork>,
     pub description: Option<String>,
+    /// When `true` the payee releases the preimage itself as soon as
+    /// the incoming HTLC is funded, so no COMMIT message is required.
+    /// `false` means the payer must send COMMIT to trigger the claim.
+    #[serde(default)]
+    pub autocommit: bool,
     /// Iroh peer id of the payee's `cassis-cli` endpoint, used by
     /// the payer to send the final COMMIT message directly. `None`
     /// for invoices not produced by a cassis receiver (e.g. raw
@@ -408,6 +416,26 @@ pub struct Invoice {
     /// aren't known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay: Option<String>,
+}
+
+/// One payable network on an [`Invoice`], paired with the target the
+/// payer addresses there. Networks that address by claim key carry an
+/// [`HtlcTarget::XOnlyPubKey`]/[`HtlcTarget::PubKey`], Lightning carries a
+/// BOLT11 hold invoice, Spark carries a Spark address.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvoiceNetwork {
+    pub network: NetworkId,
+    pub target: HtlcTarget,
+}
+
+impl Invoice {
+    /// Target the payer must address to pay this invoice on `network`.
+    pub fn target_for(&self, network: &NetworkId) -> Option<&HtlcTarget> {
+        self.networks
+            .iter()
+            .find(|entry| entry.network == *network)
+            .map(|entry| &entry.target)
+    }
 }
 
 /// Handle to an in-flight outgoing payment. Client passes it to
@@ -924,8 +952,6 @@ impl AdapterError {
 pub trait NetworkAdapter: Send + Sync {
     fn network_id(&self) -> NetworkId;
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey;
-
     /// Public identity whose secret key this adapter uses to claim funds.
     fn claim_pubkey(&self) -> XOnlyPubKey;
 
@@ -1009,67 +1035,6 @@ pub trait NetworkAdapter: Send + Sync {
     async fn can_claim(&self, amount_msat: u64) -> Result<(), AdapterError>;
 }
 
-/// Generate a local invoice and reserve its incoming contract.
-///
-/// Network-specific reservation code owns addressing and any native
-/// invoice creation. This helper owns only generic preimage/hash and
-/// invoice construction.
-pub async fn create_invoice_handle(
-    adapter: &dyn NetworkAdapter,
-    amount_msat: u64,
-    expiry: u64,
-    description: Option<String>,
-) -> Result<InvoiceHandle, AdapterError> {
-    if amount_msat == 0 {
-        return Err(AdapterError::InvalidParams(
-            "invoice amount must be positive".into(),
-        ));
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    if expiry <= now {
-        return Err(AdapterError::InvalidParams(
-            "invoice expiry must be in the future".into(),
-        ));
-    }
-    let preimage = Bytes32(rand::random::<[u8; 32]>());
-    let payment_hash = Bytes32({
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(preimage.0);
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&digest);
-        bytes
-    });
-    let operation_id = OperationId::random();
-    let reservation = adapter
-        .reserve_incoming(IncomingRequest {
-            operation_id,
-            payment_hash,
-            amount_msat,
-            deadline: expiry,
-            preimage: Some(preimage),
-        })
-        .await?;
-    let invoice = Invoice {
-        payment_hash,
-        amount_msat,
-        payee: adapter.invoice_pubkey(),
-        expires_at: expiry,
-        networks: vec![adapter.network_id()],
-        address: reservation.target.clone(),
-        description,
-        iroh_peer_id: None,
-        iroh_relay: None,
-    };
-    Ok(InvoiceHandle {
-        invoice,
-        reservation,
-        preimage,
-    })
-}
-
 #[allow(dead_code)]
 fn _assert_network_adapter_object_safe() {
     fn assert<T: Send + Sync + ?Sized>() {}
@@ -1079,6 +1044,65 @@ fn _assert_network_adapter_object_safe() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoice_carries_a_target_per_network() {
+        let cashu = NetworkId("cashu".into());
+        let lightning = NetworkId("lightning".into());
+        let invoice = Invoice {
+            payment_hash: Bytes32([1u8; 32]),
+            amount_msat: 1_000,
+            payee: XOnlyPubKey([2u8; 32]),
+            expires_at: 3_000,
+            networks: vec![
+                InvoiceNetwork {
+                    network: cashu.clone(),
+                    target: HtlcTarget::XOnlyPubKey(XOnlyPubKey([4u8; 32])),
+                },
+                InvoiceNetwork {
+                    network: lightning.clone(),
+                    target: HtlcTarget::LightningInvoice("lnbc1invoice".into()),
+                },
+            ],
+            description: None,
+            autocommit: false,
+            iroh_peer_id: None,
+            iroh_relay: None,
+        };
+        assert_eq!(
+            invoice.target_for(&cashu),
+            Some(&HtlcTarget::XOnlyPubKey(XOnlyPubKey([4u8; 32])))
+        );
+        assert_eq!(
+            invoice.target_for(&lightning),
+            Some(&HtlcTarget::LightningInvoice("lnbc1invoice".into()))
+        );
+        assert_eq!(invoice.target_for(&NetworkId("arkade".into())), None);
+    }
+
+    #[test]
+    fn invoice_autocommit_defaults_to_false_when_absent() {
+        // No `autocommit` key: older invoices must still decode, and must
+        // not silently opt into skipping COMMIT.
+        let decoded: Invoice = serde_json::from_str(
+            r#"{
+                "payment_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+                "amount_msat": 1000,
+                "payee": "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917",
+                "expires_at": 3000,
+                "networks": [
+                    {
+                        "network": "cashu",
+                        "target": {"XOnlyPubKey": "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"}
+                    }
+                ],
+                "description": null
+            }"#,
+        )
+        .expect("invoice without autocommit must decode");
+        assert!(!decoded.autocommit);
+        assert_eq!(decoded.networks[0].network, NetworkId("cashu".into()));
+    }
 
     #[test]
     fn operation_ids_are_opaque_valid_and_unique() {

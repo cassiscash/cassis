@@ -67,10 +67,65 @@ pub fn load_and_derive(home: &Path, ids: Vec<NetworkId>) -> Result<keys::Derived
     keys::derive_keys(&mn, ids).map_err(|e| e.to_string())
 }
 
+/// Reserve an incoming contract and build the matching invoice.
+///
+/// Invoice construction lives in the client rather than in
+/// `cassis-core` because it needs the node key, which only the client
+/// has access to. The target the payer addresses is read back off the
+/// reservation, so it stays correct for every network without this
+/// function knowing how any adapter addresses itself.
+pub async fn build_invoice_handle(
+    adapter: &dyn NetworkAdapter,
+    node_pubkey: cassis_core::XOnlyPubKey,
+    amount_msat: u64,
+    expiry: u64,
+    description: Option<String>,
+) -> Result<cassis_core::InvoiceHandle, cassis_core::AdapterError> {
+    if amount_msat == 0 {
+        return Err(cassis_core::AdapterError::InvalidParams(
+            "invoice amount must be positive".into(),
+        ));
+    }
+    if expiry <= unix_now() {
+        return Err(cassis_core::AdapterError::InvalidParams(
+            "invoice expiry must be in the future".into(),
+        ));
+    }
+    let preimage = Bytes32(rand::random::<[u8; 32]>());
+    let payment_hash = Bytes32(payment_hash_of(preimage.0));
+    let reservation = adapter
+        .reserve_incoming(cassis_core::IncomingRequest {
+            operation_id: cassis_core::OperationId::random(),
+            payment_hash,
+            amount_msat,
+            deadline: expiry,
+            preimage: Some(preimage),
+        })
+        .await?;
+    Ok(cassis_core::InvoiceHandle {
+        invoice: Invoice {
+            payment_hash,
+            amount_msat,
+            payee: node_pubkey,
+            expires_at: expiry,
+            networks: vec![cassis_core::InvoiceNetwork {
+                network: adapter.network_id(),
+                target: reservation.target.clone(),
+            }],
+            description,
+            autocommit: false,
+            iroh_peer_id: None,
+            iroh_relay: None,
+        },
+        reservation,
+        preimage,
+    })
+}
+
 /// Create and persist invoice using an already-open adapter object.
 ///
 /// Adapter state stays in caller-owned instance, so later receive/COMMIT
-/// operations address same reservation and native invoice.
+/// operations address the same reservation and native invoice.
 pub async fn create_invoice_with_adapter(
     home: &Path,
     adapter: &dyn NetworkAdapter,
@@ -85,20 +140,12 @@ pub async fn create_invoice_with_adapter(
             network_id
         ));
     }
-    if amount_msat == 0 {
-        return Err("invoice amount must be positive".to_string());
-    }
-    if expiry <= unix_now() {
-        return Err("invoice expiry must be in the future".to_string());
-    }
-    let handle = cassis_core::create_invoice_handle(adapter, amount_msat, expiry, None)
+    let derived = load_and_derive(home, vec![network_id.clone()])?;
+    let handle = build_invoice_handle(adapter, derived.node.pubkey(), amount_msat, expiry, None)
         .await
         .map_err(|error| error.to_string())?;
+    let preimage = handle.preimage;
     let mut invoice = handle.invoice;
-    invoice.networks = vec![network_id];
-    invoice.expires_at = expiry;
-
-    let derived = load_and_derive(home, vec![invoice.networks[0].clone()])?;
     let (iroh_peer_id, iroh_relay) = iroh_endpoint_info(&derived.iroh).await?;
     invoice.iroh_peer_id = Some(iroh_peer_id);
     invoice.iroh_relay = Some(iroh_relay);
@@ -110,10 +157,10 @@ pub async fn create_invoice_with_adapter(
         store
             .insert_invoice(&InvoiceRow {
                 payment_hash,
-                preimage: handle.preimage.0,
+                preimage: preimage.0,
                 amount_msat,
-                network_id: invoice.networks[0].clone(),
-                payee: None,
+                network_id,
+                node_pubkey: Some(invoice.payee.to_hex()),
                 description: None,
                 expires_at: expiry,
                 status: InvoiceStatus::Pending,
@@ -125,11 +172,11 @@ pub async fn create_invoice_with_adapter(
             .insert_invoice_handle(&cassis_core::InvoiceHandle {
                 invoice: invoice.clone(),
                 reservation: handle.reservation,
-                preimage: handle.preimage,
+                preimage,
             })
             .map_err(|e| e.to_string())?;
     }
-    Ok((invoice, payment_hash, handle.preimage.0))
+    Ok((invoice, payment_hash, preimage.0))
 }
 
 async fn iroh_endpoint_info(secret: &iroh::SecretKey) -> Result<(String, String), String> {
@@ -215,7 +262,7 @@ pub async fn handle_commit_frame(
     if !invoice
         .networks
         .iter()
-        .any(|network| network == &commit.network)
+        .any(|entry| entry.network == commit.network)
     {
         return Err(cassis_iroh::IrohError::Protocol(
             "COMMIT network does not match invoice network".to_string(),

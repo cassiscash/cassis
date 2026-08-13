@@ -152,7 +152,6 @@ pub struct BitcoinConfig {
     pub esplora_url: String,
     /// Per-network signing key (derived from `cassis/network/<id>`).
     pub sk: [u8; 32],
-    pub invoice_pubkey: XOnlyPubKey,
     /// Feerate in sat/vB for every transaction this adapter broadcasts.
     pub fee_rate_vb: u64,
     pub span: Span,
@@ -165,7 +164,6 @@ pub const MUTINYNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
 pub fn default_config(
     network_id: NetworkId,
     sk: [u8; 32],
-    invoice_pubkey: XOnlyPubKey,
     span: Span,
 ) -> Result<BitcoinConfig, String> {
     let kind = split_spec(&network_id.0).0.to_owned();
@@ -180,7 +178,6 @@ pub fn default_config(
         network: bitcoin::Network::Bitcoin,
         esplora_url: MAINNET_ESPLORA_URL.to_string(),
         sk,
-        invoice_pubkey,
         fee_rate_vb: DEFAULT_FEE_RATE_VB,
         span,
     };
@@ -425,7 +422,6 @@ pub struct BitcoinAdapter {
     /// key, and claim identity. HTLC internal keys are fixed NUMS, not
     /// this wallet key.
     key_xonly: XOnlyPublicKey,
-    invoice_pubkey: XOnlyPubKey,
     /// P2TR address wallet UTXOs are swept from and change returns to.
     funding_address: Address,
     client: Arc<esplora_client::AsyncClient>,
@@ -461,7 +457,6 @@ impl BitcoinAdapter {
             fee_rate_vb: cfg.fee_rate_vb,
             wallet_sk,
             key_xonly,
-            invoice_pubkey: cfg.invoice_pubkey,
             funding_address,
             client: Arc::new(client),
             span: cfg.span,
@@ -1165,10 +1160,6 @@ impl NetworkAdapter for BitcoinAdapter {
         self.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
-    }
-
     /// Claim identity: x-only half of per-network key. Taproot claim leaf
     /// embeds this key directly, so counterparties lock to it unchanged.
     fn claim_pubkey(&self) -> XOnlyPubKey {
@@ -1780,23 +1771,21 @@ mod tests {
     #[test]
     fn default_config_kinds() {
         let sk = [1u8; 32];
-        let pk = XOnlyPubKey::from_bytes([2u8; 32]).unwrap();
 
-        let cfg = default_config(NetworkId("bitcoin".to_string()), sk, pk, Span::none()).unwrap();
+        let cfg = default_config(NetworkId("bitcoin".to_string()), sk, Span::none()).unwrap();
         assert_eq!(cfg.network, bitcoin::Network::Bitcoin);
         assert_eq!(cfg.esplora_url, MAINNET_ESPLORA_URL);
 
         let cfg = default_config(
             NetworkId("bitcoin::mutinynet".to_string()),
             sk,
-            pk,
             Span::none(),
         )
         .unwrap();
         assert_eq!(cfg.network, bitcoin::Network::Signet);
         assert_eq!(cfg.esplora_url, MUTINYNET_ESPLORA_URL);
 
-        let mut other = default_config(NetworkId("bitcoin::foo".to_string()), sk, pk, Span::none())
+        let mut other = default_config(NetworkId("bitcoin::foo".to_string()), sk, Span::none())
             .err()
             .unwrap()
             .to_string();

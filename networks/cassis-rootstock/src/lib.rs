@@ -139,7 +139,6 @@ pub struct RootstockConfig {
     /// [`NetworkAdapter::claim_pubkey`] maps to exactly one EVM
     /// address, and that address is the one this key can sign for.
     pub sk: [u8; 32],
-    pub invoice_pubkey: XOnlyPubKey,
     pub span: Span,
 }
 
@@ -918,11 +917,7 @@ impl NetworkAdapter for RootstockAdapter {
         self.config.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.config.invoice_pubkey
-    }
-
-    /// Rootstock claims use dedicated per-network EVM account, not invoice key.
+    /// Rootstock claims use a dedicated per-network EVM account.
     fn claim_pubkey(&self) -> XOnlyPubKey {
         self.claim_pubkey
     }
@@ -1714,12 +1709,7 @@ impl NetworkAdapter for RootstockAdapter {
 /// contract for mainnet (`rootstock`) or testnet
 /// (`rootstock::testnet`). Callers can override `contract` on the
 /// returned config before constructing the adapter.
-pub fn default_config(
-    network_id: NetworkId,
-    sk: [u8; 32],
-    invoice_pubkey: XOnlyPubKey,
-    span: Span,
-) -> RootstockConfig {
+pub fn default_config(network_id: NetworkId, sk: [u8; 32], span: Span) -> RootstockConfig {
     match network_id.0.as_str() {
         "rootstock::testnet" => RootstockConfig {
             network_id,
@@ -1727,7 +1717,6 @@ pub fn default_config(
             contract: Some(ROOTSTOCK_TESTNET_CONTRACT.to_string()),
             chain_id: ROOTSTOCK_TESTNET_CHAIN_ID,
             sk,
-            invoice_pubkey,
             span: span.clone(),
         },
         _ => RootstockConfig {
@@ -1736,7 +1725,6 @@ pub fn default_config(
             contract: Some(ROOTSTOCK_MAINNET_CONTRACT.to_string()),
             chain_id: ROOTSTOCK_MAINNET_CHAIN_ID,
             sk,
-            invoice_pubkey,
             span,
         },
     }
@@ -2147,14 +2135,7 @@ mod tests {
 
     #[test]
     fn default_config_mainnet_has_contract_and_rpc() {
-        let cfg = default_config(
-            NetworkId("rootstock".to_string()),
-            [7u8; 32],
-            "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
-                .parse()
-                .unwrap(),
-            Span::none(),
-        );
+        let cfg = default_config(NetworkId("rootstock".to_string()), [7u8; 32], Span::none());
         assert_eq!(cfg.rpc_url, ROOTSTOCK_MAINNET_RPC);
         assert_eq!(cfg.chain_id, 30);
         assert_eq!(cfg.contract.as_deref(), Some(ROOTSTOCK_MAINNET_CONTRACT));
@@ -2165,9 +2146,6 @@ mod tests {
         let cfg = default_config(
             NetworkId("rootstock::testnet".to_string()),
             [7u8; 32],
-            "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
-                .parse()
-                .unwrap(),
             Span::none(),
         );
         assert_eq!(cfg.rpc_url, ROOTSTOCK_TESTNET_RPC);

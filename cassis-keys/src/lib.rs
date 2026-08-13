@@ -8,11 +8,12 @@ use std::str::FromStr;
 /// BIP39 mnemonic words expected.
 pub const SEED_WORD_COUNT: usize = 12;
 
-/// NIP-6 derivation path for the Nostr signing key (account 0).
+/// Derivation path for the node key (account 0).
 ///
-/// See <https://nips.nostr.com/6>: BIP32 path `m/44'/1237'/<account>'/0/0`
-/// using the Nostr SLIP44 coin type 1237.
-const NOSTR_DERIVATION_PATH: &str = "m/44'/1237'/0'/0/0";
+/// Fixed at the NIP-6 path `m/44'/1237'/<account>'/0/0` using SLIP44
+/// coin type 1237, which is also the path Nostr clients derive from
+/// the same seed. Pinned so a node's identity never drifts.
+const NODE_DERIVATION_PATH: &str = "m/44'/1237'/0'/0/0";
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -38,12 +39,11 @@ pub enum SeedError {
 /// inbound identity on the receiver side.
 #[derive(Debug, Clone)]
 pub struct DerivedKeys {
-    /// Nostr signing key used to sign route-announcement events.
-    pub nostr: SecretKey,
+    /// Node identity key. Signs route-announcement events and
+    /// identifies this node as the payee on every invoice it issues.
+    pub node: SecretKey,
     /// Iroh transport key used for peer-to-peer connections.
     pub iroh: iroh::SecretKey,
-    /// Key used to identify invoices independently from node and network keys.
-    pub invoice: SecretKey,
     /// One signing key per network the node participates in.
     pub networks: HashMap<NetworkId, SecretKey>,
 }
@@ -65,7 +65,7 @@ pub fn parse_seed(mnemonic: &str) -> Result<[u8; 64], SeedError> {
 
 /// Derive every key the node needs from a BIP39 mnemonic.
 ///
-/// The Nostr signing key is derived per NIP-6 at the BIP32 path
+/// The node key is derived per NIP-6 at the BIP32 path
 /// `m/44'/1237'/0'/0/0` (account 0). Per-network signing keys use a
 /// SLIP-21-style derivation: each key is the first 32 bytes of
 /// `HMAC-SHA512(key = seed, message = label || counter)`, where the label is
@@ -75,10 +75,8 @@ pub fn parse_seed(mnemonic: &str) -> Result<[u8; 64], SeedError> {
 pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<DerivedKeys, SeedError> {
     let seed = parse_seed(mnemonic)?;
 
-    let nostr = derive_nostr_secret_key(&seed)?;
+    let node = derive_node_secret_key(&seed)?;
     let iroh = derive_iroh_secret_key(&seed);
-    let invoice = derive_secret_key(&seed, b"cassis/invoice")
-        .map_err(|label| SeedError::DerivationExhausted { label })?;
 
     let mut networks = HashMap::with_capacity(network_ids.len());
     for network_id in network_ids {
@@ -89,9 +87,8 @@ pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<Derive
     }
 
     Ok(DerivedKeys {
-        nostr,
+        node,
         iroh,
-        invoice,
         networks,
     })
 }
@@ -107,9 +104,9 @@ pub fn generate_mnemonic() -> Result<String, SeedError> {
     Ok(mnemonic.to_string())
 }
 
-/// Derive the Nostr signing key from the BIP39 seed per NIP-6.
-fn derive_nostr_secret_key(seed: &[u8; 64]) -> Result<SecretKey, SeedError> {
-    let path = bip32::DerivationPath::from_str(NOSTR_DERIVATION_PATH)
+/// Derive the node key from the BIP39 seed.
+fn derive_node_secret_key(seed: &[u8; 64]) -> Result<SecretKey, SeedError> {
+    let path = bip32::DerivationPath::from_str(NODE_DERIVATION_PATH)
         .map_err(|err| SeedError::InvalidPath(err.to_string()))?;
     let xprv = bip32::XPrv::derive_from_path(seed, &path)
         .map_err(|err| SeedError::DerivationFailed(err.to_string()))?;
@@ -165,19 +162,19 @@ mod tests {
     }
 
     #[test]
-    fn nostr_key_matches_nip6_test_vector() {
+    fn node_key_matches_nip6_test_vector() {
         let mnemonic =
             "leader monkey parrot ring guide accident before fence cannon height naive bean";
         let keys = derive_keys(mnemonic, vec![]).unwrap();
         assert_eq!(
-            keys.nostr.to_hex(),
+            keys.node.to_hex(),
             "7f7ff03d123792d6ac594bfa67bf6d0c0ab55b6b1fdb6249303fe861f1ccba9a",
-            "nostr private key must match NIP-6 account-0 test vector"
+            "node private key must match NIP-6 account-0 test vector"
         );
         assert_eq!(
-            keys.nostr.pubkey().to_hex(),
+            keys.node.pubkey().to_hex(),
             "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917",
-            "nostr pubkey must match NIP-6 account-0 test vector"
+            "node pubkey must match NIP-6 account-0 test vector"
         );
     }
 
@@ -186,13 +183,13 @@ mod tests {
         let ids = vec![NetworkId("liquid".into()), NetworkId("arkade".into())];
         let a = derive_keys(TEST_MNEMONIC, ids.clone()).unwrap();
         let b = derive_keys(TEST_MNEMONIC, ids.clone()).unwrap();
-        assert_eq!(a.nostr.as_bytes(), b.nostr.as_bytes());
+        assert_eq!(a.node.as_bytes(), b.node.as_bytes());
         assert_eq!(
             a.networks.get(&ids[0]).unwrap().as_bytes(),
             b.networks.get(&ids[0]).unwrap().as_bytes()
         );
         assert_ne!(
-            a.nostr.as_bytes(),
+            a.node.as_bytes(),
             a.networks.get(&ids[0]).unwrap().as_bytes()
         );
     }

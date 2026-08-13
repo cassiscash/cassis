@@ -140,7 +140,7 @@ enum OutgoingState {
 pub struct LndAdapter {
     config: LndConfig,
     network_id: NetworkId,
-    invoice_pubkey: XOnlyPubKey,
+    claim_pubkey: XOnlyPubKey,
     client: reqwest::Client,
     span: Span,
     /// Hold invoices we are expecting payment for, keyed by the operation
@@ -160,7 +160,7 @@ impl std::fmt::Debug for LndAdapter {
             .debug_struct("LndAdapter")
             .field("network_id", &self.network_id)
             .field("rest_url", &self.config.rest_url)
-            .field("invoice_pubkey", &self.invoice_pubkey)
+            .field("claim_pubkey", &self.claim_pubkey)
             .finish()
     }
 }
@@ -260,7 +260,7 @@ impl LndAdapter {
         let adapter = Self {
             config,
             network_id: network_id.clone(),
-            invoice_pubkey: XOnlyPubKey([0u8; 32]),
+            claim_pubkey: XOnlyPubKey([0u8; 32]),
             client,
             span: cassis_core::network_span(&span, &network_id),
             incoming: Arc::new(Mutex::new(HashMap::new())),
@@ -275,12 +275,12 @@ impl LndAdapter {
             Error::InvalidParams(format!("invalid LND identity pubkey: {error}"))
         })?;
         let (xonly, _) = pubkey.x_only_public_key();
-        let invoice_pubkey = XOnlyPubKey::from_bytes(xonly.serialize()).map_err(|error| {
+        let claim_pubkey = XOnlyPubKey::from_bytes(xonly.serialize()).map_err(|error| {
             Error::InvalidParams(format!("invalid LND x-only identity: {error}"))
         })?;
 
         let adapter = Arc::new(Self {
-            invoice_pubkey,
+            claim_pubkey,
             ..adapter
         });
         adapter.span.in_scope(|| {
@@ -288,7 +288,7 @@ impl LndAdapter {
                 target: "cassis_lnd",
                 "LND adapter ready: rest_url={} identity={}",
                 adapter.config.rest_url,
-                invoice_pubkey.to_hex(),
+                claim_pubkey.to_hex(),
             );
         });
         Ok(adapter)
@@ -304,7 +304,7 @@ impl LndAdapter {
         Arc::new(Self {
             config: self.config.clone(),
             network_id: self.network_id.clone(),
-            invoice_pubkey: self.invoice_pubkey,
+            claim_pubkey: self.claim_pubkey,
             client: self.client.clone(),
             span: self.span.clone(),
             incoming: self.incoming.clone(),
@@ -687,14 +687,10 @@ impl NetworkAdapter for LndAdapter {
         self.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
-    }
-
-    /// LND holds the funds itself, so its node identity is both the
-    /// invoice identity and the key the hold is settled from.
+    /// LND holds the funds itself, so the LND node identity is also the
+    /// key the hold is settled from.
     fn claim_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
+        self.claim_pubkey
     }
 
     /// Hold invoices are funded by the first hop within seconds, so 30 s

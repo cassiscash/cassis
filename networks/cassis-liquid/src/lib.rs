@@ -168,18 +168,12 @@ pub struct LiquidConfig {
     pub persist_dir: Option<PathBuf>,
     /// 32-byte secret key derived from `cassis/network/<network_id>`.
     pub sk: [u8; 32],
-    pub invoice_pubkey: XOnlyPubKey,
     pub span: Span,
 }
 
 /// Canonical config for `liquid` (mainnet) or `liquid::testnet`.
 /// Callers may override any field before constructing.
-pub fn default_config(
-    network_id: NetworkId,
-    sk: [u8; 32],
-    invoice_pubkey: XOnlyPubKey,
-    span: Span,
-) -> LiquidConfig {
+pub fn default_config(network_id: NetworkId, sk: [u8; 32], span: Span) -> LiquidConfig {
     match network_id.0.as_str() {
         "liquid::testnet" => LiquidConfig {
             network_id,
@@ -187,7 +181,6 @@ pub fn default_config(
             waterfalls_url: TESTNET_WATERFALLS_URL.to_string(),
             persist_dir: None,
             sk,
-            invoice_pubkey,
             span: span.clone(),
         },
         _ => LiquidConfig {
@@ -196,7 +189,6 @@ pub fn default_config(
             waterfalls_url: MAINNET_WATERFALLS_URL.to_string(),
             persist_dir: None,
             sk,
-            invoice_pubkey,
             span,
         },
     }
@@ -360,7 +352,6 @@ struct PendingOutgoing {
 
 pub struct LiquidAdapter {
     network_id: NetworkId,
-    invoice_pubkey: XOnlyPubKey,
     span: Span,
     signer: SwSigner,
     fingerprint: Fingerprint,
@@ -511,7 +502,6 @@ impl LiquidAdapter {
 
         Ok(Arc::new(Self {
             network_id: config.network_id.clone(),
-            invoice_pubkey: config.invoice_pubkey,
             span,
             signer,
             fingerprint,
@@ -1510,10 +1500,6 @@ impl NetworkAdapter for LiquidAdapter {
         self.network_id.clone()
     }
 
-    fn invoice_pubkey(&self) -> XOnlyPubKey {
-        self.invoice_pubkey
-    }
-
     fn claim_pubkey(&self) -> XOnlyPubKey {
         self.claim_xonly
     }
@@ -2319,7 +2305,6 @@ mod tests {
         let config = default_config(
             NetworkId("liquid::testnet".to_string()),
             [7u8; 32],
-            XOnlyPubKey::from_bytes([9u8; 32]).unwrap(),
             Span::none(),
         );
         let adapter = LiquidAdapter::new(config).await.unwrap();
@@ -2327,7 +2312,6 @@ mod tests {
         let config2 = default_config(
             NetworkId("liquid::testnet".to_string()),
             [7u8; 32],
-            XOnlyPubKey::from_bytes([9u8; 32]).unwrap(),
             Span::none(),
         );
         let adapter2 = LiquidAdapter::new(config2).await.unwrap();

@@ -94,7 +94,7 @@ async fn info(network: &str) -> Result<(), String> {
     let (spec, adapter) = adapter(network).await?;
     println!("status:       ok");
     println!("network:      {}", spec.network_id());
-    println!("claim_pubkey: {}", adapter.invoice_pubkey().to_hex());
+    println!("claim_pubkey: {}", adapter.claim_pubkey().to_hex());
     println!("db_dir:       {}", adapter.db_dir().display());
     println!("balance_msat: {}", adapter.balance_msat().await?);
     Ok(())

@@ -8,7 +8,7 @@ pub mod store;
 use cassis_core::{
     AdapterError, Bytes32, HopCommit, HopCommitted, HopDiscard, HopExecute, HopPrepare,
     HtlcDescriptor, HtlcTarget, Invoice, InvoiceHandle, NetworkAdapter, NetworkId, OperationId,
-    OutgoingPayment, OutgoingRequest, PaymentResult, PaymentStatus, RouteHop,
+    OutgoingPayment, OutgoingRequest, PaymentResult, PaymentStatus, RouteHop, XOnlyPubKey,
 };
 use cassis_iroh::{node_addr_from_announcement, node_addr_from_invoice, IrohClient};
 use cassis_routing::{
@@ -382,6 +382,11 @@ impl CassisClient {
             .networks
             .first()
             .ok_or_else(|| PayError::Route("invoice has no network".to_string()))?
+            .network
+            .clone();
+        let dest_target = invoice
+            .target_for(&dest_network)
+            .ok_or_else(|| PayError::Route(format!("invoice has no target for {dest_network}")))?
             .clone();
         if sender_network == dest_network {
             return self
@@ -588,7 +593,7 @@ impl CassisClient {
                 }
             }
         }
-        htlc_targets.push(invoice.address.clone());
+        htlc_targets.push(dest_target);
 
         // Step 2: pay the first hop. The sender adapter creates
         // the first HTLC and returns the OutgoingPayment
@@ -864,7 +869,10 @@ impl CassisClient {
         let slack = fallback_transit_slack(dest_network);
         let outgoing_expiry = now.saturating_add(delta).saturating_add(slack);
 
-        let htlc_target = invoice.address.clone();
+        let htlc_target = invoice
+            .target_for(dest_network)
+            .ok_or_else(|| PayError::Route(format!("invoice has no target for {dest_network}")))?
+            .clone();
 
         let first_payment = create_outgoing_payment(
             sender.as_ref(),
@@ -1121,15 +1129,21 @@ impl CassisClient {
 
     pub async fn create_invoice_handle(
         &self,
+        node_pubkey: XOnlyPubKey,
         network: &NetworkId,
         amount_msat: u64,
         expiry: u64,
         description: Option<String>,
     ) -> Result<InvoiceHandle, ReceiveFlowError> {
         let receiver = self.receiver_for(network)?;
-        let handle =
-            cassis_core::create_invoice_handle(receiver.as_ref(), amount_msat, expiry, description)
-                .await?;
+        let handle = ops::build_invoice_handle(
+            receiver.as_ref(),
+            node_pubkey,
+            amount_msat,
+            expiry,
+            description,
+        )
+        .await?;
         self.invoice_handles
             .lock()
             .await
@@ -1150,13 +1164,14 @@ impl CassisClient {
 
     pub async fn create_invoice(
         &self,
+        node_pubkey: XOnlyPubKey,
         network: &NetworkId,
         amount_msat: u64,
         expiry: u64,
         description: Option<String>,
     ) -> Result<Invoice, ReceiveFlowError> {
         Ok(self
-            .create_invoice_handle(network, amount_msat, expiry, description)
+            .create_invoice_handle(node_pubkey, network, amount_msat, expiry, description)
             .await?
             .invoice)
     }
@@ -1213,13 +1228,14 @@ impl CassisClient {
 
     pub async fn receive(
         &self,
+        node_pubkey: XOnlyPubKey,
         network: &NetworkId,
         amount_msat: u64,
         deadline: u64,
         description: Option<String>,
     ) -> Result<ReceiveResult, ReceiveFlowError> {
         let invoice = self
-            .create_invoice(network, amount_msat, deadline, description)
+            .create_invoice(node_pubkey, network, amount_msat, deadline, description)
             .await?;
         let payment_hash = invoice.payment_hash;
         let preimage = self

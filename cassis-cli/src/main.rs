@@ -52,7 +52,6 @@ async fn main() {
         Commands::Invoice {
             amount,
             network,
-            payee,
             description,
             expires_at,
             wait,
@@ -61,7 +60,6 @@ async fn main() {
             cmd_invoice(
                 amount,
                 network,
-                payee,
                 description,
                 expires_at,
                 wait,
@@ -175,7 +173,6 @@ async fn cmd_lnd(
             cli::LndCommands::Invoice {
                 amount,
                 network,
-                payee,
                 description,
                 expires_at,
                 wait,
@@ -184,7 +181,6 @@ async fn cmd_lnd(
                 cmd_invoice(
                     amount,
                     network,
-                    payee,
                     description,
                     expires_at,
                     wait,
@@ -385,7 +381,6 @@ async fn cmd_watch(adapter_config: &AdapterConfig) -> Result<(), String> {
 async fn cmd_invoice(
     amount: u64,
     network: String,
-    payee: Option<String>,
     _description: Option<String>,
     expires_at: Option<u64>,
     wait: bool,
@@ -455,7 +450,6 @@ async fn cmd_invoice(
                 .await
             {
                 Ok(()) => {
-                    let _ = payee;
                     let mut store = open_store()?;
                     store
                         .mark_status(&payment_hash, InvoiceStatus::Claimed)
@@ -583,7 +577,7 @@ fn cmd_invoices_show(payment_hash_str: String) -> Result<(), String> {
     println!("preimage:     {}", lowercase_hex::encode(row.preimage));
     println!("amount_msat:  {}", row.amount_msat);
     println!("network:      {}", row.network_id);
-    println!("payee:        {}", row.payee.as_deref().unwrap_or("-"));
+    println!("node_pubkey: {}", row.node_pubkey.as_deref().unwrap_or("-"));
     println!(
         "description:  {}",
         row.description.as_deref().unwrap_or("-")
