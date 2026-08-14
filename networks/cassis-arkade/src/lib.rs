@@ -46,7 +46,6 @@ use async_trait::async_trait;
 use bitcoin::absolute;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::ripemd160;
-use bitcoin::hashes::sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::key::Keypair;
 use bitcoin::key::Secp256k1;
@@ -59,17 +58,14 @@ use bitcoin::Sequence;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
 use cassis_core::{
-    AcceptedIncoming, AdapterError, Bytes32, HtlcDescriptor, HtlcTarget, IncomingRequest,
-    IncomingReservation, NetworkAdapter, NetworkId, OperationId, OutgoingPayment, OutgoingRequest,
-    XOnlyPubKey,
+    sats_for_msat, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
 };
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn, Span};
+use tracing::{debug, info, Span};
 
 /// Public mainnet operator. Serves gRPC + REST on 443.
 pub const MAINNET_SERVER_URL: &str = "https://arkade.computer";
@@ -104,72 +100,10 @@ const UNILATERAL_REFUND_GAP_SECS: u32 = 12 * 60 * 60;
 /// operator applies the same cutoff to the refund CLTV).
 const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
 
-const POLL_INTERVAL_SECS: u64 = 5;
 const RPC_TIMEOUT_SECS: u64 = 30;
-/// Millisatoshi per satoshi.
-const MSAT_PER_SAT: u64 = 1000;
-
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("invalid parameters: {0}")]
-    InvalidParams(String),
-    #[error("client error: {0}")]
-    Client(String),
-}
-
-impl From<Error> for AdapterError {
-    fn from(e: Error) -> AdapterError {
-        match e {
-            Error::InvalidParams(s) => AdapterError::InvalidParams(s),
-            other => AdapterError::Network(other.to_string()),
-        }
-    }
-}
-
 /// Convenience conversion into the routing layer's network error.
-fn htlc(e: impl std::fmt::Display) -> AdapterError {
-    AdapterError::Network(e.to_string())
-}
-
-#[derive(Clone, Debug)]
-pub struct ArkadeConfig {
-    pub network_id: NetworkId,
-    /// gRPC endpoint of the operator (e.g. `https://mutinynet.arkade.sh`).
-    pub server_url: String,
-    pub esplora_url: String,
-    /// 32-byte secret key derived from `cassis/network/<network_id>`.
-    /// The adapter claims incoming VHTLCs with its x-only pubkey.
-    pub sk: [u8; 32],
-    pub span: Span,
-}
-
-/// Canonical config for `arkade` (mainnet) or `arkade::mutinynet`
-/// (mutinynet). Callers may override any field before constructing.
-pub fn default_config(network_id: NetworkId, sk: [u8; 32], span: Span) -> ArkadeConfig {
-    match network_id.0.as_str() {
-        "arkade::mutinynet" => ArkadeConfig {
-            network_id,
-            server_url: TESTNET_SERVER_URL.to_string(),
-            esplora_url: TESTNET_ESPLORA_URL.to_string(),
-            sk,
-            span: span.clone(),
-        },
-        _ => ArkadeConfig {
-            network_id,
-            server_url: MAINNET_SERVER_URL.to_string(),
-            esplora_url: MAINNET_ESPLORA_URL.to_string(),
-            sk,
-            span,
-        },
-    }
-}
-
-fn bitcoin_network(network_id: &NetworkId) -> bitcoin::Network {
-    match network_id.0.as_str() {
-        // Mutinynet is signet-based (tb1.. addresses).
-        "arkade::mutinynet" => bitcoin::Network::Signet,
-        _ => bitcoin::Network::Bitcoin,
-    }
+fn htlc(e: impl std::fmt::Display) -> NetworkError {
+    NetworkError::network(e)
 }
 
 /// RIPEMD160 of the route's 32-byte payment hash: the 20-byte value
@@ -191,67 +125,11 @@ fn exit_delay_secs(delay: Sequence) -> u32 {
     }
 }
 
-fn msat_to_sat_amount(amount_msat: u64) -> Result<bitcoin::Amount, AdapterError> {
-    if !amount_msat.is_multiple_of(MSAT_PER_SAT) {
-        return Err(AdapterError::InvalidParams(format!(
-            "amount {amount_msat} msat is not a whole number of satoshis; \
-             arkade amounts must be multiples of {MSAT_PER_SAT} msat"
-        )));
-    }
-    Ok(bitcoin::Amount::from_sat(amount_msat / MSAT_PER_SAT))
+fn sat_amount(amount_msat: u64) -> bitcoin::Amount {
+    bitcoin::Amount::from_sat(sats_for_msat(amount_msat))
 }
 
 type ArkClient = Client<esplora::EsploraBlockchain, BdkWallet, InMemorySwapStorage>;
-
-struct PendingIncoming {
-    /// Payment intent committed by this operation. Kept separately from
-    /// the map key so duplicate-hash checks never use a hash as attempt
-    /// identity.
-    payment_hash: Bytes32,
-    reservation: IncomingReservation,
-    /// Set only after a descriptor has been verified and atomically
-    /// accepted via EXECUTE or COMMIT.
-    accepted: Option<AcceptedIncoming>,
-    expected_sat: bitcoin::Amount,
-}
-
-struct PendingOutgoing {
-    payment_hash: Bytes32,
-    payment: OutgoingPayment,
-    options: VhtlcOptions,
-}
-
-fn incoming_reservation_matches(
-    pending: &PendingIncoming,
-    reservation: &IncomingReservation,
-) -> bool {
-    pending.payment_hash == reservation.payment_hash && &pending.reservation == reservation
-}
-
-fn accepted_incoming_matches(left: &AcceptedIncoming, right: &AcceptedIncoming) -> bool {
-    left.reservation == right.reservation
-        && left.descriptor == right.descriptor
-        && left.amount_msat == right.amount_msat
-}
-
-fn outgoing_request_matches(pending: &PendingOutgoing, request: &OutgoingRequest) -> bool {
-    pending.payment_hash == request.payment_hash
-        && pending.payment.operation_id == request.operation_id
-        && pending.payment.amount_msat == request.amount_msat
-        && pending.payment.destination == request.target
-        && pending.payment.destination_network == request.network
-        && pending.payment.expiry == request.expiry
-}
-
-fn outgoing_payment_matches(pending: &PendingOutgoing, payment: &OutgoingPayment) -> bool {
-    pending.payment_hash == payment.payment_hash
-        && pending.payment.operation_id == payment.operation_id
-        && pending.payment.amount_msat == payment.amount_msat
-        && pending.payment.destination == payment.destination
-        && pending.payment.destination_network == payment.destination_network
-        && pending.payment.expiry == payment.expiry
-        && pending.payment.descriptor == payment.descriptor
-}
 
 /// A pair built from one unspent VTXO at a VHTLC address.
 struct UnspentVtxo {
@@ -261,191 +139,141 @@ struct UnspentVtxo {
 }
 
 pub struct ArkadeAdapter {
-    network_id: NetworkId,
+    id: NetworkId,
+    server_url: &'static str,
     span: Span,
     /// The operator rejects scripts whose smallest exit (CSV) delay is
     /// shorter than its advertised unilateral exit delay, measured via
     /// [`exit_delay_secs`]; our delays are floored at this.
     exit_delay_floor_secs: u32,
     keypair: Keypair,
-    claim_xonly: XOnlyPublicKey,
-    claim_pubkey: XOnlyPubKey,
-    /// Operator signer key reported by GetInfo. Descriptor transfers
-    /// only round-trip inside one operator, so accept-time checks
-    /// compare against this.
+    /// Our x-only key: VHTLC receiver when claiming, sender when locking.
+    xonly: XOnlyPublicKey,
+    /// Operator signer key reported by GetInfo; both parties of a VHTLC
+    /// use the same operator.
     server_pk_xonly: XOnlyPublicKey,
     dust: bitcoin::Amount,
     client: Arc<ArkClient>,
     chain: Arc<esplora::EsploraBlockchain>,
-    incoming: Mutex<HashMap<OperationId, PendingIncoming>>,
-    outgoing: Mutex<HashMap<OperationId, PendingOutgoing>>,
-}
-
-impl std::fmt::Debug for ArkadeAdapter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ArkadeAdapter")
-            .field("network_id", &self.network_id)
-            .field("claim_pubkey", &self.claim_pubkey.to_hex())
-            .finish_non_exhaustive()
-    }
 }
 
 impl ArkadeAdapter {
-    pub async fn new(config: ArkadeConfig) -> Result<Arc<Self>, Error> {
+    /// Connect to the operator of `arkade` or `arkade::mutinynet`.
+    /// Wallet state lives with the operator and on-chain.
+    pub async fn open(id: NetworkId, secret: [u8; 32], span: &Span) -> Result<Self, String> {
+        let (network, server_url, esplora_url) = match id.param() {
+            None => (
+                bitcoin::Network::Bitcoin,
+                MAINNET_SERVER_URL,
+                MAINNET_ESPLORA_URL,
+            ),
+            Some("mutinynet") => (
+                bitcoin::Network::Signet,
+                TESTNET_SERVER_URL,
+                TESTNET_ESPLORA_URL,
+            ),
+            Some(other) => return Err(format!("unknown arkade network '{other}'")),
+        };
         install_rustls_crypto_provider();
-
         let secp = Secp256k1::new();
-        let secret = bitcoin::secp256k1::SecretKey::from_slice(&config.sk)
-            .map_err(|e| Error::InvalidParams(format!("invalid secret key: {e}")))?;
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&secret)
+            .map_err(|e| format!("invalid arkade key: {e}"))?;
         let keypair = Keypair::from_secret_key(&secp, &secret);
-        let claim_xonly = keypair.x_only_public_key().0;
-        let claim_pubkey = XOnlyPubKey::from_bytes(claim_xonly.serialize())
-            .map_err(|e| Error::InvalidParams(format!("invalid claim pubkey: {e}")))?;
-
-        let chain =
-            Arc::new(esplora::EsploraBlockchain::new(&config.esplora_url).map_err(Error::Client)?);
+        let chain = Arc::new(esplora::EsploraBlockchain::new(esplora_url)?);
         let wallet = Arc::new(
-            BdkWallet::new(
-                keypair,
-                bitcoin_network(&config.network_id),
-                &config.esplora_url,
-            )
-            .map_err(|e| Error::Client(format!("bdk wallet init: {e}")))?,
+            BdkWallet::new(keypair, network, esplora_url)
+                .map_err(|e| format!("bdk wallet: {e}"))?,
         );
         let client_config = OfflineClientConfig {
-            ark_server_url: config.server_url.clone(),
+            ark_server_url: server_url.to_string(),
             boltz_url: String::new(),
             boltz_referral_id: BoltzReferralId::Disabled,
             ..Default::default()
         };
-        let client = Arc::new(
-            OfflineClient::with_keypair(
-                client_config,
-                keypair,
-                chain.clone(),
-                wallet,
-                Arc::new(InMemorySwapStorage::new()),
-            )
-            .connect()
-            .await
-            .map_err(|e| Error::Client(format!("operator connect ({config:?}): {e}")))?,
-        );
-
+        let client = OfflineClient::with_keypair(
+            client_config,
+            keypair,
+            chain.clone(),
+            wallet,
+            Arc::new(InMemorySwapStorage::new()),
+        )
+        .connect()
+        .await
+        .map_err(|e| format!("connect to arkade operator {server_url}: {e}"))?;
         let info = client
             .server_info()
             .await
-            .map_err(|e| Error::Client(format!("get_info: {e}")))?;
-        let server_pk_xonly = XOnlyPublicKey::from(info.signer_pk);
-        let exit_delay_floor_secs = exit_delay_secs(info.unilateral_exit_delay);
-
-        let span = cassis_core::network_span(&config.span, &config.network_id);
-        span.in_scope(|| {
-            debug!(
-                target: "cassis_arkade",
-                "adapter ready: operator={} signer={} claim={} dust={} sats exit_floor={}s",
-                config.server_url,
-                server_pk_xonly,
-                claim_xonly,
-                info.dust.to_sat(),
-                exit_delay_floor_secs,
-            );
-        });
-
-        Ok(Arc::new(Self {
-            network_id: config.network_id.clone(),
+            .map_err(|e| format!("operator info: {e}"))?;
+        let span = cassis_core::network_span(span, &id);
+        debug!(parent: &span, "arkade wallet ready: operator={server_url} signer={}", info.signer_pk);
+        Ok(Self {
+            id,
+            server_url,
             span,
-            exit_delay_floor_secs,
+            exit_delay_floor_secs: exit_delay_secs(info.unilateral_exit_delay),
             keypair,
-            claim_xonly,
-            claim_pubkey,
-            server_pk_xonly,
+            xonly: keypair.x_only_public_key().0,
+            server_pk_xonly: XOnlyPublicKey::from(info.signer_pk),
             dust: info.dust,
-            client,
+            client: Arc::new(client),
             chain,
-            incoming: Mutex::new(HashMap::new()),
-            outgoing: Mutex::new(HashMap::new()),
-        }))
+        })
     }
 
-    fn unix_now() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+    fn claim_target(&self) -> HtlcTarget {
+        HtlcTarget::XOnlyPubKey(XOnlyPubKey::from_bytes(self.xonly.serialize()).expect("valid key"))
     }
 
-    /// Decode an [`HtlcDescriptor::Arkade`] back into VHTLC options.
-    fn parse_vhtlc_options(descriptor: &HtlcDescriptor) -> Result<VhtlcOptions, AdapterError> {
+    /// VHTLC options of `htlc`: receiver from the target, sender and
+    /// timelocks from the descriptor, server is our operator.
+    fn vhtlc_options(&self, htlc: &Htlc) -> Result<VhtlcOptions, NetworkError> {
         let HtlcDescriptor::Arkade {
             sender,
-            receiver,
-            server,
-            payment_hash160,
             refund_locktime,
             unilateral_claim_delay,
             unilateral_refund_delay,
             unilateral_refund_without_receiver_delay,
-        } = descriptor
+        } = &htlc.descriptor
         else {
-            return Err(AdapterError::InvalidParams(format!(
-                "unsupported htlc descriptor for arkade network: {descriptor:?}"
-            )));
+            return Err(NetworkError::invalid("not an arkade HTLC"));
         };
-        let parse_xonly = |key: &XOnlyPubKey| -> Result<XOnlyPublicKey, AdapterError> {
-            XOnlyPublicKey::from_slice(key.as_bytes())
-                .map_err(|e| AdapterError::InvalidParams(format!("invalid x-only pubkey: {e}")))
+        let HtlcTarget::XOnlyPubKey(receiver) = &htlc.target else {
+            return Err(NetworkError::invalid(
+                "arkade HTLCs are locked to an x-only key",
+            ));
         };
-        let parse_hash = |hex: &String| -> Result<ripemd160::Hash, AdapterError> {
-            let bytes = lowercase_hex_decode(hex).ok_or_else(|| {
-                AdapterError::InvalidParams(format!("invalid payment hash160 '{hex}'"))
-            })?;
-            let arr: [u8; 20] = match bytes.try_into() {
-                Ok(arr) => arr,
-                Err(moved) => {
-                    return Err(AdapterError::InvalidParams(format!(
-                        "payment hash160 must be 20 bytes, got {}",
-                        moved.len()
-                    )));
-                }
-            };
-            Ok(ripemd160::Hash::from_byte_array(arr))
+        let xonly = |key: &XOnlyPubKey| {
+            XOnlyPublicKey::from_slice(key.as_bytes()).map_err(NetworkError::invalid)
         };
-        // The descriptor carries consensus sequence numbers, so they
-        // round-trip bit-for-bit (seconds-type sequences set bit 22 and
-        // would be mangled by any blocks-vs-seconds heuristic).
-        let parse_sequence = |u: u32| -> Result<Sequence, AdapterError> {
-            let sequence = Sequence::from_consensus(u);
-            if !sequence.is_relative_lock_time() {
-                return Err(AdapterError::InvalidParams(format!(
-                    "invalid CSV delay: {u} is not a relative locktime"
-                )));
+        // Consensus sequence numbers round-trip bit for bit
+        // (seconds-type sequences set bit 22).
+        let sequence = |value: u32| {
+            let sequence = Sequence::from_consensus(value);
+            if sequence.is_relative_lock_time() {
+                Ok(sequence)
+            } else {
+                Err(NetworkError::invalid(format!(
+                    "{value} is not a relative locktime"
+                )))
             }
-            Ok(sequence)
         };
-
         Ok(VhtlcOptions {
-            sender: parse_xonly(sender)?,
-            receiver: parse_xonly(receiver)?,
-            server: parse_xonly(server)?,
-            preimage_hash: parse_hash(payment_hash160)?,
+            sender: xonly(sender)?,
+            receiver: xonly(receiver)?,
+            server: self.server_pk_xonly,
+            preimage_hash: vhtlc_payment_hash160(&htlc.payment_hash),
             refund_locktime: *refund_locktime,
-            unilateral_claim_delay: parse_sequence(*unilateral_claim_delay)?,
-            unilateral_refund_delay: parse_sequence(*unilateral_refund_delay)?,
-            unilateral_refund_without_receiver_delay: parse_sequence(
+            unilateral_claim_delay: sequence(*unilateral_claim_delay)?,
+            unilateral_refund_delay: sequence(*unilateral_refund_delay)?,
+            unilateral_refund_without_receiver_delay: sequence(
                 *unilateral_refund_without_receiver_delay,
             )?,
         })
     }
 
-    fn descriptor_from_options(options: &VhtlcOptions) -> HtlcDescriptor {
+    fn descriptor(options: &VhtlcOptions) -> HtlcDescriptor {
         HtlcDescriptor::Arkade {
-            sender: XOnlyPubKey::from_bytes(options.sender.serialize())
-                .expect("Arkade sender key is valid"),
-            receiver: XOnlyPubKey::from_bytes(options.receiver.serialize())
-                .expect("Arkade receiver key is valid"),
-            server: XOnlyPubKey::from_bytes(options.server.serialize())
-                .expect("Arkade server key is valid"),
-            payment_hash160: lowercase_hex_encode(options.preimage_hash.as_byte_array()),
+            sender: XOnlyPubKey::from_bytes(options.sender.serialize()).expect("valid key"),
             refund_locktime: options.refund_locktime,
             unilateral_claim_delay: options.unilateral_claim_delay.to_consensus_u32(),
             unilateral_refund_delay: options.unilateral_refund_delay.to_consensus_u32(),
@@ -455,52 +283,13 @@ impl ArkadeAdapter {
         }
     }
 
-    /// Validate every script-level property before any VTXO is accepted.
-    /// Chain observation stays separate so same-state restoration does not
-    /// depend on explorer availability.
-    fn validate_incoming_descriptor(
-        &self,
-        reservation: &IncomingReservation,
-        descriptor: &HtlcDescriptor,
-    ) -> Result<VhtlcOptions, AdapterError> {
-        if reservation.network != self.network_id {
-            return Err(AdapterError::InvalidParams(format!(
-                "reservation targets {}, not {}",
-                reservation.network, self.network_id
-            )));
-        }
-        if reservation.target != HtlcTarget::XOnlyPubKey(self.claim_pubkey) {
-            return Err(AdapterError::InvalidParams(
-                "incoming reservation has wrong Arkade claim target".into(),
-            ));
-        }
-
-        let options = Self::parse_vhtlc_options(descriptor)?;
-        if options.preimage_hash != vhtlc_payment_hash160(&reservation.payment_hash) {
-            return Err(AdapterError::InvalidParams(
-                "descriptor hash160 does not match the payment hash".into(),
-            ));
-        }
-        if options.server != self.server_pk_xonly {
-            return Err(AdapterError::InvalidParams(format!(
-                "descriptor targets operator {}, but this node connects to {}; \
-                 descriptors only work within a single operator",
-                options.server, self.server_pk_xonly
-            )));
-        }
-        if options.receiver != self.claim_xonly {
-            return Err(AdapterError::InvalidParams(format!(
-                "incoming HTLC is locked to {}, which this node cannot claim; \
-                 expected {} (upstream hop locked to the wrong identity)",
-                options.receiver, self.claim_xonly
-            )));
-        }
+    /// The operator accepts the VHTLC's timelocks and the receiver keeps
+    /// its head start on every unilateral path.
+    fn check_timelocks(&self, options: &VhtlcOptions) -> Result<(), NetworkError> {
         if options.refund_locktime < MIN_TIMESTAMP_LOCKTIME {
-            return Err(AdapterError::InvalidParams(format!(
-                "refund locktime {} is a block height; the operator only \
-                 accepts unix-timestamp refund CLTVs",
-                options.refund_locktime
-            )));
+            return Err(NetworkError::invalid(
+                "refund locktime must be a unix timestamp",
+            ));
         }
         for (name, delay) in [
             ("unilateral claim", options.unilateral_claim_delay),
@@ -511,119 +300,24 @@ impl ArkadeAdapter {
             ),
         ] {
             if !delay.is_time_locked() {
-                return Err(AdapterError::InvalidParams(format!(
-                    "{name} delay {delay} is block-based; the operator only \
-                     accepts seconds-type CSV delays"
+                return Err(NetworkError::invalid(format!(
+                    "{name} delay must be in seconds"
                 )));
             }
             if exit_delay_secs(delay) < self.exit_delay_floor_secs {
-                return Err(AdapterError::InvalidParams(format!(
-                    "{name} delay {delay} is below the operator's minimum \
-                     exit delay of {} seconds",
-                    self.exit_delay_floor_secs
+                return Err(NetworkError::invalid(format!(
+                    "{name} delay is below the operator's minimum exit delay"
                 )));
             }
         }
         if exit_delay_secs(options.unilateral_refund_without_receiver_delay)
             <= exit_delay_secs(options.unilateral_claim_delay)
         {
-            return Err(AdapterError::InvalidParams(format!(
-                "unilateral refund delay {} must open after the unilateral \
-                 claim delay {}",
-                options.unilateral_refund_without_receiver_delay, options.unilateral_claim_delay
-            )));
-        }
-        if u64::from(options.refund_locktime) < reservation.deadline {
-            return Err(AdapterError::InvalidParams(format!(
-                "refund locktime {} precedes the claim deadline {}",
-                options.refund_locktime, reservation.deadline
-            )));
-        }
-        Ok(options)
-    }
-
-    /// Observe all unspent VTXOs at incoming script and return native
-    /// amount in protocol millisatoshi units.
-    async fn observe_incoming_amount(
-        &self,
-        options: &VhtlcOptions,
-        expected_sat: bitcoin::Amount,
-    ) -> Result<u64, AdapterError> {
-        let vhtlc = self.script_for(options)?;
-        let outpoints = self.outpoints_at_address(&vhtlc).await.map_err(htlc)?;
-        let mut total_sats = 0u64;
-        let mut has_coins = false;
-        for outpoint in outpoints {
-            if outpoint.is_spent || outpoint.is_swept || outpoint.amount <= bitcoin::Amount::ZERO {
-                continue;
-            }
-            has_coins = true;
-            total_sats = total_sats.saturating_add(outpoint.amount.to_sat());
-        }
-        if !has_coins {
-            return Err(AdapterError::Network(
-                "no VTXO present at the VHTLC address".into(),
+            return Err(NetworkError::invalid(
+                "sender-only refund must open after the receiver's unilateral claim",
             ));
         }
-        let total = bitcoin::Amount::from_sat(total_sats);
-        if total < expected_sat {
-            return Err(AdapterError::Network(format!(
-                "locked amount {} sats is below the reserved {} sats",
-                total.to_sat(),
-                expected_sat.to_sat()
-            )));
-        }
-        total_sats.checked_mul(MSAT_PER_SAT).ok_or_else(|| {
-            AdapterError::Network("observed Arkade amount overflows u64 millisatoshis".into())
-        })
-    }
-
-    /// Parse and authenticate complete outgoing recovery state.
-    fn validate_outgoing_payment(
-        &self,
-        payment: &OutgoingPayment,
-    ) -> Result<(VhtlcOptions, XOnlyPubKey), AdapterError> {
-        if payment.destination_network != self.network_id {
-            return Err(AdapterError::InvalidParams(format!(
-                "outgoing payment targets {}, not {}",
-                payment.destination_network, self.network_id
-            )));
-        }
-        let recipient = match &payment.destination {
-            HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
-                return Err(AdapterError::InvalidParams(
-                    "arkade requires an x-only destination".into(),
-                ))
-            }
-        };
-        let options = Self::parse_vhtlc_options(&payment.descriptor)?;
-        if options.preimage_hash != vhtlc_payment_hash160(&payment.payment_hash) {
-            return Err(AdapterError::InvalidParams(
-                "Arkade descriptor hash does not match outgoing payment".into(),
-            ));
-        }
-        if options.sender != self.claim_xonly {
-            return Err(AdapterError::InvalidParams(
-                "Arkade descriptor sender is not this adapter".into(),
-            ));
-        }
-        if options.receiver != XOnlyPublicKey::from_slice(recipient.as_bytes()).map_err(htlc)? {
-            return Err(AdapterError::InvalidParams(
-                "Arkade descriptor receiver does not match outgoing destination".into(),
-            ));
-        }
-        if options.server != self.server_pk_xonly {
-            return Err(AdapterError::InvalidParams(
-                "Arkade descriptor belongs to a different operator".into(),
-            ));
-        }
-        if u64::from(options.refund_locktime) != payment.expiry {
-            return Err(AdapterError::InvalidParams(
-                "Arkade descriptor refund locktime does not match outgoing expiry".into(),
-            ));
-        }
-        Ok((options, recipient))
+        Ok(())
     }
 
     fn build_options_for_outgoing(
@@ -631,21 +325,20 @@ impl ArkadeAdapter {
         payment_hash: &Bytes32,
         recipient: &XOnlyPubKey,
         expiry: u64,
-    ) -> Result<VhtlcOptions, AdapterError> {
-        let now = Self::unix_now();
+    ) -> Result<VhtlcOptions, NetworkError> {
+        let now = cassis_core::unix_now();
         if expiry <= now {
-            return Err(AdapterError::InvalidParams("expiry in the past".into()));
+            return Err(NetworkError::Invalid("expiry in the past".into()));
         }
         let recipient_xonly = XOnlyPublicKey::from_str(recipient.to_hex().as_str())
-            .map_err(|e| AdapterError::InvalidParams(format!("invalid recipient pubkey: {e}")))?;
+            .map_err(|e| NetworkError::Invalid(format!("invalid recipient pubkey: {e}")))?;
         // The refund CLTV takes the route expiry directly: cassis
         // expiries are unix seconds, and the operator checks timestamp
         // locktimes against the chain tip's block time.
-        let refund_locktime = u32::try_from(expiry).map_err(|_| {
-            AdapterError::InvalidParams(format!("expiry {expiry} overflows nLockTime"))
-        })?;
+        let refund_locktime = u32::try_from(expiry)
+            .map_err(|_| NetworkError::Invalid(format!("expiry {expiry} overflows nLockTime")))?;
         if refund_locktime < MIN_TIMESTAMP_LOCKTIME {
-            return Err(AdapterError::InvalidParams(format!(
+            return Err(NetworkError::Invalid(format!(
                 "expiry {expiry} is not an absolute unix timestamp"
             )));
         }
@@ -658,10 +351,10 @@ impl ArkadeAdapter {
         let unilateral_refund_without_receiver_delay = Sequence::from_seconds_ceil(
             exit_delay_secs(unilateral_claim_delay).saturating_add(UNILATERAL_REFUND_GAP_SECS),
         )
-        .map_err(|e| AdapterError::InvalidParams(format!("CSV delay out of range: {e}")))?;
+        .map_err(|e| NetworkError::Invalid(format!("CSV delay out of range: {e}")))?;
 
         Ok(VhtlcOptions {
-            sender: self.claim_xonly,
+            sender: self.xonly,
             receiver: recipient_xonly,
             server: self.server_pk_xonly,
             // `payment_hash160` is HASH160(preimage), represented by
@@ -680,37 +373,38 @@ impl ArkadeAdapter {
 
     /// A seconds-type CSV sequence of at least `secs`, floored at the
     /// operator's minimum exit delay.
-    fn exit_delay(&self, secs: u32) -> Result<Sequence, AdapterError> {
+    fn exit_delay(&self, secs: u32) -> Result<Sequence, NetworkError> {
         Sequence::from_seconds_ceil(secs.max(self.exit_delay_floor_secs))
-            .map_err(|e| AdapterError::InvalidParams(format!("CSV delay out of range: {e}")))
+            .map_err(|e| NetworkError::Invalid(format!("CSV delay out of range: {e}")))
     }
 
-    fn script_for(&self, options: &VhtlcOptions) -> Result<VhtlcScript, AdapterError> {
-        VhtlcScript::new(options.clone(), bitcoin_network(&self.network_id)).map_err(htlc)
+    fn script_for(&self, options: &VhtlcOptions) -> Result<VhtlcScript, NetworkError> {
+        let network = match self.id.param() {
+            Some(_) => bitcoin::Network::Signet,
+            None => bitcoin::Network::Bitcoin,
+        };
+        VhtlcScript::new(options.clone(), network).map_err(htlc)
     }
 
     /// Timestamp of the chain tip block: what the operator holds
     /// timestamp CLTVs against (not the wall clock).
-    async fn tip_time(&self) -> Result<u64, Error> {
-        self.chain
-            .tip_time()
-            .await
-            .map_err(|e| Error::Client(format!("esplora tip_time: {e}")))
+    async fn tip_time(&self) -> Result<u64, NetworkError> {
+        self.chain.tip_time().await.map_err(NetworkError::network)
     }
 
     /// All VTXO outpoints (spent or not) at the given VHTLC address.
     async fn outpoints_at_address(
         &self,
         vhtlc: &VhtlcScript,
-    ) -> Result<Vec<VirtualTxOutPoint>, Error> {
+    ) -> Result<Vec<VirtualTxOutPoint>, NetworkError> {
         self.client
             .get_virtual_tx_outpoints(std::iter::once(vhtlc.address()))
             .await
-            .map_err(|e| Error::Client(format!("get_virtual_tx_outpoints: {e}")))
+            .map_err(|e| NetworkError::network(format!("get_virtual_tx_outpoints: {e}")))
     }
 
     /// The single unspent VTXO at the VHTLC address.
-    async fn unspent_vtxo_at(&self, options: &VhtlcOptions) -> Result<UnspentVtxo, AdapterError> {
+    async fn unspent_vtxo_at(&self, options: &VhtlcOptions) -> Result<UnspentVtxo, NetworkError> {
         let vhtlc = self.script_for(options)?;
         let mut unspent: Vec<UnspentVtxo> = self
             .outpoints_at_address(&vhtlc)
@@ -726,21 +420,21 @@ impl ArkadeAdapter {
             .collect();
         match unspent.len() {
             1 => Ok(unspent.remove(0)),
-            0 => Err(AdapterError::Network(
+            0 => Err(NetworkError::Network(
                 "no unspent VTXO found at the VHTLC address".into(),
             )),
-            n => Err(AdapterError::Network(format!(
+            n => Err(NetworkError::Network(format!(
                 "expected one VTXO at the VHTLC address, found {n}"
             ))),
         }
     }
 
-    async fn our_offchain_address(&self) -> Result<ArkAddress, AdapterError> {
+    async fn our_offchain_address(&self) -> Result<ArkAddress, NetworkError> {
         self.client
             .get_offchain_address()
             .await
             .map(|(addr, _)| addr)
-            .map_err(|e| AdapterError::Network(format!("get_offchain_address: {e}")))
+            .map_err(|e| NetworkError::Network(format!("get_offchain_address: {e}")))
     }
 
     /// Sign closure helper: schnorr-sign an offchain sighash with the
@@ -797,12 +491,12 @@ impl ArkadeAdapter {
                 Message,
             ) -> Result<Vec<(schnorr::Signature, XOnlyPublicKey)>, ark_core::Error>
             + Clone,
-    ) -> Result<bitcoin::Txid, AdapterError> {
+    ) -> Result<bitcoin::Txid, NetworkError> {
         let server_info = self
             .client
             .server_info()
             .await
-            .map_err(|e| AdapterError::Network(format!("server_info: {e}")))?;
+            .map_err(|e| NetworkError::Network(format!("server_info: {e}")))?;
 
         let OffchainTransactions {
             mut ark_tx,
@@ -825,14 +519,14 @@ impl ArkadeAdapter {
                 .submit_offchain_transaction_request(ark_tx, checkpoint_txs),
         )
         .await
-        .map_err(|_| AdapterError::Network("submit_offchain_transaction_request timed out".into()))?
+        .map_err(|_| NetworkError::Network("submit_offchain_transaction_request timed out".into()))?
         .map_err(htlc)?;
 
         let mut checkpoint_psbt = res
             .signed_checkpoint_txs
             .first()
             .cloned()
-            .ok_or_else(|| AdapterError::Network("no checkpoint PSBTs returned".into()))?;
+            .ok_or_else(|| NetworkError::Network("no checkpoint PSBTs returned".into()))?;
         sign_checkpoint_transaction(sign_fn.clone(), &mut checkpoint_psbt).map_err(htlc)?;
 
         tokio::time::timeout(
@@ -842,81 +536,42 @@ impl ArkadeAdapter {
                 .finalize_offchain_transaction(ark_txid, vec![checkpoint_psbt]),
         )
         .await
-        .map_err(|_| AdapterError::Network("finalize_offchain_transaction timed out".into()))?
+        .map_err(|_| NetworkError::Network("finalize_offchain_transaction timed out".into()))?
         .map_err(htlc)?;
 
         Ok(ark_txid)
     }
 
-    /// Collaborative claim: spends the incoming VHTLC back into our
-    /// own offchain script using the reveal-preimage leaf.
-    async fn claim_locked_htlc(
+    /// Spend the single VTXO at the VHTLC address back to our own
+    /// offchain address, through the claim leaf (with `preimage`) or the
+    /// sender-only refund leaf.
+    async fn spend_vhtlc(
         &self,
-        accepted: &AcceptedIncoming,
-        preimage: Bytes32,
-    ) -> Result<(), AdapterError> {
-        let options =
-            self.validate_incoming_descriptor(&accepted.reservation, &accepted.descriptor)?;
-        let payment_hash = accepted.reservation.payment_hash;
-
-        // Revealed preimage must satisfy both the script hash and the
-        // route hash; anything else means an inconsistent upstream.
-        let sha = sha256::Hash::hash(preimage.as_ref());
-        let computed_payment_hash = Bytes32(sha.to_byte_array());
-        if computed_payment_hash != payment_hash
-            || ripemd160::Hash::hash(computed_payment_hash.as_ref()) != options.preimage_hash
-        {
-            return Err(AdapterError::InvalidParams(
-                "preimage does not hash to the HTLC's payment hash".into(),
-            ));
-        }
-        {
-            let incoming = self.incoming.lock().await;
-            let Some(pending) = incoming.get(&accepted.reservation.operation_id) else {
-                // Successful claim already removed state. Same-handle retry
-                // is complete.
-                return Ok(());
-            };
-            let stored = pending.accepted.as_ref().ok_or_else(|| {
-                AdapterError::InvalidParams(format!(
-                    "incoming operation {} is not accepted",
-                    accepted.reservation.operation_id
-                ))
-            })?;
-            if !incoming_reservation_matches(pending, &accepted.reservation)
-                || !accepted_incoming_matches(stored, accepted)
-            {
-                return Err(AdapterError::InvalidParams(
-                    "accepted incoming state does not match reservation".into(),
-                ));
-            }
-        }
-
-        let vhtlc = self.script_for(&options)?;
-        let vtxo = self.unspent_vtxo_at(&options).await?;
-
-        self.span.in_scope(|| {
-            info!(
-                target: "cassis_arkade",
-                "claiming htlc {} amount={} sats on {}",
-                payment_hash.short(),
-                vtxo.amount.to_sat(),
-                self.network_id,
-            );
-        });
-
+        options: &VhtlcOptions,
+        claim: bool,
+        preimage: Option<&[u8; 32]>,
+    ) -> Result<bitcoin::Txid, NetworkError> {
+        let vhtlc = self.script_for(options)?;
+        let vtxo = self.unspent_vtxo_at(options).await?;
         let our_address = self.our_offchain_address().await?;
-        let claim_script = vhtlc.claim_script();
+        let (script, locktime) = if claim {
+            (vhtlc.claim_script(), None)
+        } else {
+            (
+                vhtlc.refund_without_receiver_script(),
+                Some(absolute::LockTime::from_consensus(options.refund_locktime)),
+            )
+        };
         let control_block = vhtlc
             .taproot_spend_info()
-            .control_block(&(claim_script.clone(), LeafVersion::TapScript))
-            .ok_or_else(|| AdapterError::Network("control block missing for claim leaf".into()))?;
+            .control_block(&(script.clone(), LeafVersion::TapScript))
+            .ok_or_else(|| NetworkError::network("control block missing for VHTLC leaf"))?;
         let script_pubkey = vhtlc.script_pubkey();
         // `tapscripts` consumes the script: collect it last.
         let tapscripts = vhtlc.tapscripts();
         let input = VtxoInput::new(
-            claim_script,
-            None,
+            script,
+            locktime,
             control_block,
             tapscripts,
             script_pubkey,
@@ -925,24 +580,8 @@ impl ArkadeAdapter {
             vtxo.assets,
         );
         let outputs = vec![SendReceiver::bitcoin(our_address, vtxo.amount)];
-
-        let txid = self
-            .submit_vhtlc_spend(
-                input,
-                &outputs,
-                &our_address,
-                self.signer_with(Some(&preimage.0)),
-            )
-            .await?;
-
-        self.span.in_scope(|| {
-            info!(target: "cassis_arkade", "htlc claimed for {}: tx={txid}", payment_hash.short());
-        });
-        self.incoming
-            .lock()
+        self.submit_vhtlc_spend(input, &outputs, &our_address, self.signer_with(preimage))
             .await
-            .remove(&accepted.reservation.operation_id);
-        Ok(())
     }
 
     async fn virtual_tx_psbt(&self, txid: bitcoin::Txid) -> Result<Option<psbt::Psbt>, String> {
@@ -998,18 +637,14 @@ impl ArkadeAdapter {
         Ok(None)
     }
 
-    // -----------------------------------------------------------------
-    // Wallet-facing helpers used by the CLI and Playground (funds mgmt).
-    // -----------------------------------------------------------------
-
     /// Current offchain balance (confirmed + pre-confirmed spendable
     /// VTXOs) in msat.
-    pub async fn balance_msat(&self) -> Result<u64, AdapterError> {
+    pub async fn balance_msat(&self) -> Result<u64, NetworkError> {
         let balance = self
             .client
             .offchain_balance()
             .await
-            .map_err(|e| AdapterError::Network(format!("offchain_balance: {e}")))?;
+            .map_err(|e| NetworkError::Network(format!("offchain_balance: {e}")))?;
         let total_sats = balance
             .confirmed()
             .to_sat()
@@ -1020,31 +655,31 @@ impl ArkadeAdapter {
     /// Include confirmed boarding outputs in the next batch swap.
     /// Returns the commitment transaction ID, or `None` when no
     /// boarding output or recoverable VTXO is ready to settle.
-    pub async fn onboard(&self) -> Result<Option<bitcoin::Txid>, AdapterError> {
+    pub async fn onboard(&self) -> Result<Option<bitcoin::Txid>, NetworkError> {
         // OsRng (not `thread_rng`) so the returned future stays Send
         // and can be awaited from spawned tasks.
         let mut rng = rand::rngs::OsRng;
         self.client
             .settle(&mut rng)
             .await
-            .map_err(|e| AdapterError::Network(format!("onboard: {e}")))
+            .map_err(|e| NetworkError::Network(format!("onboard: {e}")))
     }
 
     /// Addresses for manual funding, returned as
     /// `(boarding, onchain, arkade)` strings. VTXOs sent to the
     /// boarding address settle into spendable offchain coins after
     /// they confirm and the node joins a batch swap.
-    pub async fn deposit_addresses(&self) -> Result<(String, String, String), AdapterError> {
+    pub async fn deposit_addresses(&self) -> Result<(String, String, String), NetworkError> {
         let ark_address = self.our_offchain_address().await?;
         let boarding = self
             .client
             .get_boarding_address()
             .await
-            .map_err(|e| AdapterError::Network(format!("get_boarding_address: {e}")))?;
+            .map_err(|e| NetworkError::Network(format!("get_boarding_address: {e}")))?;
         let onchain = self
             .client
             .get_onchain_address()
-            .map_err(|e| AdapterError::Network(format!("get_onchain_address: {e}")))?;
+            .map_err(|e| NetworkError::Network(format!("get_onchain_address: {e}")))?;
         Ok((
             boarding.to_string(),
             onchain.to_string(),
@@ -1057,611 +692,161 @@ impl ArkadeAdapter {
         &self,
         address: &str,
         amount_msat: u64,
-    ) -> Result<bitcoin::Txid, AdapterError> {
+    ) -> Result<bitcoin::Txid, NetworkError> {
         let to = ArkAddress::decode(address.trim()).map_err(|e| {
-            AdapterError::InvalidParams(format!("invalid arkade address '{address}': {e}"))
+            NetworkError::Invalid(format!("invalid arkade address '{address}': {e}"))
         })?;
-        let amount = msat_to_sat_amount(amount_msat)?;
+        let amount = sat_amount(amount_msat);
         self.client
             .send(vec![SendReceiver::bitcoin(to, amount)])
             .await
-            .map_err(|e| AdapterError::Network(format!("send: {e}")))
+            .map_err(|e| NetworkError::Network(format!("send: {e}")))
     }
 
-    /// Operator summary line for CLI `info`.
-    pub fn operator_summary(&self) -> String {
-        format!(
-            "{} signer={}",
-            match self.network_id.0.as_str() {
-                "arkade::mutinynet" => TESTNET_SERVER_URL,
-                _ => MAINNET_SERVER_URL,
-            },
-            self.server_pk_xonly
-        )
+    /// Operator this wallet uses.
+    pub fn operator(&self) -> &str {
+        self.server_url
     }
 }
 
 #[async_trait]
-impl NetworkAdapter for ArkadeAdapter {
-    fn network_id(&self) -> NetworkId {
-        self.network_id.clone()
+impl Network for ArkadeAdapter {
+    fn id(&self) -> NetworkId {
+        self.id.clone()
     }
 
-    /// Claims happen with a dedicated per-network key.
-    fn claim_pubkey(&self) -> XOnlyPubKey {
-        self.claim_pubkey
-    }
-
-    /// Lockups land instantly in virtual mempool. Polling still gets
-    /// modest budget rather than assuming synchronous visibility.
+    /// Claims are offchain transactions co-signed by the operator.
     fn incoming_delta_secs(&self) -> u64 {
         60
     }
 
-    async fn reserve_incoming(
+    async fn receive_target(
         &self,
-        request: IncomingRequest,
-    ) -> Result<IncomingReservation, AdapterError> {
-        if let Some(preimage) = request.preimage {
-            if !request.payment_hash.matches_preimage(&preimage) {
-                return Err(AdapterError::InvalidParams(
-                    "incoming preimage does not match payment hash".into(),
-                ));
-            }
-        }
-
-        let mut incoming = self.incoming.lock().await;
-        if let Some(existing) = incoming.get(&request.operation_id) {
-            if existing.payment_hash != request.payment_hash
-                || existing.reservation.amount_msat != request.amount_msat
-                || existing.reservation.deadline != request.deadline
-            {
-                return Err(AdapterError::InvalidParams(
-                    "operation ID is already bound to different incoming state".into(),
-                ));
-            }
-            return Ok(existing.reservation.clone());
-        }
-        if incoming
-            .values()
-            .any(|pending| pending.payment_hash == request.payment_hash)
-        {
-            return Err(AdapterError::Retryable(
-                "Arkade payment hash already has an active operation".into(),
-            ));
-        }
-        if request.deadline <= Self::unix_now() {
-            return Err(AdapterError::InvalidParams("deadline in the past".into()));
-        }
-        let expected_sat = msat_to_sat_amount(request.amount_msat)?;
-        let reservation = IncomingReservation {
-            operation_id: request.operation_id,
-            payment_hash: request.payment_hash,
-            network: self.network_id.clone(),
-            amount_msat: request.amount_msat,
-            deadline: request.deadline,
-            target: HtlcTarget::XOnlyPubKey(self.claim_pubkey),
-        };
-        incoming.insert(
-            reservation.operation_id.clone(),
-            PendingIncoming {
-                payment_hash: reservation.payment_hash,
-                reservation: reservation.clone(),
-                accepted: None,
-                expected_sat,
-            },
-        );
-        Ok(reservation)
+        _payment_hash: Bytes32,
+        _amount_msat: u64,
+        _expiry: u64,
+    ) -> Result<HtlcTarget, NetworkError> {
+        Ok(self.claim_target())
     }
 
-    async fn cancel_incoming(&self, reservation: &IncomingReservation) -> Result<(), AdapterError> {
-        let mut incoming = self.incoming.lock().await;
-        let Some(pending) = incoming.get(&reservation.operation_id) else {
-            // Cancellation retry after success is a no-op.
-            return Ok(());
-        };
-        if !incoming_reservation_matches(pending, reservation) {
-            return Err(AdapterError::InvalidParams(
-                "incoming reservation does not match stored operation state".into(),
-            ));
-        }
-        if pending.accepted.is_some() {
-            return Err(AdapterError::InvalidParams(
-                "cannot cancel an accepted incoming HTLC".into(),
-            ));
-        }
-        incoming.remove(&reservation.operation_id);
+    async fn cancel_receive(&self, _payment_hash: Bytes32) -> Result<(), NetworkError> {
         Ok(())
     }
 
-    async fn accept_incoming(
-        &self,
-        reservation: &IncomingReservation,
-        descriptor: &HtlcDescriptor,
-    ) -> Result<AcceptedIncoming, AdapterError> {
-        let expected_sat = {
-            let incoming = self.incoming.lock().await;
-            let pending = incoming.get(&reservation.operation_id).ok_or_else(|| {
-                AdapterError::NotFound(format!(
-                    "no incoming reservation for operation {}",
-                    reservation.operation_id
-                ))
-            })?;
-            if !incoming_reservation_matches(pending, reservation) {
-                return Err(AdapterError::InvalidParams(
-                    "incoming reservation does not match stored operation state".into(),
-                ));
-            }
-            if let Some(accepted) = &pending.accepted {
-                if &accepted.reservation == reservation && accepted.descriptor == *descriptor {
-                    return Ok(accepted.clone());
-                }
-                return Err(AdapterError::InvalidParams(
-                    "incoming operation is already accepted with different state".into(),
-                ));
-            }
-            pending.expected_sat
-        };
-
-        let options = self.validate_incoming_descriptor(reservation, descriptor)?;
-        let amount_msat = self.observe_incoming_amount(&options, expected_sat).await?;
-        let accepted = AcceptedIncoming {
-            reservation: reservation.clone(),
-            descriptor: descriptor.clone(),
-            amount_msat,
-        };
-
-        let mut incoming = self.incoming.lock().await;
-        let pending = incoming.get_mut(&reservation.operation_id).ok_or_else(|| {
-            AdapterError::NotFound(format!(
-                "incoming operation {} disappeared during acceptance",
-                reservation.operation_id
-            ))
-        })?;
-        if !incoming_reservation_matches(pending, reservation) {
-            return Err(AdapterError::InvalidParams(
-                "incoming reservation changed during acceptance".into(),
-            ));
+    async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let options = self.vhtlc_options(htlc)?;
+        if htlc.target != self.claim_target() {
+            return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
-        if let Some(existing) = &pending.accepted {
-            if accepted_incoming_matches(existing, &accepted) {
-                return Ok(existing.clone());
-            }
-            return Err(AdapterError::InvalidParams(
-                "incoming operation is already accepted with different state".into(),
-            ));
+        // The VHTLC address is rebuilt from the payment hash, our key and
+        // our operator, so coins there are bound to all three.
+        self.check_timelocks(&options)?;
+        if u64::from(options.refund_locktime) < htlc.expiry {
+            return Err(NetworkError::invalid("refund opens before the expiry"));
         }
-        pending.accepted = Some(accepted.clone());
-        self.span.in_scope(|| {
-            debug!(
-                target: "cassis_arkade",
-                "accepted incoming htlc {} amount={} msat deadline={}",
-                reservation.payment_hash.short(),
-                amount_msat,
-                reservation.deadline,
-            );
-        });
-        Ok(accepted)
-    }
-
-    async fn restore_incoming(&self, accepted: &AcceptedIncoming) -> Result<(), AdapterError> {
-        {
-            let incoming = self.incoming.lock().await;
-            if let Some(existing) = incoming.get(&accepted.reservation.operation_id) {
-                if !incoming_reservation_matches(existing, &accepted.reservation) {
-                    return Err(AdapterError::InvalidParams(
-                        "operation ID is already bound to different incoming state".into(),
-                    ));
-                }
-                if let Some(stored) = &existing.accepted {
-                    if accepted_incoming_matches(stored, accepted) {
-                        return Ok(());
-                    }
-                    return Err(AdapterError::InvalidParams(
-                        "operation ID is already bound to different accepted state".into(),
-                    ));
-                }
-            }
+        let vtxo = self.unspent_vtxo_at(&options).await?;
+        if vtxo.amount < sat_amount(htlc.amount_msat) {
+            return Err(NetworkError::invalid("VHTLC is worth less than the HTLC"));
         }
-        let options =
-            self.validate_incoming_descriptor(&accepted.reservation, &accepted.descriptor)?;
-        let expected_sat = msat_to_sat_amount(accepted.reservation.amount_msat)?;
-        if accepted.amount_msat < accepted.reservation.amount_msat {
-            return Err(AdapterError::InvalidParams(
-                "accepted incoming amount is below reservation amount".into(),
-            ));
-        }
-        let observed_msat = self.observe_incoming_amount(&options, expected_sat).await?;
-        if observed_msat != accepted.amount_msat {
-            return Err(AdapterError::InvalidParams(format!(
-                "restored incoming amount {observed_msat} msat does not match accepted {} msat",
-                accepted.amount_msat
-            )));
-        }
-
-        let mut incoming = self.incoming.lock().await;
-        if let Some(existing) = incoming.get(&accepted.reservation.operation_id) {
-            if !incoming_reservation_matches(existing, &accepted.reservation) {
-                return Err(AdapterError::InvalidParams(
-                    "operation ID is already bound to different incoming state".into(),
-                ));
-            }
-            if let Some(stored) = &existing.accepted {
-                if accepted_incoming_matches(stored, accepted) {
-                    return Ok(());
-                }
-                return Err(AdapterError::InvalidParams(
-                    "operation ID is already bound to different accepted state".into(),
-                ));
-            }
-        } else if incoming
-            .values()
-            .any(|pending| pending.payment_hash == accepted.reservation.payment_hash)
-        {
-            return Err(AdapterError::Retryable(
-                "Arkade payment hash already has an active operation".into(),
-            ));
-        }
-        incoming.insert(
-            accepted.reservation.operation_id.clone(),
-            PendingIncoming {
-                payment_hash: accepted.reservation.payment_hash,
-                reservation: accepted.reservation.clone(),
-                accepted: Some(accepted.clone()),
-                expected_sat,
-            },
-        );
         Ok(())
     }
 
-    async fn watch_incoming(
+    async fn claim_incoming_htlc(
         &self,
-        reservation: &IncomingReservation,
-        deadline: u64,
-    ) -> Result<(), AdapterError> {
-        let effective_deadline = deadline.min(reservation.deadline);
-        loop {
-            {
-                let incoming = self.incoming.lock().await;
-                let pending = incoming.get(&reservation.operation_id).ok_or_else(|| {
-                    AdapterError::NotFound(format!(
-                        "no incoming reservation for operation {}",
-                        reservation.operation_id
-                    ))
-                })?;
-                if !incoming_reservation_matches(pending, reservation) {
-                    return Err(AdapterError::InvalidParams(
-                        "incoming reservation does not match stored operation state".into(),
-                    ));
-                }
-                if pending.accepted.is_some() {
-                    return Ok(());
-                }
-            }
-            if Self::unix_now() >= effective_deadline {
-                return Err(AdapterError::DeadlineExceeded);
-            }
-            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
-        }
-    }
-
-    async fn claim_incoming(
-        &self,
-        accepted: &AcceptedIncoming,
+        htlc: &Htlc,
         preimage: Bytes32,
-    ) -> Result<(), AdapterError> {
-        self.claim_locked_htlc(accepted, preimage).await
+    ) -> Result<(), NetworkError> {
+        let options = self.vhtlc_options(htlc)?;
+        let txid = self.spend_vhtlc(&options, true, Some(&preimage.0)).await?;
+        info!(parent: &self.span, "claimed {}: tx {txid}", htlc.payment_hash.short());
+        Ok(())
     }
 
-    async fn claim_reserved_incoming(
+    async fn create_outgoing_htlc(
         &self,
-        reservation: &IncomingReservation,
-        preimage: Bytes32,
-    ) -> Result<(), AdapterError> {
-        let accepted = {
-            let incoming = self.incoming.lock().await;
-            let slot = incoming.get(&reservation.operation_id).ok_or_else(|| {
-                AdapterError::NotFound(format!(
-                    "no incoming Arkade reservation for operation {}",
-                    reservation.operation_id
-                ))
-            })?;
-            slot.accepted.clone().ok_or(AdapterError::Unimplemented)
-        }?;
-        self.claim_incoming(&accepted, preimage).await
-    }
-
-    async fn create_outgoing(
-        &self,
-        request: OutgoingRequest,
-    ) -> Result<OutgoingPayment, AdapterError> {
-        // Keep lock through external funding. Concurrent retries for one
-        // operation must not broadcast two VHTLCs.
-        let mut outgoing = self.outgoing.lock().await;
-        if let Some(existing) = outgoing.get(&request.operation_id) {
-            if outgoing_request_matches(existing, &request) {
-                return Ok(existing.payment.clone());
-            }
-            return Err(AdapterError::InvalidParams(
-                "operation ID is already bound to different outgoing state".into(),
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+        target: &HtlcTarget,
+    ) -> Result<HtlcDescriptor, NetworkError> {
+        let HtlcTarget::XOnlyPubKey(receiver) = target else {
+            return Err(NetworkError::invalid(
+                "arkade HTLCs are locked to an x-only key",
             ));
-        }
-        if outgoing
-            .values()
-            .any(|pending| pending.payment_hash == request.payment_hash)
-        {
-            return Err(AdapterError::Retryable(
-                "Arkade payment hash already has an active operation".into(),
-            ));
-        }
-        if request.network != self.network_id {
-            return Err(AdapterError::InvalidParams(format!(
-                "outgoing payment targets {}, not {}",
-                request.network, self.network_id
-            )));
-        }
-        let recipient = match &request.target {
-            HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
-            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
-                return Err(AdapterError::InvalidParams(
-                    "arkade requires a pubkey target".into(),
-                ))
-            }
         };
-        let amount = msat_to_sat_amount(request.amount_msat)?;
+        let amount = sat_amount(amount_msat);
         if amount < self.dust {
-            return Err(AdapterError::InvalidParams(format!(
-                "amount {} sats is below the operator's dust limit of {} sats",
+            return Err(NetworkError::invalid(format!(
+                "{} sats is below the operator's dust limit of {} sats",
                 amount.to_sat(),
                 self.dust.to_sat()
             )));
         }
-        let options =
-            self.build_options_for_outgoing(&request.payment_hash, &recipient, request.expiry)?;
-        let destination = self.script_for(&options)?.address();
-        self.span.in_scope(|| {
-            info!(
-                target: "cassis_arkade",
-                "locking htlc {}: {} sats -> {} (expiry {})",
-                request.payment_hash.short(),
-                amount.to_sat(),
-                destination.encode(),
-                request.expiry,
-            );
-        });
+        let options = self.build_options_for_outgoing(&payment_hash, receiver, expiry)?;
+        let address = self.script_for(&options)?.address();
         let txid = self
             .client
-            .send(vec![SendReceiver::bitcoin(destination, amount)])
+            .send(vec![SendReceiver::bitcoin(address, amount)])
             .await
-            .map_err(|e| AdapterError::Network(format!("lock send failed: {e}")))?;
-        self.span.in_scope(|| {
-            debug!(
-                target: "cassis_arkade",
-                "htlc locked {}: txid={txid}",
-                request.payment_hash.short()
-            );
-        });
-        let descriptor = Self::descriptor_from_options(&options);
-        let payment = OutgoingPayment {
-            operation_id: request.operation_id.clone(),
-            payment_hash: request.payment_hash,
-            amount_msat: request.amount_msat,
-            destination: request.target.clone(),
-            destination_network: request.network.clone(),
-            expiry: request.expiry,
-            descriptor,
-        };
-        outgoing.insert(
-            request.operation_id,
-            PendingOutgoing {
-                payment_hash: request.payment_hash,
-                payment: payment.clone(),
-                options,
-            },
+            .map_err(|e| NetworkError::network(format!("lock: {e}")))?;
+        info!(
+            parent: &self.span,
+            "locked {} sats for {} until {expiry}: tx {txid}",
+            amount.to_sat(),
+            payment_hash.short()
         );
-        Ok(payment)
+        Ok(Self::descriptor(&options))
     }
 
-    async fn watch_outgoing(
-        &self,
-        payment: &OutgoingPayment,
-        deadline: u64,
-    ) -> Result<Bytes32, AdapterError> {
-        let options = {
-            let outgoing = self.outgoing.lock().await;
-            let pending = outgoing.get(&payment.operation_id).ok_or_else(|| {
-                AdapterError::NotFound(format!("no outgoing operation {}", payment.operation_id))
-            })?;
-            if !outgoing_payment_matches(pending, payment) {
-                return Err(AdapterError::InvalidParams(
-                    "outgoing payment does not match stored operation state".into(),
-                ));
-            }
-            pending.options.clone()
-        };
+    async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
+        let options = self.vhtlc_options(htlc)?;
         let vhtlc = self.script_for(&options)?;
-        loop {
-            if Self::unix_now() >= deadline {
-                return Err(AdapterError::DeadlineExceeded);
-            }
-            let spent_txid = match self.outpoints_at_address(&vhtlc).await {
-                Ok(outpoints) => outpoints.iter().find_map(|outpoint| {
-                    if outpoint.is_spent {
-                        outpoint.ark_txid
-                    } else {
-                        None
-                    }
-                }),
-                Err(error) => {
-                    self.span.in_scope(|| {
-                        warn!(target: "cassis_arkade", "outgoing settlement poll failed: {error}");
-                    });
-                    None
-                }
-            };
-            if let Some(txid) = spent_txid {
-                let fetched_psbt = self
-                    .virtual_tx_psbt(txid)
-                    .await
-                    .map_err(|error| AdapterError::Network(format!("get_virtual_txs: {error}")))?;
-                match fetched_psbt.as_ref().map(Self::extract_preimage_from_psbt) {
-                    Some(Ok(Some(preimage))) => {
-                        let computed =
-                            ripemd160::Hash::hash(sha256::Hash::hash(&preimage).as_byte_array());
-                        if computed != options.preimage_hash {
-                            return Err(AdapterError::Network(format!(
-                                "revealed preimage hashes to {computed}, expected {}",
-                                options.preimage_hash
-                            )));
-                        }
-                        self.span.in_scope(|| {
-                            info!(
-                                target: "cassis_arkade",
-                                "preimage observed on {} for {}",
-                                self.network_id,
-                                payment.payment_hash.short(),
-                            );
-                        });
-                        return Ok(Bytes32(preimage));
-                    }
-                    Some(Err(message)) => {
-                        self.span.in_scope(|| {
-                            warn!(target: "cassis_arkade", "preimage extraction from {txid}: {message}");
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        let spent = self
+            .outpoints_at_address(&vhtlc)
+            .await?
+            .into_iter()
+            .find_map(|outpoint| outpoint.is_spent.then_some(outpoint.ark_txid).flatten());
+        let Some(txid) = spent else {
+            return Ok(OutgoingState::Pending);
+        };
+        let psbt = self
+            .virtual_tx_psbt(txid)
+            .await
+            .map_err(NetworkError::network)?
+            .ok_or_else(|| NetworkError::network("spending transaction not found"))?;
+        match Self::extract_preimage_from_psbt(&psbt).map_err(NetworkError::network)? {
+            Some(preimage) => Ok(OutgoingState::Claimed(Bytes32(preimage))),
+            None => Ok(OutgoingState::Refunded),
         }
     }
 
-    async fn refund_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
-        self.validate_outgoing_payment(payment)?;
-        let options = {
-            let outgoing = self.outgoing.lock().await;
-            let Some(pending) = outgoing.get(&payment.operation_id) else {
-                // Successful refund already removed state. Same-handle retry
-                // is complete.
-                return Ok(());
-            };
-            if !outgoing_payment_matches(pending, payment) {
-                return Err(AdapterError::InvalidParams(
-                    "outgoing payment does not match stored operation state".into(),
-                ));
-            }
-            pending.options.clone()
-        };
-        let vhtlc = self.script_for(&options)?;
-        let tip_time = self.tip_time().await.map_err(htlc)?;
+    async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let options = self.vhtlc_options(htlc)?;
+        let tip_time = self.tip_time().await?;
         if u64::from(options.refund_locktime) > tip_time {
-            return Err(AdapterError::Retryable(format!(
-                "timelock not reached: tip_time={tip_time} refund_locktime={}",
+            return Err(NetworkError::network(format!(
+                "refund opens at {}, chain tip is at {tip_time}",
                 options.refund_locktime
             )));
         }
-        let vtxo = self.unspent_vtxo_at(&options).await?;
-        let our_address = self.our_offchain_address().await?;
-        let refund_script = vhtlc.refund_without_receiver_script();
-        let control_block = vhtlc
-            .taproot_spend_info()
-            .control_block(&(refund_script.clone(), LeafVersion::TapScript))
-            .ok_or_else(|| AdapterError::Network("control block missing for refund leaf".into()))?;
-        let script_pubkey = vhtlc.script_pubkey();
-        let tapscripts = vhtlc.tapscripts();
-        let input = VtxoInput::new(
-            refund_script,
-            Some(absolute::LockTime::from_consensus(options.refund_locktime)),
-            control_block,
-            tapscripts,
-            script_pubkey,
-            vtxo.amount,
-            vtxo.outpoint,
-            vtxo.assets,
-        );
-        let outputs = vec![SendReceiver::bitcoin(our_address, vtxo.amount)];
-        let txid = self
-            .submit_vhtlc_spend(input, &outputs, &our_address, self.signer_with(None))
-            .await?;
-        self.span.in_scope(|| {
-            info!(
-                target: "cassis_arkade",
-                "htlc refunded {}: tx={txid}",
-                payment.payment_hash.short()
-            );
-        });
-        self.outgoing.lock().await.remove(&payment.operation_id);
+        let txid = self.spend_vhtlc(&options, false, None).await?;
+        info!(parent: &self.span, "refunded {}: tx {txid}", htlc.payment_hash.short());
         Ok(())
     }
 
-    async fn restore_outgoing(&self, payment: &OutgoingPayment) -> Result<(), AdapterError> {
-        let mut outgoing = self.outgoing.lock().await;
-        if let Some(existing) = outgoing.get(&payment.operation_id) {
-            if outgoing_payment_matches(existing, payment) {
-                return Ok(());
-            }
-            return Err(AdapterError::InvalidParams(
-                "operation ID is already bound to different outgoing state".into(),
-            ));
-        }
-        if outgoing
-            .values()
-            .any(|pending| pending.payment_hash == payment.payment_hash)
-        {
-            return Err(AdapterError::Retryable(
-                "Arkade payment hash already has an active operation".into(),
-            ));
-        }
-        let (options, _recipient) = self.validate_outgoing_payment(payment)?;
-        outgoing.insert(
-            payment.operation_id.clone(),
-            PendingOutgoing {
-                payment_hash: payment.payment_hash,
-                payment: payment.clone(),
-                options,
-            },
-        );
-        Ok(())
-    }
-
-    /// Offchain balance check: spendable VTXOs must cover routed amount.
-    async fn restore_incoming_reservation(
-        &self,
-        reservation: &IncomingReservation,
-    ) -> Result<(), AdapterError> {
-        let restored = self
-            .reserve_incoming(IncomingRequest {
-                operation_id: reservation.operation_id.clone(),
-                payment_hash: reservation.payment_hash,
-                amount_msat: reservation.amount_msat,
-                deadline: reservation.deadline,
-                preimage: None,
-            })
-            .await?;
-        if restored == *reservation {
-            Ok(())
-        } else {
-            Err(AdapterError::InvalidParams(
-                "restored Arkade reservation differs from persisted state".into(),
-            ))
-        }
-    }
-
-    async fn can_route(&self, amount_msat: u64) -> Result<(), AdapterError> {
-        let needed = msat_to_sat_amount(amount_msat)?;
+    async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
         let available = self.balance_msat().await?;
-        if needed.to_sat().saturating_mul(MSAT_PER_SAT) > available {
-            return Err(AdapterError::InvalidParams(format!(
-                "insufficient arkade balance on {}: need {available} msat, \
-                 requested {amount_msat} msat",
-                self.network_id
+        let needed = sats_for_msat(amount_msat) * MSAT_PER_SAT;
+        if available < needed {
+            return Err(NetworkError::invalid(format!(
+                "need {needed} msat, wallet has {available} msat"
             )));
         }
         Ok(())
     }
 
-    /// Operator co-signs claims, so adapter pays no native fee.
-    async fn can_claim(&self, _amount_msat: u64) -> Result<(), AdapterError> {
+    /// The operator co-signs claims for free.
+    async fn can_receive(&self, _amount_msat: u64) -> Result<(), NetworkError> {
         Ok(())
     }
 }
@@ -1676,14 +861,4 @@ fn install_rustls_crypto_provider() {
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-fn lowercase_hex_encode(bytes: &[u8]) -> String {
-    use bitcoin::hex::DisplayHex as _;
-    bytes.to_lower_hex_string()
-}
-
-fn lowercase_hex_decode(hex: &str) -> Option<Vec<u8>> {
-    use bitcoin::hex::FromHex as _;
-    Vec::<u8>::from_hex(hex).ok()
 }

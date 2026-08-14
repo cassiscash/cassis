@@ -10,42 +10,24 @@ use tracing_subscriber::{fmt, EnvFilter};
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 
-const CONTEXTS: &[(&str, &str, &str)] = &[
-    ("iroh_server", "\x1b[34m", "iroh server"),
-    ("iroh_client", "\x1b[32m", "iroh client"),
-    ("nostr", "\x1b[33m", "nostr"),
-    ("cassisd", "\x1b[36m", "cassisd"),
-    ("cassis_router", "\x1b[36m", "router"),
-    ("cassis_cli", "\x1b[35m", "cassis-cli"),
-    ("cassis_client", "\x1b[33m", "cassis-client"),
-    ("cassis_rootstock", "\x1b[91m", "rootstock"),
-    ("cassis_cashu", "\x1b[94m", "cashu"),
-];
-
-const OUR_TARGETS: &[&str] = &[
-    "iroh_server",
-    "iroh_client",
-    "nostr",
-    "cassisd",
-    "cassis_router",
+/// Crates whose logs are shown at `debug` by default; everything else
+/// only from `warn`. `RUST_LOG` overrides this.
+const OUR_CRATES: &[&str] = &[
+    "cassis_core",
     "cassis_cli",
-    "cassis_client",
-    // Network adapters. Without these the per-network logs (HTLC
-    // lock/claim, preimage reveal) fall under the `warn` default and
-    // are silently dropped everywhere except the playground, which
-    // installs no filter at all.
-    "cassis_rootstock",
+    "cassis_arkade",
+    "cassis_bitcoin",
     "cassis_cashu",
+    "cassis_fedimint",
+    "cassis_liquid",
+    "cassis_lnd",
+    "cassis_rootstock",
 ];
 
 pub fn init_logging() {
-    let default_filter = {
-        let mut f = "warn".to_string();
-        for t in OUR_TARGETS {
-            f.push_str(&format!(",{t}=debug"));
-        }
-        f
-    };
+    let default_filter = OUR_CRATES.iter().fold("warn".to_string(), |filter, krate| {
+        format!("{filter},{krate}=debug")
+    });
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     tracing_subscriber::registry()
@@ -55,6 +37,23 @@ pub fn init_logging() {
         .with(ScopeLayer)
         .with(fmt::layer().event_format(CassisFormatter))
         .init();
+}
+
+/// `cassis_core::node::router` renders as `core::router`, in a color
+/// picked from the crate name.
+fn context(target: &str) -> (&'static str, String) {
+    const COLORS: &[&str] = &[
+        "\x1b[34m", "\x1b[32m", "\x1b[33m", "\x1b[36m", "\x1b[35m", "\x1b[91m", "\x1b[94m",
+    ];
+    let mut segments = target.split("::");
+    let krate = segments.next().unwrap_or(target);
+    let module = segments.last();
+    let name = krate.strip_prefix("cassis_").unwrap_or(krate);
+    let color = COLORS[krate.bytes().map(usize::from).sum::<usize>() % COLORS.len()];
+    match module {
+        Some(module) => (color, format!("{name}::{module}")),
+        None => (color, name.to_string()),
+    }
 }
 
 struct CassisFormatter;
@@ -70,12 +69,7 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
-        let target = event.metadata().target();
-        let (color, display) = CONTEXTS
-            .iter()
-            .find(|(t, _, _)| *t == target)
-            .map(|(_, c, d)| (*c, *d))
-            .unwrap_or(("", target));
+        let (color, display) = context(event.metadata().target());
         let level = *event.metadata().level();
         let level_color = match level {
             tracing::Level::ERROR => "\x1b[31m",

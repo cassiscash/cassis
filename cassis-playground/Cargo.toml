@@ -16,27 +16,19 @@ name = "cassis-prefund"
 path = "src/bin/prefund.rs"
 
 [dependencies]
-cassis-client = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock", "bitcoin"] }
-cassis-routing = { workspace = true }
-cassis-core = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock", "bitcoin"] }
-cassis-keys = { workspace = true }
-cassis-router = { workspace = true, features = ["cashu", "arkade", "liquid", "rootstock", "bitcoin"] }
+cassis-core = { workspace = true, features = ["node"] }
 cassis-cashu = { workspace = true }
 cassis-arkade = { workspace = true }
 cassis-bitcoin = { workspace = true }
 cassis-liquid = { workspace = true }
 cassis-rootstock = { workspace = true }
+iroh = { workspace = true }
 ritualistic = { workspace = true }
-cdk = { workspace = true }
-lowercase-hex = { workspace = true }
-minisqlite = { workspace = true }
 rustyline = { workspace = true }
 sha2 = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "process", "time", "io-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-cassis-core = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }

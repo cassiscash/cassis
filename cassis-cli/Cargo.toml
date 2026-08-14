@@ -4,62 +4,28 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
-cashu = ["dep:cassis-cashu", "dep:cdk", "cassis-router/cashu", "cassis-core/cashu"]
-fedimint = ["dep:cassis-fedimint", "cassis-client/fedimint", "cassis-router/fedimint"]
-arkade = ["dep:cassis-arkade", "cassis-client/arkade", "cassis-router/arkade", "cassis-core/arkade"]
-liquid = ["dep:cassis-liquid", "cassis-client/liquid", "cassis-router/liquid", "cassis-core/liquid"]
-rootstock = ["dep:cassis-rootstock", "cassis-router/rootstock", "cassis-core/rootstock"]
-lightning = ["dep:cassis-lnd", "cassis-client/lightning", "cassis-router/lightning", "cassis-core/lightning"]
+default = ["arkade", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
+arkade = ["dep:cassis-arkade"]
+bitcoin = ["dep:cassis-bitcoin"]
+cashu = ["dep:cassis-cashu"]
+fedimint = ["dep:cassis-fedimint"]
+lightning = ["dep:cassis-lnd"]
+liquid = ["dep:cassis-liquid"]
+rootstock = ["dep:cassis-rootstock"]
 
 [dependencies]
-cassis-client = { workspace = true }
-cassis-core = { workspace = true }
-cassis-iroh = { workspace = true }
-cassis-keys = { workspace = true }
-cassis-router = { workspace = true }
-cassis-routing = { workspace = true }
+cassis-core = { workspace = true, features = ["node"] }
 clap = { workspace = true }
-rand = { workspace = true }
-sha2 = { workspace = true }
-futures = { workspace = true }
-iroh = { workspace = true }
-lowercase-hex = { workspace = true }
 minisqlite = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
-base64 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = { workspace = true }
 
-[dependencies.cassis-cashu]
-workspace = true
-optional = true
-
-# Used by the cashu wallet subcommands to encode / decode
-# NUT-00 tokens via `cdk::nuts::Token`. Same version
-# `cassis-cashu` pulls in transitively.
-[dependencies.cdk]
-workspace = true
-optional = true
-
-[dependencies.cassis-fedimint]
-workspace = true
-optional = true
-
-[dependencies.cassis-arkade]
-workspace = true
-optional = true
-
-[dependencies.cassis-liquid]
-workspace = true
-optional = true
-
-[dependencies.cassis-rootstock]
-workspace = true
-optional = true
-
-[dependencies.cassis-lnd]
-workspace = true
-optional = true
+cassis-arkade = { workspace = true, optional = true }
+cassis-bitcoin = { workspace = true, optional = true }
+cassis-cashu = { workspace = true, optional = true }
+cassis-fedimint = { workspace = true, optional = true }
+cassis-liquid = { workspace = true, optional = true }
+cassis-lnd = { workspace = true, optional = true }
+cassis-rootstock = { workspace = true, optional = true }

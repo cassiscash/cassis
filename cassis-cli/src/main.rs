@@ -1,611 +1,384 @@
-//! Thin CLI over `cassis-client`. Each command delegates the heavy
-//! lifting (adapter building, invoice persistence, route lookup, pay
-//! payment execution, receive daemon) to `cassis-client` so the GUI and the
-//! CLI share exactly the same logic. The seed is generated on first
-//! use: any command that needs keys initializes the home directory's
-//! seed automatically when it is missing.
+//! `cassis-cli`: one Cassis node, living in a home directory (see
+//! [`home`]). It pays, receives, routes between its networks, and
+//! manages each network's funds under a subcommand of its own. Each
+//! network is compiled in by the cargo feature of the same name.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+#[cfg(not(any(
+    feature = "arkade",
+    feature = "bitcoin",
+    feature = "cashu",
+    feature = "fedimint",
+    feature = "lightning",
+    feature = "liquid",
+    feature = "rootstock"
+)))]
+compile_error!("cassis-cli needs at least one network feature, e.g. `--features cashu`");
 
-use cassis_client::adapters::{build_adapters_with_config, AdapterConfig};
-use cassis_client::netspec::NetSpec;
-use cassis_client::ops::{
-    create_invoice_with_adapter, node_store_path, start_receive_with_config, unix_now,
+mod home;
+mod wallets;
+
+use cassis_core::node::{
+    create_invoice, HopRecord, InvoiceRecord, Node, NodeConfig, PaymentRecord, RoutingPolicy,
 };
-use cassis_client::paths::{cassis_home, set_home_override, store_path};
-use cassis_client::seed_store::{read_mnemonic, seed_path, write_mnemonic};
-use cassis_client::store::{InvoiceStatus, Store};
-use cassis_client::CassisClient;
-use cassis_core::{Bytes32, Invoice, NetworkAdapter, NetworkId};
-use cassis_keys as keys;
-use clap::Parser;
-use tracing::{error, info, info_span};
+use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS};
+use cassis_core::{unix_now, Invoice, NetworkId};
+use clap::{Parser, Subcommand};
+use home::Home;
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::{info, info_span, Span};
 
-mod arkade;
-mod cashu;
-mod cli;
-mod fedimint;
-mod liquid;
-mod rootstock;
-use cli::{Cli, Commands};
+#[derive(Parser)]
+#[command(name = "cassis-cli", about = "Cassis node: pay, receive, route")]
+struct Cli {
+    /// Node directory. Defaults to `$CASSIS_HOME`, else `~/.cassis`.
+    #[arg(long, global = true, value_name = "DIR")]
+    home: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print the seed phrase.
+    Seed,
+    /// Print the node identity and its networks.
+    Info,
+    /// Add networks this node participates in, e.g. `cashu::mint.host`,
+    /// `liquid`, `arkade::mutinynet`, `lightning`.
+    Enable {
+        #[arg(required = true)]
+        networks: Vec<String>,
+        /// LND REST URL, when enabling `lightning`.
+        #[arg(long)]
+        lnd_rest_url: Option<String>,
+        #[arg(long)]
+        lnd_tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        lnd_macaroon: Option<PathBuf>,
+    },
+    /// Remove networks from this node.
+    Disable {
+        #[arg(required = true)]
+        networks: Vec<String>,
+    },
+    /// Run the node until interrupted: claim payments to its invoices,
+    /// settle and refund its HTLCs, and with `--route` route between
+    /// its networks.
+    Run {
+        #[arg(long)]
+        route: bool,
+        #[arg(long, default_value_t = 1000)]
+        fee_base_msat: u64,
+        #[arg(long, default_value_t = 500)]
+        fee_ppm: u64,
+        #[arg(long = "nostr-relay", value_name = "URL")]
+        nostr_relays: Vec<String>,
+    },
+    /// Create an invoice. A running node (`run`) claims it when paid.
+    Invoice {
+        #[arg(long)]
+        amount_msat: u64,
+        /// Networks it can be paid on; all of the node's by default.
+        #[arg(long = "network")]
+        networks: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, default_value_t = 3600)]
+        expires_in: u64,
+        /// Serve the node here until the invoice is paid or expires.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Pay an invoice (JSON) from one of this node's networks.
+    Pay {
+        #[arg(long)]
+        invoice: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long = "nostr-relay", value_name = "URL")]
+        nostr_relays: Vec<String>,
+    },
+    /// Show the cheapest announced route between two networks.
+    Route {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount_msat: u64,
+        #[arg(long = "nostr-relay", value_name = "URL")]
+        nostr_relays: Vec<String>,
+    },
+    /// List the invoices this node issued.
+    Invoices,
+    /// List the payments this node made.
+    Payments,
+    /// List the hops this node routed.
+    Hops,
+    #[command(flatten)]
+    Wallet(wallets::Command),
+}
 
 #[tokio::main]
 async fn main() {
     cassis_core::logging::init_logging();
-    if let Err(e) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        eprintln!("failed to install rustls provider: {e:?}");
-        std::process::exit(2);
-    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
-    if let Some(home) = cli.home.as_deref() {
-        set_home_override(PathBuf::from(home));
-    }
-    let adapter_config = AdapterConfig::default();
-    let result: Result<(), String> = match cli.command {
-        Commands::Pay {
-            invoice,
-            from,
-            nostr_relay,
-        } => cmd_pay(invoice, from, nostr_relay, &adapter_config).await,
-        Commands::Invoice {
-            amount,
-            network,
-            description,
-            expires_at,
-            wait,
-            timeout,
-        } => {
-            cmd_invoice(
-                amount,
-                network,
-                description,
-                expires_at,
-                wait,
-                timeout,
-                &adapter_config,
-            )
-            .await
-        }
-        Commands::Receive => cmd_receive(&adapter_config).await,
-        Commands::Watch => cmd_watch(&adapter_config).await,
-        Commands::Invoices { command } => match command {
-            cli::InvoicesCommands::List { status } => cmd_invoices_list(status),
-            cli::InvoicesCommands::Show { payment_hash } => cmd_invoices_show(payment_hash),
-        },
-        Commands::Route {
-            destination_pubkey,
-            amount,
-            from,
-            nostr_relay,
-        } => cmd_route(destination_pubkey, amount, from, nostr_relay).await,
-        Commands::Node { command } => match command {
-            cli::NodeCommands::Info => {
-                println!("node info: use `cassis-cli seed show` and `cassis-cli invoices list`");
-                Ok(())
-            }
-        },
-        Commands::Seed { command } => match command {
-            cli::SeedCommands::Show => cmd_seed_show(),
-        },
-        Commands::Cashu { command } => cashu::run(command),
-        #[cfg(feature = "arkade")]
-        Commands::Arkade { command, network } => arkade::run(network, command).await,
-        #[cfg(not(feature = "arkade"))]
-        Commands::Arkade { .. } => {
-            Err("'cassis-cli arkade' requires building with the 'arkade' feature".to_string())
-        }
-        #[cfg(feature = "liquid")]
-        Commands::Liquid { command, network } => liquid::run(network, command).await,
-        #[cfg(not(feature = "liquid"))]
-        Commands::Liquid { .. } => {
-            Err("'cassis-cli liquid' requires building with the 'liquid' feature".to_string())
-        }
-        Commands::Register { network } => cmd_register(network),
-        Commands::Lnd {
-            lnd_rest_url,
-            lnd_tls_cert,
-            lnd_macaroon,
-            command,
-        } => cmd_lnd(lnd_rest_url, lnd_tls_cert, lnd_macaroon, command).await,
-        Commands::Rootstock { network, command } => rootstock::run(network, command).await,
-        Commands::Fedimint { network, command } => fedimint::run(network, command).await,
-        Commands::Router { .. } => {
-            Err("'router' is now integrated into the GUI; run `cargo run -p cassis-gui`".into())
-        }
-    };
-    if let Err(e) = result {
-        error!("{e}");
+    if let Err(error) = run(cli).await {
+        eprintln!("error: {error}");
         std::process::exit(1);
     }
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn node_home() -> PathBuf {
-    cassis_home()
+async fn run(cli: Cli) -> Result<(), String> {
+    let home = Home::open(cli.home)?;
+    let span = info_span!("node", node = "cassis");
+    match cli.command {
+        Command::Seed => println!("{}", home.mnemonic()?),
+        Command::Info => {
+            println!("node pubkey: {}", home.keys.node.pubkey().to_hex());
+            println!("networks:");
+            for network in home.networks()? {
+                println!("  {network}");
+            }
+        }
+        Command::Enable {
+            networks,
+            lnd_rest_url,
+            lnd_tls_cert,
+            lnd_macaroon,
+        } => {
+            let mut enabled = home.networks()?;
+            for spec in &networks {
+                let network = NetworkId::parse(spec)?;
+                if network.kind() == "lightning" {
+                    configure_lnd(
+                        &home,
+                        lnd_rest_url.clone(),
+                        lnd_tls_cert.clone(),
+                        lnd_macaroon.clone(),
+                    )?;
+                }
+                // Fail early on networks this binary cannot open.
+                home.open_network(&network, &span).await?;
+                if !enabled.contains(&network) {
+                    enabled.push(network);
+                }
+            }
+            home.set_networks(&enabled)?;
+        }
+        Command::Disable { networks } => {
+            let remove = networks
+                .iter()
+                .map(|spec| NetworkId::parse(spec))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut enabled = home.networks()?;
+            enabled.retain(|network| !remove.contains(network));
+            home.set_networks(&enabled)?;
+        }
+        Command::Run {
+            route,
+            fee_base_msat,
+            fee_ppm,
+            nostr_relays,
+        } => {
+            let node = serve(&home, &span).await?;
+            if route {
+                node.start_routing(RoutingPolicy {
+                    fee_base_msat,
+                    fee_ppm,
+                    nostr_relays: relays(nostr_relays),
+                    ..RoutingPolicy::default()
+                });
+            }
+            info!("running as {}; Ctrl-C to stop", node.iroh_peer_id());
+            tokio::signal::ctrl_c().await.ok();
+        }
+        Command::Invoice {
+            amount_msat,
+            networks,
+            description,
+            expires_in,
+            wait,
+        } => {
+            let networks = if networks.is_empty() {
+                home.networks()?
+            } else {
+                networks
+                    .iter()
+                    .map(|spec| NetworkId::parse(spec))
+                    .collect::<Result<_, _>>()?
+            };
+            let expires_at = unix_now() + expires_in;
+            let invoice = if wait {
+                let node = serve(&home, &span).await?;
+                node.create_invoice(&networks, amount_msat, expires_at, description)
+                    .await?
+            } else {
+                let opened = home.open_networks(&networks, &span).await?;
+                create_invoice(
+                    &home.store,
+                    &home.keys,
+                    None,
+                    &opened,
+                    amount_msat,
+                    expires_at,
+                    description,
+                )
+                .await?
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&invoice).map_err(|e| e.to_string())?
+            );
+            if wait {
+                wait_for_claim(&home, &invoice).await?;
+            }
+        }
+        Command::Pay {
+            invoice,
+            from,
+            nostr_relays,
+        } => {
+            let invoice: Invoice =
+                serde_json::from_str(&invoice).map_err(|e| format!("invalid invoice: {e}"))?;
+            let from = NetworkId::parse(&from)?;
+            let sender = home.open_network(&from, &span).await?;
+            let node = Node::start(
+                NodeConfig {
+                    keys: home.keys.clone(),
+                    store: home.store.clone(),
+                    span,
+                    serve: false,
+                },
+                vec![sender],
+            )
+            .await?;
+            let preimage = node.pay(&invoice, &from, &relays(nostr_relays)).await?;
+            println!("paid; preimage {preimage}");
+        }
+        Command::Route {
+            from,
+            to,
+            amount_msat,
+            nostr_relays,
+        } => {
+            let announcements = routing::fetch_announcements(&relays(nostr_relays)).await?;
+            let route = routing::find_route(
+                &announcements,
+                &NetworkId::parse(&from)?,
+                &NetworkId::parse(&to)?,
+                amount_msat,
+            )?;
+            let plan = routing::plan_route(&route, amount_msat, 0, 0)?;
+            println!("{} msat over {} hop(s)", plan.amounts[0], route.len());
+            for (i, hop) in route.iter().enumerate() {
+                println!(
+                    "  {}: {} -> {} via {} (forwards {} msat)",
+                    i + 1,
+                    hop.from,
+                    hop.to,
+                    hop.node_pubkey.to_hex(),
+                    plan.amounts[i + 1]
+                );
+            }
+        }
+        Command::Invoices => {
+            for record in home.store.list::<InvoiceRecord>("invoices")? {
+                println!(
+                    "{} {:>12} msat {:?} expires {}",
+                    record.invoice.payment_hash,
+                    record.invoice.amount_msat,
+                    record.status,
+                    record.invoice.expires_at
+                );
+            }
+        }
+        Command::Payments => {
+            for record in home.store.list::<PaymentRecord>("payments")? {
+                println!(
+                    "{} {:>12} msat on {} {:?}",
+                    record.invoice.payment_hash,
+                    record.htlc.amount_msat,
+                    record.network,
+                    record.status
+                );
+            }
+        }
+        Command::Hops => {
+            for record in home.store.list::<HopRecord>("hops")? {
+                println!(
+                    "{} {} -> {} {:>12} msat {:?}",
+                    record.prepare.payment_hash,
+                    record.prepare.incoming_network,
+                    record.prepare.outgoing_network,
+                    record.prepare.amount_msat,
+                    record.state
+                );
+            }
+        }
+        Command::Wallet(command) => wallets::run(&home, command, &span).await?,
+    }
+    Ok(())
 }
 
-fn open_store() -> Result<Store, String> {
-    Store::open(&store_path()).map_err(|e| e.to_string())
+/// Start the node, serving under its identity, with all its networks.
+async fn serve(home: &Home, span: &Span) -> Result<Node, String> {
+    let networks = home.open_networks(&home.networks()?, span).await?;
+    if networks.is_empty() {
+        return Err("no networks enabled; see `cassis-cli enable`".into());
+    }
+    Node::start(
+        NodeConfig {
+            keys: home.keys.clone(),
+            store: home.store.clone(),
+            span: span.clone(),
+            serve: true,
+        },
+        networks,
+    )
+    .await
 }
 
-fn derive_for(mnemonic: &str, specs: &[NetSpec]) -> Result<keys::DerivedKeys, String> {
-    let ids: Vec<NetworkId> = specs.iter().map(|s| s.network_id()).collect();
-    keys::derive_keys(mnemonic, ids).map_err(|e| e.to_string())
+async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
+    let key = invoice.payment_hash.to_string();
+    loop {
+        let record: InvoiceRecord = home
+            .store
+            .get("invoices", &key)?
+            .ok_or("invoice disappeared")?;
+        match record.status {
+            cassis_core::node::InvoiceStatus::Claimed => {
+                println!("claimed");
+                return Ok(());
+            }
+            cassis_core::node::InvoiceStatus::Expired => return Err("invoice expired".into()),
+            cassis_core::node::InvoiceStatus::Pending => {
+                tokio::time::sleep(Duration::from_secs(1)).await
+            }
+        }
+    }
 }
 
-/// Shared adapter configuration for the non-LND commands: no LND
-/// connection is available outside the `lnd` subcommand, so a
-/// `lightning`-network request through the generic commands fails with
-/// a clear configuration error when the adapter is built.
-///
-/// Everything LND-specific lives in the `lnd` subcommand; later
-/// backends (`cln`, `phoenixd`) implement the same `lightning`
-/// network spec with their own per-backend configuration.
-async fn cmd_lnd(
-    lnd_rest_url: Option<String>,
-    lnd_tls_cert: Option<String>,
-    lnd_macaroon: Option<String>,
-    command: cli::LndCommands,
+fn relays(relays: Vec<String>) -> Vec<String> {
+    if relays.is_empty() {
+        DEFAULT_NOSTR_RELAYS.iter().map(|r| r.to_string()).collect()
+    } else {
+        relays
+    }
+}
+
+#[allow(unused_variables)]
+fn configure_lnd(
+    home: &Home,
+    rest_url: Option<String>,
+    tls_cert: Option<PathBuf>,
+    macaroon: Option<PathBuf>,
 ) -> Result<(), String> {
     #[cfg(feature = "lightning")]
-    {
-        let rest_url = lnd_rest_url.ok_or_else(|| {
-            "'lnd' requires --lnd-rest-url, e.g. https://127.0.0.1:8080".to_string()
-        })?;
-        let adapter_config = AdapterConfig {
-            lnd: Some(cassis_lnd::LndConfig::new(
-                rest_url,
-                lnd_tls_cert.as_deref().map(PathBuf::from),
-                lnd_macaroon.as_deref().map(PathBuf::from),
-            )),
-        };
-        match command {
-            cli::LndCommands::Pay {
-                invoice,
-                from,
-                nostr_relay,
-            } => cmd_pay(invoice, from, nostr_relay, &adapter_config).await,
-            cli::LndCommands::Invoice {
-                amount,
-                network,
-                description,
-                expires_at,
-                wait,
-                timeout,
-            } => {
-                cmd_invoice(
-                    amount,
-                    network,
-                    description,
-                    expires_at,
-                    wait,
-                    timeout,
-                    &adapter_config,
-                )
-                .await
-            }
-            cli::LndCommands::Receive => cmd_receive(&adapter_config).await,
-            cli::LndCommands::Watch => cmd_watch(&adapter_config).await,
-        }
-    }
-    #[cfg(not(feature = "lightning"))]
-    {
-        let _ = (lnd_rest_url, lnd_tls_cert, lnd_macaroon, command);
-        Err("'cassis-cli lnd' requires building with the 'lightning' feature".to_string())
-    }
-}
-
-// ============================================================================
-// seed show (auto-init)
-// ============================================================================
-
-/// Read the home directory's seed, generating and persisting a fresh
-/// 12-word mnemonic when the seed file does not exist yet. Every
-/// command that needs keys funnels through here, so a fresh home is
-/// usable without a separate init step.
-fn read_or_init_mnemonic() -> Result<String, String> {
-    let home = node_home();
-    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-    let p = seed_path(&home);
-    if !p.exists() {
-        let mn = keys::generate_mnemonic().map_err(|e| e.to_string())?;
-        write_mnemonic(&p, &mn, true).map_err(|e| e.to_string())?;
-        println!("generated new seed at {}", p.display());
-        println!("backup this phrase — losing it means losing access to all derived keys.");
-    }
-    read_mnemonic(&p).map_err(|e| e.to_string())
-}
-
-fn cmd_seed_show() -> Result<(), String> {
-    let mn = read_or_init_mnemonic()?;
-    println!("{mn}");
-    Ok(())
-}
-
-// ============================================================================
-// register
-// ============================================================================
-
-fn cmd_register(specs: Vec<String>) -> Result<(), String> {
-    if specs.is_empty() {
-        return Err("at least one --network spec is required".to_string());
-    }
-    let mut store = open_store()?;
-    std::fs::create_dir_all(node_home()).map_err(|e| e.to_string())?;
-    let mut existing: Vec<String> = load_registered_networks(&mut store)?;
-    for raw in specs {
-        let parsed = NetSpec::parse(&raw)?;
-        let id = parsed.network_id().0;
-        if !existing.iter().any(|e| e == &id) {
-            existing.push(id);
-        }
-    }
-    save_registered_networks(&mut store, &existing)?;
-    println!("registered networks:");
-    for e in &existing {
-        println!("  - {e}");
+    if let Some(rest_url) = rest_url {
+        home.set_lnd_config(&cassis_lnd::LndConfig::new(rest_url, tls_cert, macaroon))?;
     }
     Ok(())
-}
-
-fn load_registered_networks(store: &mut Store) -> Result<Vec<String>, String> {
-    use cassis_client::store::SqlValue;
-    store
-        .conn()
-        .execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")
-        .map_err(|e| e.to_string())?;
-    let result = store
-        .conn()
-        .query("SELECT value FROM meta WHERE key='networks';")
-        .map_err(|e| e.to_string())?;
-    let raw = match result.rows.first().and_then(|r| r.first()) {
-        Some(SqlValue::Text(s)) => s.clone(),
-        _ => return Ok(Vec::new()),
-    };
-    Ok(raw
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect())
-}
-
-fn save_registered_networks(store: &mut Store, networks: &[String]) -> Result<(), String> {
-    let joined = networks.join("\n");
-    let escaped = joined.replace('\'', "''");
-    store
-        .conn()
-        .execute(&format!(
-            "INSERT INTO meta(key, value) VALUES('networks', '{escaped}') \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
-        ))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-// ============================================================================
-// pay
-// ============================================================================
-
-async fn cmd_pay(
-    invoice: String,
-    from: String,
-    nostr_relay: Vec<String>,
-    adapter_config: &AdapterConfig,
-) -> Result<(), String> {
-    let invoice_struct: Invoice =
-        serde_json::from_str(&invoice).map_err(|e| format!("invalid invoice JSON: {e}"))?;
-    let sender_network = NetworkId(from.clone());
-    if invoice_struct.networks.is_empty() {
-        return Err("invoice has no network hints".to_string());
-    }
-    let relays = if nostr_relay.is_empty() {
-        cli::default_nostr_relays()
-    } else {
-        nostr_relay
-    };
-    // Build sender adapter from --from, not invoice destination. Cross-network
-    // routes need sender network available locally.
-    let sender_spec = NetSpec::parse(&from)?;
-    let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, std::slice::from_ref(&sender_spec))?;
-    let adapters = build_adapters_with_config(
-        &[sender_spec],
-        &derived,
-        &node_store_path(&node_home()),
-        info_span!("node", node = "cassis-cli"),
-        adapter_config,
-    )
-    .await?;
-    let client = CassisClient::with_store_path(adapters, relays, store_path()).await;
-    info!(
-        "paying {} msat via '{}' route",
-        invoice_struct.amount_msat, from
-    );
-    let result = client
-        .pay(invoice_struct, sender_network)
-        .await
-        .map_err(|e| format!("pay: {e}"))?;
-    match result.status {
-        cassis_core::PaymentStatus::Completed => println!("status: completed"),
-        cassis_core::PaymentStatus::Refunded => println!("status: refunded"),
-        cassis_core::PaymentStatus::Failed => println!("status: failed"),
-    }
-    Ok(())
-}
-
-async fn cmd_watch(adapter_config: &AdapterConfig) -> Result<(), String> {
-    let pending = {
-        let mut store = open_store()?;
-        store.list_pending_outgoing().map_err(|e| e.to_string())?
-    };
-    if pending.is_empty() {
-        println!("no pending outgoing HTLCs");
-        return Ok(());
-    }
-
-    let mut specs = Vec::new();
-    for row in &pending {
-        let spec = NetSpec::parse(&row.sender_network.0)?;
-        if !specs
-            .iter()
-            .any(|existing: &NetSpec| existing.network_id() == spec.network_id())
-        {
-            specs.push(spec);
-        }
-    }
-    let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, &specs)?;
-    let adapters = build_adapters_with_config(
-        &specs,
-        &derived,
-        &node_store_path(&node_home()),
-        info_span!("node", node = "cassis-cli"),
-        adapter_config,
-    )
-    .await?;
-    let client =
-        CassisClient::with_store_path(adapters, cli::default_nostr_relays(), store_path()).await;
-    client.watch_pending().await
-}
-
-// ============================================================================
-// invoice
-// ============================================================================
-
-#[allow(clippy::too_many_arguments)] // clap-bound flags, CLI glue
-async fn cmd_invoice(
-    amount: u64,
-    network: String,
-    _description: Option<String>,
-    expires_at: Option<u64>,
-    wait: bool,
-    timeout: u64,
-    adapter_config: &AdapterConfig,
-) -> Result<(), String> {
-    let spec = NetSpec::parse(&network)?;
-    let network_id = spec.network_id();
-    let expiry = expires_at.unwrap_or(unix_now() + 600);
-    let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let adapters = build_adapters_with_config(
-        std::slice::from_ref(&spec),
-        &derived,
-        &node_store_path(&node_home()),
-        info_span!("node", node = "cassis-cli"),
-        adapter_config,
-    )
-    .await?;
-    let adapter = adapters
-        .get(&network_id)
-        .cloned()
-        .ok_or_else(|| format!("network adapter missing for {network_id}"))?;
-    let (invoice, payment_hash, preimage) = create_invoice_with_adapter(
-        &node_home(),
-        adapter.as_ref(),
-        network_id.clone(),
-        amount,
-        expiry,
-    )
-    .await?;
-    let adapter_map: Arc<HashMap<NetworkId, Arc<dyn NetworkAdapter>>> = Arc::new(adapters);
-    println!("payment_hash: {payment_hash}");
-    println!("preimage:     {}", lowercase_hex::encode(preimage));
-    println!("network:      {network_id}");
-    println!("amount_msat:  {amount}");
-    println!("expires_at:   {expiry}");
-    println!("status:       pending (persisted)");
-    if let Ok(json) = serde_json::to_string(&invoice) {
-        println!("invoice_json: {json}");
-    }
-    if !wait {
-        return Ok(());
-    }
-    info!("waiting for COMMIT or upstream fund (timeout={timeout}s)...");
-    let now = unix_now();
-    let deadline = now.saturating_add(timeout);
-    let Some(adapter) = adapter_map.get(&network_id) else {
-        return Ok(());
-    };
-    let handle = {
-        let mut store = open_store()?;
-        store
-            .list_invoice_handles()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|handle| handle.invoice.payment_hash == payment_hash)
-    };
-    if let Some(handle) = handle {
-        if adapter
-            .watch_incoming(&handle.reservation, deadline)
-            .await
-            .is_ok()
-        {
-            match adapter
-                .claim_reserved_incoming(&handle.reservation, Bytes32(preimage))
-                .await
-            {
-                Ok(()) => {
-                    let mut store = open_store()?;
-                    store
-                        .mark_status(&payment_hash, InvoiceStatus::Claimed)
-                        .map_err(|e| e.to_string())?;
-                    println!("status:       claimed");
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "reservation claim unavailable; use receive daemon/COMMIT: {error}"
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-// ============================================================================
-// receive
-// ============================================================================
-
-async fn cmd_receive(adapter_config: &AdapterConfig) -> Result<(), String> {
-    let home = node_home();
-    let mut store = open_store()?;
-    let registered = load_registered_networks(&mut store)?;
-    if registered.is_empty() {
-        return Err(
-            "no networks registered; run `cassis-cli register --network <spec>` first".to_string(),
-        );
-    }
-    let specs: Vec<NetSpec> = registered
-        .iter()
-        .map(|raw| NetSpec::parse(raw))
-        .collect::<Result<Vec<_>, _>>()?;
-    info!(
-        "receive: {} network(s) listening; pending invoices will be claimed",
-        specs.len()
-    );
-    let _jh = start_receive_with_config(
-        &home,
-        &specs,
-        info_span!("node", node = "cassis-cli"),
-        adapter_config,
-    )
-    .await?;
-    println!("receive: ready (cassis_client::start_receive spawned the iroh listener)");
-    tokio::signal::ctrl_c().await.ok();
-    info!("shutting down");
-    Ok(())
-}
-
-// ============================================================================
-// route
-// ============================================================================
-
-async fn cmd_route(
-    destination_pubkey: String,
-    amount: u64,
-    from: String,
-    nostr_relay: Vec<String>,
-) -> Result<(), String> {
-    let from = NetworkId(from);
-    let to = NetworkId(destination_pubkey);
-    let relays = if nostr_relay.is_empty() {
-        cli::default_nostr_relays()
-    } else {
-        nostr_relay
-    };
-    let hops = cassis_client::find_route(&relays, &to, amount, &from)
-        .await
-        .map_err(|e| e.to_string())?;
-    println!("route found ({} hop(s)):", hops.len());
-    for (i, hop) in hops.iter().enumerate() {
-        println!(
-            "  hop {}: {} | {} -> {}",
-            i + 1,
-            hop.node.node_pubkey,
-            hop.incoming.0,
-            hop.outgoing.0,
-        );
-    }
-    Ok(())
-}
-
-// ============================================================================
-// invoices list / show
-// ============================================================================
-
-fn cmd_invoices_list(status_str: Option<String>) -> Result<(), String> {
-    let mut store = open_store()?;
-    let status = match status_str.as_deref() {
-        None => None,
-        Some("pending") => Some(InvoiceStatus::Pending),
-        Some("claimed") => Some(InvoiceStatus::Claimed),
-        Some("failed") => Some(InvoiceStatus::Failed),
-        Some(other) => return Err(format!("unknown status filter '{other}'")),
-    };
-    let rows = store.list(status).map_err(|e| e.to_string())?;
-    if rows.is_empty() {
-        println!("(no invoices)");
-        return Ok(());
-    }
-    println!(
-        "{:<66} {:>12}  {:<10}  {:<8}  created_at",
-        "payment_hash", "amount_msat", "network", "status"
-    );
-    for r in &rows {
-        println!(
-            "{:<66} {:>12}  {:<10}  {:<8}  {}",
-            r.payment_hash.to_string(),
-            r.amount_msat,
-            r.network_id.0,
-            r.status.as_str(),
-            r.created_at,
-        );
-    }
-    Ok(())
-}
-
-fn cmd_invoices_show(payment_hash_str: String) -> Result<(), String> {
-    let ph = parse_payment_hash(&payment_hash_str)?;
-    let mut store = open_store()?;
-    let row = store.get(&ph).map_err(|e| e.to_string())?;
-    println!("payment_hash: {}", row.payment_hash);
-    println!("preimage:     {}", lowercase_hex::encode(row.preimage));
-    println!("amount_msat:  {}", row.amount_msat);
-    println!("network:      {}", row.network_id);
-    println!("node_pubkey: {}", row.node_pubkey.as_deref().unwrap_or("-"));
-    println!(
-        "description:  {}",
-        row.description.as_deref().unwrap_or("-")
-    );
-    println!("expires_at:   {}", row.expires_at);
-    println!("status:       {}", row.status.as_str());
-    println!("created_at:   {}", row.created_at);
-    println!(
-        "claimed_at:   {}",
-        row.claimed_at
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string())
-    );
-    Ok(())
-}
-
-fn parse_payment_hash(s: &str) -> Result<Bytes32, String> {
-    let s = s.trim();
-    if s.len() != 64 {
-        return Err(format!(
-            "payment hash must be 64 hex chars, got {}",
-            s.len()
-        ));
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        let hex = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
-        out[i] = u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-    }
-    Ok(Bytes32(out))
 }

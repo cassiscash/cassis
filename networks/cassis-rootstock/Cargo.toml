@@ -3,20 +3,11 @@ name = "cassis-rootstock"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-
 [dependencies]
+alloy = { workspace = true }
 async-trait = { workspace = true }
 cassis-core = { workspace = true }
-# Needed to normalize a secret key to its even-Y form so the x-only
-# pubkey -> EVM address mapping is well defined (see `normalize_sk`).
+# Normalizes the key to its even-Y form so the x-only identity maps to
+# one EVM address (see `normalized_key`).
 secp256k1 = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tracing = { workspace = true }
-
-alloy = { workspace = true }

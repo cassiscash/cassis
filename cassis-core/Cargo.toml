@@ -4,24 +4,35 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-cashu = []
-liquid = []
-arkade = []
-bitcoin = []
-rootstock = []
-lightning = []
+default = ["node"]
+# The node runtime: iroh transport, sqlite store and the payer, router
+# and payee coordination. Network crates and wasm builds go without.
+node = ["dep:futures", "dep:iroh", "dep:minisqlite", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
+bip32 = { workspace = true }
+bip39 = { workspace = true }
+hmac = { workspace = true }
 lowercase-hex = { workspace = true, features = ["alloc"] }
 rand = { workspace = true }
 ritualistic = { workspace = true }
 secp256k1 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tokio_with_wasm = { version = "0.8", features = ["rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+futures = { workspace = true, optional = true }
+iroh = { workspace = true, optional = true }
+minisqlite = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
 [dev-dependencies]
-serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
