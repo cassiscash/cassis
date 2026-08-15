@@ -324,8 +324,7 @@ impl Network for CashuAdapter {
         if htlc.target != HtlcTarget::XOnlyPubKey(self.claim_pubkey) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
-        let claim_key =
-            PublicKey::from_slice(self.claim_pubkey.as_bytes()).map_err(NetworkError::invalid)?;
+        let claim_key = cashu_key(&self.claim_pubkey)?;
         for proof in &proofs {
             let terms = HtlcTerms::of(proof)?;
             if terms.payment_hash != htlc.payment_hash {
@@ -401,7 +400,7 @@ impl Network for CashuAdapter {
         };
         let terms = HtlcTerms {
             payment_hash,
-            receiver: PublicKey::from_slice(receiver.as_bytes()).map_err(NetworkError::invalid)?,
+            receiver: cashu_key(receiver)?,
             locktime: expiry,
         };
         let proofs = self.take(sats_for_msat(amount_msat), Some(&terms)).await?;
@@ -476,6 +475,13 @@ fn is_loopback_host(host: &str) -> bool {
         host.split(':').next().unwrap_or(host)
     };
     matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// The cdk key of an x-only identity: its even-Y point. NUT-11/14
+/// signatures are BIP340, so parity does not matter.
+fn cashu_key(key: &XOnlyPubKey) -> Result<PublicKey, NetworkError> {
+    let compressed = cassis_core::PubKey::from_x_only(key).map_err(NetworkError::invalid)?;
+    PublicKey::from_slice(compressed.as_bytes()).map_err(NetworkError::invalid)
 }
 
 fn sum_sats(proofs: &[Proof]) -> u64 {

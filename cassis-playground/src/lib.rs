@@ -1,3 +1,5 @@
+pub mod local;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -6,7 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::logging::ScopeFields;
-use cassis_core::node::{Node, NodeConfig, PrepareVeto, RoutingPolicy};
+use cassis_core::node::{Node, NodeConfig, RoutingPolicy};
 use cassis_core::routing;
 use cassis_core::store::Store;
 use cassis_core::{unix_now, Network, NetworkId};
@@ -30,11 +32,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const ROOT: &str = "tmp/playground";
 
-/// Root directory for the e2e test environment. Kept in `target/` so
-/// `cargo clean` wipes test state and normal builds never touch it.
-pub const E2E_ROOT: &str = "target/e2e";
 const COMMAND_HISTORY: &str = "commands.history";
-pub const RELAY: &str = "ws://localhost:10000";
+const RELAY: &str = "ws://localhost:10000";
 pub const DEFAULT_PREFUND_SEED: &str =
     "position emerge strong hawk clog educate suspect sport vast forward gesture absorb";
 const DEFAULT_FUND_AMOUNT: u64 = 1000;
@@ -258,7 +257,7 @@ impl tracing::field::Visit for PlaygroundMessageVisitor<'_> {
 }
 
 #[derive(Default)]
-struct MemoryRelay {
+pub(crate) struct MemoryRelay {
     events: Vec<NostrEvent>,
 }
 
@@ -924,7 +923,7 @@ fn prefund_store_path(root: &Path, seed: &str) -> PathBuf {
         .join("store.db")
 }
 
-pub async fn command_fund(
+async fn command_fund(
     playground: &Playground,
     node_id: &str,
     network_id: &str,
@@ -1165,7 +1164,7 @@ async fn command_onboard(
     Ok(())
 }
 
-pub async fn command_onboard_node(playground: &Playground, node_id: &str) -> Result<(), String> {
+async fn command_onboard_node(playground: &Playground, node_id: &str) -> Result<(), String> {
     let wallet = playground
         .ensure_wallet(node_id, &network_spec("arkade_testnet")?)
         .await?;
@@ -1207,23 +1206,10 @@ async fn command_open(
     Ok(())
 }
 
-pub async fn command_router(
+async fn command_router(
     playground: &Playground,
     node_id: &str,
     network_ids: Vec<String>,
-) -> Result<(), String> {
-    command_router_with_veto(playground, node_id, network_ids, None).await
-}
-
-/// [`command_router`] with a caller-supplied PREPARE veto hook. The
-/// hook runs on the router for every incoming PREPARE and may reject
-/// it for arbitrary reasons; used by e2e tests to force payment
-/// failures through a specific hop.
-pub async fn command_router_with_veto(
-    playground: &Playground,
-    node_id: &str,
-    network_ids: Vec<String>,
-    prepare_veto: Option<PrepareVeto>,
 ) -> Result<(), String> {
     if !playground.nodes.lock().await.contains_key(node_id) {
         return Err(format!("unknown node '{node_id}'"));
@@ -1242,7 +1228,6 @@ pub async fn command_router_with_veto(
     let node = playground.ensure_node(node_id).await?;
     node.start_routing(RoutingPolicy {
         nostr_relays: vec![RELAY.to_string()],
-        prepare_veto,
         ..RoutingPolicy::default()
     });
     set_status(playground, node_id, Status::Routing).await;
@@ -1250,7 +1235,7 @@ pub async fn command_router_with_veto(
     Ok(())
 }
 
-pub async fn command_pay(
+async fn command_pay(
     playground: &Playground,
     sender: &str,
     target: &str,

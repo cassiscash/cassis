@@ -20,11 +20,17 @@ cassis-core = { workspace = true, features = ["node"] }
 cassis-cashu = { workspace = true }
 cassis-arkade = { workspace = true }
 cassis-bitcoin = { workspace = true }
+cassis-fedimint = { workspace = true }
 cassis-liquid = { workspace = true }
 cassis-rootstock = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-connectors = { workspace = true }
+fedimint-core = { workspace = true }
 iroh = { workspace = true }
+reqwest = { workspace = true }
 ritualistic = { workspace = true }
 rustyline = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "process", "time", "io-util"] }
 tracing = { workspace = true }

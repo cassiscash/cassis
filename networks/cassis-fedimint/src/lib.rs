@@ -26,23 +26,21 @@ use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
-use fedimint_client::module::oplog::UpdateStreamOrOutcome;
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
+use fedimint_core::base32::{self, FEDIMINT_PREFIX};
 use fedimint_core::core::OperationId as FedimintOperationId;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleRegistry;
 use fedimint_core::{secp256k1, Amount, OutPoint, TransactionId};
 use fedimint_derive_secret::DerivableSecret;
+use fedimint_eventlog::EventLogId;
 use fedimint_lnv2_client::common::contracts::{OutgoingContract, PaymentImage};
 use fedimint_lnv2_client::htlc::HtlcError as LnHtlcError;
 use fedimint_lnv2_client::LightningClientModule;
-use fedimint_mint_client::{
-    MintClientInit, MintClientModule, OOBNotes, ReissueExternalNotesState,
-    SelectNotesWithAtleastAmount,
-};
-use fedimint_wallet_client::{DepositStateV2, WalletClientInit, WalletClientModule, WithdrawState};
+use fedimint_mintv2_client::{ECash, MintClientInit, MintClientModule};
+use fedimint_walletv2_client::{FinalSendOperationState, WalletClientInit, WalletClientModule};
 use tracing::{info, Span};
 
 /// Contract funding and claims are federation consensus outputs.
@@ -122,17 +120,12 @@ impl FedimintAdapter {
             .await
             .map_err(|e| format!("failed to build client builder: {e}"))?;
 
-        // Mint module is REQUIRED as the primary module — it issues
-        // the ecash that funds outgoing contracts (and into which
-        // incoming contracts pay us). The LNv2 module is the one we
-        // drive.
+        // The modules fedimintd enables by default since 0.12: mintv2
+        // is the primary module funding and receiving contracts, lnv2
+        // holds the HTLCs, walletv2 pegs in and out.
         builder.with_module(MintClientInit);
         builder.with_module(fedimint_lnv2_client::LightningClientInit::default());
-        // Wallet module: only needed for on-chain peg-in/peg-out, but
-        // it must be registered before opening ANY client so the module
-        // exists in the executor's registry (a federation without a
-        // wallet module simply never instantiates it).
-        builder.with_module(WalletClientInit(None));
+        builder.with_module(WalletClientInit);
 
         let client: ClientHandleArc = if already_initialized {
             let handle = builder
@@ -156,9 +149,6 @@ impl FedimintAdapter {
                 .map_err(|e| format!("failed to join federation: {e}"))?;
             Arc::new(handle)
         };
-
-        // Start the executor so the LN state machines run.
-        client.start_executor();
 
         // Sanity-check that the LNv2 module is present.
         let _ln_module: &LightningClientModule =
@@ -205,175 +195,100 @@ impl FedimintAdapter {
         Ok(balance.msats)
     }
 
-    // ==================================================================
-    // Raw ecash (out-of-band notes)
-    // ==================================================================
-
-    /// Maximum wait for operation outcome streams (reissue, deposit,
-    /// withdraw) before they are abandoned.
-    const OP_WAIT_SECS: u64 = 3600;
-
-    /// Remove up to `amount_msat` of ecash from the wallet and return
-    /// it as a serialized out-of-band note string (base64). The notes
-    /// auto-cancel (return to our wallet) after `try_cancel_after`
-    /// seconds unless the recipient reissues them.
-    pub async fn send_ecash(
-        &self,
-        amount_msat: u64,
-        try_cancel_after_secs: u64,
-    ) -> Result<String, String> {
-        let mint = self
-            .client
-            .get_first_module::<MintClientModule>()
-            .map_err(|e| format!("federation has no mint module: {e}"))?
-            .module;
-        let (_operation_id, oob_notes) = mint
-            .spend_notes_with_selector(
-                &SelectNotesWithAtleastAmount,
+    /// Take `amount_msat` of ecash out of the wallet as a notes string
+    /// that embeds the federation's invite code.
+    pub async fn send_ecash(&self, amount_msat: u64) -> Result<String, String> {
+        let (_, ecash) = self
+            .mint()?
+            .send(
                 Amount::from_msats(amount_msat),
-                Some(Duration::from_secs(try_cancel_after_secs)),
-                true,
                 serde_json::Value::Null,
+                true,
             )
             .await
             .map_err(|e| format!("send: {e}"))?;
-        Ok(oob_notes.to_string())
+        Ok(base32::encode_prefixed(FEDIMINT_PREFIX, &ecash))
     }
 
-    /// Reissue a raw out-of-band ecash note string into our wallet.
-    /// When `wait` is set, follows the reissuance until Done/Failed;
-    /// the amount reissued is returned either way.
-    pub async fn receive_ecash(&self, note: &str, wait: bool) -> Result<u64, String> {
-        let oob_notes = OOBNotes::from_str(note).map_err(|e| format!("invalid ecash note: {e}"))?;
-        let amount_msat = oob_notes.notes().total_amount().msats;
-        let mint = self
-            .client
-            .get_first_module::<MintClientModule>()
-            .map_err(|e| format!("federation has no mint module: {e}"))?
-            .module;
-        let operation_id = mint
-            .reissue_external_notes(oob_notes, serde_json::Value::Null)
+    /// Reissue an ecash notes string into the wallet. Returns its amount.
+    pub async fn receive_ecash(&self, notes: &str) -> Result<u64, String> {
+        let ecash: ECash = base32::decode_prefixed(FEDIMINT_PREFIX, notes.trim())
+            .map_err(|e| format!("invalid ecash: {e}"))?;
+        let amount_msat = ecash.amount().msats;
+        let mint = self.mint()?;
+        let operation = mint
+            .receive(ecash, serde_json::Value::Null)
             .await
-            .map_err(|e| format!("reissue: {e}"))?;
-        if wait {
-            let stream = mint
-                .subscribe_reissue_external_notes(operation_id)
-                .await
-                .map_err(|e| format!("subscribe reissue: {e}"))?;
-            let deadline_reissue =
-                tokio::time::Instant::now() + Duration::from_secs(Self::OP_WAIT_SECS);
-            Self::until_terminal(stream, deadline_reissue, "reissue", |state| match state {
-                ReissueExternalNotesState::Done => Some(Ok(())),
-                ReissueExternalNotesState::Failed(e) => Some(Err(format!("reissue failed: {e}"))),
-                _ => None,
-            })
-            .await?;
+            .map_err(|e| format!("receive: {e}"))?;
+        match mint
+            .await_final_receive_operation_state(operation)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            fedimint_mintv2_client::FinalReceiveOperationState::Success => Ok(amount_msat),
+            other => Err(format!("ecash not received: {other:?}")),
         }
-        Ok(amount_msat)
     }
 
-    /// Allocate a fresh (tweaked) on-chain deposit address owned by
-    /// the federation and return it together with its operation id for
-    /// [`Self::await_deposit`]. Note the caveats attached to peg-ins in
-    /// fedimint: transactions funding the address must stay under
-    /// ~40 kB and honor any federation-wide minimum peg-in amount.
-    pub async fn deposit_address(&self) -> Result<(String, FedimintOperationId), String> {
-        let wallet = self.wallet_module()?;
-        let info = wallet
-            .allocate_deposit_address_expert_only(serde_json::Value::Null)
-            .await
-            .map_err(|e| format!("allocate deposit address: {e}"))?;
-        Ok((info.address.to_string(), info.operation_id))
+    /// A peg-in address, and the position to pass to
+    /// [`Self::await_deposit`] to wait for a payment to it.
+    pub async fn deposit_address(&self) -> Result<(String, EventLogId), String> {
+        let position = self.client.get_next_event_log_id().await;
+        Ok((self.wallet()?.receive().await.to_string(), position))
     }
 
-    /// Follow a deposit operation (from [`Self::deposit_address`])
-    /// until the peg-in is claimed into our ecash wallet
-    /// (`Ok(amount_sat)`) or fails. `timeout_secs` caps the total wait.
+    /// Wait until a peg-in after `position` is claimed into the wallet.
     pub async fn await_deposit(
         &self,
-        operation_id: FedimintOperationId,
+        position: EventLogId,
         timeout_secs: u64,
-    ) -> Result<u64, String> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-        let wallet = self.wallet_module()?;
-        let stream = wallet
-            .subscribe_deposit(operation_id)
-            .await
-            .map_err(|e| format!("subscribe deposit: {e}"))?;
-        Self::until_terminal(stream, deadline, "deposit", |state| match state {
-            DepositStateV2::Claimed { btc_deposited, .. } => Some(Ok(btc_deposited.to_sat())),
-            DepositStateV2::Failed(e) => Some(Err(format!("deposit failed: {e}"))),
-            _ => None,
-        })
-        .await
-    }
-
-    /// Peg out: withdraw on-chain. Fetches the federation's peg-out
-    /// fees for the destination and amount, submits the withdraw
-    /// transaction and waits until either the on-chain transaction id
-    /// is known or the operation fails. Returns the on-chain txid.
-    pub async fn withdraw(&self, address_str: &str, amount_sat: u64) -> Result<String, String> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(Self::OP_WAIT_SECS);
-        let wallet = self.wallet_module()?;
-        let address = bitcoin::Address::from_str(address_str)
-            .map_err(|e| format!("invalid destination address: {e}"))?
-            .require_network(wallet.get_network())
-            .map_err(|e| format!("destination address not on the federation's network: {e}"))?;
-        let amount = bitcoin::Amount::from_sat(amount_sat);
-        let fees = wallet
-            .get_withdraw_fees(&address, amount)
-            .await
-            .map_err(|e| format!("peg-out fee query failed: {e}"))?;
-        let operation_id = wallet
-            .withdraw(&address, amount, fees, serde_json::Value::Null)
-            .await
-            .map_err(|e| format!("withdraw: {e}"))?;
-        let stream = wallet
-            .subscribe_withdraw_updates(operation_id)
-            .await
-            .map_err(|e| format!("subscribe withdraw: {e}"))?;
-        let txid = Self::until_terminal(stream, deadline, "withdraw", |state| match state {
-            WithdrawState::Succeeded(txid) => Some(Ok(*txid)),
-            WithdrawState::Failed(e) => Some(Err(format!("withdraw failed: {e}"))),
-            _ => None,
-        })
-        .await?;
-        Ok(txid.to_string())
-    }
-
-    /// Follow an operation update stream until a terminal state (or a
-    /// deadline).
-    async fn until_terminal<S, T>(
-        stream: UpdateStreamOrOutcome<S>,
-        deadline: tokio::time::Instant,
-        what: &str,
-        terminal: impl Fn(&S) -> Option<Result<T, String>>,
-    ) -> Result<T, String>
-    where
-        S: std::fmt::Debug + Send,
-        T: Send,
-    {
-        match stream {
-            UpdateStreamOrOutcome::Outcome(state) => terminal(&state)
-                .unwrap_or_else(|| Err(format!("{what} already finished in a non-final state"))),
-            UpdateStreamOrOutcome::UpdateStream(stream) => {
-                use futures::StreamExt;
-                let mut filtered =
-                    std::pin::pin!(stream.filter_map(|state| std::future::ready(terminal(&state))));
-                match tokio::time::timeout_at(deadline, filtered.as_mut().next()).await {
-                    Ok(Some(result)) => result,
-                    Ok(None) => Err(format!("{what} stream ended without a final state")),
-                    Err(_) => Err(format!("timed out waiting for {what}")),
-                }
-            }
+    ) -> Result<(), String> {
+        let receive = self.wallet()?.await_receive(position);
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), receive).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("deposit: {e}")),
+            Err(_) => Err("timed out waiting for the deposit".into()),
         }
     }
 
-    fn wallet_module(&self) -> Result<&WalletClientModule, String> {
+    /// Peg out `amount_sat` to `address`. Returns the on-chain txid.
+    pub async fn withdraw(&self, address: &str, amount_sat: u64) -> Result<String, String> {
+        let wallet = self.wallet()?;
+        let address =
+            bitcoin::Address::from_str(address).map_err(|e| format!("invalid address: {e}"))?;
+        let fee = wallet.send_fee().await.map_err(|e| format!("fee: {e}"))?;
+        let operation = wallet
+            .send(
+                address,
+                bitcoin::Amount::from_sat(amount_sat),
+                Some(fee),
+                serde_json::Value::Null,
+            )
+            .await
+            .map_err(|e| format!("withdraw: {e}"))?;
+        match wallet
+            .await_final_send_operation_state(operation)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            FinalSendOperationState::Success(txid) => Ok(txid.to_string()),
+            other => Err(format!("withdraw failed: {other:?}")),
+        }
+    }
+
+    fn mint(&self) -> Result<&MintClientModule, String> {
+        Ok(self
+            .client
+            .get_first_module::<MintClientModule>()
+            .map_err(|e| format!("federation has no mintv2 module: {e}"))?
+            .module)
+    }
+
+    fn wallet(&self) -> Result<&WalletClientModule, String> {
         Ok(self
             .client
             .get_first_module::<WalletClientModule>()
-            .map_err(|e| format!("federation has no wallet (peg) module: {e}"))?
+            .map_err(|e| format!("federation has no walletv2 module: {e}"))?
             .module)
     }
 

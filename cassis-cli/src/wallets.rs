@@ -111,16 +111,11 @@ pub enum FedimintCommand {
     Send {
         #[arg(long)]
         amount_msat: u64,
-        /// Seconds after which unclaimed notes return to the wallet.
-        #[arg(long, default_value_t = 86400)]
-        cancel_after_secs: u64,
     },
     /// Reissue ecash notes into the wallet.
     Receive {
         #[arg(long)]
-        note: String,
-        #[arg(long)]
-        wait: bool,
+        notes: String,
     },
     /// Peg-in address.
     Deposit {
@@ -260,22 +255,18 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             .await?;
             match command {
                 FedimintCommand::Balance => println!("{} msat", wallet.balance_msat().await?),
-                FedimintCommand::Send {
-                    amount_msat,
-                    cancel_after_secs,
-                } => println!(
-                    "{}",
-                    wallet.send_ecash(amount_msat, cancel_after_secs).await?
-                ),
-                FedimintCommand::Receive { note, wait } => {
-                    println!("received {} msat", wallet.receive_ecash(&note, wait).await?)
+                FedimintCommand::Send { amount_msat } => {
+                    println!("{}", wallet.send_ecash(amount_msat).await?)
+                }
+                FedimintCommand::Receive { notes } => {
+                    println!("received {} msat", wallet.receive_ecash(&notes).await?)
                 }
                 FedimintCommand::Deposit { wait, timeout_secs } => {
-                    let (address, operation) = wallet.deposit_address().await?;
+                    let (address, position) = wallet.deposit_address().await?;
                     println!("{address}");
                     if wait {
-                        let sats = wallet.await_deposit(operation, timeout_secs).await?;
-                        println!("deposited {sats} sat");
+                        wallet.await_deposit(position, timeout_secs).await?;
+                        println!("deposited");
                     }
                 }
                 FedimintCommand::Withdraw { to, amount_sat } => {

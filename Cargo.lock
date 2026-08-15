@@ -841,7 +841,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -852,7 +852,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1355,12 +1355,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "assert_matches"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
 
 [[package]]
 name = "async-channel"
@@ -2447,10 +2441,11 @@ dependencies = [
  "fedimint-connectors",
  "fedimint-core",
  "fedimint-derive-secret",
+ "fedimint-eventlog",
  "fedimint-lnv2-client",
- "fedimint-mint-client",
+ "fedimint-mintv2-client",
  "fedimint-rocksdb",
- "fedimint-wallet-client",
+ "fedimint-walletv2-client",
  "futures",
  "serde_json",
  "tokio",
@@ -2503,11 +2498,17 @@ dependencies = [
  "cassis-bitcoin",
  "cassis-cashu",
  "cassis-core",
+ "cassis-fedimint",
  "cassis-liquid",
  "cassis-rootstock",
+ "fedimint-api-client",
+ "fedimint-connectors",
+ "fedimint-core",
  "iroh 1.0.3",
+ "reqwest 0.12.28",
  "ritualistic",
  "rustyline",
+ "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -3104,16 +3105,6 @@ version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
 dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-deque"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
-dependencies = [
- "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
@@ -3912,7 +3903,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4433,16 +4424,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "fedimint-mint-client"
+name = "fedimint-mintv2-client"
 version = "0.13.0-alpha"
 source = "git+https://github.com/fedimint/fedimint?rev=cf55fd9cdc61412bc079c8d00208e7fcc07a3948#cf55fd9cdc61412bc079c8d00208e7fcc07a3948"
 dependencies = [
  "anyhow",
  "aquamarine",
- "assert_matches",
+ "async-channel 2.5.0",
  "async-stream",
  "async-trait",
- "base64 0.22.1",
  "bitcoin_hashes",
  "bls12_381",
  "erased-serde",
@@ -4453,15 +4443,14 @@ dependencies = [
  "fedimint-derive-secret",
  "fedimint-eventlog",
  "fedimint-logging",
- "fedimint-mint-common",
+ "fedimint-mintv2-common",
  "fedimint-tbs",
  "fedimint-threshold-crypto",
  "futures",
  "hex",
  "itertools 0.14.0",
- "rayon",
+ "rand 0.8.7",
  "serde",
- "serde-big-array",
  "serde_json",
  "serdect 0.2.0",
  "strum 0.27.2",
@@ -4473,7 +4462,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fedimint-mint-common"
+name = "fedimint-mintv2-common"
 version = "0.13.0-alpha"
 source = "git+https://github.com/fedimint/fedimint?rev=cf55fd9cdc61412bc079c8d00208e7fcc07a3948#cf55fd9cdc61412bc079c8d00208e7fcc07a3948"
 dependencies = [
@@ -4564,50 +4553,45 @@ dependencies = [
 ]
 
 [[package]]
-name = "fedimint-wallet-client"
+name = "fedimint-walletv2-client"
 version = "0.13.0-alpha"
 source = "git+https://github.com/fedimint/fedimint?rev=cf55fd9cdc61412bc079c8d00208e7fcc07a3948#cf55fd9cdc61412bc079c8d00208e7fcc07a3948"
 dependencies = [
  "anyhow",
- "aquamarine",
- "assert_matches",
  "async-stream",
  "async-trait",
  "bitcoin",
  "erased-serde",
  "fedimint-api-client",
- "fedimint-bitcoind",
+ "fedimint-client",
  "fedimint-client-module",
  "fedimint-core",
  "fedimint-derive-secret",
  "fedimint-eventlog",
  "fedimint-logging",
- "fedimint-wallet-common",
+ "fedimint-walletv2-common",
  "futures",
- "rand 0.8.7",
+ "secp256k1 0.29.1",
  "serde",
  "serde_json",
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "thiserror 2.0.19",
- "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "fedimint-wallet-common"
+name = "fedimint-walletv2-common"
 version = "0.13.0-alpha"
 source = "git+https://github.com/fedimint/fedimint?rev=cf55fd9cdc61412bc079c8d00208e7fcc07a3948#cf55fd9cdc61412bc079c8d00208e7fcc07a3948"
 dependencies = [
  "anyhow",
  "bitcoin",
  "fedimint-core",
- "hex",
- "impl-tools",
  "miniscript",
+ "secp256k1 0.29.1",
  "serde",
  "thiserror 2.0.19",
- "tracing",
 ]
 
 [[package]]
@@ -5962,30 +5946,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba6a270039626615617f3f36d15fc827041df3b78c439da2cadfa47455a77f2f"
 dependencies = [
  "parity-scale-codec",
-]
-
-[[package]]
-name = "impl-tools"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ae95c9095c2f1126d7db785955c73cdc5fc33e7c3fa911bd4a42931672029a7"
-dependencies = [
- "autocfg",
- "impl-tools-lib",
- "proc-macro-error2",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "impl-tools-lib"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab699036df31c1f7d3561bfa6e9cb9bc3bb0fd2e2cd9bf121c31cb961d049ddf"
-dependencies = [
- "proc-macro-error2",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -8115,7 +8075,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9376,7 +9336,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9548,26 +9508,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
 dependencies = [
  "rustversion",
-]
-
-[[package]]
-name = "rayon"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -10054,7 +9994,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10122,7 +10062,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10431,7 +10371,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10910,7 +10850,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11260,7 +11200,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12313,7 +12253,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
