@@ -1,3 +1,4 @@
+mod esplora;
 pub mod local;
 
 use std::collections::{HashMap, HashSet, VecDeque};

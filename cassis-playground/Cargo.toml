@@ -16,6 +16,8 @@ name = "cassis-prefund"
 path = "src/bin/prefund.rs"
 
 [dependencies]
+axum = { workspace = true }
+bitcoin = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-cashu = { workspace = true }
 cassis-arkade = { workspace = true }

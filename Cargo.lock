@@ -2344,6 +2344,7 @@ dependencies = [
  "ark-bdk-wallet",
  "ark-client",
  "ark-core",
+ "ark-grpc",
  "async-trait",
  "bitcoin",
  "cassis-core",
@@ -2494,6 +2495,8 @@ dependencies = [
 name = "cassis-playground"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "bitcoin",
  "cassis-arkade",
  "cassis-bitcoin",
  "cassis-cashu",

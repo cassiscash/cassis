@@ -453,28 +453,7 @@ pub fn mint_url(id: &NetworkId) -> Result<String, String> {
     if id.kind() != "cashu" {
         return Err(format!("{id} is not a cashu network"));
     }
-    let host = id
-        .param()
-        .filter(|host| !host.is_empty())
-        .ok_or("no mint host")?;
-    let scheme = if is_loopback_host(host) {
-        "http"
-    } else {
-        "https"
-    };
-    Ok(format!("{scheme}://{host}"))
-}
-
-/// `localhost`, `127.0.0.1` or `::1`, with or without port and brackets.
-fn is_loopback_host(host: &str) -> bool {
-    let host = if let Some(rest) = host.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else if host == "::1" || host.starts_with("::1:") {
-        "::1"
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    id.host_url()
 }
 
 /// The cdk key of an x-only identity: its even-Y point. NUT-11/14
@@ -544,21 +523,6 @@ fn decode_proofs(descriptor: &HtlcDescriptor) -> Result<Proofs, NetworkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mint_url_scheme_follows_the_host() {
-        let url = |host: &str| mint_url(&NetworkId(format!("cashu::{host}"))).unwrap();
-        assert_eq!(url("mint.example.com"), "https://mint.example.com");
-        assert_eq!(
-            url("mint.example.com:3338"),
-            "https://mint.example.com:3338"
-        );
-        assert_eq!(url("localhost:3338"), "http://localhost:3338");
-        assert_eq!(url("127.0.0.1"), "http://127.0.0.1");
-        assert_eq!(url("::1"), "http://::1");
-        assert_eq!(url("[::1]:3338"), "http://[::1]:3338");
-        assert!(mint_url(&NetworkId("liquid".into())).is_err());
-    }
 
     #[test]
     fn input_fee_rounds_up() {

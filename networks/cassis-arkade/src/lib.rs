@@ -40,6 +40,7 @@ use ark_core::server::VirtualTxOutPoint;
 use ark_core::vhtlc::VhtlcOptions;
 use ark_core::vhtlc::VhtlcScript;
 use ark_core::ArkAddress;
+use ark_core::ArkNote;
 use ark_core::Asset;
 use ark_core::VTXO_CONDITION_KEY;
 use async_trait::async_trait;
@@ -101,6 +102,20 @@ const UNILATERAL_REFUND_GAP_SECS: u32 = 12 * 60 * 60;
 const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
 
 const RPC_TIMEOUT_SECS: u64 = 30;
+/// The chain the operator at `server_url` runs on.
+async fn operator_network(server_url: &str) -> Result<bitcoin::Network, String> {
+    let mut client = ark_grpc::Client::new(server_url.to_string());
+    let info = async {
+        client.connect().await?;
+        client.get_info().await
+    };
+    tokio::time::timeout(Duration::from_secs(RPC_TIMEOUT_SECS), info)
+        .await
+        .map_err(|_| format!("arkade operator {server_url} did not answer"))?
+        .map(|info| info.network)
+        .map_err(|e| format!("arkade operator {server_url}: {e}"))
+}
+
 /// Convenience conversion into the routing layer's network error.
 fn htlc(e: impl std::fmt::Display) -> NetworkError {
     NetworkError::network(e)
@@ -140,7 +155,8 @@ struct UnspentVtxo {
 
 pub struct ArkadeAdapter {
     id: NetworkId,
-    server_url: &'static str,
+    network: bitcoin::Network,
+    server_url: String,
     span: Span,
     /// The operator rejects scripts whose smallest exit (CSV) delay is
     /// shorter than its advertised unilateral exit delay, measured via
@@ -158,23 +174,40 @@ pub struct ArkadeAdapter {
 }
 
 impl ArkadeAdapter {
-    /// Connect to the operator of `arkade` or `arkade::mutinynet`.
-    /// Wallet state lives with the operator and on-chain.
+    /// Connect to the operator of `arkade`, `arkade::mutinynet` or
+    /// `arkade::<host>`. Wallet state lives with the operator and
+    /// on-chain.
     pub async fn open(id: NetworkId, secret: [u8; 32], span: &Span) -> Result<Self, String> {
-        let (network, server_url, esplora_url) = match id.param() {
-            None => (
-                bitcoin::Network::Bitcoin,
-                MAINNET_SERVER_URL,
-                MAINNET_ESPLORA_URL,
-            ),
-            Some("mutinynet") => (
-                bitcoin::Network::Signet,
-                TESTNET_SERVER_URL,
-                TESTNET_ESPLORA_URL,
-            ),
-            Some(other) => return Err(format!("unknown arkade network '{other}'")),
-        };
+        Self::open_with_esplora(id, secret, None, span).await
+    }
+
+    /// [`open`](Self::open), reading the chain from the Esplora API at
+    /// `esplora_url` instead of the public one for the operator's chain
+    /// (required on chains without one, like regtest).
+    pub async fn open_with_esplora(
+        id: NetworkId,
+        secret: [u8; 32],
+        esplora_url: Option<&str>,
+        span: &Span,
+    ) -> Result<Self, String> {
         install_rustls_crypto_provider();
+        let server_url = match id.param() {
+            None => MAINNET_SERVER_URL.to_string(),
+            Some("mutinynet") => TESTNET_SERVER_URL.to_string(),
+            Some(_) => id.host_url()?,
+        };
+        let network = operator_network(&server_url).await?;
+        let esplora_url = match (esplora_url, network) {
+            (Some(url), _) => url,
+            (None, bitcoin::Network::Bitcoin) => MAINNET_ESPLORA_URL,
+            // The only signet arkade operators run on.
+            (None, bitcoin::Network::Signet) => TESTNET_ESPLORA_URL,
+            (None, other) => {
+                return Err(format!(
+                    "arkade operator {server_url} is on {other}: it needs an esplora URL"
+                ))
+            }
+        };
         let secp = Secp256k1::new();
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&secret)
             .map_err(|e| format!("invalid arkade key: {e}"))?;
@@ -185,7 +218,7 @@ impl ArkadeAdapter {
                 .map_err(|e| format!("bdk wallet: {e}"))?,
         );
         let client_config = OfflineClientConfig {
-            ark_server_url: server_url.to_string(),
+            ark_server_url: server_url.clone(),
             boltz_url: String::new(),
             boltz_referral_id: BoltzReferralId::Disabled,
             ..Default::default()
@@ -208,6 +241,7 @@ impl ArkadeAdapter {
         debug!(parent: &span, "arkade wallet ready: operator={server_url} signer={}", info.signer_pk);
         Ok(Self {
             id,
+            network,
             server_url,
             span,
             exit_delay_floor_secs: exit_delay_secs(info.unilateral_exit_delay),
@@ -379,11 +413,7 @@ impl ArkadeAdapter {
     }
 
     fn script_for(&self, options: &VhtlcOptions) -> Result<VhtlcScript, NetworkError> {
-        let network = match self.id.param() {
-            Some(_) => bitcoin::Network::Signet,
-            None => bitcoin::Network::Bitcoin,
-        };
-        VhtlcScript::new(options.clone(), network).map_err(htlc)
+        VhtlcScript::new(options.clone(), self.network).map_err(htlc)
     }
 
     /// Timestamp of the chain tip block: what the operator holds
@@ -665,6 +695,19 @@ impl ArkadeAdapter {
             .map_err(|e| NetworkError::Network(format!("onboard: {e}")))
     }
 
+    /// Redeem an arknote (`arknote...`, issued by the operator) into
+    /// VTXOs in the next batch. Returns the commitment transaction ID.
+    pub async fn redeem_note(&self, note: &str) -> Result<bitcoin::Txid, NetworkError> {
+        let note = ArkNote::from_string(note.trim())
+            .map_err(|e| NetworkError::Invalid(format!("invalid arknote: {e}")))?;
+        let mut rng = rand::rngs::OsRng;
+        self.client
+            .settle_with_notes(&mut rng, vec![note])
+            .await
+            .map_err(|e| NetworkError::Network(format!("redeem note: {e}")))?
+            .ok_or_else(|| NetworkError::Network("redeem note: nothing settled".into()))
+    }
+
     /// Addresses for manual funding, returned as
     /// `(boarding, onchain, arkade)` strings. VTXOs sent to the
     /// boarding address settle into spendable offchain coins after
@@ -705,7 +748,7 @@ impl ArkadeAdapter {
 
     /// Operator this wallet uses.
     pub fn operator(&self) -> &str {
-        self.server_url
+        &self.server_url
     }
 }
 

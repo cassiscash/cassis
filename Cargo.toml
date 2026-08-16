@@ -22,6 +22,7 @@ anyhow = "1.0.104"
 async-trait = "0.1.91"
 base64 = "0.22.1"
 bitcoin = "0.32.102"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
 bip32 = { version = "0.5.3", default-features = false, features = ["secp256k1", "std"] }
 bip39 = "2.2.2"
 cdk = { version = "0.17.3", features = ["wallet"] }
@@ -66,6 +67,7 @@ alloy = { version = "2.4", default-features = false, features = [
 ] }
 ark-client = { version = "0.10", default-features = false, features = ["tls-webpki-roots"] }
 ark-core = "0.10"
+ark-grpc = { version = "0.10", default-features = false, features = ["tls-webpki-roots"] }
 ark-bdk-wallet = "0.10"
 esplora-client = { version = "0.10", features = ["async-https"] }
 rustyline = "17"

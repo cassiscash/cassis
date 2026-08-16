@@ -19,7 +19,9 @@ use std::fmt;
 ///   (loopback hosts use `http`, everything else `https`).
 /// * `fedimint::<invite code>`
 /// * `liquid`, `liquid::testnet`
-/// * `arkade`, `arkade::mutinynet`
+/// * `arkade`, `arkade::mutinynet` — the public operators — or
+///   `arkade::<host[:port]>`, any other operator (loopback hosts use
+///   `http`, everything else `https`)
 /// * `bitcoin`, `bitcoin::mutinynet`
 /// * `rootstock`, `rootstock::testnet`
 /// * `lightning`
@@ -55,8 +57,18 @@ impl NetworkId {
                     .ok_or("network 'fedimint' requires an invite code, e.g. fedimint::fed1q...")?;
                 return Ok(Self(spec.to_string()));
             }
+            "arkade" => {
+                if param.is_some_and(|host| host.is_empty() || host.contains("://")) {
+                    return Err(
+                        "network 'arkade' takes 'mutinynet' or an operator host without \
+                         scheme, e.g. arkade::127.0.0.1:7070"
+                            .to_string(),
+                    );
+                }
+                return Ok(Self(spec.to_string()));
+            }
             "liquid" | "rootstock" => &["testnet"],
-            "arkade" | "bitcoin" => &["mutinynet"],
+            "bitcoin" => &["mutinynet"],
             "lightning" => &[],
             other => return Err(format!("unsupported network kind '{other}'")),
         };
@@ -84,6 +96,21 @@ impl NetworkId {
         self.0.split_once("::").map(|(_, param)| param)
     }
 
+    /// `https://<param>` for a network addressed by host (a cashu mint,
+    /// an arkade operator), `http` for loopback hosts.
+    pub fn host_url(&self) -> Result<String, String> {
+        let host = self
+            .param()
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| format!("{self} names no host"))?;
+        let scheme = if is_loopback_host(host) {
+            "http"
+        } else {
+            "https"
+        };
+        Ok(format!("{scheme}://{host}"))
+    }
+
     /// Per-hop incoming delta used when a route announcement does not
     /// publish one. Mirrors [`Network::incoming_delta_secs`] of each
     /// network crate.
@@ -95,6 +122,18 @@ impl NetworkId {
             _ => 30,
         }
     }
+}
+
+/// `localhost`, `127.0.0.1` or `::1`, with or without port and brackets.
+fn is_loopback_host(host: &str) -> bool {
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if host == "::1" || host.starts_with("::1:") {
+        "::1"
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 impl fmt::Display for NetworkId {
@@ -314,6 +353,7 @@ mod tests {
             "liquid::testnet",
             "arkade",
             "arkade::mutinynet",
+            "arkade::127.0.0.1:7070",
             "bitcoin",
             "bitcoin::mutinynet",
             "rootstock",
@@ -333,7 +373,8 @@ mod tests {
             "cashu:localhost:3338",
             "fedimint::",
             "liquid::foo",
-            "arkade::testnet",
+            "arkade::",
+            "arkade::https://operator.example.com",
             "bitcoin::testnet",
             "lightning::testnet",
             "mystery",
@@ -348,6 +389,21 @@ mod tests {
         assert_eq!(id.kind(), "cashu");
         assert_eq!(id.param(), Some("localhost:3338"));
         assert_eq!(NetworkId::parse("liquid").unwrap().param(), None);
+    }
+
+    #[test]
+    fn host_url_scheme_follows_the_host() {
+        let url = |id: &str| NetworkId(id.into()).host_url().unwrap();
+        assert_eq!(url("cashu::mint.example.com"), "https://mint.example.com");
+        assert_eq!(
+            url("cashu::mint.example.com:3338"),
+            "https://mint.example.com:3338"
+        );
+        assert_eq!(url("arkade::localhost:7070"), "http://localhost:7070");
+        assert_eq!(url("cashu::127.0.0.1"), "http://127.0.0.1");
+        assert_eq!(url("cashu::::1"), "http://::1");
+        assert_eq!(url("cashu::[::1]:3338"), "http://[::1]:3338");
+        assert!(NetworkId("liquid".into()).host_url().is_err());
     }
 
     #[test]

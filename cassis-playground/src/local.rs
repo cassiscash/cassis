@@ -6,7 +6,12 @@
 //!
 //! Needs `cdk-mintd`, `cdk-cli` and `bitcoind` on `PATH`, and
 //! `fedimintd` at `$CASSIS_FEDIMINTD` or `<workspace>/tmp/fedimintd-v0.12.1`.
+//!
+//! Arkade operators are `arkd` (see [`LocalEnv::arkd`]) on the same
+//! regtest `bitcoind`, read through an in-process Esplora API, funding
+//! nodes with arknotes.
 
+use cassis_arkade::ArkadeAdapter;
 use cassis_cashu::CashuAdapter;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{Node, NodeConfig, PrepareVeto, RoutingPolicy};
@@ -31,11 +36,19 @@ use tracing::{info, info_span};
 const BITCOIND_AUTH: (&str, &str) = ("bitcoin", "bitcoin");
 const FEDIMINT_PASSWORD: &str = "pass";
 
+const ARKD_PASSWORD: &str = "password";
+/// Signs the operator's side of VTXO trees and offchain transactions.
+const ARKD_SIGNER_KEY: &str = "afcd3fa10f82a05fddc9574fdb13b3991b568e89cc39a72ba4401df8abef35f0";
+/// On-chain coins the operator starts with, to fund batches.
+const ARKD_OPERATOR_BTC: f64 = 10.0;
+
 pub struct LocalEnv {
     root: PathBuf,
     relay: String,
     children: Mutex<Vec<Child>>,
     bitcoind: OnceCell<Bitcoind>,
+    esplora: OnceCell<String>,
+    arkd: OnceCell<Arkd>,
     counter: std::sync::atomic::AtomicUsize,
 }
 
@@ -66,6 +79,8 @@ impl LocalEnv {
             relay: format!("ws://127.0.0.1:{port}"),
             children: Mutex::new(Vec::new()),
             bitcoind: OnceCell::new(),
+            esplora: OnceCell::new(),
+            arkd: OnceCell::new(),
             counter: Default::default(),
         })
     }
@@ -215,6 +230,25 @@ impl LocalEnv {
         NetworkId::parse(&format!("fedimint::{}", invite.trim()))
     }
 
+    /// Esplora REST API over the regtest bitcoind.
+    async fn esplora(&self) -> Result<&str, String> {
+        let bitcoind = self.bitcoind().await?;
+        self.esplora
+            .get_or_try_init(|| crate::esplora::serve(bitcoind.clone()))
+            .await
+            .map(String::as_str)
+    }
+
+    /// An arkd operator on the regtest bitcoind, as an arkade network,
+    /// its on-chain wallet funded to finance batches.
+    ///
+    /// Uses `$CASSIS_ARKD` or `<workspace>/target/arkd-light`, building
+    /// it with `cassis-playground/arkd/build.sh` (needs `go`) if missing.
+    pub async fn arkd(&self) -> Result<NetworkId, String> {
+        let arkd = self.arkd.get_or_try_init(|| Arkd::start(self)).await?;
+        NetworkId::parse(&format!("arkade::127.0.0.1:{}", arkd.port))
+    }
+
     /// A serving node on `networks`, named `name` in logs.
     pub async fn node(&self, name: &str, networks: &[NetworkId]) -> Result<TestNode, String> {
         let home = self.root.join("nodes").join(name);
@@ -250,6 +284,15 @@ impl LocalEnv {
                     };
                     Wallet::Fedimint(Arc::new(adapter))
                 }
+                "arkade" => Wallet::Arkade(Arc::new(
+                    ArkadeAdapter::open_with_esplora(
+                        network.clone(),
+                        secret,
+                        Some(self.esplora().await?),
+                        &span,
+                    )
+                    .await?,
+                )),
                 other => return Err(format!("the local environment has no '{other}' ledgers")),
             };
             wallets.insert(network.clone(), wallet);
@@ -329,6 +372,13 @@ impl LocalEnv {
                 }
                 waiting.await.map_err(|e| e.to_string())??;
             }
+            Wallet::Arkade(wallet) => {
+                let arkd = self.arkd.get().ok_or("arkd is not running")?;
+                let note = arkd.note(amount_msat.div_ceil(1000)).await?;
+                wallet.redeem_note(&note).await.map_err(|e| e.to_string())?;
+                // Confirm the batch.
+                self.bitcoind().await?.mine(1).await?;
+            }
         }
         info!("funded {} on {network}", node.name);
         Ok(())
@@ -347,6 +397,7 @@ pub struct TestNode {
 enum Wallet {
     Cashu(Arc<CashuAdapter>),
     Fedimint(Arc<FedimintAdapter>),
+    Arkade(Arc<ArkadeAdapter>),
 }
 
 impl Wallet {
@@ -354,6 +405,7 @@ impl Wallet {
         match self {
             Wallet::Cashu(wallet) => wallet.clone(),
             Wallet::Fedimint(wallet) => wallet.clone(),
+            Wallet::Arkade(wallet) => wallet.clone(),
         }
     }
 }
@@ -369,6 +421,7 @@ impl TestNode {
         match self.wallet(network)? {
             Wallet::Cashu(wallet) => wallet.balance_msat(),
             Wallet::Fedimint(wallet) => wallet.balance_msat().await,
+            Wallet::Arkade(wallet) => wallet.balance_msat().await.map_err(|e| e.to_string()),
         }
     }
 
@@ -409,13 +462,14 @@ pub async fn wait_for_announcements(env: &LocalEnv, count: usize) -> Result<(), 
     .await
 }
 
-struct Bitcoind {
+#[derive(Clone)]
+pub(crate) struct Bitcoind {
     url: String,
     http: reqwest::Client,
 }
 
 impl Bitcoind {
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+    pub(crate) async fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
         let response: Value = self
             .http
             .post(&self.url)
@@ -439,6 +493,160 @@ impl Bitcoind {
             .await
             .map(|_| ())
     }
+}
+
+/// An arkd operator: `arkd-light` (arkd with its wallet in-process on
+/// Esplora) in light mode.
+struct Arkd {
+    port: u16,
+    admin: String,
+    http: reqwest::Client,
+}
+
+impl Arkd {
+    async fn start(env: &LocalEnv) -> Result<Self, String> {
+        let esplora = env.esplora().await?.to_string();
+        let binary = arkd_path().await?;
+        let dir = env.next_dir("arkd");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let (port, admin_port) = (free_port()?, free_port()?);
+        let mut command = Command::new(&binary);
+        command
+            .env("ARKD_DATADIR", &dir)
+            .env("ARKD_PORT", port.to_string())
+            .env("ARKD_ADMIN_PORT", admin_port.to_string())
+            .env("ARKD_NO_TLS", "true")
+            .env("ARKD_NO_MACAROONS", "true")
+            .env("ARKD_LOG_LEVEL", "5")
+            .env("ARKD_ESPLORA_URL", &esplora)
+            .env("ARKD_WALLET_NETWORK", "regtest")
+            .env("ARKD_WALLET_SIGNER_KEY", ARKD_SIGNER_KEY)
+            // Light mode.
+            .env("ARKD_LIVE_STORE_TYPE", "inmemory")
+            .env("ARKD_DB_TYPE", "sqlite")
+            .env("ARKD_EVENT_DB_TYPE", "badger")
+            // Quick batches; delays and expiries in seconds (multiples
+            // of 512), since blocks are only mined on demand.
+            .env("ARKD_SESSION_DURATION", "5")
+            .env("ARKD_UNILATERAL_EXIT_DELAY", "512")
+            .env("ARKD_PUBLIC_UNILATERAL_EXIT_DELAY", "512")
+            .env("ARKD_CHECKPOINT_EXIT_DELAY", "512")
+            .env("ARKD_BOARDING_EXIT_DELAY", "1024")
+            .env("ARKD_VTXO_TREE_EXPIRY", "3584");
+        let log = dir.join("arkd.log");
+        env.spawn(command, &log).await?;
+        let arkd = Self {
+            port,
+            admin: format!("http://127.0.0.1:{admin_port}/v1/admin"),
+            http: reqwest::Client::new(),
+        };
+        wait_for(&format!("arkd (see {})", log.display()), || async {
+            arkd.get("/wallet/status").await.is_ok()
+        })
+        .await?;
+        let seed = arkd.get("/wallet/seed").await?["seed"].clone();
+        arkd.post(
+            "/wallet/create",
+            json!({"seed": seed, "password": ARKD_PASSWORD}),
+        )
+        .await?;
+        arkd.post("/wallet/unlock", json!({"password": ARKD_PASSWORD}))
+            .await?;
+        let info = format!("http://127.0.0.1:{port}/v1/info");
+        wait_for("arkd to be ready", || async {
+            reqwest::get(&info)
+                .await
+                .is_ok_and(|response| response.status().is_success())
+        })
+        .await?;
+
+        let bitcoind = env.bitcoind().await?;
+        let address = arkd.get("/wallet/address").await?["address"].clone();
+        bitcoind
+            .rpc("sendtoaddress", json!([address, ARKD_OPERATOR_BTC]))
+            .await?;
+        bitcoind.mine(1).await?;
+        wait_for("arkd operator funds", || async {
+            arkd.balance_sats()
+                .await
+                .is_ok_and(|sats| sats as f64 >= ARKD_OPERATOR_BTC * 1e8)
+        })
+        .await?;
+        info!("arkd up on port {port}");
+        Ok(arkd)
+    }
+
+    async fn get(&self, path: &str) -> Result<Value, String> {
+        self.request(self.http.get(format!("{}{path}", self.admin)))
+            .await
+    }
+
+    async fn post(&self, path: &str, body: Value) -> Result<Value, String> {
+        self.request(self.http.post(format!("{}{path}", self.admin)).json(&body))
+            .await
+    }
+
+    async fn request(&self, request: reqwest::RequestBuilder) -> Result<Value, String> {
+        let response = request.send().await.map_err(|e| format!("arkd: {e}"))?;
+        let status = response.status();
+        let body: Value = response.json().await.map_err(|e| format!("arkd: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("arkd: {status}: {body}"));
+        }
+        Ok(body)
+    }
+
+    /// Spendable sats in the operator's on-chain wallet.
+    async fn balance_sats(&self) -> Result<u64, String> {
+        let balance = self.get("/wallet/balance").await?;
+        let btc = balance["mainAccount"]["available"]
+            .as_str()
+            .ok_or_else(|| format!("arkd balance: {balance}"))?;
+        let (whole, fraction) = btc.split_once('.').unwrap_or((btc, "0"));
+        let parse = |digits: &str| digits.parse::<u64>().map_err(|e| format!("{btc}: {e}"));
+        Ok(parse(whole)? * 100_000_000 + parse(&format!("{fraction:0<8}")[..8])?)
+    }
+
+    /// An arknote worth `sats`, redeemable into VTXOs.
+    async fn note(&self, sats: u64) -> Result<String, String> {
+        let notes = self
+            .post("/note", json!({"amount": sats, "quantity": 1}))
+            .await?;
+        notes["notes"][0]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("arkd issued no note: {notes}"))
+    }
+}
+
+/// `$CASSIS_ARKD`, or `target/arkd-light`, built on first use.
+async fn arkd_path() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("CASSIS_ARKD") {
+        return Ok(PathBuf::from(path));
+    }
+    let path = workspace_dir().join("target/arkd-light");
+    static BUILD: OnceCell<()> = OnceCell::const_new();
+    BUILD
+        .get_or_try_init(|| async {
+            if path.exists() {
+                return Ok(());
+            }
+            info!("building arkd-light (once)");
+            let output = Command::new(workspace_dir().join("cassis-playground/arkd/build.sh"))
+                .arg(&path)
+                .output()
+                .await
+                .map_err(|e| format!("build arkd-light: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "build arkd-light: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(path)
 }
 
 /// Poll `ready` for up to two minutes.

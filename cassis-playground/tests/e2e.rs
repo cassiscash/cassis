@@ -1,6 +1,8 @@
 //! End-to-end payments across real ledgers running locally: cashu mints
-//! (`cdk-mintd`, fake Lightning) and fedimint federations (`fedimintd`
-//! on regtest bitcoin), with routers funded with their fake money.
+//! (`cdk-mintd`, fake Lightning), fedimint federations (`fedimintd`
+//! on regtest bitcoin) and arkd operators (on the same regtest bitcoin,
+//! funding nodes with arknotes), with routers funded with their fake
+//! money.
 //!
 //! Each test brings up its own ledgers on free ports, so they can run in
 //! parallel. They need `cdk-mintd`, `cdk-cli`, `bitcoind` and fedimintd
@@ -9,6 +11,8 @@
 //! ```text
 //! cargo test -p cassis-playground --test e2e -- --ignored
 //! ```
+//!
+//! The arkade tests also need `go`, to build arkd on first use.
 
 use cassis_core::node::PrepareVeto;
 use cassis_core::NetworkId;
@@ -102,6 +106,42 @@ async fn fedimint_to_fedimint() {
         env.federation().await.unwrap(),
     );
     single_hop(&env, &a, &b).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns a cashu mint and arkd; run with --ignored"]
+async fn cashu_to_arkade() {
+    init_logs();
+    let env = LocalEnv::start("cashu_to_arkade").await.unwrap();
+    let (a, b) = (env.cashu_mint().await.unwrap(), env.arkd().await.unwrap());
+    single_hop(&env, &a, &b).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns arkd and a federation; run with --ignored"]
+async fn arkade_to_fedimint() {
+    init_logs();
+    let env = LocalEnv::start("arkade_to_fedimint").await.unwrap();
+    let (a, b) = (env.arkd().await.unwrap(), env.federation().await.unwrap());
+    single_hop(&env, &a, &b).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "spawns arkd; run with --ignored"]
+async fn arkade_to_arkade_needs_no_router() {
+    init_logs();
+    let env = LocalEnv::start("arkade_same_network").await.unwrap();
+    let network = env.arkd().await.unwrap();
+    let alice = env
+        .node("alice", std::slice::from_ref(&network))
+        .await
+        .unwrap();
+    let carol = env
+        .node("carol", std::slice::from_ref(&network))
+        .await
+        .unwrap();
+    env.fund(&alice, &network, FUND_MSAT).await.unwrap();
+    pay(&alice, &network, &carol, &network).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

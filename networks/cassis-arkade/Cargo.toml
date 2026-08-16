@@ -15,6 +15,8 @@ tokio = { workspace = true, features = ["time"] }
 # re-exports the gRPC transport used to talk to the operator.
 ark-client = { workspace = true }
 ark-core = { workspace = true }
+# Bare operator client, to learn its chain before opening the wallet.
+ark-grpc = { workspace = true }
 # bdk-backed onchain wallet required by the ark-client type bounds.
 ark-bdk-wallet = { workspace = true }
 esplora-client = { workspace = true, features = ["async-https"] }
