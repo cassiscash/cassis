@@ -7,11 +7,12 @@
 //! Needs `cdk-mintd`, `cdk-cli` and `bitcoind` on `PATH`, and
 //! `fedimintd` at `$CASSIS_FEDIMINTD` or `<workspace>/tmp/fedimintd-v0.12.1`.
 //!
-//! Arkade operators are `arkd` (see [`LocalEnv::arkd`]) on the same
-//! regtest `bitcoind`, read through an in-process Esplora API, funding
-//! nodes with arknotes.
+//! Bitcoin itself and arkade operators (`arkd`, see [`LocalEnv::arkd`],
+//! funding nodes with arknotes) run on the same regtest `bitcoind`,
+//! read through an in-process Esplora API.
 
 use cassis_arkade::ArkadeAdapter;
+use cassis_bitcoin::BitcoinAdapter;
 use cassis_cashu::CashuAdapter;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{Node, NodeConfig, PrepareVeto, RoutingPolicy};
@@ -239,6 +240,19 @@ impl LocalEnv {
             .map(String::as_str)
     }
 
+    /// Bitcoin itself: the regtest chain, read through the in-process
+    /// Esplora API. Lockups need a confirmation (see
+    /// [`mine`](Self::mine)) before receivers act on them.
+    pub async fn bitcoin(&self) -> Result<NetworkId, String> {
+        self.esplora().await?;
+        NetworkId::parse("bitcoin::regtest")
+    }
+
+    /// Mine `blocks` regtest blocks.
+    pub async fn mine(&self, blocks: u64) -> Result<(), String> {
+        self.bitcoind().await?.mine(blocks).await
+    }
+
     /// An arkd operator on the regtest bitcoind, as an arkade network,
     /// its on-chain wallet funded to finance batches.
     ///
@@ -293,6 +307,12 @@ impl LocalEnv {
                     )
                     .await?,
                 )),
+                "bitcoin" => Wallet::Bitcoin(Arc::new(BitcoinAdapter::open_with_esplora(
+                    network.clone(),
+                    secret,
+                    Some(self.esplora().await?),
+                    &span,
+                )?)),
                 other => return Err(format!("the local environment has no '{other}' ledgers")),
             };
             wallets.insert(network.clone(), wallet);
@@ -313,6 +333,27 @@ impl LocalEnv {
             wallets,
             relays: self.relays(),
         })
+    }
+
+    /// Run `task` while mining a block every two seconds, so ledgers
+    /// timed by the regtest chain (fedimint contract expirations, arkade
+    /// refund locktimes) keep up with the wall clock.
+    pub async fn mine_while<T>(&self, task: impl std::future::Future<Output = T>) -> T {
+        let bitcoind = self.bitcoind().await.ok().cloned();
+        let miner = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Some(bitcoind) = &bitcoind {
+                    if let Err(error) = bitcoind.mine(1).await {
+                        tracing::warn!("mining: {error}");
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            result = task => result,
+            _ = miner => unreachable!("the miner never stops"),
+        }
     }
 
     /// Give `node` `amount_msat` of fake money on `network`.
@@ -372,6 +413,21 @@ impl LocalEnv {
                 }
                 waiting.await.map_err(|e| e.to_string())??;
             }
+            Wallet::Bitcoin(wallet) => {
+                let bitcoind = self.bitcoind().await?;
+                let btc = amount_msat.div_ceil(1000) as f64 / 1e8;
+                bitcoind
+                    .rpc("sendtoaddress", json!([wallet.deposit_address(), btc]))
+                    .await?;
+                bitcoind.mine(1).await?;
+                wait_for("bitcoin deposit", || async {
+                    wallet
+                        .balance_msat()
+                        .await
+                        .is_ok_and(|balance| balance >= amount_msat)
+                })
+                .await?;
+            }
             Wallet::Arkade(wallet) => {
                 let arkd = self.arkd.get().ok_or("arkd is not running")?;
                 let note = arkd.note(amount_msat.div_ceil(1000)).await?;
@@ -398,6 +454,7 @@ enum Wallet {
     Cashu(Arc<CashuAdapter>),
     Fedimint(Arc<FedimintAdapter>),
     Arkade(Arc<ArkadeAdapter>),
+    Bitcoin(Arc<BitcoinAdapter>),
 }
 
 impl Wallet {
@@ -406,6 +463,7 @@ impl Wallet {
             Wallet::Cashu(wallet) => wallet.clone(),
             Wallet::Fedimint(wallet) => wallet.clone(),
             Wallet::Arkade(wallet) => wallet.clone(),
+            Wallet::Bitcoin(wallet) => wallet.clone(),
         }
     }
 }
@@ -422,17 +480,31 @@ impl TestNode {
             Wallet::Cashu(wallet) => wallet.balance_msat(),
             Wallet::Fedimint(wallet) => wallet.balance_msat().await,
             Wallet::Arkade(wallet) => wallet.balance_msat().await.map_err(|e| e.to_string()),
+            Wallet::Bitcoin(wallet) => wallet.balance_msat().await.map_err(|e| e.to_string()),
         }
     }
 
     /// Route between all of this node's networks, announcing on the
     /// environment's relay.
     pub fn route(&self, prepare_veto: Option<PrepareVeto>) {
-        self.node.start_routing(RoutingPolicy {
-            nostr_relays: self.relays.clone(),
+        self.route_with(RoutingPolicy {
             prepare_veto,
             ..RoutingPolicy::default()
         });
+    }
+
+    /// [`route`](Self::route) under `policy`, announcing on the
+    /// environment's relay whatever relays it names.
+    pub fn route_with(&self, policy: RoutingPolicy) {
+        self.node.start_routing(RoutingPolicy {
+            nostr_relays: self.relays.clone(),
+            ..policy
+        });
+    }
+
+    /// Take the node down: it stops answering, routing and settling.
+    pub async fn shutdown(&self) {
+        self.node.shutdown().await;
     }
 
     pub async fn invoice(&self, network: &NetworkId, amount_msat: u64) -> Result<Invoice, String> {

@@ -11,8 +11,8 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// EXECUTE funds an HTLC before answering, which on some networks
-/// waits for propagation or a receipt.
+/// Answers are quick (EXECUTE and COMMIT answer `Pending` rather than
+/// wait), but PREPARE asks the wallets, which may be slow backends.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
@@ -109,7 +109,14 @@ impl Transport {
         serde_json::from_slice(&reply).map_err(|e| format!("decode response: {e}"))
     }
 
-    /// Accept requests forever, answering each with `handler`.
+    /// Close the endpoint: open connections are dropped and peers can
+    /// no longer reach it.
+    pub async fn close(&self) {
+        self.endpoint.close().await;
+    }
+
+    /// Accept requests until the endpoint closes, answering each with
+    /// `handler`.
     pub async fn serve(&self, handler: Handler) {
         while let Some(incoming) = self.endpoint.accept().await {
             let handler = handler.clone();

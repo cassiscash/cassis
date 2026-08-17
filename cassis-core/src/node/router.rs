@@ -1,14 +1,14 @@
 //! Router role: PREPARE / EXECUTE / DISCARD / SETTLE handling and route
 //! announcements.
 
-use super::{HopRecord, HopState, Node, HOPS};
-use crate::network::{Htlc, HtlcDescriptor, HtlcTarget};
+use super::{HopRecord, HopState, Node, HOPS, INLINE_WAIT, VERIFY_RETRY_INTERVAL};
+use crate::network::{Htlc, HtlcTarget, NetworkError};
 use crate::primitives::{unix_now, OperationId};
-use crate::protocol::{Discard, Execute, Prepare, Settle};
+use crate::protocol::{Discard, Execute, Prepare, Response, Settle};
 use crate::routing::{self, RouteAnnouncement, DEFAULT_TRANSIT_SLACK_SECS};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn, Instrument};
+use tracing::{error, info, warn};
 
 /// How long a PREPARE reservation waits for its EXECUTE.
 const RESERVATION_TTL_SECS: u64 = 600;
@@ -62,15 +62,12 @@ impl Node {
     pub fn start_routing(&self, policy: RoutingPolicy) {
         *self.0.routing.write().unwrap_or_else(|e| e.into_inner()) = Some(policy);
         let node = self.clone();
-        tokio::spawn(
-            async move {
-                loop {
-                    node.announce().await;
-                    tokio::time::sleep(ANNOUNCE_INTERVAL).await;
-                }
+        self.spawn(async move {
+            loop {
+                node.announce().await;
+                tokio::time::sleep(ANNOUNCE_INTERVAL).await;
             }
-            .instrument(self.span()),
-        );
+        });
     }
 
     fn routing(&self) -> Option<RoutingPolicy> {
@@ -200,7 +197,10 @@ impl Node {
             .any(|reservation| reservation.prepare.payment_hash == prepare.payment_hash)
             || self.hops()?.iter().any(|hop| {
                 hop.prepare.payment_hash == prepare.payment_hash
-                    && matches!(hop.state, HopState::Funding | HopState::Forwarded)
+                    && matches!(
+                        hop.state,
+                        HopState::Verifying | HopState::Funding | HopState::Forwarded
+                    )
             });
         if hash_in_use {
             return Err("payment hash already has an active attempt here".into());
@@ -233,24 +233,45 @@ impl Node {
         Ok(target)
     }
 
-    pub(super) async fn execute(
-        &self,
-        execute: Execute,
-        peer: String,
-    ) -> Result<HtlcDescriptor, String> {
-        let _busy = self
-            .busy(format!("hop:{}", execute.operation_id))
-            .ok_or("this operation is already being executed")?;
-        // A retried EXECUTE gets the answer of the first one.
-        if let Some(hop) = self.hop(&execute.operation_id)? {
-            if hop.owner != peer || hop.prepare.payment_hash != execute.payment_hash {
-                return Err("operation belongs to another payment".into());
+    /// Start forwarding a prepared hop, or report on one already
+    /// started: [`Response::Executed`] once the outgoing HTLC is funded,
+    /// [`Response::Pending`] while the incoming one is not final yet.
+    pub(super) async fn execute(&self, execute: Execute, peer: String) -> Response {
+        if self.hop(&execute.operation_id).ok().flatten().is_none() {
+            if let Err(error) = self.start_hop(execute.clone(), peer.clone()).await {
+                return Response::Error(error);
             }
-            return hop
-                .outgoing
-                .map(|htlc| htlc.descriptor)
-                .ok_or_else(|| format!("this operation failed earlier: {:?}", hop.state));
         }
+        let report = || -> Response {
+            match self.hop(&execute.operation_id) {
+                Ok(Some(hop))
+                    if hop.owner != peer || hop.prepare.payment_hash != execute.payment_hash =>
+                {
+                    Response::Error("operation belongs to another payment".into())
+                }
+                Ok(Some(hop)) => match (hop.state, hop.outgoing) {
+                    (HopState::Failed(reason), _) => Response::Error(reason),
+                    (_, Some(outgoing)) => Response::Executed(outgoing.descriptor),
+                    _ => Response::Pending,
+                },
+                Ok(None) => Response::Error("no matching PREPARE".into()),
+                Err(error) => Response::Error(error),
+            }
+        };
+        // Answer right away when forwarding is quick.
+        let deadline = tokio::time::Instant::now() + INLINE_WAIT;
+        loop {
+            let response = report();
+            if !matches!(response, Response::Pending) || tokio::time::Instant::now() >= deadline {
+                return response;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Turn the reservation of `execute` into a journaled hop and
+    /// forward it in the background.
+    async fn start_hop(&self, execute: Execute, peer: String) -> Result<(), String> {
         let reservation = {
             let mut reservations = self.0.reservations.lock().await;
             match reservations.get(&execute.operation_id) {
@@ -263,45 +284,80 @@ impl Node {
                 .remove(&execute.operation_id)
                 .expect("checked above")
         };
-        let prepare = reservation.prepare.clone();
-        let incoming_network = self.network(&prepare.incoming_network)?;
-        let outgoing_network = self.network(&prepare.outgoing_network)?;
+        let prepare = reservation.prepare;
         if prepare.outgoing_expiry <= unix_now() {
             return Err("outgoing expiry passed before EXECUTE".into());
         }
-        let incoming = Htlc {
-            payment_hash: prepare.payment_hash,
-            amount_msat: prepare.amount_msat,
-            expiry: prepare.incoming_expiry,
-            target: reservation.target.clone(),
-            descriptor: execute.incoming_descriptor,
-        };
-        if let Err(error) = incoming_network.verify_incoming_htlc(&incoming).await {
-            // Leave the reservation for a corrected retry.
-            self.0
-                .reservations
-                .lock()
-                .await
-                .insert(execute.operation_id, reservation);
-            return Err(format!("incoming HTLC rejected: {error}"));
-        }
-
-        let mut hop = HopRecord {
-            operation_id: execute.operation_id.clone(),
+        let hop = HopRecord {
+            operation_id: execute.operation_id,
             owner: peer,
-            prepare: prepare.clone(),
-            incoming,
+            incoming: Htlc {
+                payment_hash: prepare.payment_hash,
+                amount_msat: prepare.amount_msat,
+                expiry: prepare.incoming_expiry,
+                target: reservation.target,
+                descriptor: execute.incoming_descriptor,
+            },
+            prepare,
+            outgoing_target: execute.outgoing_target,
             outgoing: None,
-            state: HopState::Funding,
+            state: HopState::Verifying,
             preimage: None,
         };
         self.save_hop(&hop)?;
-        let funded = outgoing_network
+        self.spawn(self.clone().forward(hop));
+        Ok(())
+    }
+
+    /// Wait for the incoming HTLC of `hop` to verify, then fund its
+    /// outgoing HTLC.
+    async fn forward(self, mut hop: HopRecord) {
+        let Some(_busy) = self.busy(format!("hop:{}", hop.operation_id)) else {
+            return;
+        };
+        let prepare = hop.prepare.clone();
+        let (incoming, outgoing) = match (
+            self.network(&prepare.incoming_network),
+            self.network(&prepare.outgoing_network),
+        ) {
+            (Ok(incoming), Ok(outgoing)) => (incoming, outgoing),
+            (Err(error), _) | (_, Err(error)) => return self.fail_hop(hop, error).await,
+        };
+        let mut waiting = false;
+        loop {
+            match incoming.verify_incoming_htlc(&hop.incoming).await {
+                Ok(()) => break,
+                Err(NetworkError::NotYet(reason)) if unix_now() < prepare.outgoing_expiry => {
+                    if !waiting {
+                        info!(
+                            "EXECUTE {}: waiting for the incoming HTLC: {reason}",
+                            prepare.payment_hash.short()
+                        );
+                        waiting = true;
+                    }
+                    tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+                }
+                Err(error) => {
+                    let reason = format!("incoming HTLC rejected: {error}");
+                    return self.fail_hop(hop, reason).await;
+                }
+            }
+        }
+        if prepare.outgoing_expiry <= unix_now() {
+            let reason = "outgoing expiry passed while verifying".to_string();
+            return self.fail_hop(hop, reason).await;
+        }
+
+        hop.state = HopState::Funding;
+        if let Err(error) = self.save_hop(&hop) {
+            return self.fail_hop(hop, error).await;
+        }
+        let funded = outgoing
             .create_outgoing_htlc(
                 prepare.payment_hash,
                 prepare.outgoing_amount_msat,
                 prepare.outgoing_expiry,
-                &execute.outgoing_target,
+                &hop.outgoing_target,
             )
             .await;
         match funded {
@@ -310,11 +366,13 @@ impl Node {
                     payment_hash: prepare.payment_hash,
                     amount_msat: prepare.outgoing_amount_msat,
                     expiry: prepare.outgoing_expiry,
-                    target: execute.outgoing_target,
-                    descriptor: descriptor.clone(),
+                    target: hop.outgoing_target.clone(),
+                    descriptor,
                 });
                 hop.state = HopState::Forwarded;
-                self.save_hop(&hop)?;
+                if let Err(error) = self.save_hop(&hop) {
+                    error!("journaling forwarded hop {}: {error}", hop.operation_id);
+                }
                 info!(
                     "EXECUTE {}: forwarded {} msat {} -> {}",
                     prepare.payment_hash.short(),
@@ -322,16 +380,29 @@ impl Node {
                     prepare.incoming_network,
                     prepare.outgoing_network
                 );
-                Ok(descriptor)
             }
             Err(error) => {
-                hop.state = HopState::Failed(format!("funding the outgoing HTLC: {error}"));
-                self.save_hop(&hop)?;
-                Err(format!(
+                hop.state = HopState::Failed(format!(
                     "cannot fund on {}: {error}",
                     prepare.outgoing_network
-                ))
+                ));
+                if let Err(error) = self.save_hop(&hop) {
+                    error!("journaling failed hop {}: {error}", hop.operation_id);
+                }
             }
+        }
+    }
+
+    /// End a hop that never funded its outgoing HTLC.
+    async fn fail_hop(&self, mut hop: HopRecord, reason: String) {
+        warn!(
+            "EXECUTE {} failed: {reason}",
+            hop.prepare.payment_hash.short()
+        );
+        self.release(&hop.prepare).await;
+        hop.state = HopState::Failed(reason);
+        if let Err(error) = self.save_hop(&hop) {
+            error!("journaling failed hop {}: {error}", hop.operation_id);
         }
     }
 
@@ -349,7 +420,7 @@ impl Node {
             }
         };
         if let Some(reservation) = reservation {
-            self.release(reservation).await;
+            self.release(&reservation.prepare).await;
         }
     }
 
@@ -386,12 +457,12 @@ impl Node {
                 .collect()
         };
         for reservation in expired {
-            self.release(reservation).await;
+            self.release(&reservation.prepare).await;
         }
     }
 
-    async fn release(&self, reservation: Reservation) {
-        let prepare = &reservation.prepare;
+    /// Release what the incoming network set up to receive `prepare`.
+    async fn release(&self, prepare: &Prepare) {
         if let Ok(network) = self.network(&prepare.incoming_network) {
             if let Err(error) = network.cancel_receive(prepare.payment_hash).await {
                 warn!(
@@ -403,7 +474,8 @@ impl Node {
         }
     }
 
-    pub(super) fn hops(&self) -> Result<Vec<HopRecord>, String> {
+    /// Hops this node routed, in any state.
+    pub fn hops(&self) -> Result<Vec<HopRecord>, String> {
         self.store().list(HOPS)
     }
 
@@ -415,19 +487,26 @@ impl Node {
         self.store().put(HOPS, hop.operation_id.as_str(), hop)
     }
 
-    /// Hops left mid-funding by a crash cannot be resumed: whether the
-    /// outgoing HTLC exists is unknown, and funding it again could pay
-    /// twice.
-    pub(super) fn fail_interrupted_hops(&self) -> Result<(), String> {
+    /// After a restart: go on waiting for hops still verifying, and
+    /// fail hops left mid-funding, which cannot be resumed: whether
+    /// their outgoing HTLC exists is unknown, and funding it again could
+    /// pay twice.
+    pub(super) fn resume_hops(&self) -> Result<(), String> {
         for mut hop in self.hops()? {
-            if hop.state == HopState::Funding {
-                error!(
-                    "hop {} was interrupted while funding its outgoing HTLC on {}; \
-                     check that wallet for a lock to {:?}",
-                    hop.prepare.payment_hash, hop.prepare.outgoing_network, hop.prepare,
-                );
-                hop.state = HopState::Failed("interrupted while funding".into());
-                self.save_hop(&hop)?;
+            match hop.state {
+                HopState::Verifying => {
+                    self.spawn(self.clone().forward(hop));
+                }
+                HopState::Funding => {
+                    error!(
+                        "hop {} was interrupted while funding its outgoing HTLC on {}; \
+                         check that wallet for a lock to {:?}",
+                        hop.prepare.payment_hash, hop.prepare.outgoing_network, hop.prepare,
+                    );
+                    hop.state = HopState::Failed("interrupted while funding".into());
+                    self.save_hop(&hop)?;
+                }
+                _ => {}
             }
         }
         Ok(())

@@ -43,8 +43,9 @@
 //! use the tweaked key).
 //!
 //! Lockups are accepted unconfirmed on mutinynet, and only with one
-//! confirmation on mainnet, where unconfirmed transactions can be
-//! replaced.
+//! confirmation on mainnet and regtest (where unconfirmed transactions
+//! can be replaced, and the tests mine on demand): until then
+//! verification answers [`NetworkError::NotYet`].
 
 use async_trait::async_trait;
 use bitcoin::absolute;
@@ -254,6 +255,8 @@ pub struct BitcoinAdapter {
     key_xonly: XOnlyPublicKey,
     /// P2TR address wallet UTXOs live at, and change and claims return to.
     funding_address: Address,
+    /// Incoming lockups must be confirmed before they are relied on.
+    require_confirmation: bool,
     client: esplora_client::AsyncClient,
     span: Span,
 }
@@ -262,11 +265,27 @@ impl BitcoinAdapter {
     /// Open the wallet for `bitcoin` or `bitcoin::mutinynet`. All state
     /// is on-chain, so no data directory is needed.
     pub fn open(id: NetworkId, secret: [u8; 32], span: &Span) -> Result<Self, String> {
-        let (network, esplora_url) = match id.param() {
-            None => (bitcoin::Network::Bitcoin, MAINNET_ESPLORA_URL),
-            Some("mutinynet") => (bitcoin::Network::Signet, MUTINYNET_ESPLORA_URL),
+        Self::open_with_esplora(id, secret, None, span)
+    }
+
+    /// [`open`](Self::open), reading the chain from the Esplora API at
+    /// `esplora_url` instead of the public one (required for
+    /// `bitcoin::regtest`, which has none).
+    pub fn open_with_esplora(
+        id: NetworkId,
+        secret: [u8; 32],
+        esplora_url: Option<&str>,
+        span: &Span,
+    ) -> Result<Self, String> {
+        let (network, default_url) = match id.param() {
+            None => (bitcoin::Network::Bitcoin, Some(MAINNET_ESPLORA_URL)),
+            Some("mutinynet") => (bitcoin::Network::Signet, Some(MUTINYNET_ESPLORA_URL)),
+            Some("regtest") => (bitcoin::Network::Regtest, None),
             Some(other) => return Err(format!("unknown bitcoin network '{other}'")),
         };
+        let esplora_url = esplora_url
+            .or(default_url)
+            .ok_or_else(|| format!("{id} needs an esplora URL"))?;
         let secp = Secp256k1::new();
         let wallet_sk = bitcoin::secp256k1::SecretKey::from_slice(&secret)
             .map_err(|e| format!("invalid bitcoin key: {e}"))?;
@@ -285,6 +304,7 @@ impl BitcoinAdapter {
             wallet_sk,
             key_xonly,
             funding_address,
+            require_confirmation: network != bitcoin::Network::Signet,
             client,
             span,
         })
@@ -870,10 +890,8 @@ impl Network for BitcoinAdapter {
         if u64::from(options.refund_locktime) < htlc.expiry {
             return Err(NetworkError::invalid("refund opens before the expiry"));
         }
-        if self.network == bitcoin::Network::Bitcoin && !confirmed {
-            return Err(NetworkError::network(
-                "lockup is unconfirmed; mainnet HTLCs need a confirmation",
-            ));
+        if self.require_confirmation && !confirmed {
+            return Err(NetworkError::not_yet("lockup is unconfirmed"));
         }
         Ok(())
     }

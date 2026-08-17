@@ -19,7 +19,7 @@ mod router;
 mod settle;
 
 use crate::keys::NodeKeys;
-use crate::network::{Htlc, Network, NetworkId};
+use crate::network::{Htlc, HtlcTarget, Network, NetworkId};
 use crate::primitives::{Bytes32, OperationId, XOnlyPubKey};
 use crate::protocol::{Invoice, Prepare, Request, Response};
 use crate::store::Store;
@@ -27,6 +27,7 @@ use crate::transport::{Handler, Transport};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tracing::{Instrument, Span};
 
 pub use payee::create_invoice;
@@ -35,6 +36,12 @@ pub use router::{PrepareVeto, RoutingPolicy};
 const INVOICES: &str = "invoices";
 const PAYMENTS: &str = "payments";
 const HOPS: &str = "hops";
+
+/// How long EXECUTE and COMMIT work before answering
+/// [`Response::Pending`] instead of the outcome.
+const INLINE_WAIT: Duration = Duration::from_secs(5);
+/// How often an incoming HTLC that is not final yet is verified again.
+const VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// An invoice this node issued, with its secret preimage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -82,6 +89,8 @@ pub struct HopRecord {
     pub owner: String,
     pub prepare: Prepare,
     pub incoming: Htlc,
+    /// Where EXECUTE asked to forward to.
+    pub outgoing_target: HtlcTarget,
     pub outgoing: Option<Htlc>,
     pub state: HopState,
     /// Learned from downstream; claims `incoming`.
@@ -90,6 +99,9 @@ pub struct HopRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HopState {
+    /// Waiting for the incoming HTLC to verify (to confirm, say).
+    /// Nothing is funded yet.
+    Verifying,
     /// Funding the outgoing HTLC.
     Funding,
     /// Outgoing HTLC funded; waiting for its preimage or its expiry.
@@ -128,6 +140,11 @@ struct Inner {
     /// Keys of records some task is currently acting on; others skip
     /// them instead of acting twice.
     busy: Mutex<HashSet<String>>,
+    /// Claims started by COMMIT, by payment hash, until a repeated
+    /// COMMIT collects their failure.
+    commits: Mutex<HashMap<Bytes32, payee::CommitState>>,
+    /// Background work, stopped by [`Node::shutdown`].
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 impl Node {
@@ -150,19 +167,51 @@ impl Node {
             routing: RwLock::new(None),
             reservations: Default::default(),
             busy: Default::default(),
+            commits: Default::default(),
+            tasks: Default::default(),
         }));
         if config.serve {
-            node.fail_interrupted_hops()?;
+            node.resume_hops()?;
             let server = node.clone();
             let handler: Handler = Arc::new(move |request, peer| {
                 let node = server.clone();
                 Box::pin(async move { node.handle(request, peer).await })
             });
             let transport = node.0.transport.clone();
-            tokio::spawn(async move { transport.serve(handler).await }.instrument(node.span()));
-            tokio::spawn(node.clone().settle_loop().instrument(node.span()));
+            node.spawn(async move { transport.serve(handler).await });
+            node.spawn(node.clone().settle_loop());
         }
         Ok(node)
+    }
+
+    /// Run `task` in the background, under the node's span, until it
+    /// ends or the node shuts down.
+    fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(task.instrument(self.span()));
+        let mut tasks = self.0.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle.abort_handle());
+    }
+
+    /// Stop serving, routing and settling, and close the endpoint. The
+    /// journal stays in the store: a node started again on it resumes
+    /// settling where this one stopped.
+    pub async fn shutdown(&self) {
+        for task in self
+            .0
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+        self.0.transport.close().await;
+    }
+
+    /// Payments this node made, settled or not.
+    pub fn payments(&self) -> Result<Vec<PaymentRecord>, String> {
+        self.store().list(PAYMENTS)
     }
 
     pub fn span(&self) -> Span {
@@ -215,18 +264,12 @@ impl Node {
     async fn handle(&self, request: Request, peer: String) -> Response {
         match request {
             Request::Prepare(prepare) => Response::Prepared(self.prepare(prepare, peer).await),
-            Request::Execute(execute) => match self.execute(execute, peer).await {
-                Ok(descriptor) => Response::Executed(descriptor),
-                Err(error) => Response::Error(error),
-            },
+            Request::Execute(execute) => self.execute(execute, peer).await,
             Request::Discard(discard) => {
                 self.discard(discard, peer).await;
                 Response::Discarded
             }
-            Request::Commit(commit) => match self.commit(commit).await {
-                Ok(preimage) => Response::Committed(preimage),
-                Err(error) => Response::Error(error),
-            },
+            Request::Commit(commit) => self.commit(commit).await,
             Request::Settle(settle) => {
                 self.settle_hop(settle, peer).await;
                 Response::Settled

@@ -22,7 +22,7 @@ use std::fmt;
 /// * `arkade`, `arkade::mutinynet` — the public operators — or
 ///   `arkade::<host[:port]>`, any other operator (loopback hosts use
 ///   `http`, everything else `https`)
-/// * `bitcoin`, `bitcoin::mutinynet`
+/// * `bitcoin`, `bitcoin::mutinynet`, `bitcoin::regtest`
 /// * `rootstock`, `rootstock::testnet`
 /// * `lightning`
 ///
@@ -68,7 +68,7 @@ impl NetworkId {
                 return Ok(Self(spec.to_string()));
             }
             "liquid" | "rootstock" => &["testnet"],
-            "bitcoin" => &["mutinynet"],
+            "bitcoin" => &["mutinynet", "regtest"],
             "lightning" => &[],
             other => return Err(format!("unsupported network kind '{other}'")),
         };
@@ -243,6 +243,10 @@ pub enum NetworkError {
     /// The network or a backend service failed; retrying may help.
     #[error("network: {0}")]
     Network(String),
+    /// Valid, but not usable yet (an unconfirmed lockup, say): ask
+    /// again later.
+    #[error("not yet: {0}")]
+    NotYet(String),
 }
 
 impl NetworkError {
@@ -252,6 +256,10 @@ impl NetworkError {
 
     pub fn network(message: impl fmt::Display) -> Self {
         Self::Network(message.to_string())
+    }
+
+    pub fn not_yet(message: impl fmt::Display) -> Self {
+        Self::NotYet(message.to_string())
     }
 }
 
@@ -295,6 +303,9 @@ pub trait Network: Send + Sync {
     /// 4. it locks at least `htlc.amount_msat`;
     /// 5. its refund cannot happen before `htlc.expiry`;
     /// 6. it is funded, final enough to rely on, and not yet spent.
+    ///
+    /// [`NetworkError::NotYet`] means the HTLC is right but not final
+    /// enough yet (e.g. unconfirmed): callers wait and verify again.
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError>;
 
     /// Claim a verified incoming HTLC by revealing `preimage`.
@@ -356,6 +367,7 @@ mod tests {
             "arkade::127.0.0.1:7070",
             "bitcoin",
             "bitcoin::mutinynet",
+            "bitcoin::regtest",
             "rootstock",
             "rootstock::testnet",
             "lightning",

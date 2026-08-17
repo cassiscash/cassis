@@ -7,7 +7,11 @@ use crate::protocol::{Commit, Discard, Execute, Invoice, Prepare, Request, Respo
 use crate::routing::{self, RouteAnnouncement};
 use crate::transport::PeerAddr;
 use futures::future::join_all;
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// How often a pending EXECUTE or COMMIT is asked again.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Node {
     /// Pay `invoice` from this node's `from` network, routing through
@@ -17,6 +21,10 @@ impl Node {
     /// Once the first HTLC is funded the payment is journaled: if the
     /// payment fails afterwards, a serving node refunds it after its
     /// expiry.
+    ///
+    /// Hops and the payee may wait for their incoming HTLC to become
+    /// final (to confirm, on Bitcoin), so this can take as long as the
+    /// route's timelocks allow.
     pub async fn pay(
         &self,
         invoice: &Invoice,
@@ -163,9 +171,11 @@ impl Node {
                 outgoing_target: targets[i + 1].clone(),
             };
             descriptor = match self
-                .0
-                .transport
-                .request(&hop.peer, &Request::Execute(execute))
+                .request_until_done(
+                    &hop.peer,
+                    &Request::Execute(execute),
+                    hop.prepare.outgoing_expiry,
+                )
                 .await
             {
                 Ok(Response::Executed(next)) => next,
@@ -186,10 +196,9 @@ impl Node {
             expiry: plan.expiries[hops.len()],
             descriptor,
         };
+        let deadline = commit.expiry;
         let preimage = match self
-            .0
-            .transport
-            .request(&payee, &Request::Commit(commit))
+            .request_until_done(&payee, &Request::Commit(commit), deadline)
             .await
         {
             Ok(Response::Committed(preimage)) if hash.matches_preimage(&preimage) => preimage,
@@ -253,6 +262,30 @@ impl Node {
             .min_by_key(|(cost, _, _)| *cost)
             .map(|(_, route, network)| (route, network))
             .ok_or_else(|| format!("no route from {from} to any network of the invoice"))
+    }
+
+    /// Send `request` to `peer` again and again while it answers
+    /// [`Response::Pending`], until `deadline` (unix seconds). Once the
+    /// peer has accepted the request, connection failures are retried
+    /// too: the work goes on without us.
+    async fn request_until_done(
+        &self,
+        peer: &PeerAddr,
+        request: &Request,
+        deadline: u64,
+    ) -> Result<Response, String> {
+        let mut accepted = false;
+        loop {
+            match self.0.transport.request(peer, request).await {
+                Ok(Response::Pending) => accepted = true,
+                Err(error) if accepted => warn!("asking {} again: {error}", peer.id),
+                other => return other,
+            }
+            if unix_now() >= deadline {
+                return Err("still pending at its deadline".into());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     async fn discard_hops(&self, hops: &[Hop]) {

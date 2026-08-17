@@ -16,14 +16,17 @@
 //! **DISCARD** releases PREPARE reservations of an aborted attempt.
 //!
 //! Every request is one JSON message on its own stream, answered by
-//! exactly one [`Response`].
+//! exactly one [`Response`]. EXECUTE and COMMIT may have to wait for
+//! their incoming HTLC to become final (a confirmation, say): they then
+//! answer [`Response::Pending`] and keep working, and the payer repeats
+//! the same request until it gets the outcome.
 
 use crate::network::{HtlcDescriptor, HtlcTarget, NetworkId};
 use crate::primitives::{Bytes32, OperationId, XOnlyPubKey};
 use serde::{Deserialize, Serialize};
 
 /// Protocol identifier negotiated on every connection.
-pub const ALPN: &[u8] = b"cassis-hop/3";
+pub const ALPN: &[u8] = b"cassis-hop/4";
 
 /// A payment request created by the payee.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +140,9 @@ pub enum Response {
     /// The preimage the payee claimed with.
     Committed(Bytes32),
     Settled,
+    /// EXECUTE or COMMIT accepted and still in progress: repeat the
+    /// request to learn its outcome.
+    Pending,
     Error(String),
 }
 

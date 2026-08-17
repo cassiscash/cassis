@@ -199,6 +199,12 @@ fn fee_estimates() -> Value {
 impl Index {
     /// Catch up with bitcoind's chain and mempool.
     async fn sync(&mut self, bitcoind: &Bitcoind) -> Result<(), String> {
+        // The mempool first: a transaction mined before this snapshot is
+        // in the blocks synced below, one mined after is still in the
+        // snapshot. Either way it is not taken for evicted.
+        let mempool: HashSet<Txid> =
+            serde_json::from_value(bitcoind.rpc("getrawmempool", json!([])).await?)
+                .map_err(|e| format!("getrawmempool: {e}"))?;
         let count = bitcoind
             .rpc("getblockcount", json!([]))
             .await?
@@ -235,9 +241,6 @@ impl Index {
             self.blocks.push(info);
         }
 
-        let mempool: HashSet<Txid> =
-            serde_json::from_value(bitcoind.rpc("getrawmempool", json!([])).await?)
-                .map_err(|e| format!("getrawmempool: {e}"))?;
         // Evicted or replaced transactions.
         for txid in self.mempool.clone() {
             if !mempool.contains(&txid) {

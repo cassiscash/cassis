@@ -1,13 +1,21 @@
 //! Payee role: issue invoices, claim on COMMIT.
 
-use super::{InvoiceRecord, InvoiceStatus, Node, INVOICES};
+use super::{InvoiceRecord, InvoiceStatus, Node, INLINE_WAIT, INVOICES, VERIFY_RETRY_INTERVAL};
 use crate::keys::NodeKeys;
-use crate::network::{Htlc, Network};
+use crate::network::{Htlc, Network, NetworkError};
 use crate::primitives::{unix_now, Bytes32};
-use crate::protocol::{Commit, Invoice, InvoiceNetwork};
+use crate::protocol::{Commit, Invoice, InvoiceNetwork, Response};
 use crate::store::Store;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// A claim started by COMMIT.
+pub(super) enum CommitState {
+    Claiming,
+    /// Kept until a repeated COMMIT reports it.
+    Failed(String),
+}
 
 /// Create and record an invoice payable on each of `networks`.
 ///
@@ -97,7 +105,67 @@ impl Node {
         .await
     }
 
-    pub(super) async fn commit(&self, commit: Commit) -> Result<Bytes32, String> {
+    /// Start claiming the HTLC of `commit`, or report on a claim
+    /// already started: [`Response::Committed`] once claimed,
+    /// [`Response::Pending`] while the HTLC is not final yet.
+    pub(super) async fn commit(&self, commit: Commit) -> Response {
+        let hash = commit.payment_hash;
+        let start = {
+            let mut commits = self.0.commits.lock().unwrap_or_else(|e| e.into_inner());
+            match commits.get(&hash) {
+                Some(CommitState::Claiming) => false,
+                Some(CommitState::Failed(_)) => false,
+                None => {
+                    commits.insert(hash, CommitState::Claiming);
+                    true
+                }
+            }
+        };
+        if start {
+            self.spawn(self.clone().claim(commit));
+        }
+        // Answer right away when claiming is quick.
+        let deadline = tokio::time::Instant::now() + INLINE_WAIT;
+        loop {
+            let record: Option<InvoiceRecord> =
+                self.store().get(INVOICES, &hash.to_string()).ok().flatten();
+            if let Some(record) = record.filter(|r| r.status == InvoiceStatus::Claimed) {
+                return Response::Committed(record.preimage);
+            }
+            {
+                let mut commits = self.0.commits.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(CommitState::Failed(reason)) = commits.get(&hash) {
+                    // Reported once; a corrected COMMIT may start over.
+                    let reason = reason.clone();
+                    commits.remove(&hash);
+                    return Response::Error(reason);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Response::Pending;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Verify the HTLC of `commit`, waiting while it is not final yet,
+    /// and claim it.
+    async fn claim(self, commit: Commit) {
+        let hash = commit.payment_hash;
+        let outcome = self.try_claim(commit).await;
+        let mut commits = self.0.commits.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(()) => {
+                commits.remove(&hash);
+            }
+            Err(reason) => {
+                warn!("COMMIT {} failed: {reason}", hash.short());
+                commits.insert(hash, CommitState::Failed(reason));
+            }
+        }
+    }
+
+    async fn try_claim(&self, commit: Commit) -> Result<(), String> {
         let key = commit.payment_hash.to_string();
         let _busy = self
             .busy(format!("invoice:{key}"))
@@ -105,13 +173,11 @@ impl Node {
         let mut record: InvoiceRecord =
             self.store().get(INVOICES, &key)?.ok_or("unknown invoice")?;
         match record.status {
-            // The preimage is public once claimed.
-            InvoiceStatus::Claimed => return Ok(record.preimage),
+            InvoiceStatus::Claimed => return Ok(()),
             InvoiceStatus::Expired => return Err("invoice expired".into()),
             InvoiceStatus::Pending => {}
         }
-        let now = unix_now();
-        if record.invoice.expires_at <= now {
+        if record.invoice.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
         let target = record
@@ -120,7 +186,9 @@ impl Node {
             .cloned()
             .ok_or_else(|| format!("invoice is not payable on {}", commit.network))?;
         let network = self.network(&commit.network)?;
-        if commit.expiry < now.saturating_add(network.incoming_delta_secs()) {
+        // The claim itself must land before the HTLC expires.
+        let claim_by = commit.expiry.saturating_sub(network.incoming_delta_secs());
+        if claim_by <= unix_now() {
             return Err("HTLC expires too soon to claim it".into());
         }
         let htlc = Htlc {
@@ -130,10 +198,23 @@ impl Node {
             target,
             descriptor: commit.descriptor,
         };
-        network
-            .verify_incoming_htlc(&htlc)
-            .await
-            .map_err(|e| format!("HTLC rejected: {e}"))?;
+        let mut waiting = false;
+        loop {
+            match network.verify_incoming_htlc(&htlc).await {
+                Ok(()) => break,
+                Err(NetworkError::NotYet(reason)) if unix_now() < claim_by => {
+                    if !waiting {
+                        info!(
+                            "COMMIT {}: waiting for the HTLC: {reason}",
+                            htlc.payment_hash.short()
+                        );
+                        waiting = true;
+                    }
+                    tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+                }
+                Err(error) => return Err(format!("HTLC rejected: {error}")),
+            }
+        }
         info!(
             "claiming {} msat for invoice {} on {}",
             htlc.amount_msat, key, commit.network
@@ -146,7 +227,7 @@ impl Node {
         record.settled_at = Some(unix_now());
         self.store().put(INVOICES, &key, &record)?;
         self.cancel_targets(&record, Some(&commit.network)).await;
-        Ok(record.preimage)
+        Ok(())
     }
 
     /// Release what the invoice's networks, except `claimed_on`, set up
