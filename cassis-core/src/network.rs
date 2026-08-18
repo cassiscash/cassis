@@ -12,6 +12,7 @@ use crate::primitives::{Bytes32, PubKey, XOnlyPubKey};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 /// Canonical network identifier: `<kind>` or `<kind>::<param>`.
 ///
@@ -111,15 +112,35 @@ impl NetworkId {
         Ok(format!("{scheme}://{host}"))
     }
 
-    /// Per-hop incoming delta used when a route announcement does not
-    /// publish one. Mirrors [`Network::incoming_delta_secs`] of each
-    /// network crate.
+    /// Default safety margin of an HTLC received on this network: how
+    /// long a router needs, after learning the preimage at the last
+    /// moment (its outgoing HTLC's expiry), to get its claim of the
+    /// incoming HTLC through before that one can be refunded. Each hop
+    /// adds the margin of its incoming network, so expiries grow from
+    /// the payee back to the payer.
     pub fn default_incoming_delta(&self) -> u64 {
+        const MINUTE: u64 = 60;
         match self.kind() {
-            "arkade" => 60,
-            "bitcoin" | "liquid" => 300,
-            "rootstock" => 600,
-            _ => 30,
+            // One request to the mint, timed by the mint's clock: covers
+            // clock skew and short downtime.
+            "cashu" => 5 * MINUTE,
+            // Contracts expire after a number of bitcoin blocks, which
+            // can come early: about four blocks of margin.
+            "fedimint" => 40 * MINUTE,
+            // An offchain claim co-signed by the operator, timed by the
+            // chain tip's time.
+            "arkade" => 20 * MINUTE,
+            // The claim must confirm on-chain before a refund can.
+            "bitcoin" => 60 * MINUTE,
+            // Regular one-minute blocks.
+            "liquid" => 10 * MINUTE,
+            // ~30s blocks, with some variance.
+            "rootstock" => 20 * MINUTE,
+            // The hold invoice must be settled before its CLTV, counted
+            // in bitcoin blocks, runs out.
+            "lightning" => 60 * MINUTE,
+            // Unknown kinds: the most cautious of the above.
+            _ => 60 * MINUTE,
         }
     }
 }
@@ -277,8 +298,12 @@ pub trait Network: Send + Sync {
     /// Seconds this network needs to get a claim through once the
     /// preimage is known. A router requires at least this much between
     /// the expiry of its outgoing HTLC and the expiry of the incoming
-    /// one it claims on this network.
-    fn incoming_delta_secs(&self) -> u64;
+    /// one it claims on this network. Defaults to
+    /// [`NetworkId::default_incoming_delta`]; see
+    /// [`with_incoming_delta`] to change it.
+    fn incoming_delta_secs(&self) -> u64 {
+        self.id().default_incoming_delta()
+    }
 
     /// What a payer must lock an HTLC for `payment_hash` to so that this
     /// node can claim it. Idempotent per payment hash. Networks whose
@@ -339,6 +364,84 @@ pub trait Network: Send + Sync {
     /// Whether this node can afford to claim an incoming HTLC of
     /// `amount_msat` (e.g. gas paid from its own balance).
     async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError>;
+}
+
+/// `network` with a safety margin of `secs` instead of its own (see
+/// [`Network::incoming_delta_secs`]), e.g. to test expiries without
+/// waiting for the real margins.
+pub fn with_incoming_delta(network: Arc<dyn Network>, secs: u64) -> Arc<dyn Network> {
+    Arc::new(WithIncomingDelta { network, secs })
+}
+
+struct WithIncomingDelta {
+    network: Arc<dyn Network>,
+    secs: u64,
+}
+
+#[async_trait]
+impl Network for WithIncomingDelta {
+    fn id(&self) -> NetworkId {
+        self.network.id()
+    }
+
+    fn incoming_delta_secs(&self) -> u64 {
+        self.secs
+    }
+
+    async fn receive_target(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+    ) -> Result<HtlcTarget, NetworkError> {
+        self.network
+            .receive_target(payment_hash, amount_msat, expiry)
+            .await
+    }
+
+    async fn cancel_receive(&self, payment_hash: Bytes32) -> Result<(), NetworkError> {
+        self.network.cancel_receive(payment_hash).await
+    }
+
+    async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        self.network.verify_incoming_htlc(htlc).await
+    }
+
+    async fn claim_incoming_htlc(
+        &self,
+        htlc: &Htlc,
+        preimage: Bytes32,
+    ) -> Result<(), NetworkError> {
+        self.network.claim_incoming_htlc(htlc, preimage).await
+    }
+
+    async fn create_outgoing_htlc(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+        target: &HtlcTarget,
+    ) -> Result<HtlcDescriptor, NetworkError> {
+        self.network
+            .create_outgoing_htlc(payment_hash, amount_msat, expiry, target)
+            .await
+    }
+
+    async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
+        self.network.check_outgoing_htlc(htlc).await
+    }
+
+    async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        self.network.refund_outgoing_htlc(htlc).await
+    }
+
+    async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        self.network.can_send(amount_msat).await
+    }
+
+    async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        self.network.can_receive(amount_msat).await
+    }
 }
 
 /// Build the per-network child span an adapter enters around its logs.
@@ -420,18 +523,13 @@ mod tests {
 
     #[test]
     fn default_incoming_delta_uses_the_kind() {
-        assert_eq!(
-            NetworkId("cashu::localhost".into()).default_incoming_delta(),
-            30
-        );
-        assert_eq!(
-            NetworkId("liquid::testnet".into()).default_incoming_delta(),
-            300
-        );
-        assert_eq!(NetworkId("rootstock".into()).default_incoming_delta(), 600);
-        assert_eq!(
-            NetworkId("arkade::mutinynet".into()).default_incoming_delta(),
-            60
-        );
+        let delta = |id: &str| NetworkId(id.into()).default_incoming_delta() / 60;
+        assert_eq!(delta("cashu::localhost"), 5);
+        assert_eq!(delta("fedimint::fed1q"), 40);
+        assert_eq!(delta("arkade::mutinynet"), 20);
+        assert_eq!(delta("bitcoin"), 60);
+        assert_eq!(delta("liquid::testnet"), 10);
+        assert_eq!(delta("rootstock"), 20);
+        assert_eq!(delta("lightning"), 60);
     }
 }

@@ -76,7 +76,7 @@ impl Node {
         let plan = routing::plan_route(
             &route,
             invoice.amount_msat,
-            payee_network.default_incoming_delta(),
+            invoice.incoming_delta_for(&payee_network),
             unix_now(),
         )?;
         let hops: Vec<Hop> = route

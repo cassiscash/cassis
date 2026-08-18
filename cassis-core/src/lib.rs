@@ -26,7 +26,8 @@ pub mod store;
 pub mod transport;
 
 pub use network::{
-    network_span, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId, OutgoingState,
+    network_span, with_incoming_delta, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError,
+    NetworkId, OutgoingState,
 };
 pub use primitives::{
     sats_for_msat, unix_now, Bytes32, OperationId, PubKey, XOnlyPubKey, MSAT_PER_SAT,

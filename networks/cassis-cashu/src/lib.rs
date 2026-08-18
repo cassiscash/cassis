@@ -301,11 +301,6 @@ impl Network for CashuAdapter {
         self.id.clone()
     }
 
-    /// Mint swaps settle in one request.
-    fn incoming_delta_secs(&self) -> u64 {
-        30
-    }
-
     async fn receive_target(
         &self,
         _payment_hash: Bytes32,

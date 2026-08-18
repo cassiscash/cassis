@@ -328,11 +328,6 @@ impl Network for LndAdapter {
         self.id.clone()
     }
 
-    /// Settling a hold invoice is one call to LND.
-    fn incoming_delta_secs(&self) -> u64 {
-        30
-    }
-
     async fn receive_target(
         &self,
         payment_hash: Bytes32,

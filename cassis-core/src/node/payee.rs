@@ -51,6 +51,7 @@ pub async fn create_invoice(
         targets.push(InvoiceNetwork {
             network: network.id(),
             target,
+            incoming_delta_secs: Some(network.incoming_delta_secs()),
         });
     }
     let invoice = Invoice {

@@ -758,11 +758,6 @@ impl Network for ArkadeAdapter {
         self.id.clone()
     }
 
-    /// Claims are offchain transactions co-signed by the operator.
-    fn incoming_delta_secs(&self) -> u64 {
-        60
-    }
-
     async fn receive_target(
         &self,
         _payment_hash: Bytes32,

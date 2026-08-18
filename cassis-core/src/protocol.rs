@@ -56,6 +56,11 @@ pub struct Invoice {
 pub struct InvoiceNetwork {
     pub network: NetworkId,
     pub target: HtlcTarget,
+    /// The payee's safety margin on this network (see
+    /// [`crate::Network::incoming_delta_secs`]): its HTLC must expire at
+    /// least this long after COMMIT. The network's default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_delta_secs: Option<u64>,
 }
 
 impl Invoice {
@@ -65,6 +70,15 @@ impl Invoice {
             .iter()
             .find(|entry| entry.network == *network)
             .map(|entry| &entry.target)
+    }
+
+    /// The payee's safety margin when paid on `network`.
+    pub fn incoming_delta_for(&self, network: &NetworkId) -> u64 {
+        self.networks
+            .iter()
+            .find(|entry| entry.network == *network)
+            .and_then(|entry| entry.incoming_delta_secs)
+            .unwrap_or_else(|| network.default_incoming_delta())
     }
 }
 

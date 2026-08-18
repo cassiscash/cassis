@@ -310,11 +310,6 @@ impl Network for RootstockAdapter {
         self.id.clone()
     }
 
-    /// Claims wait for a block.
-    fn incoming_delta_secs(&self) -> u64 {
-        600
-    }
-
     async fn receive_target(
         &self,
         _payment_hash: Bytes32,

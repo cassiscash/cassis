@@ -17,7 +17,7 @@ use cassis_cashu::CashuAdapter;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{Node, NodeConfig, PrepareVeto, RoutingPolicy};
 use cassis_core::store::Store;
-use cassis_core::{unix_now, Bytes32, Invoice, Network, NetworkId};
+use cassis_core::{unix_now, with_incoming_delta, Bytes32, Invoice, Network, NetworkId};
 use cassis_fedimint::FedimintAdapter;
 use fedimint_api_client::api::DynGlobalApi;
 use fedimint_connectors::ConnectorRegistry;
@@ -42,6 +42,9 @@ const ARKD_PASSWORD: &str = "password";
 const ARKD_SIGNER_KEY: &str = "afcd3fa10f82a05fddc9574fdb13b3991b568e89cc39a72ba4401df8abef35f0";
 /// On-chain coins the operator starts with, to fund batches.
 const ARKD_OPERATOR_BTC: f64 = 10.0;
+/// Safety margin of every network in the environment, instead of the
+/// real ones (up to an hour) that would make expiries slow to test.
+const TEST_INCOMING_DELTA_SECS: u64 = 30;
 
 pub struct LocalEnv {
     root: PathBuf,
@@ -50,6 +53,8 @@ pub struct LocalEnv {
     bitcoind: OnceCell<Bitcoind>,
     esplora: OnceCell<String>,
     arkd: OnceCell<Arkd>,
+    /// A client of each federation, to watch its block count.
+    federations: Mutex<HashMap<NetworkId, Arc<FedimintAdapter>>>,
     counter: std::sync::atomic::AtomicUsize,
 }
 
@@ -82,6 +87,7 @@ impl LocalEnv {
             bitcoind: OnceCell::new(),
             esplora: OnceCell::new(),
             arkd: OnceCell::new(),
+            federations: Default::default(),
             counter: Default::default(),
         })
     }
@@ -296,7 +302,13 @@ impl LocalEnv {
                             Err(error) => return Err(error),
                         }
                     };
-                    Wallet::Fedimint(Arc::new(adapter))
+                    let adapter = Arc::new(adapter);
+                    self.federations
+                        .lock()
+                        .await
+                        .entry(network.clone())
+                        .or_insert_with(|| adapter.clone());
+                    Wallet::Fedimint(adapter)
                 }
                 "arkade" => Wallet::Arkade(Arc::new(
                     ArkadeAdapter::open_with_esplora(
@@ -324,7 +336,10 @@ impl LocalEnv {
                 span,
                 serve: true,
             },
-            wallets.values().map(Wallet::network).collect(),
+            wallets
+                .values()
+                .map(|wallet| with_incoming_delta(wallet.network(), TEST_INCOMING_DELTA_SECS))
+                .collect(),
         )
         .await?;
         Ok(TestNode {
@@ -354,6 +369,33 @@ impl LocalEnv {
             result = task => result,
             _ = miner => unreachable!("the miner never stops"),
         }
+    }
+
+    /// Wait until every federation has agreed on bitcoind's tip. Blocks
+    /// mined in a burst (funding) reach a federation's consensus over
+    /// several seconds, and contracts expire against that count: one
+    /// locked meanwhile could expire as soon as it catches up.
+    async fn wait_for_federations(&self) -> Result<(), String> {
+        let federations: Vec<_> = self.federations.lock().await.values().cloned().collect();
+        if federations.is_empty() {
+            return Ok(());
+        }
+        let bitcoind = self.bitcoind().await?;
+        let height = bitcoind
+            .rpc("getblockcount", json!([]))
+            .await?
+            .as_u64()
+            .ok_or("getblockcount: not a number")?;
+        for federation in federations {
+            wait_for("federation block count", || async {
+                federation
+                    .consensus_block_count()
+                    .await
+                    .is_ok_and(|count| count > height)
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Give `node` `amount_msat` of fake money on `network`.
@@ -436,6 +478,7 @@ impl LocalEnv {
                 self.bitcoind().await?.mine(1).await?;
             }
         }
+        self.wait_for_federations().await?;
         info!("funded {} on {network}", node.name);
         Ok(())
     }

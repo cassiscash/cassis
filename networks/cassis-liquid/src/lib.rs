@@ -861,10 +861,6 @@ impl Network for LiquidAdapter {
         self.id.clone()
     }
 
-    fn incoming_delta_secs(&self) -> u64 {
-        300
-    }
-
     async fn receive_target(
         &self,
         _payment_hash: Bytes32,

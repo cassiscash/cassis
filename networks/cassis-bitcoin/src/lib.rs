@@ -858,11 +858,6 @@ impl Network for BitcoinAdapter {
         self.id.clone()
     }
 
-    /// Claims are on-chain transactions.
-    fn incoming_delta_secs(&self) -> u64 {
-        300
-    }
-
     async fn receive_target(
         &self,
         _payment_hash: Bytes32,

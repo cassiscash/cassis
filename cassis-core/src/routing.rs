@@ -373,4 +373,26 @@ mod tests {
         assert_eq!(plan.amounts, vec![5_000]);
         assert_eq!(plan.expiries, vec![1_090]);
     }
+
+    /// fedimint -> router -> cashu -> router -> arkade, with the default
+    /// margins and no transit slack: each hop adds the margin of its
+    /// incoming network, so the payer's HTLC expires last.
+    #[test]
+    fn expiries_grow_by_each_incoming_margin() {
+        let id = |spec: &str| NetworkId(spec.into());
+        let (fedimint, cashu, arkade) = (id("fedimint::fed1q"), id("cashu::mint"), id("arkade"));
+        let announce = |from: &NetworkId, to: &NetworkId| RouteAnnouncement {
+            incoming_delta_secs: from.default_incoming_delta(),
+            transit_slack_secs: 0,
+            ..hop(1, &from.0, &to.0, 0, 0)
+        };
+        let route = [announce(&fedimint, &cashu), announce(&cashu, &arkade)];
+        let plan = plan_route(&route, 1_000, arkade.default_incoming_delta(), 0).unwrap();
+        // The payee's leg also gets one default slack, for COMMIT.
+        let payee = 20 * 60 + DEFAULT_TRANSIT_SLACK_SECS;
+        assert_eq!(
+            plan.expiries,
+            vec![payee + (5 + 40) * 60, payee + 5 * 60, payee]
+        );
+    }
 }

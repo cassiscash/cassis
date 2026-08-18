@@ -43,8 +43,6 @@ use fedimint_mintv2_client::{ECash, MintClientInit, MintClientModule};
 use fedimint_walletv2_client::{FinalSendOperationState, WalletClientInit, WalletClientModule};
 use tracing::{info, Span};
 
-/// Contract funding and claims are federation consensus outputs.
-const INCOMING_DELTA_SECS: u64 = 30;
 /// Salt mixed into the per-network secret when constructing the
 /// fedimint root derivation. The federation id is added internally
 /// by `RootSecret::StandardDoubleDerive`, so this constant simply
@@ -186,6 +184,16 @@ impl FedimintAdapter {
 
     /// Wallet balance in msat, bitcoin-denominated (same bucket the
     /// outgoing contracts are funded from).
+    /// The federation's agreed bitcoin block count (tip height + 1),
+    /// which contract expirations count against.
+    pub async fn consensus_block_count(&self) -> Result<u64, String> {
+        self.ln()
+            .map_err(|e| e.to_string())?
+            .consensus_block_count()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn balance_msat(&self) -> Result<u64, String> {
         let balance = self
             .client
@@ -369,10 +377,6 @@ impl Network for FedimintAdapter {
         self.id.clone()
     }
 
-    fn incoming_delta_secs(&self) -> u64 {
-        INCOMING_DELTA_SECS
-    }
-
     async fn receive_target(
         &self,
         _payment_hash: Bytes32,
@@ -403,7 +407,12 @@ impl Network for FedimintAdapter {
         .await
         .map_err(|_| NetworkError::network("contract is not funded"))?
         .map_err(ln_err)?;
-        let needed_blocks = htlc.expiry.saturating_sub(unix_now()) / SECS_PER_BLOCK;
+        // Rounded up, as when locking: the contract must last at least
+        // as many blocks as the expiry is expected to take.
+        let needed_blocks = htlc
+            .expiry
+            .saturating_sub(unix_now())
+            .div_ceil(SECS_PER_BLOCK);
         if remaining_blocks < needed_blocks {
             return Err(NetworkError::invalid("contract expires before the expiry"));
         }
