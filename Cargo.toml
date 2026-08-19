@@ -65,10 +65,10 @@ alloy = { version = "2.4", default-features = false, features = [
   "eips",
   "rlp",
 ] }
-ark-client = { version = "0.10", default-features = false, features = ["tls-webpki-roots"] }
-ark-core = "0.10"
-ark-grpc = { version = "0.10", default-features = false, features = ["tls-webpki-roots"] }
-ark-bdk-wallet = "0.10"
+ark-client = { version = "0.12", default-features = false, features = ["tls-webpki-roots"] }
+ark-core = "0.12"
+ark-grpc = { version = "0.12", default-features = false, features = ["tls-webpki-roots"] }
+ark-bdk-wallet = "0.12"
 esplora-client = { version = "0.10", features = ["async-https"] }
 rustyline = "17"
 

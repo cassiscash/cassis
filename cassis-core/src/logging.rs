@@ -35,7 +35,14 @@ pub fn init_logging() {
         // Must be registered for the formatter to see `node` / `network`:
         // the registry does not retain span field values on its own.
         .with(ScopeLayer)
-        .with(fmt::layer().event_format(CassisFormatter))
+        // Logs go to stderr so stdout stays machine-readable: commands
+        // like `cassis-cli invoice` print JSON there, and mixing debug
+        // lines into it breaks every script that parses the output.
+        .with(
+            fmt::layer()
+                .event_format(CassisFormatter)
+                .with_writer(std::io::stderr),
+        )
         .init();
 }
 

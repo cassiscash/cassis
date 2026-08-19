@@ -25,11 +25,14 @@
 pub mod esplora;
 
 use ark_bdk_wallet::Wallet as BdkWallet;
+use ark_client::Blockchain;
 use ark_client::BoltzReferralId;
 use ark_client::Client;
 use ark_client::InMemorySwapStorage;
 use ark_client::OfflineClient;
 use ark_client::OfflineClientConfig;
+use ark_core::contract::{SpendPath, SpendPathKind};
+use ark_core::intent::{self, IntentMessage};
 use ark_core::send::build_offchain_transactions;
 use ark_core::send::sign_ark_transaction;
 use ark_core::send::sign_checkpoint_transaction;
@@ -42,6 +45,7 @@ use ark_core::vhtlc::VhtlcScript;
 use ark_core::ArkAddress;
 use ark_core::ArkNote;
 use ark_core::Asset;
+use ark_core::BoardingOutput;
 use ark_core::VTXO_CONDITION_KEY;
 use async_trait::async_trait;
 use bitcoin::absolute;
@@ -56,11 +60,12 @@ use bitcoin::secp256k1::schnorr;
 use bitcoin::secp256k1::Message;
 use bitcoin::taproot::LeafVersion;
 use bitcoin::Sequence;
+use bitcoin::TxOut;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
 use cassis_core::{
-    sats_for_msat, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
-    OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
+    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError,
+    NetworkId, OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -74,6 +79,13 @@ pub const MAINNET_SERVER_URL: &str = "https://arkade.computer";
 pub const TESTNET_SERVER_URL: &str = "https://mutinynet.arkade.sh";
 const MAINNET_ESPLORA_URL: &str = "https://mempool.space/api";
 const TESTNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
+
+/// How long the SDK may wait for the next batch event. Its default is
+/// 30s, but joining a round means waiting for the operator's session:
+/// the public mutinynet operator batches every 60s, so the default can
+/// time out after the intent was already registered (and leaves the
+/// input locked to that intent).
+const BATCH_TIMEOUT_SECS: u64 = 300;
 
 // The operator re-validates every tapscript leaf of a VHTLC whenever
 // a spend of it is registered, and unless it is itself configured
@@ -221,6 +233,7 @@ impl ArkadeAdapter {
             ark_server_url: server_url.clone(),
             boltz_url: String::new(),
             boltz_referral_id: BoltzReferralId::Disabled,
+            timeout: Duration::from_secs(BATCH_TIMEOUT_SECS),
             ..Default::default()
         };
         let client = OfflineClient::with_keypair(
@@ -619,7 +632,7 @@ impl ArkadeAdapter {
             Duration::from_secs(RPC_TIMEOUT_SECS),
             self.client
                 .network_client()
-                .get_virtual_txs(vec![txid.to_string()], None),
+                .get_virtual_txs(vec![txid.to_string()], None, None),
         )
         .await
         .map_err(|_| "get_virtual_txs timed out".to_string())?
@@ -685,14 +698,141 @@ impl ArkadeAdapter {
     /// Include confirmed boarding outputs in the next batch swap.
     /// Returns the commitment transaction ID, or `None` when no
     /// boarding output or recoverable VTXO is ready to settle.
+    ///
+    /// A `settle` that times out after registering its intent leaves the
+    /// boarding input locked to that intent at the operator. Retrying then
+    /// fails with `duplicated input`, so clear the stale intent and retry
+    /// once.
     pub async fn onboard(&self) -> Result<Option<bitcoin::Txid>, NetworkError> {
         // OsRng (not `thread_rng`) so the returned future stays Send
         // and can be awaited from spawned tasks.
         let mut rng = rand::rngs::OsRng;
-        self.client
-            .settle(&mut rng)
+        let mut last = String::new();
+        for attempt in 0..2 {
+            match self.client.settle(&mut rng).await {
+                Ok(txid) => return Ok(txid),
+                Err(error) => {
+                    last = error.to_string();
+                    if attempt == 1 || !is_stale_intent_error(&last) {
+                        break;
+                    }
+                    info!(
+                        parent: &self.span,
+                        "onboard: clearing a stale intent after '{last}'"
+                    );
+                    if let Err(error) = self.delete_stale_boarding_intents().await {
+                        debug!(
+                            parent: &self.span,
+                            "onboard: no stale boarding intent to delete: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        Err(NetworkError::Network(format!("onboard: {last}")))
+    }
+
+    /// Delete queued intents the operator still holds for our boarding
+    /// outputs. The SDK only cleans up intent inputs that are VTXOs; a
+    /// timed-out settlement of boarding outputs is otherwise stuck
+    /// forever ("duplicated input" on every retry).
+    async fn delete_stale_boarding_intents(&self) -> Result<(), NetworkError> {
+        let info = self
+            .client
+            .server_info()
             .await
-            .map_err(|e| NetworkError::Network(format!("onboard: {e}")))
+            .map_err(|e| NetworkError::Network(format!("operator info: {e}")))?;
+        let secp = Secp256k1::new();
+        let boarding = BoardingOutput::new(
+            &secp,
+            info.signer_pk.x_only_public_key().0,
+            self.xonly,
+            info.boarding_exit_delay,
+            info.network,
+        )
+        .map_err(|e| NetworkError::Network(format!("boarding output: {e}")))?;
+        let utxos = self
+            .chain
+            .find_outpoints(boarding.address())
+            .await
+            .map_err(|e| NetworkError::Network(format!("boarding utxos: {e}")))?;
+        let (forfeit_script, control_block) = boarding.forfeit_spend_info();
+        let inputs: Vec<intent::Input> = utxos
+            .into_iter()
+            .filter(|utxo| !utxo.is_spent)
+            .map(|utxo| {
+                let selection = SpendPath::new(
+                    SpendPathKind::Forfeit,
+                    forfeit_script.clone(),
+                    control_block.clone(),
+                )
+                .select();
+                intent::Input::new_with_spend_selection(
+                    utxo.outpoint,
+                    boarding.exit_delay(),
+                    TxOut {
+                        value: utxo.amount,
+                        script_pubkey: boarding.script_pubkey(),
+                    },
+                    boarding.tapscripts(),
+                    selection,
+                    true,
+                    false,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let keypair = self.keypair;
+        let sign_for_onchain =
+            |_input: &mut psbt::Input,
+             message: Message|
+             -> Result<(schnorr::Signature, XOnlyPublicKey), ark_core::Error> {
+                Ok((
+                    secp.sign_schnorr_no_aux_rand(&message, &keypair),
+                    keypair.x_only_public_key().0,
+                ))
+            };
+        let sign_for_vtxo = |_input: &mut psbt::Input,
+                             _message: Message|
+         -> Result<
+            Vec<(schnorr::Signature, XOnlyPublicKey)>,
+            ark_core::Error,
+        > { Ok(Vec::new()) };
+        let delete = intent::make_intent(
+            sign_for_vtxo,
+            sign_for_onchain,
+            inputs,
+            Vec::new(),
+            IntentMessage::Delete {
+                expire_at: unix_now() + 120,
+            },
+        )
+        .map_err(|e| NetworkError::Network(format!("delete intent proof: {e}")))?;
+        // An intent currently held by a batch is not queued and cannot be
+        // deleted until that batch finishes; retry for about one round.
+        let mut last = String::new();
+        for attempt in 0..3 {
+            match self
+                .client
+                .network_client()
+                .delete_intent(delete.clone())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last = error.to_string();
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+        Err(NetworkError::Network(format!(
+            "delete boarding intent: {last}"
+        )))
     }
 
     /// Redeem an arknote (`arknote...`, issued by the operator) into
@@ -892,6 +1032,19 @@ impl Network for ArkadeAdapter {
 // ---------------------------------------------------------------------------
 // Helpers below keep module-private concerns out of the trait impl.
 // ---------------------------------------------------------------------------
+
+/// Whether a failed batch join may have left an intent queued at the
+/// operator (as opposed to failing before registration).
+fn is_stale_intent_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("duplicated input")
+        || error.contains("timed out waiting for batch event")
+        || error.contains("operation timed out")
+        // The SDK tried its own cleanup first, but only knows how to
+        // delete intents that hold VTXOs, not boarding outputs.
+        || error.contains("failed to delete the stale intent")
+        || error.contains("no vtxo inputs of this wallet")
+}
 
 /// tonic gRPC needs a TLS root set installed exactly once per process.
 fn install_rustls_crypto_provider() {

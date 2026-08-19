@@ -841,7 +841,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -852,7 +852,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -921,9 +921,9 @@ dependencies = [
 
 [[package]]
 name = "ark-bdk-wallet"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8681c78a4618b095d49c2f91b36bf105bc6ab50a758e4a0b8942982c70a066f2"
+checksum = "cc40e5a6c27d842e477de7510ab327c667383622aa414af3115e9b0377f20142"
 dependencies = [
  "anyhow",
  "ark-client",
@@ -941,9 +941,9 @@ dependencies = [
 
 [[package]]
 name = "ark-client"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "930ae75b2156c2f52683b34c54649b79d2df1d812b9f09997f2b75f59fe67e4d"
+checksum = "59fc6ea950003181ad27e9891a02f3b06617de9963645a8e258f0b921adab945"
 dependencies = [
  "ark-core",
  "ark-delegator",
@@ -965,7 +965,7 @@ dependencies = [
  "prost-types 0.13.5",
  "rand 0.8.7",
  "reqwest 0.12.28",
- "secp256k1 0.32.0-beta.2",
+ "secp256k1 0.33.1",
  "serde",
  "serde_json",
  "serde_with 3.21.0",
@@ -980,9 +980,9 @@ dependencies = [
 
 [[package]]
 name = "ark-core"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77fae7a8afde12d8972393ec23fa436d0d15cdec26ae67d9b50093d300bdebe8"
+checksum = "ace6dccaca2f279025696377f7fa57d3c3f45696d054c7c3822c9211647598ef"
 dependencies = [
  "bech32 0.11.1",
  "bitcoin",
@@ -992,7 +992,7 @@ dependencies = [
  "hex",
  "js-sys",
  "rand 0.8.7",
- "secp256k1 0.32.0-beta.2",
+ "secp256k1 0.33.1",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1002,9 +1002,9 @@ dependencies = [
 
 [[package]]
 name = "ark-delegator"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5dd54f75ec582c7a13e8730a6be1f62092a83c88e7f80aca7e144ec979bdc73"
+checksum = "08574857df0ca54c13558255f2e311463232bc2092aefc1d72b47575ffdf8b17"
 dependencies = [
  "ark-core",
  "bitcoin",
@@ -1016,9 +1016,9 @@ dependencies = [
 
 [[package]]
 name = "ark-fees"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76b6bfd7438277cf330d28e596d7a22a991d6a11db5ae70705855a1b92bdbe61"
+checksum = "2b0f340600e1837ad3a5f57dd160775d4dcebb603bc922cfa33c68fd7e2fc64c"
 dependencies = [
  "cel",
 ]
@@ -1191,9 +1191,9 @@ dependencies = [
 
 [[package]]
 name = "ark-grpc"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65fba48122ca6671a961175efc7d8d181394d0ef951afbc335727fc5c076d7c"
+checksum = "5c09b5cec33fbcff8b7a71092ad21a8940d333c093750972ed34692800db0712"
 dependencies = [
  "ark-core",
  "async-stream",
@@ -3906,7 +3906,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8078,7 +8078,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9339,7 +9339,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9997,7 +9997,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10065,7 +10065,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10273,6 +10273,16 @@ checksum = "3c5fdc7d6e800869d3fd60ff857c479bf0a83ea7bf44b389e64461e844204994"
 dependencies = [
  "rand 0.9.5",
  "secp256k1-sys 0.12.0",
+]
+
+[[package]]
+name = "secp256k1"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7f404a8dab7a7a5a631e741d8699aa9c8e1d689fc26ccf897c7187565490b69"
+dependencies = [
+ "rand 0.9.5",
+ "secp256k1-sys 0.14.1",
  "serde",
 ]
 
@@ -10308,6 +10318,15 @@ name = "secp256k1-sys"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d3be00697c88c00fe102af8dc316038cc2062eab8da646e7463f4c0e70ca9fd"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "secp256k1-sys"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b2992d4a3cd244539a7d5d0966aadbe5ca7fb868a5d7e38c29499b9e709bbd"
 dependencies = [
  "cc",
 ]
@@ -10374,7 +10393,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10853,7 +10872,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11203,7 +11222,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12256,7 +12275,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

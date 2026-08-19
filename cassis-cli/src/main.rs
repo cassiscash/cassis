@@ -194,6 +194,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             info!("running as {}; Ctrl-C to stop", node.iroh_peer_id());
             tokio::signal::ctrl_c().await.ok();
+            node.shutdown().await;
         }
         Command::Invoice {
             amount_msat,
@@ -211,10 +212,14 @@ async fn run(cli: Cli) -> Result<(), String> {
                     .collect::<Result<_, _>>()?
             };
             let expires_at = unix_now() + expires_in;
+            let mut serving = None;
             let invoice = if wait {
                 let node = serve(&home, &span).await?;
-                node.create_invoice(&networks, amount_msat, expires_at, description)
-                    .await?
+                let invoice = node
+                    .create_invoice(&networks, amount_msat, expires_at, description)
+                    .await?;
+                serving = Some(node);
+                invoice
             } else {
                 let opened = home.open_networks(&networks, &span).await?;
                 create_invoice(
@@ -234,6 +239,14 @@ async fn run(cli: Cli) -> Result<(), String> {
             );
             if wait {
                 wait_for_claim(&home, &invoice).await?;
+                // A payer that got `Pending` from COMMIT polls again every
+                // 5s. Keep the node serving for one more round trip: exiting
+                // immediately leaves the payment Pending forever when the
+                // payer never receives the preimage.
+                tokio::time::sleep(CLAIM_GRACE).await;
+                if let Some(node) = serving {
+                    node.shutdown().await;
+                }
             }
         }
         Command::Pay {
@@ -255,8 +268,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                 vec![sender],
             )
             .await?;
-            let preimage = node.pay(&invoice, &from, &relays(nostr_relays)).await?;
-            println!("paid; preimage {preimage}");
+            let preimage = node.pay(&invoice, &from, &relays(nostr_relays)).await;
+            node.shutdown().await;
+            println!("paid; preimage {}", preimage?);
         }
         Command::Route {
             from,
@@ -340,6 +354,10 @@ async fn serve(home: &Home, span: &Span) -> Result<Node, String> {
     )
     .await
 }
+
+/// How long `invoice --wait` keeps serving after a claim so the payer
+/// can collect the preimage from a COMMIT it was told was still pending.
+const CLAIM_GRACE: Duration = Duration::from_secs(30);
 
 async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
     let key = invoice.payment_hash.to_string();
