@@ -1,0 +1,4 @@
+[env]
+# secp256k1-sys' bundled C calls memmove without its declaration, which
+# recent clang rejects for wasm32; compiler-builtins provides it at link.
+CFLAGS_wasm32_unknown_unknown = "-Wno-implicit-function-declaration"

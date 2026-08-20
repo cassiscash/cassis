@@ -102,6 +102,10 @@ pub enum ArkadeCommand {
         #[arg(long)]
         amount_msat: u64,
     },
+    /// Redeem an arknote issued by the operator into VTXOs.
+    RedeemNote {
+        note: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -201,9 +205,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
         #[cfg(feature = "arkade")]
         Command::Arkade { network, command } => {
             let network = kind(&network, "arkade")?;
-            let wallet =
-                cassis_arkade::ArkadeAdapter::open(network.clone(), home.secret(&network), span)
-                    .await?;
+            let wallet = home.open_arkade(&network, span).await?;
             let error = |e: cassis_core::NetworkError| e.to_string();
             match command {
                 ArkadeCommand::Balance => {
@@ -225,6 +227,9 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                         .await
                         .map_err(error)?
                 ),
+                ArkadeCommand::RedeemNote { note } => {
+                    println!("{}", wallet.redeem_note(&note).await.map_err(error)?)
+                }
             }
         }
         #[cfg(feature = "rootstock")]

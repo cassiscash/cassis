@@ -3,7 +3,7 @@
 # in-process on top of an Esplora API (no NBXplorer, no bitcoind), meant
 # for light mode (in-memory live store, sqlite db, badger event db).
 #
-#   cassis-playground/arkd/build.sh [output]   (default: target/arkd-light)
+#   scripts/live/arkd/build.sh [output]   (default: target/arkd-light)
 #
 # Needs git and go. Overridable: ARKD_REPO, ARKD_REV, ARKD_SRC (an
 # existing checkout to build from instead of cloning), and the usual
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-workspace="$(cd "$here/../.." && pwd)"
+workspace="$(cd "$here/../../.." && pwd)"
 out="$(realpath -m "${1:-$workspace/target/arkd-light}")"
 repo="${ARKD_REPO:-https://github.com/arkade-os/arkd}"
 rev="${ARKD_REV:-f863e484719344edbe4a8d10cf5fe994b123f2c0}"

@@ -15,6 +15,7 @@
 compile_error!("cassis-cli needs at least one network feature, e.g. `--features cashu`");
 
 mod home;
+mod order_demo;
 mod wallets;
 
 use cassis_core::node::{
@@ -109,6 +110,12 @@ enum Command {
         amount_msat: u64,
         #[arg(long = "nostr-relay", value_name = "URL")]
         nostr_relays: Vec<String>,
+    },
+    /// Serve a demo Cassis Order Protocol flow (a coffee counter) with
+    /// this node as the payee, printing its `cop:` URI.
+    OrderDemo {
+        #[arg(long, default_value = "Cassis Coffee")]
+        name: String,
     },
     /// List the invoices this node issued.
     Invoices,
@@ -297,6 +304,10 @@ async fn run(cli: Cli) -> Result<(), String> {
                     plan.amounts[i + 1]
                 );
             }
+        }
+        Command::OrderDemo { name } => {
+            let node = serve(&home, &span).await?;
+            order_demo::run(node, home.keys.order_endpoint_secret(), &name).await?;
         }
         Command::Invoices => {
             for record in home.store.list::<InvoiceRecord>("invoices")? {

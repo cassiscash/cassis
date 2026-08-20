@@ -1053,3 +1053,60 @@ fn install_rustls_crypto_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the VHTLC an outgoing cassis HTLC locks to, so other
+    /// implementations (the Arkade wallet's TS payer and payee) can check
+    /// they build the same script from the same descriptor.
+    #[test]
+    fn vhtlc_golden_vector() {
+        let secp = Secp256k1::new();
+        let key = |byte: u8| {
+            let secret = bitcoin::secp256k1::SecretKey::from_slice(&[byte; 32]).unwrap();
+            Keypair::from_secret_key(&secp, &secret)
+                .x_only_public_key()
+                .0
+        };
+        let claim_delay = Sequence::from_seconds_ceil(UNILATERAL_CLAIM_DELAY_SECS).unwrap();
+        let refund_without_receiver_delay =
+            Sequence::from_seconds_ceil(exit_delay_secs(claim_delay) + UNILATERAL_REFUND_GAP_SECS)
+                .unwrap();
+        let options = VhtlcOptions {
+            sender: key(1),
+            receiver: key(2),
+            server: key(3),
+            preimage_hash: vhtlc_payment_hash160(&Bytes32([0x11; 32])),
+            refund_locktime: 1_800_000_000,
+            unilateral_claim_delay: claim_delay,
+            unilateral_refund_delay: claim_delay,
+            unilateral_refund_without_receiver_delay: refund_without_receiver_delay,
+        };
+        let HtlcDescriptor::Arkade {
+            unilateral_claim_delay,
+            unilateral_refund_without_receiver_delay,
+            ..
+        } = ArkadeAdapter::descriptor(&options)
+        else {
+            unreachable!()
+        };
+        let script = VhtlcScript::new(options, bitcoin::Network::Regtest).unwrap();
+        println!(
+            "sender={} receiver={} server={} claim_delay={unilateral_claim_delay} \
+             refund_without_receiver_delay={unilateral_refund_without_receiver_delay} \
+             script_pubkey={}",
+            key(1),
+            key(2),
+            key(3),
+            script.script_pubkey().to_hex_string()
+        );
+        assert_eq!(unilateral_claim_delay, 0x0040_0055);
+        assert_eq!(unilateral_refund_without_receiver_delay, 0x0040_00aa);
+        assert_eq!(
+            script.script_pubkey().to_hex_string(),
+            "5120bec74228e3b7b5094571c4d5b1a528a91f55e45a852c3e7991b5190fc5418883"
+        );
+    }
+}

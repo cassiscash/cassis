@@ -52,6 +52,13 @@ impl NodeKeys {
         Ok(Self { seed, node, iroh })
     }
 
+    /// Secret of the endpoint serving this node's Cassis Order Protocol
+    /// flows: stable, so a printed `cop:` URI keeps working, and distinct
+    /// from [`NodeKeys::iroh`], which answers `cassis-hop`.
+    pub fn order_endpoint_secret(&self) -> [u8; 32] {
+        hmac(&self.seed, b"cassis/order", None)
+    }
+
     /// Signing key of this node on `network`: the first 32 bytes of
     /// `HMAC-SHA512(seed, "cassis/network/<id>" || counter)` that form a
     /// valid secp256k1 scalar.

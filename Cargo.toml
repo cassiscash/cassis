@@ -9,7 +9,7 @@ members = [
   "networks/cassis-liquid",
   "networks/cassis-lnd",
   "cassis-cli",
-  "cassis-playground",
+  "cassis-wasm",
 ]
 resolver = "2"
 

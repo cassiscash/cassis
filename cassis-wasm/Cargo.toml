@@ -1,0 +1,23 @@
+[package]
+name = "cassis-wasm"
+version.workspace = true
+edition.workspace = true
+
+# Browser bindings for wallets: the iroh transport (cassis-hop requests
+# to a payee, serving COMMIT as a payee, Cassis Order Protocol streams)
+# and the wire types, validated by cassis-core. Payer/payee logic and
+# the network adapters stay on the JS side.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cassis-core = { workspace = true }
+futures = { workspace = true }
+iroh = { workspace = true }
+js-sys = "0.3"
+n0-future = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4"

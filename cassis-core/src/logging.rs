@@ -174,7 +174,7 @@ impl tracing::field::Visit for ScopeVisitor<'_> {
 ///
 /// Required because the registry keeps no record of a span's field
 /// values. Any subscriber that wants the `[node/network]` prefix — this
-/// crate's [`init_logging`] or the playground's own layer — must install
+/// crate's [`init_logging`] or a custom one — must install
 /// this alongside it, once.
 pub struct ScopeLayer;
 

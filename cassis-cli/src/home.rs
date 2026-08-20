@@ -102,6 +102,25 @@ impl Home {
         self.keys.network_secret(network)
     }
 
+    /// The arkade wallet of `network`. `$CASSIS_ESPLORA_URL` overrides
+    /// the chain API, as operators on chains without a public one
+    /// (regtest) need.
+    #[cfg(feature = "arkade")]
+    pub async fn open_arkade(
+        &self,
+        network: &NetworkId,
+        span: &Span,
+    ) -> Result<cassis_arkade::ArkadeAdapter, String> {
+        let esplora = std::env::var("CASSIS_ESPLORA_URL").ok();
+        cassis_arkade::ArkadeAdapter::open_with_esplora(
+            network.clone(),
+            self.secret(network),
+            esplora.as_deref(),
+            span,
+        )
+        .await
+    }
+
     /// Open the adapter of `network`, if this binary was built with it.
     pub async fn open_network(
         &self,
@@ -128,10 +147,7 @@ impl Home {
                 span,
             )?),
             #[cfg(feature = "arkade")]
-            "arkade" => Arc::new(
-                cassis_arkade::ArkadeAdapter::open(network.clone(), self.secret(network), span)
-                    .await?,
-            ),
+            "arkade" => Arc::new(self.open_arkade(network, span).await?),
             #[cfg(feature = "rootstock")]
             "rootstock" => Arc::new(cassis_rootstock::RootstockAdapter::open(
                 network.clone(),
