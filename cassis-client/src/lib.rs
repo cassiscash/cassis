@@ -1,3 +1,10 @@
+pub mod adapters;
+pub mod netspec;
+pub mod ops;
+pub mod paths;
+pub mod seed_store;
+pub mod store;
+
 use cassis_core::{
     Bytes32, HopCommit, HopDispatch, HopPrepare, HtlcDescriptor, Invoice, NetworkId,
     NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment, PaymentResult, PaymentStatus,
