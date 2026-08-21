@@ -9,10 +9,16 @@
 //!   preimage)`, where the sender reads the preimage.
 //! * **Refund**: `refund(...)` once the block height reaches `timelock`.
 //!
+//! Senders read claims from the contract's events, or, on nodes without
+//! `eth_getLogs` (Rootstock's public ones), from the claim transaction
+//! itself, found by scanning blocks once `swaps()` no longer has the
+//! lock.
+//!
 //! The claim address of an x-only identity is the address of its even-Y
 //! point, and the adapter normalizes its own key to that point (see
 //! [`normalized_key`]).
 
+use alloy::consensus::Transaction as _;
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, U256};
@@ -89,20 +95,33 @@ const ROOTSTOCK_TESTNET_RPC: &str = "https://public-node.testnet.rsk.co";
 const ROOTSTOCK_MAINNET_CONTRACT: &str = "0x3612e393cA2fbB8874854B88fFCf04307a518239";
 const ROOTSTOCK_TESTNET_CONTRACT: &str = "0x165f8e654b3fe310a854805323718d51977ad95f";
 
-/// Gas a `EtherSwap.lock()` consumes, used to reserve gas before
-/// committing to a route and to cap the lock transaction itself.
-const LOCK_TX_GAS: u64 = 50_000;
-/// Gas an `EtherSwap.claim()` consumes; the reserve for the incoming
-/// side of a route.
-const CLAIM_TX_GAS: u64 = 30_000;
+/// Gas reserved for an `EtherSwap.lock()` (about 46k in practice)
+/// before committing to a route. Transactions themselves get the node's
+/// estimate plus [`GAS_MARGIN_PERCENT`].
+const LOCK_TX_GAS: u64 = 60_000;
+/// Gas reserved for an `EtherSwap.claim()`: the reserve for the
+/// incoming side of a route.
+const CLAIM_TX_GAS: u64 = 60_000;
+/// Headroom over a node's gas estimate, which is exact only for the
+/// state it was made on.
+const GAS_MARGIN_PERCENT: u64 = 25;
+/// JSON-RPC "method not found", what Rootstock's public nodes answer
+/// `eth_getLogs` with.
+const METHOD_NOT_FOUND: i64 = -32601;
 
-const RSK_BLOCK_TIME_SECS: u64 = 30;
+/// Shortest average block interval assumed over an HTLC's life, to
+/// turn expiries into timelocks no block cadence reaches early. Blocks
+/// target about 30s but often come faster (testnet averages ~25s).
+const RSK_FAST_BLOCK_SECS: u64 = 20;
+/// Blocks a lock's timelock adds over [`RSK_FAST_BLOCK_SECS`], so the
+/// tip moving on before the receiver verifies does not fail the check.
+const LOCK_MARGIN_BLOCKS: u64 = 10;
 const WEI_PER_RBTC: u128 = 1_000_000_000_000_000_000;
 const MSAT_PER_RBTC: u128 = 100_000_000_000;
 
 /// How far before an HTLC's timelock its lock can lie, when searching
 /// the contract's events for it (one day of blocks).
-const MAX_LOCK_BLOCKS: u64 = 24 * 60 * 60 / RSK_BLOCK_TIME_SECS;
+const MAX_LOCK_BLOCKS: u64 = 24 * 60 * 60 / RSK_FAST_BLOCK_SECS;
 
 fn rpc_error(context: &str) -> impl Fn(alloy::transports::TransportError) -> NetworkError + '_ {
     move |e| NetworkError::network(format!("{context}: {e}"))
@@ -281,15 +300,23 @@ impl RootstockAdapter {
         Ok(exists.last().is_some_and(|byte| *byte != 0))
     }
 
-    /// Send a contract call and wait for it to succeed.
+    /// Send a contract call, its gas limit the node's estimate with
+    /// [`GAS_MARGIN_PERCENT`] more, and wait for it to succeed.
     async fn transact(
         &self,
         request: TransactionRequest,
         what: &str,
     ) -> Result<B256, NetworkError> {
+        let request = request.from(self.address).to(self.contract);
+        let estimate = self
+            .provider
+            .estimate_gas(request.clone())
+            .await
+            .map_err(rpc_error(what))?;
+        let request = request.gas_limit(estimate + estimate * GAS_MARGIN_PERCENT / 100);
         let pending = self
             .provider
-            .send_transaction(request.to(self.contract))
+            .send_transaction(request)
             .await
             .map_err(rpc_error(what))?;
         let tx_hash = *pending.tx_hash();
@@ -301,6 +328,58 @@ impl RootstockAdapter {
             return Err(NetworkError::network(format!("{what} {tx_hash} reverted")));
         }
         Ok(tx_hash)
+    }
+
+    /// [`Network::check_outgoing_htlc`] without `eth_getLogs`: pending
+    /// while the contract still holds the lock, else settled by the
+    /// latest `claim` revealing the preimage or successful `refund` of
+    /// it, found scanning back from the tip.
+    async fn check_outgoing_without_logs(
+        &self,
+        htlc: &Htlc,
+        swap: &Swap,
+    ) -> Result<OutgoingState, NetworkError> {
+        if self.swap_exists(htlc.payment_hash, swap).await? {
+            return Ok(OutgoingState::Pending);
+        }
+        let tip = self.block_number().await?;
+        let oldest = swap.timelock.saturating_sub(MAX_LOCK_BLOCKS);
+        for number in (oldest..=tip).rev() {
+            let block = self
+                .provider
+                .get_block_by_number(BlockNumberOrTag::Number(number))
+                .full()
+                .await
+                .map_err(rpc_error("block"))?
+                .ok_or_else(|| NetworkError::network(format!("block {number} not found")))?;
+            for tx in block.transactions.txns() {
+                if tx.to() != Some(self.contract) {
+                    continue;
+                }
+                if let Ok(claim) = IEtherSwap::claimCall::abi_decode(tx.input()) {
+                    let preimage = Bytes32(claim.preimage.0);
+                    if htlc.payment_hash.matches_preimage(&preimage) {
+                        return Ok(OutgoingState::Claimed(preimage));
+                    }
+                } else if let Ok(refund) = IEtherSwap::refundCall::abi_decode(tx.input()) {
+                    if refund.preimageHash.0 != htlc.payment_hash.0 {
+                        continue;
+                    }
+                    let receipt = self
+                        .provider
+                        .get_transaction_receipt(*tx.inner.tx_hash())
+                        .await
+                        .map_err(rpc_error("receipt"))?;
+                    if receipt.is_some_and(|receipt| receipt.status()) {
+                        return Ok(OutgoingState::Refunded);
+                    }
+                }
+            }
+        }
+        Err(NetworkError::network(format!(
+            "lock of {} is gone but no claim or refund of it since block {oldest}",
+            htlc.payment_hash.short()
+        )))
     }
 }
 
@@ -331,7 +410,10 @@ impl Network for RootstockAdapter {
         if swap.amount_wei < msat_to_wei(htlc.amount_msat) {
             return Err(NetworkError::invalid("lock is worth less than the HTLC"));
         }
-        let blocks = htlc.expiry.saturating_sub(unix_now()) / RSK_BLOCK_TIME_SECS;
+        let blocks = htlc
+            .expiry
+            .saturating_sub(unix_now())
+            .div_ceil(RSK_FAST_BLOCK_SECS);
         if swap.timelock < self.block_number().await? + blocks {
             return Err(NetworkError::invalid("refund opens before the expiry"));
         }
@@ -349,19 +431,16 @@ impl Network for RootstockAdapter {
     ) -> Result<(), NetworkError> {
         let swap = Swap::of(htlc)?;
         let gas_price = self.gas_price().await?;
-        let request = TransactionRequest::default()
-            .gas_price(gas_price)
-            .gas_limit(CLAIM_TX_GAS)
-            .input(
-                IEtherSwap::claimCall {
-                    preimage: B256::from(preimage.0),
-                    amount: swap.amount_wei,
-                    refundAddress: swap.refund_address,
-                    timelock: U256::from(swap.timelock),
-                }
-                .abi_encode()
-                .into(),
-            );
+        let request = TransactionRequest::default().gas_price(gas_price).input(
+            IEtherSwap::claimCall {
+                preimage: B256::from(preimage.0),
+                amount: swap.amount_wei,
+                refundAddress: swap.refund_address,
+                timelock: U256::from(swap.timelock),
+            }
+            .abi_encode()
+            .into(),
+        );
         let tx = self.transact(request, "claim").await?;
         info!(parent: &self.span, "claimed {}: tx {tx}", htlc.payment_hash.short());
         Ok(())
@@ -381,7 +460,8 @@ impl Network for RootstockAdapter {
         };
         let blocks = expiry
             .saturating_sub(unix_now())
-            .div_ceil(RSK_BLOCK_TIME_SECS);
+            .div_ceil(RSK_FAST_BLOCK_SECS)
+            + LOCK_MARGIN_BLOCKS;
         let swap = Swap {
             amount_wei: msat_to_wei(amount_msat),
             claim_address: evm_address_from_pubkey(claim),
@@ -392,7 +472,6 @@ impl Network for RootstockAdapter {
         let request = TransactionRequest::default()
             .value(swap.amount_wei)
             .gas_price(self.gas_price().await?)
-            .gas_limit(LOCK_TX_GAS)
             .input(
                 IEtherSwap::lockCall {
                     preimageHash: B256::from(payment_hash.0),
@@ -420,11 +499,17 @@ impl Network for RootstockAdapter {
             .from_block(BlockNumberOrTag::Number(
                 swap.timelock.saturating_sub(MAX_LOCK_BLOCKS),
             ));
-        let logs = self
-            .provider
-            .get_logs(&filter)
-            .await
-            .map_err(rpc_error("logs"))?;
+        let logs = match self.provider.get_logs(&filter).await {
+            Ok(logs) => logs,
+            Err(error)
+                if error
+                    .as_error_resp()
+                    .is_some_and(|response| response.code == METHOD_NOT_FOUND) =>
+            {
+                return self.check_outgoing_without_logs(htlc, &swap).await;
+            }
+            Err(error) => return Err(rpc_error("logs")(error)),
+        };
         for log in logs {
             match log.topic0() {
                 Some(topic) if *topic == IEtherSwap::Claim::SIGNATURE_HASH => {
