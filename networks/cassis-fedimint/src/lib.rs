@@ -12,8 +12,8 @@
 //!
 //! The claim key is an even-parity key derived from the node's network
 //! secret, so the x-only target `02 || x` is exact. Contract
-//! expirations count federation consensus blocks; [`SECS_PER_BLOCK`]
-//! converts from cassis' unix expiries.
+//! expirations count federation consensus blocks; [`secs_per_block`]
+//! of the federation's chain converts from cassis' unix expiries.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -54,11 +54,17 @@ const ROOT_SECRET_SALT: &[u8] = b"cassis/fedimint/v1";
 /// with the per-network secret.
 const CLAIM_KEY_DOMAIN: &[u8] = b"cassis/fedimint/claim/v1";
 
-/// Seconds per federation consensus block, used to convert cassis's
-/// absolute unix expiry into an LNv2 expiration delta. Matches the
-/// convention the fedimint adapter has always used for this
-/// federation's block cadence.
-const SECS_PER_BLOCK: u64 = 600;
+/// Seconds per block of a federation's chain, used to convert cassis's
+/// absolute unix expiries into LNv2 expiration deltas. Signet
+/// federations run on mutinynet, whose blocks come every 30 seconds:
+/// assuming ten minutes there would make contracts expire 20 times
+/// sooner than agreed.
+fn secs_per_block(network: bitcoin::Network) -> u64 {
+    match network {
+        bitcoin::Network::Signet => 30,
+        _ => 600,
+    }
+}
 
 /// How long verification waits for an incoming contract to be funded.
 const FUNDING_WAIT: Duration = Duration::from_secs(30);
@@ -73,6 +79,8 @@ pub struct FedimintAdapter {
     client: ClientHandleArc,
     /// Even-parity claim keypair, so the x-only target is exact.
     claim_keypair: secp256k1::Keypair,
+    /// See [`secs_per_block`].
+    secs_per_block: u64,
 }
 
 impl FedimintAdapter {
@@ -152,13 +160,18 @@ impl FedimintAdapter {
         let _ln_module: &LightningClientModule =
             Self::ln_module(&client).map_err(|e| format!("federation has no LNv2 module: {e}"))?;
         let claim_keypair = Self::derive_claim_keypair(&secret);
+        let network = client
+            .get_first_module::<WalletClientModule>()
+            .map_err(|e| format!("federation has no walletv2 module: {e}"))?
+            .get_network();
         let span = cassis_core::network_span(span, &id);
-        info!(parent: &span, "fedimint client ready");
+        info!(parent: &span, "fedimint client ready on {network}");
         Ok(Self {
             id,
             span,
             client,
             claim_keypair,
+            secs_per_block: secs_per_block(network),
         })
     }
 
@@ -412,7 +425,7 @@ impl Network for FedimintAdapter {
         let needed_blocks = htlc
             .expiry
             .saturating_sub(unix_now())
-            .div_ceil(SECS_PER_BLOCK);
+            .div_ceil(self.secs_per_block);
         if remaining_blocks < needed_blocks {
             return Err(NetworkError::invalid("contract expires before the expiry"));
         }
@@ -462,7 +475,7 @@ impl Network for FedimintAdapter {
         };
         let expiration_delta = expiry
             .saturating_sub(unix_now())
-            .div_ceil(SECS_PER_BLOCK)
+            .div_ceil(self.secs_per_block)
             .max(1);
         let (_, outpoint, contract) = self
             .ln()?
