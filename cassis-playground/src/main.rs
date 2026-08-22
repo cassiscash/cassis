@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -12,26 +11,21 @@ use cassis_client::ops::{
 use cassis_client::store::CashuProofDb;
 use cassis_client::CassisClient;
 use cdk::nuts::Token;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use log::{info, warn, LevelFilter, Log, Metadata, Record};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
-    text::Text,
-    widgets::{Block, Borders, Paragraph, Wrap},
-    Terminal,
-};
+use log::{info, warn, Level, LevelFilter, Log, Metadata, Record};
+use ritualistic::server::{CustomRelay, RelayInternals};
+use ritualistic::{Event as NostrEvent, Filter as NostrFilter};
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, ExternalPrinter, Helper};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tui_input::{backend::crossterm::EventHandler, Input};
 
 const ROOT: &str = "/tmp/cassis-playground";
-const RELAY: &str = "ws://localhost:10547";
+const COMMAND_HISTORY: &str = "commands.history";
+const RELAY: &str = "ws://localhost:10000";
 const RSK_SEED: &str = "tmp/rsk-seed";
 
 #[derive(Clone)]
@@ -64,7 +58,7 @@ const NETWORKS: &[NetworkDef] = &[
     },
 ];
 
-const NODE_NAMES: &[&str] = &["node_a", "node_b", "node_c", "node_d", "node_e"];
+const NODE_NAMES: &[&str] = &["alice", "bob", "charlie", "derek", "ernest"];
 const NODE_COLORS: &[&str] = &["red", "green", "blue", "yellow", "magenta"];
 
 #[derive(Clone, Debug)]
@@ -86,14 +80,21 @@ struct NodeState {
 
 struct LogSink {
     lines: Arc<StdMutex<VecDeque<String>>>,
+    printer: Arc<StdMutex<Option<Box<dyn ExternalPrinter + Send>>>>,
 }
 
 impl Log for LogSink {
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() != Level::Trace && !metadata.target().starts_with("iroh")
     }
     fn log(&self, record: &Record<'_>) {
         let line = format!("[{}] {}", record.level(), record.args());
+        if let Ok(mut printer) = self.printer.lock() {
+            if let Some(printer) = printer.as_mut() {
+                let _ = printer.print(line.clone());
+                return;
+            }
+        }
         if let Ok(mut lines) = self.lines.lock() {
             lines.push_back(line);
             while lines.len() > 100 {
@@ -104,9 +105,38 @@ impl Log for LogSink {
     fn flush(&self) {}
 }
 
+#[derive(Default)]
+struct MemoryRelay {
+    events: Vec<NostrEvent>,
+}
+
+impl CustomRelay for MemoryRelay {
+    fn handle_event(&mut self, event: &NostrEvent) -> Result<(), String> {
+        if !event.check_id() || !event.verify_signature() {
+            return Err("invalid event".to_string());
+        }
+        if self.events.iter().any(|existing| existing.id == event.id) {
+            return Err("duplicate event".to_string());
+        }
+        self.events.push(event.clone());
+        Ok(())
+    }
+
+    fn handle_request(&mut self, filter: &NostrFilter) -> Result<Vec<NostrEvent>, String> {
+        Ok(self
+            .events
+            .iter()
+            .filter(|event| filter.matches(event))
+            .cloned()
+            .collect())
+    }
+}
+
 struct Playground {
     nodes: Mutex<HashMap<String, NodeState>>,
     children: Mutex<Vec<Child>>,
+    relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    balances: Mutex<HashMap<(String, String), String>>,
 }
 
 impl Playground {
@@ -115,6 +145,8 @@ impl Playground {
         let playground = Arc::new(Self {
             nodes: Mutex::new(HashMap::new()),
             children: Mutex::new(Vec::new()),
+            relay_task: Mutex::new(None),
+            balances: Mutex::new(HashMap::new()),
         });
         for (idx, id) in NODE_NAMES.iter().enumerate() {
             let home = node_home(id);
@@ -136,9 +168,26 @@ impl Playground {
     }
 
     async fn start_infrastructure(&self) -> Result<(), String> {
-        let mut relay = Command::new("nak");
-        relay.arg("serve").arg("--port").arg("10547");
-        self.spawn_child(relay, "nak relay").await?;
+        let relay = RelayInternals {
+            info: ritualistic::relay_information::RelayInformationDocument {
+                url: RELAY.to_string(),
+                name: "cassis playground".to_string(),
+                description: "in-process relay".to_string(),
+                ..Default::default()
+            },
+            custom_relay: Box::new(tokio::sync::Mutex::new(MemoryRelay::default())),
+        };
+        let task = tokio::spawn(async move {
+            if let Err(error) = ritualistic::server::start(
+                Arc::new(relay),
+                "127.0.0.1:10000".parse().expect("valid relay address"),
+            )
+            .await
+            {
+                log::error!("relay stopped: {error}");
+            }
+        });
+        *self.relay_task.lock().await = Some(task);
         for (idx, network) in NETWORKS
             .iter()
             .enumerate()
@@ -186,22 +235,54 @@ impl Playground {
 
     async fn summary(&self) -> String {
         let mut output = String::new();
-        let mut nodes = self.nodes.lock().await;
-        for node in nodes.values_mut() {
+        let nodes = self.nodes.lock().await;
+        let balances = self.balances.lock().await;
+        let mut sorted_nodes: Vec<&NodeState> = nodes.values().collect();
+        sorted_nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        for node in sorted_nodes {
             output.push_str(&format!(
                 "{}: {}\n",
-                node.id,
+                colored_node_name(&node.id),
                 status_text(&node.status, &node.memberships)
             ));
-            for network_id in node.memberships.clone() {
-                let balance = match self.node_balance(&node.id, &network_id).await {
-                    Ok(value) => value,
-                    Err(e) => format!("error: {e}"),
-                };
+            for network_id in &node.memberships {
+                let balance = balances
+                    .get(&(node.id.clone(), network_id.clone()))
+                    .map(String::as_str)
+                    .unwrap_or("(not refreshed)");
                 output.push_str(&format!("  {network_id}: {balance}\n"));
             }
         }
         output
+    }
+
+    /// Recompute every displayed balance. Called once after a command
+    /// completes, never from the render loop.
+    async fn refresh_balances(&self) {
+        let entries: Vec<(String, String)> = {
+            let nodes = self.nodes.lock().await;
+            nodes
+                .values()
+                .flat_map(|node| {
+                    node.memberships
+                        .iter()
+                        .map(|network| (node.id.clone(), network.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let mut refreshed = Vec::with_capacity(entries.len());
+        for (node_id, network_id) in entries {
+            let value = self
+                .node_balance(&node_id, &network_id)
+                .await
+                .unwrap_or_else(|e| format!("error: {e}"));
+            refreshed.push(((node_id, network_id), value));
+        }
+        let mut balances = self.balances.lock().await;
+        for (key, value) in refreshed {
+            balances.insert(key, value);
+        }
     }
 
     async fn node_balance(&self, node_id: &str, network_id: &str) -> Result<String, String> {
@@ -238,6 +319,27 @@ fn status_text(status: &Status, memberships: &[String]) -> String {
         Status::Paying => "paying".to_string(),
         Status::Receiving => "receiving".to_string(),
     }
+}
+
+fn node_color(name: &str) -> &'static str {
+    NODE_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .and_then(|index| NODE_COLORS.get(index))
+        .copied()
+        .unwrap_or("reset")
+}
+
+fn colored_node_name(name: &str) -> String {
+    let code = match node_color(name) {
+        "red" => "31",
+        "green" => "32",
+        "blue" => "34",
+        "yellow" => "33",
+        "magenta" => "35",
+        _ => "0",
+    };
+    format!("\x1b[{code}m{name}\x1b[0m")
 }
 
 fn network(id: &str) -> Result<&'static NetworkDef, String> {
@@ -494,52 +596,158 @@ async fn set_status(playground: &Playground, id: &str, status: Status) {
     }
 }
 
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    summary: &str,
-    logs: &Arc<StdMutex<VecDeque<String>>>,
-    input: &Input,
-) -> io::Result<()> {
-    let log_text = logs
-        .lock()
-        .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+#[derive(Clone, Default)]
+struct CommandHelper;
+
+impl Completer for CommandHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        let word = &line[start..pos];
+        let candidates = [
+            "fund", "router", "pay", "route", "balance", "balances", "help", "quit", "exit",
+        ]
+        .into_iter()
+        .chain(NODE_NAMES.iter().copied())
+        .chain(NETWORKS.iter().map(|network| network.id))
+        .filter(|candidate| candidate.starts_with(word))
+        .map(|candidate| Pair {
+            display: candidate.to_string(),
+            replacement: candidate.to_string(),
+        })
+        .collect();
+        Ok((start, candidates))
+    }
+}
+
+impl Hinter for CommandHelper {
+    type Hint = String;
+}
+
+impl Highlighter for CommandHelper {}
+impl Validator for CommandHelper {}
+impl Helper for CommandHelper {}
+
+async fn route_node_name(playground: &Playground, pubkey: ritualistic::PubKey) -> String {
+    let network_ids = NETWORKS
+        .iter()
+        .map(|network| NetSpec::parse(network.spec).map(|spec| spec.network_id()))
+        .collect::<Result<Vec<_>, _>>()
         .unwrap_or_default();
-    terminal.draw(|frame| {
-        let summary_height = summary.lines().count().max(1) as u16 + 2;
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(summary_height),
-                Constraint::Min(3),
-                Constraint::Length(3),
-            ])
-            .split(frame.area());
-        frame.render_widget(
-            Paragraph::new(Text::from(summary))
-                .block(Block::default().borders(Borders::ALL).title("nodes")),
-            areas[0],
+    let nodes = playground.nodes.lock().await;
+    for node in nodes.values() {
+        if let Ok(keys) = load_and_derive(&node_home(&node.id), network_ids.clone()) {
+            if keys.nostr.pubkey() == pubkey {
+                return node.id.clone();
+            }
+        }
+    }
+    pubkey.to_hex()[..8].to_string()
+}
+
+async fn command_route(
+    playground: &Playground,
+    sender: &str,
+    target: &str,
+    amount_msat: u64,
+) -> Result<(), String> {
+    let (sender_network, destination_network) = {
+        let nodes = playground.nodes.lock().await;
+        let sender_network = nodes
+            .get(sender)
+            .and_then(|node| node.memberships.first())
+            .ok_or_else(|| format!("{sender} has no networks"))?
+            .clone();
+        let destination_network = nodes
+            .get(target)
+            .and_then(|node| node.memberships.first())
+            .ok_or_else(|| format!("{target} has no networks"))?
+            .clone();
+        (sender_network, destination_network)
+    };
+    let sender_network = NetSpec::parse(network(&sender_network)?.spec)?.network_id();
+    let destination_network = NetSpec::parse(network(&destination_network)?.spec)?.network_id();
+    let route = cassis_client::find_route(
+        &[RELAY.to_string()],
+        &destination_network,
+        amount_msat,
+        &sender_network,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if route.is_empty() {
+        return Err("no route found".to_string());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let destination_delta = cassis_routing::fallback_incoming_delta(&destination_network)
+        .saturating_add(cassis_routing::fallback_transit_slack(&destination_network));
+    let mut expiries = vec![now.saturating_add(destination_delta)];
+    for hop in route.iter().rev() {
+        let delta = if hop.node.incoming_delta_secs > 0 {
+            hop.node.incoming_delta_secs
+        } else {
+            cassis_routing::fallback_incoming_delta(&hop.incoming)
+        };
+        let slack = if hop.node.transit_slack_secs > 0 {
+            hop.node.transit_slack_secs
+        } else {
+            cassis_routing::fallback_transit_slack(&hop.incoming)
+        };
+        expiries.push(
+            expiries
+                .last()
+                .copied()
+                .unwrap_or(now)
+                .saturating_add(delta)
+                .saturating_add(slack),
         );
-        frame.render_widget(
-            Paragraph::new(Text::from(log_text))
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title("events")),
-            areas[1],
+    }
+    expiries.reverse();
+    expiries.push(now);
+
+    let mut amounts = vec![(0, 0); route.len()];
+    let mut outgoing = amount_msat;
+    for (index, hop) in route.iter().enumerate().rev() {
+        let fee = hop
+            .node
+            .fee_base_msat
+            .saturating_add(hop.node.fee_ppm.saturating_mul(outgoing) / 1_000_000);
+        let incoming = outgoing.saturating_add(fee);
+        amounts[index] = (incoming, outgoing);
+        outgoing = incoming;
+    }
+
+    info!("route {sender} -> {target}: {} msat", outgoing);
+    for (index, hop) in route.iter().enumerate() {
+        let name = route_node_name(playground, hop.node.node_pubkey).await;
+        let (incoming, outgoing) = amounts[index];
+        info!(
+            "  hop {}: {} ({}) -> ({})\n    incoming: amount={} msat locktime={}\n    outgoing: amount={} msat locktime={}",
+            index + 1,
+            colored_node_name(&name),
+            hop.incoming,
+            hop.outgoing,
+            incoming,
+            expiries[index],
+            outgoing,
+            expiries[index + 1],
         );
-        frame.render_widget(
-            Paragraph::new(input.value())
-                .style(Style::default().fg(Color::Cyan))
-                .block(Block::default().borders(Borders::ALL).title("command")),
-            areas[2],
-        );
-        frame.set_cursor_position((
-            areas[2].x + 1 + input.visual_cursor() as u16,
-            areas[2].y + 1,
-        ));
-    })?;
+    }
     Ok(())
 }
 
 async fn execute_line(playground: Arc<Playground>, line: String) {
+    info!("{line}");
     let mut parts = line.split_whitespace();
     match parts.next() {
         Some("fund") => match (parts.next(), parts.next()) {
@@ -571,59 +779,73 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             }
             _ => info!("usage: pay <node_id_sender> <node_id_target> <amount_msat>"),
         },
+        Some("balances") | Some("balance") => {}
+        Some("route") => match (
+            parts.next(),
+            parts.next(),
+            parts.next().and_then(|s| s.parse::<u64>().ok()),
+        ) {
+            (Some(sender), Some(target), Some(amount)) => {
+                if let Err(e) = command_route(&playground, sender, target, amount).await {
+                    warn!("route failed: {e}");
+                }
+            }
+            _ => info!("usage: route <sender> <target> <amount_msat>"),
+        },
         Some("help") => info!(
-            "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | quit"
+            "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | balances | route <sender> <target> <amount_msat> | quit"
         ),
         Some("quit") | Some("exit") => info!("use Ctrl-C to exit"),
         Some(other) => info!("unknown command '{other}'; try help"),
         None => {}
     }
+    playground.refresh_balances().await;
+    info!("summary:\n{}", playground.summary().await);
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs = Arc::new(StdMutex::new(VecDeque::new()));
+    let printer = Arc::new(StdMutex::new(None));
     log::set_boxed_logger(Box::new(LogSink {
         lines: logs.clone(),
+        printer: printer.clone(),
     }))?;
     log::set_max_level(LevelFilter::Info);
     let playground = Playground::new().await?;
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let mut input = Input::default();
-    let result = loop {
-        let summary = playground.summary().await;
-        draw(&mut terminal, &summary, &logs, &input)?;
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(KeyEvent {
-                code, modifiers, ..
-            }) = event::read()?
-            {
-                if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
-                    break Ok(());
-                }
-                if code == KeyCode::Enter {
-                    let line = input.value().to_string();
-                    input.reset();
-                    let pg = playground.clone();
-                    tokio::spawn(execute_line(pg, line));
-                } else {
-                    input.handle_event(&Event::Key(KeyEvent {
-                        code,
-                        modifiers,
-                        kind: event::KeyEventKind::Press,
-                        state: event::KeyEventState::NONE,
-                    }));
+    let mut editor = Editor::<CommandHelper, rustyline::history::DefaultHistory>::new()?;
+    editor.set_helper(Some(CommandHelper));
+    let history_path = Path::new(ROOT).join(COMMAND_HISTORY);
+    let _ = editor.load_history(&history_path);
+    *printer.lock().unwrap() = Some(Box::new(editor.create_external_printer()?));
+    if let Ok(lines) = logs.lock() {
+        if let Ok(mut printer) = printer.lock() {
+            if let Some(printer) = printer.as_mut() {
+                for line in lines.iter() {
+                    let _ = printer.print(line.clone());
+                    let _ = printer.print("\n".to_string());
                 }
             }
         }
-    };
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    }
+    info!(
+        "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | balances | route <sender> <target> <amount_msat> | quit"
+    );
+
+    loop {
+        match editor.readline("cassis ~> ") {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    editor.add_history_entry(line.as_str())?;
+                    let pg = playground.clone();
+                    tokio::spawn(execute_line(pg, line));
+                }
+            }
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    editor.append_history(&history_path)?;
+    Ok(())
 }
