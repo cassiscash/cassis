@@ -245,7 +245,18 @@ async fn run(cli: Cli) -> Result<(), String> {
                 serde_json::to_string(&invoice).map_err(|e| e.to_string())?
             );
             if wait {
-                wait_for_claim(&home, &invoice).await?;
+                // Some network clients install their own SIGINT handler,
+                // so Ctrl-C would not end the process by itself.
+                let claimed = tokio::select! {
+                    claimed = wait_for_claim(&home, &invoice) => claimed,
+                    _ = tokio::signal::ctrl_c() => Err("interrupted".into()),
+                };
+                if let Err(error) = claimed {
+                    if let Some(node) = serving {
+                        node.shutdown().await;
+                    }
+                    return Err(error);
+                }
                 // A payer that got `Pending` from COMMIT polls again every
                 // 5s. Keep the node serving for one more round trip: exiting
                 // immediately leaves the payment Pending forever when the
