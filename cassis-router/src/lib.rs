@@ -17,7 +17,7 @@ use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
     network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDispatch,
     HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, NetworkId, NetworkRouterAdapter,
-    WatchError,
+    PubKey, WatchError,
 };
 use cassis_iroh::{Frame, IrohError, IrohServer};
 use cassis_keys as keys;
@@ -564,13 +564,17 @@ impl CassisRouter {
         }
 
         // Now create the outgoing HTLC on the next network.
+        let recipient: PubKey = match dispatch.recipient.parse() {
+            Ok(recipient) => recipient,
+            Err(err) => return Err(format!("invalid recipient pubkey: {err}")),
+        };
         match outgoing_entry
             .adapter
             .create_outgoing_htlc(
                 dispatch.payment_hash,
                 dispatch.amount_msat,
                 dispatch.outgoing_expiry,
-                &dispatch.recipient,
+                recipient,
             )
             .await
         {

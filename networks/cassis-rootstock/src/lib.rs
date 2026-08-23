@@ -11,7 +11,7 @@ use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
 use cassis_core::{
     Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, WatchError,
+    OutgoingHtlc, PubKey, WatchError,
 };
 use log::{debug, warn};
 use std::collections::HashMap;
@@ -399,7 +399,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: &str,
+        recipient: PubKey,
     ) -> Result<OutgoingHtlc, HtlcError> {
         if amount_msat == 0 {
             return Err(HtlcError::InvalidParams("amount must be > 0".into()));
@@ -408,11 +408,10 @@ impl NetworkRouterAdapter for RootstockAdapter {
         if expiry <= now {
             return Err(HtlcError::InvalidParams("expiry in the past".into()));
         }
-        let claim_address = Address::from_str(recipient).map_err(|e| {
-            HtlcError::InvalidParams(format!(
-                "recipient '{recipient}' is not an EVM address: {e}"
-            ))
-        })?;
+        let claim_address = Address::from_slice(
+            &alloy::primitives::keccak256(&recipient.to_ecdsa_key().serialize_uncompressed()[1..])
+                .0[12..],
+        );
         let amount_wei = Self::msat_to_wei(amount_msat);
         let latest = self
             .block_number()
@@ -469,7 +468,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
             payment_hash,
             amount_msat,
             expiry,
-            recipient: recipient.to_string(),
+            recipient: recipient.to_hex(),
             network: self.config.network_id.clone(),
         })
     }

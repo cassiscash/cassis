@@ -1,6 +1,7 @@
 pub mod logging;
 
 use async_trait::async_trait;
+pub use ritualistic::PubKey;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -587,7 +588,7 @@ pub trait NetworkRouterAdapter: Send + Sync {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: &str,
+        recipient: PubKey,
     ) -> Result<OutgoingHtlc, HtlcError>;
 
     async fn claim_incoming(
@@ -905,7 +906,9 @@ where
             payment_hash,
             amount_msat,
             expiry,
-            destination_pubkey,
+            destination_pubkey.parse().map_err(|e| {
+                SendError::InvalidParams(format!("invalid destination pubkey: {e}"))
+            })?,
         )
         .await
         .map_err(|e| match e {
