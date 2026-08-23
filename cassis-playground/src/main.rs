@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -27,6 +27,11 @@ const ROOT: &str = "/tmp/cassis-playground";
 const COMMAND_HISTORY: &str = "commands.history";
 const RELAY: &str = "ws://localhost:10000";
 const RSK_SEED: &str = "tmp/rsk-seed";
+const DEFAULT_FUND_AMOUNT: u64 = 1000;
+
+tokio::task_local! {
+    static NODE_LOG_CONTEXT: String;
+}
 
 #[derive(Clone)]
 struct NetworkDef {
@@ -58,8 +63,10 @@ const NETWORKS: &[NetworkDef] = &[
     },
 ];
 
-const NODE_NAMES: &[&str] = &["alice", "bob", "charlie", "derek", "ernest"];
-const NODE_COLORS: &[&str] = &["red", "green", "blue", "yellow", "magenta"];
+const NODE_NAMES: &[&str] = &[
+    "alice", "bob", "charlie", "derek", "ernest", "frank", "george",
+];
+const NODE_COLORS: &[&str] = &["red", "green", "blue", "yellow", "magenta", "cyan", "white"];
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -71,6 +78,8 @@ enum Status {
 
 struct NodeState {
     id: String,
+    nostr_pubkey: String,
+    iroh_id: String,
     memberships: Vec<String>,
     status: Status,
     #[allow(dead_code)]
@@ -95,7 +104,16 @@ impl Log for LogSink {
         if trimmed.ends_with(';') && !trimmed[..trimmed.len() - 1].contains(char::is_whitespace) {
             return;
         }
-        let line = format!("[{}] {}", record.level(), message);
+        let line = NODE_LOG_CONTEXT
+            .try_with(|node| {
+                format!(
+                    "[{}] {}: {}",
+                    record.level(),
+                    colored_node_name(node),
+                    message
+                )
+            })
+            .unwrap_or_else(|_| format!("[{}] {}", record.level(), message));
         if let Ok(mut printer) = self.printer.lock() {
             if let Some(printer) = printer.as_mut() {
                 let _ = printer.print(line.clone());
@@ -155,13 +173,32 @@ impl Playground {
             relay_task: Mutex::new(None),
             balances: Mutex::new(HashMap::new()),
         });
+        let network_ids = NETWORKS
+            .iter()
+            .map(|network| NetSpec::parse(network.spec).map(|spec| spec.network_id()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut iroh_ids = HashSet::new();
+        let mut nostr_pubkeys = HashSet::new();
         for (idx, id) in NODE_NAMES.iter().enumerate() {
             let home = node_home(id);
             init_node_home(&home)?;
+            let keys = load_and_derive(&home, network_ids.clone())?;
+            let nostr_pubkey = keys.nostr.pubkey().to_hex();
+            let iroh_id = keys.iroh.public().to_string();
+            if !iroh_ids.insert(iroh_id.clone()) {
+                return Err(format!("duplicate iroh identity for node {id}: {iroh_id}"));
+            }
+            if !nostr_pubkeys.insert(nostr_pubkey.clone()) {
+                return Err(format!(
+                    "duplicate nostr identity for node {id}: {nostr_pubkey}"
+                ));
+            }
             playground.nodes.lock().await.insert(
                 (*id).to_string(),
                 NodeState {
                     id: (*id).to_string(),
+                    nostr_pubkey,
+                    iroh_id,
                     memberships: Vec::new(),
                     status: Status::Idle,
                     receive_tasks: Vec::new(),
@@ -248,8 +285,10 @@ impl Playground {
         sorted_nodes.sort_by(|left, right| left.id.cmp(&right.id));
         for node in &sorted_nodes {
             output.push_str(&format!(
-                "{}: {}\n",
+                "{} [pub:{} iroh:{}]: {}\n",
                 colored_node_name(&node.id),
+                identity_suffix(&node.nostr_pubkey),
+                identity_suffix(&node.iroh_id),
                 status_text(&node.status, &node.memberships)
             ));
             for network_id in &node.memberships {
@@ -257,7 +296,10 @@ impl Playground {
                     .get(&(node.id.clone(), network_id.clone()))
                     .map(String::as_str)
                     .unwrap_or("(not refreshed)");
-                output.push_str(&format!("  {network_id}: {balance}\n"));
+                output.push_str(&format!(
+                    "  {}: {balance}\n",
+                    colored_network_name(network_id)
+                ));
             }
         }
         if !output.is_empty() {
@@ -285,7 +327,7 @@ impl Playground {
                 }
             }
             if !lines.is_empty() {
-                output.push_str(&format!("{network_id}:\n"));
+                output.push_str(&format!("{}:\n", colored_network_name(&network_id)));
                 output.push_str(&lines.join("\n"));
                 output.push('\n');
             }
@@ -328,31 +370,37 @@ impl Playground {
         let spec = NetSpec::parse(network.spec)?;
         let ids = vec![spec.network_id()];
         let derived = load_and_derive(&home, ids)?;
-        match network.mint_url {
+        let total = match network.mint_url {
             Some(_) => {
                 let adapter = build_cashu_adapter(&spec, &derived, &node_store_path(&home)).await?;
-                let total: u64 = adapter
+                adapter
                     .balance()
                     .await
                     .iter()
                     .map(|p| u64::from(p.amount))
-                    .sum();
-                Ok(format!("{total} sat"))
+                    .sum()
             }
             None => {
                 let adapter =
                     cassis_client::adapters::build_rootstock_adapter(&spec, &derived).await?;
-                let msat = adapter.balance_msat().await.map_err(|e| e.to_string())?;
-                Ok(format!("{msat} msat"))
+                adapter.balance_msat().await.map_err(|e| e.to_string())? / 1000
             }
-        }
+        };
+        Ok(format!("{total} sat"))
     }
 }
 
 fn status_text(status: &Status, memberships: &[String]) -> String {
     match status {
         Status::Idle => "idle".to_string(),
-        Status::Routing => format!("routing ({})", memberships.join(", ")),
+        Status::Routing => format!(
+            "routing ({})",
+            memberships
+                .iter()
+                .map(|network| colored_network_name(network))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Status::Paying => "paying".to_string(),
         Status::Receiving => "receiving".to_string(),
     }
@@ -385,14 +433,34 @@ fn node_color(name: &str) -> &'static str {
 
 fn colored_node_name(name: &str) -> String {
     let code = match node_color(name) {
-        "red" => "31",
-        "green" => "32",
-        "blue" => "34",
-        "yellow" => "33",
-        "magenta" => "35",
+        "red" => "91",
+        "green" => "92",
+        "blue" => "94",
+        "yellow" => "93",
+        "magenta" => "95",
+        "cyan" => "96",
+        "white" => "97",
         _ => "0",
     };
     format!("\x1b[{code}m{name}\x1b[0m")
+}
+
+fn colored_network_name(name: &str) -> String {
+    let background = if name.starts_with("cashu") { 44 } else { 41 };
+    let foreground = match name {
+        "cashu_1" => 97,
+        "cashu_2" => 93,
+        "cashu_3" => 96,
+        "rootstock_testnet" => 97,
+        _ => 37,
+    };
+    format!("\x1b[{background};{foreground}m{name}\x1b[0m")
+}
+
+fn identity_suffix(identity: &str) -> &str {
+    identity
+        .get(identity.len().saturating_sub(4)..)
+        .unwrap_or(identity)
 }
 
 fn network(id: &str) -> Result<&'static NetworkDef, String> {
@@ -416,6 +484,7 @@ async fn command_fund(
     playground: &Playground,
     node_id: &str,
     network_id: &str,
+    amount: u64,
 ) -> Result<(), String> {
     if !playground.nodes.lock().await.contains_key(node_id) {
         return Err(format!("unknown node '{node_id}'"));
@@ -423,8 +492,8 @@ async fn command_fund(
     let net = network(network_id)?.clone();
     ensure_membership(playground, node_id, network_id).await?;
     match net.mint_url {
-        Some(mint_url) => fund_cashu(node_id, network_id, mint_url).await,
-        None => fund_rootstock(node_id).await,
+        Some(mint_url) => fund_cashu(node_id, network_id, mint_url, amount).await,
+        None => fund_rootstock(node_id, amount * 1000).await,
     }
 }
 
@@ -443,7 +512,12 @@ async fn ensure_membership(
     Ok(())
 }
 
-async fn fund_cashu(node_id: &str, network_id: &str, mint_url: &str) -> Result<(), String> {
+async fn fund_cashu(
+    node_id: &str,
+    network_id: &str,
+    mint_url: &str,
+    amount_sat: u64,
+) -> Result<(), String> {
     let cdk = cdk_dir(network_id);
     std::fs::create_dir_all(&cdk).map_err(|e| e.to_string())?;
     let mint = Command::new("cdk-cli")
@@ -452,7 +526,7 @@ async fn fund_cashu(node_id: &str, network_id: &str, mint_url: &str) -> Result<(
         .arg("-n")
         .arg("mint")
         .arg(mint_url)
-        .arg("1000")
+        .arg(amount_sat.to_string())
         .output()
         .await
         .map_err(|e| e.to_string())?;
@@ -465,7 +539,7 @@ async fn fund_cashu(node_id: &str, network_id: &str, mint_url: &str) -> Result<(
         .arg("-n")
         .arg("send")
         .arg("-a")
-        .arg("1000")
+        .arg(amount_sat.to_string())
         .arg("--mint-url")
         .arg(mint_url)
         .output()
@@ -492,13 +566,14 @@ async fn fund_cashu(node_id: &str, network_id: &str, mint_url: &str) -> Result<(
         .await
         .map_err(|e| e.to_string())?;
     info!(
-        "funded {node_id} on {network_id}: {} sat",
+        "funded {node_id} on {}: {} sat",
+        colored_network_name(network_id),
         received.iter().map(|p| u64::from(p.amount)).sum::<u64>()
     );
     Ok(())
 }
 
-async fn fund_rootstock(node_id: &str) -> Result<(), String> {
+async fn fund_rootstock(node_id: &str, amount_msat: u64) -> Result<(), String> {
     let source_mnemonic =
         std::fs::read_to_string(RSK_SEED).map_err(|e| format!("read {RSK_SEED}: {e}"))?;
     let source_spec = NetSpec::parse("rootstock::testnet")?;
@@ -511,10 +586,13 @@ async fn fund_rootstock(node_id: &str) -> Result<(), String> {
     let target =
         cassis_client::adapters::build_rootstock_adapter(&source_spec, &target_keys).await?;
     let tx = source
-        .transfer(&target.address().to_string(), 1000)
+        .transfer(&target.address().to_string(), amount_msat)
         .await
         .map_err(|e| e.to_string())?;
-    info!("funded {node_id} on rootstock_testnet: tx {tx}");
+    info!(
+        "funded {node_id} on {}: tx {tx}",
+        colored_network_name("rootstock_testnet")
+    );
     Ok(())
 }
 
@@ -551,6 +629,7 @@ async fn command_router(
         .collect();
     let cashu_store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path));
+    let router_node_id = node_id.to_string();
     let jh = tokio::spawn(async move {
         let config = cassis_router::RouterConfig {
             network_specs,
@@ -558,9 +637,13 @@ async fn command_router(
             derived_keys: derived,
             cashu_store,
         };
-        if let Err(e) = cassis_router::run_router(config).await {
-            warn!("router failed: {e}");
-        }
+        NODE_LOG_CONTEXT
+            .scope(router_node_id, async move {
+                if let Err(e) = cassis_router::run_router(config).await {
+                    warn!("router failed: {e}");
+                }
+            })
+            .await;
     });
     let mut nodes = playground.nodes.lock().await;
     let node = nodes.get_mut(node_id).unwrap();
@@ -788,8 +871,8 @@ async fn command_route(
             "  hop {}: {} ({}) -> ({})\n    incoming: amount={} msat locktime={}\n    outgoing: amount={} msat locktime={}",
             index + 1,
             colored_node_name(&name),
-            hop.incoming,
-            hop.outgoing,
+            colored_network_name(&hop.incoming.to_string()),
+            colored_network_name(&hop.outgoing.to_string()),
             incoming,
             expiries[index],
             outgoing,
@@ -806,18 +889,36 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
     match verb {
         Some("fund") => match (parts.next(), parts.next()) {
             (Some(node), Some(network)) => {
-                if let Err(e) = command_fund(&playground, node, network).await {
-                    warn!("fund failed: {e}");
-                }
+                let amount = match parts.next() {
+                    Some(value) => match value.parse::<u64>() {
+                        Ok(amount) => amount,
+                        Err(_) => {
+                            warn!("fund failed: amount must be an integer");
+                            return;
+                        }
+                    },
+                    None => DEFAULT_FUND_AMOUNT,
+                };
+                NODE_LOG_CONTEXT
+                    .scope(node.to_string(), async {
+                        if let Err(e) = command_fund(&playground, node, network, amount).await {
+                            warn!("fund failed: {e}");
+                        }
+                    })
+                    .await;
             }
-            _ => info!("usage: fund <node_id> <network_id>"),
+            _ => info!("usage: fund <node_id> <network_id> [amount]"),
         },
         Some("router") => match parts.next() {
             Some(node) => {
                 let networks = parts.map(str::to_string).collect();
-                if let Err(e) = command_router(&playground, node, networks).await {
-                    warn!("router failed: {e}");
-                }
+                NODE_LOG_CONTEXT
+                    .scope(node.to_string(), async {
+                        if let Err(e) = command_router(&playground, node, networks).await {
+                            warn!("router failed: {e}");
+                        }
+                    })
+                    .await;
             }
             None => info!("usage: router <node_id> [<network_id> ...]"),
         },
@@ -827,9 +928,13 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             parts.next().and_then(|s| s.parse::<u64>().ok()),
         ) {
             (Some(sender), Some(target), Some(amount)) => {
-                if let Err(e) = command_pay(&playground, sender, target, amount).await {
-                    warn!("pay failed: {e}");
-                }
+                NODE_LOG_CONTEXT
+                    .scope(sender.to_string(), async {
+                        if let Err(e) = command_pay(&playground, sender, target, amount).await {
+                            warn!("pay failed: {e}");
+                        }
+                    })
+                    .await;
             }
             _ => info!("usage: pay <node_id_sender> <node_id_target> <amount_msat>"),
         },
@@ -840,14 +945,18 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             parts.next().and_then(|s| s.parse::<u64>().ok()),
         ) {
             (Some(sender), Some(target), Some(amount)) => {
-                if let Err(e) = command_route(&playground, sender, target, amount).await {
-                    warn!("route failed: {e}");
-                }
+                NODE_LOG_CONTEXT
+                    .scope(sender.to_string(), async {
+                        if let Err(e) = command_route(&playground, sender, target, amount).await {
+                            warn!("route failed: {e}");
+                        }
+                    })
+                    .await;
             }
             _ => info!("usage: route <sender> <target> <amount_msat>"),
         },
         Some("help") => info!(
-            "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
+            "fund <node> <network> [amount] (cashu: sats, rootstock: msats) | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
         ),
         Some("quit") | Some("exit") => info!("use Ctrl-C to exit"),
         Some(other) => info!("unknown command '{other}'; try help"),
@@ -888,8 +997,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    info!("summary:\n{}", playground.summary().await);
     info!(
-        "fund <node> <network> | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
+        "fund <node> <network> [amount] (cashu: sats, rootstock: msats) | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
     );
 
     loop {
