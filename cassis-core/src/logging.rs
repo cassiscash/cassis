@@ -1,4 +1,11 @@
-use std::io::Write;
+use std::fmt::Write;
+
+use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::{format::Writer, FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter};
 
 const RESET: &str = "\x1b[0m";
 
@@ -30,27 +37,62 @@ pub fn init_logging() {
         }
         f
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&default_filter))
-        .format(|buf, record| {
-            let target = record.target();
-            let (color, display) = CONTEXTS
-                .iter()
-                .find(|(t, _, _)| *t == target)
-                .map(|(_, c, d)| (*c, *d))
-                .unwrap_or(("", target));
-            let level_color = match record.level() {
-                log::Level::Error => "\x1b[31m",
-                log::Level::Warn => "\x1b[33m",
-                log::Level::Info => "\x1b[32m",
-                log::Level::Debug => "\x1b[36m",
-                log::Level::Trace => "\x1b[37m",
-            };
-            writeln!(
-                buf,
-                "{color}[{display}]{RESET} {level_color}{:<5}{RESET} {}",
-                record.level(),
-                record.args(),
-            )
-        })
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().event_format(CassisFormatter))
         .init();
+}
+
+struct CassisFormatter;
+
+impl<S, N> FormatEvent<S, N> for CassisFormatter
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        let target = event.metadata().target();
+        let (color, display) = CONTEXTS
+            .iter()
+            .find(|(t, _, _)| *t == target)
+            .map(|(_, c, d)| (*c, *d))
+            .unwrap_or(("", target));
+        let level = *event.metadata().level();
+        let level_color = match level {
+            tracing::Level::ERROR => "\x1b[31m",
+            tracing::Level::WARN => "\x1b[33m",
+            tracing::Level::INFO => "\x1b[32m",
+            tracing::Level::DEBUG => "\x1b[36m",
+            tracing::Level::TRACE => "\x1b[37m",
+        };
+        let mut message = String::new();
+        event.record(&mut MessageVisitor(&mut message));
+        writeln!(
+            writer,
+            "{color}[{display}]{RESET} {level_color}{level:<5}{RESET} {message}"
+        )
+    }
+}
+
+struct MessageVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0.push_str(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            let _ = write!(self.0, "{value:?}");
+        }
+    }
 }

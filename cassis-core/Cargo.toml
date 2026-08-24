@@ -11,10 +11,10 @@ rootstock = []
 
 [dependencies]
 async-trait = "0.1.91"
-env_logger = "0.11.11"
-log = "0.4.33"
 lowercase-hex = { version = "0.1.1", features = ["alloc"] }
 rand = "0.8.7"
 ritualistic = "0.1.1"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "1.0.69"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }

@@ -21,12 +21,12 @@ use cassis_core::{
 };
 use cassis_iroh::{Frame, IrohError, IrohServer};
 use cassis_keys as keys;
-use log::{debug, error, info, warn};
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 

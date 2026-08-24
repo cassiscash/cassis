@@ -1,10 +1,10 @@
 use cassis_core::{NetworkId, RouteAnnouncement};
-use log::{debug, info};
 use ritualistic::{Filter, Kind, Network, SubscriptionOptions, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
+use tracing::{debug, info};
 
 mod delta_table;
 
