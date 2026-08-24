@@ -479,7 +479,7 @@ impl Node {
         self.store().list(HOPS)
     }
 
-    fn hop(&self, operation_id: &OperationId) -> Result<Option<HopRecord>, String> {
+    pub(super) fn hop(&self, operation_id: &OperationId) -> Result<Option<HopRecord>, String> {
         self.store().get(HOPS, operation_id.as_str())
     }
 

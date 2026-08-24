@@ -75,6 +75,13 @@ impl Node {
         let Some(_busy) = self.busy(format!("hop:{}", hop.operation_id)) else {
             return;
         };
+        // The listing may be stale: a COMMIT could have settled it since.
+        let Ok(Some(hop)) = self.hop(&hop.operation_id) else {
+            return;
+        };
+        if hop.state != HopState::Forwarded {
+            return;
+        }
         let (Some(outgoing), Ok(network)) = (
             hop.outgoing.clone(),
             self.network(&hop.prepare.outgoing_network),
