@@ -42,6 +42,8 @@ pub struct DerivedKeys {
     pub nostr: SecretKey,
     /// Iroh transport key used for peer-to-peer connections.
     pub iroh: iroh::SecretKey,
+    /// Key used to identify invoices independently from node and network keys.
+    pub invoice: SecretKey,
     /// One signing key per network the node participates in.
     pub networks: HashMap<NetworkId, SecretKey>,
 }
@@ -75,6 +77,8 @@ pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<Derive
 
     let nostr = derive_nostr_secret_key(&seed)?;
     let iroh = derive_iroh_secret_key(&seed);
+    let invoice = derive_secret_key(&seed, b"cassis/invoice")
+        .map_err(|label| SeedError::DerivationExhausted { label })?;
 
     let mut networks = HashMap::with_capacity(network_ids.len());
     for network_id in network_ids {
@@ -87,6 +91,7 @@ pub fn derive_keys(mnemonic: &str, network_ids: Vec<NetworkId>) -> Result<Derive
     Ok(DerivedKeys {
         nostr,
         iroh,
+        invoice,
         networks,
     })
 }

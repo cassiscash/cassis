@@ -3,7 +3,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
     Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, WatchError,
+    OutgoingHtlc, PubKey, WatchError,
 };
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
@@ -100,6 +100,7 @@ pub struct CashuAdapter {
     client: cdk::wallet::HttpClient,
     #[allow(dead_code)]
     secret_key: [u8; 32],
+    invoice_pubkey: PubKey,
     keysets: Arc<Mutex<Vec<KeySetInfo>>>,
     /// In-flight outgoing HTLCs we have locked at the mint, keyed
     /// by the payment hash so the cross-network hop layer can pair
@@ -128,6 +129,7 @@ impl CashuAdapter {
         network_id: NetworkId,
         mint_url: String,
         secret_key: [u8; 32],
+        invoice_pubkey: PubKey,
         store: Arc<dyn CashuProofStore>,
     ) -> CashuResult<Self> {
         let mint_url_str = mint_url.clone();
@@ -140,6 +142,7 @@ impl CashuAdapter {
             mint_url_str,
             client,
             secret_key,
+            invoice_pubkey,
             keysets: Arc::new(Mutex::new(Vec::new())),
             outgoing: Mutex::new(HashMap::new()),
             incoming: Mutex::new(HashMap::new()),
@@ -475,6 +478,10 @@ pub struct SendResult {
 
 #[async_trait]
 impl NetworkRouterAdapter for CashuAdapter {
+    fn invoice_pubkey(&self) -> PubKey {
+        self.invoice_pubkey
+    }
+
     fn network_id(&self) -> NetworkId {
         self.network_id.clone()
     }
@@ -505,7 +512,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         // Cashu works in sats; round the msat floor up.
         let min_amount_sat = min_amount_msat.div_ceil(1000).max(1);
         let arrival = Arc::new(Notify::new());
-        let payment_hash_hex = htlc::payment_hash_hex(&payment_hash.0);
+        let payment_hash_hex = lowercase_hex::encode(payment_hash.0);
         let mut incoming = self.incoming.lock().await;
         incoming.insert(
             payment_hash,
@@ -999,7 +1006,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         verify_proofs_htlc_locked(&proofs, &payment_hash.0)
             .map_err(|e| HtlcError::Network(e.to_string()))?;
         let amount_sat: u64 = proofs.iter().map(|p| u64::from(p.amount)).sum();
-        let payment_hash_hex = htlc::payment_hash_hex(&payment_hash.0);
+        let payment_hash_hex = lowercase_hex::encode(payment_hash.0);
         let mut incoming = self.incoming.lock().await;
         match incoming.get_mut(&payment_hash) {
             Some(slot) => {
@@ -1101,12 +1108,19 @@ mod tests {
         Arc::new(InMemoryProofStore::new())
     }
 
+    fn test_invoice_pubkey() -> PubKey {
+        "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn new_accepts_a_valid_mint_url() {
         let adapter = CashuAdapter::new(
             NetworkId("mint.example.com".to_string()),
             "https://mint.example.com".to_string(),
             [0u8; 32],
+            test_invoice_pubkey(),
             test_store(),
         );
         assert!(adapter.is_ok(), "valid url should construct");
@@ -1118,6 +1132,7 @@ mod tests {
             NetworkId("not a url".to_string()),
             "not a url".to_string(),
             [0u8; 32],
+            test_invoice_pubkey(),
             test_store(),
         );
         assert!(
@@ -1132,6 +1147,7 @@ mod tests {
             NetworkId("".to_string()),
             "".to_string(),
             [0u8; 32],
+            test_invoice_pubkey(),
             test_store(),
         );
         assert!(adapter.is_err(), "empty url must be rejected");

@@ -64,8 +64,14 @@ async fn build_pair(
             let store: Arc<dyn cassis_cashu::CashuProofStore> =
                 Arc::new(CashuProofDb::new(store_path.to_path_buf()));
             let adapter = Arc::new(
-                cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.clone(), sk, store)
-                    .map_err(|e| format!("cashu adapter init failed: {e}"))?,
+                cassis_cashu::CashuAdapter::new(
+                    network_id.clone(),
+                    mint_url.clone(),
+                    sk,
+                    derived.invoice.pubkey(),
+                    store,
+                )
+                .map_err(|e| format!("cashu adapter init failed: {e}"))?,
             );
             Ok(AdapterPair {
                 network_id,
@@ -74,7 +80,8 @@ async fn build_pair(
             })
         }
         NetSpec::Rootstock { .. } => {
-            let cfg = cassis_rootstock::default_config(network_id.clone(), sk);
+            let cfg =
+                cassis_rootstock::default_config(network_id.clone(), sk, derived.invoice.pubkey());
             let adapter = cassis_rootstock::RootstockAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
@@ -127,9 +134,15 @@ pub async fn build_cashu_adapter(
         .unwrap_or([0u8; 32]);
     let store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path.to_path_buf()));
-    cassis_cashu::CashuAdapter::new(network_id, mint_url.clone(), sk, store)
-        .map(|a| Arc::new(a))
-        .map_err(|e| format!("cashu adapter init failed: {e}"))
+    cassis_cashu::CashuAdapter::new(
+        network_id,
+        mint_url.clone(),
+        sk,
+        derived.invoice.pubkey(),
+        store,
+    )
+    .map(|a| Arc::new(a))
+    .map_err(|e| format!("cashu adapter init failed: {e}"))
 }
 
 /// Build a concrete `cassis_rootstock::RootstockAdapter` for a
@@ -150,7 +163,7 @@ pub async fn build_rootstock_adapter(
         .get(&network_id)
         .map(|k| *k.as_bytes())
         .unwrap_or([0u8; 32]);
-    let cfg = cassis_rootstock::default_config(network_id, sk);
+    let cfg = cassis_rootstock::default_config(network_id, sk, derived.invoice.pubkey());
     cassis_rootstock::RootstockAdapter::new(cfg)
         .await
         .map_err(|e| format!("rootstock adapter init failed: {e}"))
@@ -173,9 +186,14 @@ pub async fn build_cashu_adapter_from_url(
         .unwrap_or([0u8; 32]);
     let store: Arc<dyn cassis_cashu::CashuProofStore> =
         Arc::new(CashuProofDb::new(store_path.to_path_buf()));
-    let adapter =
-        cassis_cashu::CashuAdapter::new(network_id.clone(), mint_url.to_string(), sk, store)
-            .map_err(|e| format!("cashu adapter init failed: {e}"))?;
+    let adapter = cassis_cashu::CashuAdapter::new(
+        network_id.clone(),
+        mint_url.to_string(),
+        sk,
+        derived.invoice.pubkey(),
+        store,
+    )
+    .map_err(|e| format!("cashu adapter init failed: {e}"))?;
     let canonical = cassis_core::cashu_mint_url(&network_id)
         .map_err(|e| format!("canonicalize mint url: {e}"))?;
     let spec = NetSpec::Cashu {

@@ -222,6 +222,7 @@ async fn build_adapter(
                     network_id.clone(),
                     mint_url,
                     sk,
+                    derived.invoice.pubkey(),
                     cashu_store.clone(),
                 )
                 .map_err(|e| format!("cashu adapter init failed: {e}"))?,
@@ -253,7 +254,10 @@ async fn build_adapter(
             }
             let network_id = NetworkId("liquid".to_string());
             let adapter: Arc<dyn NetworkRouterAdapter> =
-                Arc::new(cassis_liquid::LiquidAdapter::new(network_id.clone()));
+                Arc::new(cassis_liquid::LiquidAdapter::new(
+                    network_id.clone(),
+                    config.derived_keys.invoice.pubkey(),
+                ));
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
@@ -275,7 +279,10 @@ async fn build_adapter(
             }
             let network_id = NetworkId("ark".to_string());
             let adapter: Arc<dyn NetworkRouterAdapter> =
-                Arc::new(cassis_arkade::ArkAdapter::new(network_id.clone()));
+                Arc::new(cassis_arkade::ArkAdapter::new(
+                    network_id.clone(),
+                    config.derived_keys.invoice.pubkey(),
+                ));
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
@@ -306,7 +313,11 @@ async fn build_adapter(
                 .get(&network_id)
                 .map(|k| *k.as_bytes())
                 .unwrap_or([0u8; 32]);
-            let cfg = cassis_rootstock::default_config(network_id.clone(), sk);
+            let cfg = cassis_rootstock::default_config(
+                network_id.clone(),
+                sk,
+                derived.invoice.pubkey(),
+            );
             let adapter: Arc<dyn NetworkRouterAdapter> = cassis_rootstock::RootstockAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
@@ -368,7 +379,7 @@ impl CassisRouter {
                     target: "cassis_router",
                     "received PREPARE: payment_hash={} amount_msat={} {} -> {} via {} \
                      incoming_deadline={} outgoing_expiry={}",
-                    p.payment_hash,
+                    p.payment_hash.short(),
                     p.amount_msat,
                     p.incoming_network,
                     p.outgoing_network,
@@ -382,7 +393,7 @@ impl CassisRouter {
                     target: "cassis_router",
                     "received DISPATCH: payment_hash={} amount_msat={} {} -> {} via {} \
                      incoming_deadline={} outgoing_expiry={}",
-                    d.payment_hash,
+                    d.payment_hash.short(),
                     d.amount_msat,
                     d.incoming_network,
                     d.outgoing_network,
@@ -395,7 +406,7 @@ impl CassisRouter {
                 info!(
                     target: "cassis_router",
                     "received COMMIT (unusual for a router): payment_hash={} amount_msat={} network={}",
-                    c.payment_hash, c.amount_msat, c.network,
+                    c.payment_hash.short(), c.amount_msat, c.network,
                 );
             }
             other => {
@@ -461,7 +472,7 @@ impl CassisRouter {
             warn!(
                 target: "cassis_router",
                 "PREPARE rejected: payment_hash={} reason=can_route failed: {e}",
-                prepare.payment_hash,
+                prepare.payment_hash.short(),
             );
             return Ok(HopPrepared {
                 payment_hash: prepare.payment_hash,
@@ -475,7 +486,7 @@ impl CassisRouter {
         info!(
             target: "cassis_router",
             "PREPARE accepted: payment_hash={} amount_msat={} {} -> {} via {}",
-            prepare.payment_hash,
+            prepare.payment_hash.short(),
             prepare.amount_msat,
             prepare.incoming_network,
             prepare.outgoing_network,
@@ -537,9 +548,6 @@ impl CassisRouter {
             .get(&dispatch.outgoing_network)
             .ok_or_else(|| "outgoing network unsupported".to_string())?;
 
-        // Verify the incoming HTLC is really claimable on
-        // this adapter (e.g. cashu: NUT-14 proofs decode and
-        // reference the right payment hash).
         if let Err(e) = incoming_entry
             .adapter
             .verify_incoming_htlc(&dispatch.incoming_descriptor, dispatch.payment_hash)
@@ -625,7 +633,7 @@ impl CassisRouter {
             target: "cassis_router",
             "DISPATCH done: payment_hash={} amount_msat={} {} -> {} via {} \
              outgoing_descriptor={:?}",
-            dispatch.payment_hash,
+            dispatch.payment_hash.short(),
             dispatch.amount_msat,
             dispatch.incoming_network,
             dispatch.outgoing_network,
@@ -648,7 +656,7 @@ impl CassisRouter {
         info!(
             target: "cassis_router",
             "COMMIT (received by router, unusual): payment_hash={} amount_msat={} network={}",
-            commit.payment_hash,
+            commit.payment_hash.short(),
             commit.amount_msat,
             commit.network,
         );
@@ -719,7 +727,8 @@ impl CassisRouter {
                 Ok(preimage) => {
                     info!(
                         target: "cassis_router",
-                        "  preimage revealed for {payment_hash} on {}, claiming incoming",
+                        "  preimage revealed for {} on {}, claiming incoming",
+                        payment_hash.short(),
                         prepare.outgoing_network,
                     );
                     self.claim_incoming(payment_hash, &prepare, preimage).await;
@@ -763,8 +772,9 @@ impl CassisRouter {
             Ok(()) => {
                 info!(
                     target: "cassis_router",
-                    "  incoming HTLC claimed on {} for {payment_hash}",
+                    "  incoming HTLC claimed on {} for {}",
                     prepare.incoming_network,
+                    payment_hash.short(),
                 );
             }
             Err(err) => {

@@ -8,6 +8,12 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Bytes32(pub [u8; 32]);
 
+impl Bytes32 {
+    pub fn short(&self) -> String {
+        format!("…{}", self)[60..].to_string()
+    }
+}
+
 impl fmt::Debug for Bytes32 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", lowercase_hex::encode(self.0))
@@ -288,7 +294,7 @@ pub struct RouteAnnouncement {
 pub struct Invoice {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
-    pub payee: String,
+    pub payee: PubKey,
     pub expires_at: u64,
     pub networks: Vec<NetworkId>,
     pub description: Option<String>,
@@ -459,6 +465,7 @@ pub enum HtlcDescriptor {
     Rootstock {
         contract: String,
         amount_wei: u128,
+        claim_address: String,
         refund_address: String,
         timelock: u64,
     },
@@ -573,6 +580,8 @@ pub enum SendError {
 #[async_trait]
 pub trait NetworkRouterAdapter: Send + Sync {
     fn network_id(&self) -> NetworkId;
+
+    fn invoice_pubkey(&self) -> PubKey;
 
     fn incoming_delta_secs(&self) -> u64;
 
@@ -834,7 +843,7 @@ where
         Ok(Invoice {
             payment_hash: htlc.payment_hash,
             amount_msat,
-            payee: network_id.0.clone(),
+            payee: self.invoice_pubkey(),
             expires_at: expiry,
             networks: vec![network_id],
             description,

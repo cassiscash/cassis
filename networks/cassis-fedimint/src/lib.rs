@@ -120,6 +120,7 @@ const ROOT_SECRET_SALT: &[u8] = b"cassis/fedimint/v1";
 /// the client's executor.
 pub struct FedimintAdapter {
     network_id: NetworkId,
+    invoice_pubkey: PubKey,
     client: ClientHandleArc,
     /// LN invoice produced by `create_invoice` / consumed by
     /// `pay_invoice`. Contracts are keyed by the cassis payment hash
@@ -179,6 +180,7 @@ impl FedimintAdapter {
         network_id: NetworkId,
         address: String,
         secret: [u8; 32],
+        invoice_pubkey: PubKey,
     ) -> Result<Self, String> {
         // Connector stack: defaults enable iroh next (`/v1`) and the
         // `iroh://` scheme. Guardian endpoints in the federation
@@ -266,6 +268,7 @@ impl FedimintAdapter {
 
         Ok(Self {
             network_id,
+            invoice_pubkey,
             client,
             incoming_ops: Mutex::new(HashMap::new()),
             outgoing_ops: Mutex::new(HashMap::new()),
@@ -379,7 +382,7 @@ impl NetworkReceiverAdapter for FedimintAdapter {
         Ok(cassis_core::Invoice {
             payment_hash,
             amount_msat,
-            payee: invoice_str,
+            payee: self.invoice_pubkey,
             expires_at: expiry,
             networks: vec![self.network_id.clone()],
             description: Some(DEFAULT_INVOICE_DESCRIPTION.to_string()),
