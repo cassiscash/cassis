@@ -136,7 +136,7 @@ plus `r6` between cashu2 and `cashu.mutinynet.com` (payee grace).
 | rootstock payee without RBTC | claim fails, route locked until expiry, finding a |
 | router killed after EXECUTE, restarted | payer waits, then payee refuses: claim window passed (by design); everything refunds at expiry |
 | router killed as payee claims, restarted | payer paid; restarted router finds the downstream claim on chain (fix 2) and settles |
-| expired HTLCs | routers refund on their own (cashu, rootstock); payer refunds once serving |
+| expired HTLCs | every stopped payment (payee offline, router killed, claim failed) refunded at every hop: routers on their own on cashu, rootstock, fedimint and arkade::mutinynet; the payer (3 payments, 3015 sat) once serving |
 
 ### Fixed
 
@@ -159,6 +159,12 @@ plus `r6` between cashu2 and `cashu.mutinynet.com` (payee grace).
    federation's network (30s on signet).
 5. **`invoice --wait` ignored Ctrl-C** (a network client installs its
    own SIGINT handler); it now stops on it.
+6. **Settled hops were claimed again until they expired.** The settle
+   loop worked on a hop listed at the start of its pass; when the
+   payer's COMMIT settled it meanwhile, the loop found the downstream
+   claim, claimed the incoming HTLC a second time (`Token Already
+   Spent`, `swap has no Ether locked`), overwrote `Settled` and retried
+   until expiry, ending `Failed`. No funds lost; it now reloads the hop.
 
 ### Open findings
 
