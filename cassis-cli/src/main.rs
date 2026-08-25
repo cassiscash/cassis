@@ -17,7 +17,7 @@ use cassis_client::CassisClient;
 use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter};
 use cassis_keys as keys;
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, info_span};
 
 mod cli;
 use cli::{CashuCommands, Cli, Commands, RootstockCommands};
@@ -233,7 +233,13 @@ async fn cmd_pay(invoice: String, from: String, nostr_relay: Vec<String>) -> Res
     let net_spec = NetSpec::parse(&dest_network.0)?;
     let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&net_spec))?;
-    let senders = build_senders(&[net_spec], &derived, &node_store_path(&node_home())).await?;
+    let senders = build_senders(
+        &[net_spec],
+        &derived,
+        &node_store_path(&node_home()),
+        info_span!("node", node = "cassis-cli"),
+    )
+    .await?;
     let client = CassisClient::new(senders, relays).await;
     info!(
         "paying {} msat via '{}' route",
@@ -290,6 +296,7 @@ async fn cmd_invoice(
         std::slice::from_ref(&spec),
         &derived,
         &node_store_path(&node_home()),
+        info_span!("node", node = "cassis-cli"),
     )
     .await?;
     let receiver_map: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>> =
@@ -329,7 +336,7 @@ async fn cmd_receive() -> Result<(), String> {
         "receive: {} network(s) listening; pending invoices will be claimed",
         specs.len()
     );
-    let _jh = start_receive(&home, &specs).await?;
+    let _jh = start_receive(&home, &specs, info_span!("node", node = "cassis-cli")).await?;
     println!("receive: ready (cassis_client::start_receive spawned the iroh listener)");
     tokio::signal::ctrl_c().await.ok();
     info!("shutting down");
@@ -508,7 +515,8 @@ async fn cmd_rootstock_send(network: String, to: String, amount_msat: u64) -> Re
     let spec = NetSpec::Rootstock { testnet };
     let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let adapter = build_rootstock_adapter(&spec, &derived).await?;
+    let adapter =
+        build_rootstock_adapter(&spec, &derived, info_span!("node", node = "cassis-cli")).await?;
     let tx_hash = adapter
         .transfer(&to, amount_msat)
         .await

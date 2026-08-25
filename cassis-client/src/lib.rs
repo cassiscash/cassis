@@ -409,7 +409,17 @@ impl CassisClient {
             incoming_deadline: invoice.expires_at,
             incoming_descriptor: descriptor,
         };
+        info!(
+            target: "cassis_client",
+            "sending COMMIT to payee for payment_hash={}",
+            invoice.payment_hash.short(),
+        );
         let committed = self.iroh_client.send_commit(payee_addr, commit).await?;
+        info!(
+            target: "cassis_client",
+            "payee accepted COMMIT for payment_hash={}",
+            invoice.payment_hash.short(),
+        );
         let preimage = committed.preimage;
         if preimage.0 == [0u8; 32] {
             return Err(PayError::Commit(

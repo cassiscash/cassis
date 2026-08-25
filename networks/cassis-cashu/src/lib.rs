@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+use tracing::Span;
 
 mod errors;
 mod htlc;
@@ -101,6 +102,8 @@ pub struct CashuAdapter {
     #[allow(dead_code)]
     secret_key: [u8; 32],
     invoice_pubkey: PubKey,
+    #[allow(dead_code)]
+    span: Span,
     keysets: Arc<Mutex<Vec<KeySetInfo>>>,
     /// In-flight outgoing HTLCs we have locked at the mint, keyed
     /// by the payment hash so the cross-network hop layer can pair
@@ -131,6 +134,7 @@ impl CashuAdapter {
         secret_key: [u8; 32],
         invoice_pubkey: PubKey,
         store: Arc<dyn CashuProofStore>,
+        span: Span,
     ) -> CashuResult<Self> {
         let mint_url_str = mint_url.clone();
         let mint_url = MintUrl::from_str(&mint_url)
@@ -143,6 +147,7 @@ impl CashuAdapter {
             client,
             secret_key,
             invoice_pubkey,
+            span,
             keysets: Arc::new(Mutex::new(Vec::new())),
             outgoing: Mutex::new(HashMap::new()),
             incoming: Mutex::new(HashMap::new()),
@@ -1122,6 +1127,7 @@ mod tests {
             [0u8; 32],
             test_invoice_pubkey(),
             test_store(),
+            Span::none(),
         );
         assert!(adapter.is_ok(), "valid url should construct");
     }
@@ -1134,6 +1140,7 @@ mod tests {
             [0u8; 32],
             test_invoice_pubkey(),
             test_store(),
+            Span::none(),
         );
         assert!(
             adapter.is_err(),
@@ -1149,6 +1156,7 @@ mod tests {
             [0u8; 32],
             test_invoice_pubkey(),
             test_store(),
+            Span::none(),
         );
         assert!(adapter.is_err(), "empty url must be rejected");
     }
