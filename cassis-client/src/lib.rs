@@ -179,6 +179,14 @@ impl CassisClient {
             ));
         }
 
+        // Validate the chain of networks before reserving capacity on
+        // anyone. Each hop reports a claim identity that is only valid on
+        // one network, so a break anywhere in this chain would have us
+        // lock an HTLC to a key valid on a *different* network — the same
+        // silent-divergence class this identity plumbing exists to
+        // prevent. Cheaper to reject here than after PREPAREing everyone.
+        validate_route_networks(&route, &sender_network, &dest_network)?;
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -232,56 +240,45 @@ impl CassisClient {
                         outgoing_network: hop.outgoing.clone(),
                         incoming_deadline: expiries.get(idx).copied().unwrap_or(now),
                         outgoing_expiry: expiries.get(idx + 1).copied().unwrap_or(now),
-                        // Final HTLC must use invoice key: payee signs the
-                        // Cashu witness with matching invoice secret.
-                        recipient: if idx + 1 == route.len() {
-                            invoice.payee
-                        } else {
-                            hop.node.node_pubkey
-                        },
                     },
                 )
             })
             .collect();
-        let prepared_futures = prepares
-            .iter()
-            .cloned()
-            .map(|(idx, p)| {
-                let peer = route[idx].node.node_pubkey;
-                let addr = addrs[idx].clone();
-                let route_len = route.len();
-                info!(
-                    target: "cassis_client",
-                    "PREPARE hop {}/{route_len}: peer={peer} addr={addr:?} incoming={} outgoing={} \
-                     amount_msat={} incoming_deadline={} outgoing_expiry={} recipient={} payment_hash={}",
-                    idx+1,
-                    p.incoming_network,
-                    p.outgoing_network,
-                    p.amount_msat,
-                    p.incoming_deadline,
-                    p.outgoing_expiry,
-                    p.recipient,
-                    p.payment_hash,
-                );
-                async move {
-                    let reply = self.iroh_client.send_prepare(addr, p.clone()).await;
-                    match &reply {
-                        Ok(ack) => info!(
-                            target: "cassis_client",
-                            "PREPARE hop {}/{route_len}: peer={peer} accepted={} reason={:?}",
-                            idx+1,
-                            ack.accepted,
-                            ack.reason,
-                        ),
-                        Err(e) => info!(
-                            target: "cassis_client",
-                            "PREPARE hop {}/{route_len}: peer={peer} error={e}",
-                            idx+1
-                        ),
-                    }
-                    reply
+        let prepared_futures = prepares.iter().cloned().map(|(idx, p)| {
+            let peer = route[idx].node.node_pubkey;
+            let addr = addrs[idx].clone();
+            let route_len = route.len();
+            info!(
+                target: "cassis_client",
+                "PREPARE hop {}/{route_len}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+                 amount_msat={} incoming_deadline={} outgoing_expiry={} payment_hash={}",
+                idx+1,
+                p.incoming_network,
+                p.outgoing_network,
+                p.amount_msat,
+                p.incoming_deadline,
+                p.outgoing_expiry,
+                p.payment_hash,
+            );
+            async move {
+                let reply = self.iroh_client.send_prepare(addr, p.clone()).await;
+                match &reply {
+                    Ok(ack) => info!(
+                        target: "cassis_client",
+                        "PREPARE hop {}/{route_len}: peer={peer} accepted={} reason={:?}",
+                        idx+1,
+                        ack.accepted,
+                        ack.reason,
+                    ),
+                    Err(e) => info!(
+                        target: "cassis_client",
+                        "PREPARE hop {}/{route_len}: peer={peer} error={e}",
+                        idx+1
+                    ),
                 }
-            });
+                reply
+            }
+        });
         let prepared_result = try_join_all(prepared_futures).await;
         let prepared: Vec<cassis_core::HopPrepared> = match prepared_result {
             Ok(p) => p,
@@ -304,12 +301,34 @@ impl CassisClient {
             }
         }
 
+        // Resolve who each HTLC must be locked to. Every hop reports
+        // the identity it claims its *incoming* HTLC with, so the party
+        // upstream of it locks to that key; the payee's identity comes
+        // from the invoice. `recipients[i]` is therefore the key the
+        // HTLC funding hop `i` must be locked to, and `recipients[len]`
+        // is the payee's.
+        //
+        // This is why `recipient` rides on DISPATCH rather than
+        // PREPARE: the PREPAREs above run concurrently, so hop `i+1`'s
+        // reply does not exist yet while hop `i`'s PREPARE is built.
+        // Deriving it here, after every reply is in, also makes the
+        // "lock to hop i instead of hop i+1" off-by-one unrepresentable.
+        // A missing claim identity is a hard error rather than a
+        // fallback to the announced node key: guessing is exactly what
+        // caused HTLCs to be locked to unclaimable identities, and the
+        // failure only surfaced on-chain after funds were committed.
+        let mut recipients: Vec<cassis_core::PubKey> = Vec::with_capacity(route.len() + 1);
+        for (idx, ack) in prepared.iter().enumerate() {
+            recipients.push(ack.claim_pubkey.ok_or_else(|| PayError::HopRejected {
+                index: idx,
+                reason: "hop accepted the PREPARE but reported no claim identity".to_string(),
+            })?);
+        }
+        recipients.push(invoice.claim_pubkey_for(&dest_network));
+
         // Step 2: pay the first hop. The sender adapter creates
         // the first HTLC and returns the OutgoingPayment
         // descriptor (cashu proofs, etc.).
-        let first_hop = route
-            .first()
-            .ok_or_else(|| PayError::Route("route missing".to_string()))?;
         let sender = self
             .senders
             .get(&sender_network)
@@ -319,12 +338,19 @@ impl CassisClient {
         // so it must not expire before the first hop's incoming
         // deadline (expiries[0]).
         let first_outgoing_expiry = expiries.first().copied().unwrap_or(now);
+        // Lock to the first hop's self-reported claim identity, not to
+        // its announced node key: those are different keys whenever the
+        // network claims with a dedicated per-network key (rootstock).
+        let first_recipient = recipients[0];
         let first_payment: OutgoingPayment = sender
             .pay_invoice(
                 invoice.payment_hash,
                 invoice.amount_msat,
-                first_hop.node.node_pubkey,
-                &first_hop.outgoing,
+                first_recipient,
+                // The HTLC is created on our own sending network, which
+                // `validate_route_networks` proved is the first hop's
+                // incoming network.
+                &sender_network,
                 first_outgoing_expiry,
             )
             .await
@@ -342,9 +368,14 @@ impl CassisClient {
         // HTLC info for the *incoming* side of the next hop.
         let mut descriptor = first_descriptor;
         for (i, hop) in route.iter().enumerate() {
+            // `recipients[i + 1]` is the party downstream of hop `i`:
+            // the next hop's claim identity, or the payee's for the last
+            // hop.
+            let recipient = recipients[i + 1];
             let dispatch = HopDispatch {
                 payment_hash: invoice.payment_hash,
                 incoming_descriptor: descriptor,
+                recipient,
             };
             let peer = hop.node.node_pubkey;
             let addr = addrs[i].clone();
@@ -360,7 +391,7 @@ impl CassisClient {
                 invoice.amount_msat,
                 expiries[i],
                 expiries[i + 1],
-                hop.node.node_pubkey,
+                recipient,
                 dispatch.payment_hash,
                 dispatch.incoming_descriptor,
             );
@@ -549,6 +580,51 @@ impl CassisClient {
             preimage: Some(preimage),
         })
     }
+}
+
+/// Verify the route forms an unbroken chain of networks from the payer
+/// to the payee.
+///
+/// Every HTLC in the chain is locked to a claim identity that is only
+/// meaningful on one network: the payer's HTLC to hop 0's identity on
+/// `route[0].incoming`, hop `i`'s to hop `i+1`'s on `route[i+1].incoming`,
+/// and the last hop's to the payee's on the invoice's network. If any
+/// adjacent pair disagreed we would lock funds to a key valid somewhere
+/// else, which is exactly the silent, funds-stuck failure the claim
+/// identity plumbing exists to prevent. Checked up front so a bad route
+/// is rejected before any hop reserves capacity.
+fn validate_route_networks(
+    route: &[RouteHop],
+    sender_network: &NetworkId,
+    dest_network: &NetworkId,
+) -> Result<(), PayError> {
+    // Callers reject empty routes before reaching here.
+    let first = &route[0];
+    if &first.incoming != sender_network {
+        return Err(PayError::Route(format!(
+            "first hop receives on {} but we are sending on {sender_network}",
+            first.incoming,
+        )));
+    }
+    for (idx, pair) in route.windows(2).enumerate() {
+        if pair[0].outgoing != pair[1].incoming {
+            return Err(PayError::Route(format!(
+                "discontiguous route: hop {} sends on {} but hop {} receives on {}",
+                idx + 1,
+                pair[0].outgoing,
+                idx + 2,
+                pair[1].incoming,
+            )));
+        }
+    }
+    let last = &route[route.len() - 1];
+    if &last.outgoing != dest_network {
+        return Err(PayError::Route(format!(
+            "last hop sends on {} but the invoice is payable on {dest_network}",
+            last.outgoing,
+        )));
+    }
+    Ok(())
 }
 
 /// Local helper: verify a candidate preimage hashes to the

@@ -196,6 +196,23 @@ pub struct NetworkEntry {
     pub incoming_delta_secs: u64,
 }
 
+/// Per-network signing key for `network_id`, or a descriptive error.
+/// An all-zero fallback is not a valid secp256k1 scalar, so it only
+/// deferred the failure to the first signature.
+///
+/// Gated to exactly the features whose arms call it, so it disappears
+/// rather than needing a blanket dead-code allow.
+#[cfg(any(feature = "cashu", feature = "rootstock"))]
+fn network_sk(derived: &keys::DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32], String> {
+    derived
+        .networks
+        .get(network_id)
+        .map(|k| *k.as_bytes())
+        .ok_or_else(|| {
+            format!("no signing key derived for network '{network_id}'; derive keys for it first")
+        })
+}
+
 #[allow(unused_variables)]
 async fn build_adapter(
     spec: &str,
@@ -216,11 +233,10 @@ async fn build_adapter(
             let network_id = cashu_network_id(host);
             let mint_url =
                 cashu_mint_url(&network_id).map_err(|e| format!("cashu mint url: {e}"))?;
-            let sk = derived
-                .networks
-                .get(&network_id)
-                .map(|k| *k.as_bytes())
-                .unwrap_or([0u8; 32]);
+            // The cashu adapter signs NUT-14 witnesses with this key and
+            // advertises the matching identity via `claim_pubkey()`, so
+            // upstream hops lock proofs to a key we can actually spend.
+            let sk = network_sk(derived, &network_id)?;
             let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
                 cassis_cashu::CashuAdapter::new(
                     network_id.clone(),
@@ -315,14 +331,15 @@ async fn build_adapter(
                     ));
                 }
             };
-            let sk = derived
-                .networks
-                .get(&network_id)
-                .map(|k| *k.as_bytes())
-                .unwrap_or([0u8; 32]);
+            let sk = network_sk(derived, &network_id)?;
+            // Rootstock claims are signed by a dedicated per-network
+            // EVM account, not by the invoice key. The adapter
+            // advertises the matching identity via `claim_pubkey()` so
+            // upstream hops lock to an address we can actually claim
+            // from.
             let cfg = cassis_rootstock::default_config(
                 network_id.clone(),
-                *derived.invoice.as_bytes(),
+                sk,
                 derived.invoice.pubkey(),
                 span.clone(),
             );
@@ -393,13 +410,12 @@ impl CassisRouter {
             Frame::Prepare(p) => {
                 info!(
                     target: "cassis_router",
-                    "received PREPARE: payment_hash={} amount_msat={} {} -> {} via {} \
+                    "received PREPARE: payment_hash={} amount_msat={} {} -> {} \
                      incoming_deadline={} outgoing_expiry={}",
                     p.payment_hash.short(),
                     p.amount_msat,
                     p.incoming_network,
                     p.outgoing_network,
-                    p.recipient,
                     p.incoming_deadline,
                     p.outgoing_expiry,
                 );
@@ -407,8 +423,9 @@ impl CassisRouter {
             Frame::Dispatch(d) => {
                 info!(
                     target: "cassis_router",
-                    "received DISPATCH: payment_hash={} incoming_descriptor={:?}",
+                    "received DISPATCH: payment_hash={} recipient={} incoming_descriptor={:?}",
                     d.payment_hash.short(),
+                    d.recipient,
                     d.incoming_descriptor,
                 );
             }
@@ -469,6 +486,13 @@ impl CassisRouter {
         }
         self.validate_prepare(&prepare)?;
 
+        // Resolved up front: the reply has to carry the identity the
+        // upstream party must lock our incoming HTLC to.
+        let incoming_entry = self
+            .adapters
+            .get(&prepare.incoming_network)
+            .ok_or_else(|| "incoming network unsupported".to_string())?;
+
         // Funds check on the outgoing side: the adapter must
         // be able to back the HTLC right now. The default
         // (cashu) sums the local balance; stub adapters
@@ -488,6 +512,7 @@ impl CassisRouter {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some(format!("can_route failed: {e}")),
+                claim_pubkey: None,
             });
         }
 
@@ -499,6 +524,7 @@ impl CassisRouter {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some("PREPARE capacity exhausted".into()),
+                claim_pubkey: None,
             });
         }
         prepared.push(PreparedEntry {
@@ -507,17 +533,21 @@ impl CassisRouter {
         });
         info!(
             target: "cassis_router",
-            "PREPARE accepted: payment_hash={} amount_msat={} {} -> {} via {}",
+            "PREPARE accepted: payment_hash={} amount_msat={} {} -> {}",
             prepare.payment_hash.short(),
             prepare.amount_msat,
             prepare.incoming_network,
             prepare.outgoing_network,
-            prepare.recipient,
         );
         Ok(HopPrepared {
             payment_hash: prepare.payment_hash,
             accepted: true,
             reason: None,
+            // Tell the upstream party which identity to lock our
+            // incoming HTLC to. Self-reporting it keeps lock and claim
+            // in agreement without the payer having to guess which of
+            // our keys signs claims on this network.
+            claim_pubkey: Some(incoming_entry.adapter.claim_pubkey()),
         })
     }
 
@@ -573,8 +603,12 @@ impl CassisRouter {
             return Err(format!("accept_incoming_htlc failed: {e}"));
         }
 
-        // Now create the outgoing HTLC on the next network.
-        let recipient = prepare.recipient;
+        // Now create the outgoing HTLC on the next network. The
+        // recipient comes from the DISPATCH frame, not from the stored
+        // PREPARE: it is the downstream party's self-reported
+        // `claim_pubkey`, which the payer only learns once every hop has
+        // answered its (concurrent) PREPARE.
+        let recipient = dispatch.recipient;
         match outgoing_entry
             .adapter
             .create_outgoing_htlc(
@@ -630,7 +664,7 @@ impl CassisRouter {
             prepare.amount_msat,
             prepare.incoming_network,
             prepare.outgoing_network,
-            prepare.recipient,
+            recipient,
             outgoing_descriptor,
         );
         Ok(HopDispatched {

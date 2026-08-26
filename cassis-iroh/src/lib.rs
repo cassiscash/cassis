@@ -451,14 +451,15 @@ mod tests {
         // decode on the router with postcard's WontImplement error
         // and the connection would drop. External tagging round-trips
         // fine.
+        let recipient = cassis_core::PubKey::from_bytes([
+            0x17, 0x16, 0x2c, 0x92, 0x1d, 0xc4, 0xd2, 0x51, 0x8f, 0x9a, 0x10, 0x1d, 0xb3, 0x36,
+            0x95, 0xdf, 0x1a, 0xfb, 0x56, 0xab, 0x82, 0xf5, 0xff, 0x3e, 0x5d, 0xa6, 0xee, 0xc3,
+            0xca, 0x5c, 0xd9, 0x17,
+        ])
+        .expect("valid x-only pubkey");
         let dispatch = Frame::Dispatch(HopDispatch {
             payment_hash: Bytes32([0x42u8; 32]),
-            amount_msat: 10_000,
-            incoming_network: NetworkId("cashu::localhost:8093".into()),
-            outgoing_network: NetworkId("cashu::localhost:8092".into()),
-            incoming_deadline: 1_786_000_000,
-            outgoing_expiry: 1_785_999_900,
-            recipient: "peer-1".into(),
+            recipient,
             incoming_descriptor: HtlcDescriptor::Cashu {
                 proofs_b64: vec!["eyJhbW91bnQiOjF9".into(), "eyJhbW91bnQiOjJ9".into()],
             },
@@ -467,7 +468,7 @@ mod tests {
         let decoded: Frame = postcard::from_bytes(&bytes).expect("decode dispatch");
         match decoded {
             Frame::Dispatch(d) => {
-                assert_eq!(d.amount_msat, 10_000);
+                assert_eq!(d.recipient, recipient);
                 assert_eq!(
                     d.incoming_descriptor,
                     HtlcDescriptor::Cashu {

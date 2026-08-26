@@ -9,15 +9,12 @@ use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut00::{BlindedMessage, Proofs};
-use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::nut07::{CheckStateRequest, State as ProofState};
 use cdk::nuts::nut10::SpendingConditions;
 use cdk::nuts::nut12::ProofDleq;
 use cdk::nuts::nut14::HTLCWitness;
 use cdk::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Witness};
-use cdk::secret::Secret;
 use cdk::wallet::MintConnector;
-use cdk::Amount;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -28,12 +25,18 @@ mod errors;
 mod htlc;
 mod store;
 
+// Re-exported so downstream crates can build and inspect `Proof`
+// values without taking their own direct dependency on cdk.
 pub use cdk::nuts::nut00::Proof;
+pub use cdk::nuts::nut01::PublicKey;
+pub use cdk::nuts::nut02::Id as KeysetId;
+pub use cdk::secret::Secret;
+pub use cdk::Amount;
 pub use errors::CashuError as Error;
 use errors::{CashuError, CashuResult};
 use htlc::{
-    add_preimage_to_proofs, build_htlc_outputs, htlc_conditions, proof_y, verify_proofs_htlc,
-    verify_proofs_htlc_locked,
+    add_preimage_to_proofs, build_htlc_outputs, claim_pubkey_from_secret, htlc_conditions, proof_y,
+    verify_proofs_htlc, verify_proofs_htlc_locked,
 };
 pub use store::CashuProofStore;
 
@@ -99,8 +102,14 @@ pub struct CashuAdapter {
     /// implements [`MintConnector`], giving us the NUT-01/02/03/07
     /// calls the adapter's DHKE and HTLC logic drives.
     client: cdk::wallet::HttpClient,
-    #[allow(dead_code)]
     secret_key: [u8; 32],
+    /// x-only identity of `secret_key`: the key counterparties must
+    /// lock HTLC proofs to for this adapter to be able to claim them.
+    ///
+    /// Parity is irrelevant here: NUT-11/14 verification is BIP340
+    /// x-only, so the `0x02` prefix `pubkey_from_cassis` re-applies is
+    /// never checked against the signature.
+    claim_pubkey: PubKey,
     invoice_pubkey: PubKey,
     #[allow(dead_code)]
     span: Span,
@@ -140,12 +149,16 @@ impl CashuAdapter {
         let mint_url = MintUrl::from_str(&mint_url)
             .map_err(|e| CashuError::Nuts(format!("invalid mint url '{mint_url}': {e}")))?;
         let client = cdk::wallet::HttpClient::new(mint_url.clone(), None);
+        // Derive up front so a key we cannot sign with is rejected here
+        // rather than surfacing later as an unclaimable HTLC.
+        let claim_pubkey = claim_pubkey_from_secret(&secret_key)?;
         Ok(Self {
             network_id,
             mint_url,
             mint_url_str,
             client,
             secret_key,
+            claim_pubkey,
             invoice_pubkey,
             span,
             keysets: Arc::new(Mutex::new(Vec::new())),
@@ -485,6 +498,20 @@ pub struct SendResult {
 impl NetworkRouterAdapter for CashuAdapter {
     fn invoice_pubkey(&self) -> PubKey {
         self.invoice_pubkey
+    }
+
+    /// Report the key we actually sign NUT-14 witnesses with, which is
+    /// `self.secret_key` — not necessarily the invoice key. Callers
+    /// construct this adapter with different keys depending on the role
+    /// (the payee uses its invoice key; a routing hop uses its
+    /// per-network key), so deriving the identity from the signing key
+    /// keeps the advertised identity truthful either way.
+    ///
+    /// Computed once in [`CashuAdapter::new`], so an unusable signing
+    /// key fails loudly at construction rather than silently
+    /// advertising an identity we cannot claim with.
+    fn claim_pubkey(&self) -> PubKey {
+        self.claim_pubkey
     }
 
     fn network_id(&self) -> NetworkId {
@@ -1131,7 +1158,7 @@ mod tests {
         let adapter = CashuAdapter::new(
             NetworkId("mint.example.com".to_string()),
             "https://mint.example.com".to_string(),
-            [0u8; 32],
+            [1u8; 32],
             test_invoice_pubkey(),
             test_store(),
             Span::none(),
@@ -1144,7 +1171,7 @@ mod tests {
         let adapter = CashuAdapter::new(
             NetworkId("not a url".to_string()),
             "not a url".to_string(),
-            [0u8; 32],
+            [1u8; 32],
             test_invoice_pubkey(),
             test_store(),
             Span::none(),
@@ -1160,7 +1187,7 @@ mod tests {
         let adapter = CashuAdapter::new(
             NetworkId("".to_string()),
             "".to_string(),
-            [0u8; 32],
+            [1u8; 32],
             test_invoice_pubkey(),
             test_store(),
             Span::none(),

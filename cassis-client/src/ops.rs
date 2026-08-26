@@ -78,7 +78,6 @@ pub fn load_and_derive(home: &Path, ids: Vec<NetworkId>) -> Result<keys::Derived
 /// Generates the preimage locally and persists the row in the node's
 /// store. Returns the Invoice (with the local iroh peer id baked in)
 /// ready for the payer to consume.
-#[allow(unused_variables)]
 pub async fn create_invoice_for(
     home: &Path,
     network_id: NetworkId,
@@ -90,6 +89,25 @@ pub async fn create_invoice_for(
     let derived = keys::derive_keys(&mnemonic, ids).map_err(|e| e.to_string())?;
 
     let store_path = node_store_path(home);
+    // Ask the receiver adapter which identity it will actually claim
+    // with on this network. For cashu that is the invoice key, but
+    // rootstock claims on-chain with a dedicated per-network EVM
+    // account, so the last hop has to lock to *that* key or the payee
+    // cannot claim.
+    let claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)> = {
+        let receivers = build_receivers(
+            std::slice::from_ref(&spec),
+            &derived,
+            &store_path,
+            Span::current(),
+        )
+        .await?;
+        receivers
+            .get(&network_id)
+            .and_then(|r| r.claim_pubkey())
+            .map(|pubkey| vec![(network_id.clone(), pubkey)])
+            .unwrap_or_default()
+    };
     let now = unix_now();
     let ttl = 600u64;
     let preimage = generate_preimage();
@@ -123,6 +141,7 @@ pub async fn create_invoice_for(
         amount_msat,
         payee: derived.invoice.pubkey(),
         expires_at: invoice_expiry,
+        claim_pubkeys,
         networks: vec![network_id],
         description: None,
         iroh_peer_id: Some(iroh_peer_id),
