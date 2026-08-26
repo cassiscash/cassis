@@ -111,7 +111,11 @@ pub struct CashuAdapter {
     /// never checked against the signature.
     claim_pubkey: PubKey,
     invoice_pubkey: PubKey,
-    #[allow(dead_code)]
+    /// The caller's node span with this adapter's `network` field
+    /// attached, entered around every log below so each line carries
+    /// both the owning node and the network. Built once in
+    /// [`CashuAdapter::new`], since the adapter's methods run on
+    /// unrelated tasks where the ambient span is unrelated or absent.
     span: Span,
     keysets: Arc<Mutex<Vec<KeySetInfo>>>,
     /// In-flight outgoing HTLCs we have locked at the mint, keyed
@@ -152,6 +156,16 @@ impl CashuAdapter {
         // Derive up front so a key we cannot sign with is rejected here
         // rather than surfacing later as an unclaimable HTLC.
         let claim_pubkey = claim_pubkey_from_secret(&secret_key)?;
+        let span = cassis_core::network_span(&span, &network_id);
+        // `debug!`, not `info!`: adapters are rebuilt for every balance
+        // query, so this would otherwise fire on each poll.
+        span.in_scope(|| {
+            tracing::debug!(
+                target: "cassis_cashu",
+                "adapter ready: mint={mint_url_str} claim_pubkey={}",
+                claim_pubkey.to_hex(),
+            );
+        });
         Ok(Self {
             network_id,
             mint_url,
@@ -581,6 +595,15 @@ impl NetworkRouterAdapter for CashuAdapter {
         if amount_msat == 0 {
             return Err(HtlcError::InvalidParams("amount must be > 0".into()));
         }
+        self.span.in_scope(|| {
+            tracing::info!(
+                target: "cassis_cashu",
+                "preparing htlc {} amount={} msat locked to={}",
+                payment_hash.short(),
+                amount_msat,
+                recipient.to_hex(),
+            );
+        });
         if expiry <= now_unix_secs() {
             return Err(HtlcError::InvalidParams("expiry in the past".into()));
         }
@@ -806,6 +829,19 @@ impl NetworkRouterAdapter for CashuAdapter {
         // the proofs are locked under. This is the receiver
         // path of NUT-14 and is what makes the swap at the
         // mint valid.
+        // This is the point of no return for a payee: adding the
+        // preimage to the witness and swapping at the mint publishes it,
+        // making the whole upstream chain claimable. Log it before it
+        // becomes public knowledge.
+        self.span.in_scope(|| {
+            tracing::info!(
+                target: "cassis_cashu",
+                "revealing preimage to mint for {}: preimage={} ({} proof(s))",
+                payment_hash.short(),
+                preimage,
+                locked.len(),
+            );
+        });
         let mut proofs = locked;
         let signing_key = cdk::nuts::nut01::SecretKey::from_slice(&self.secret_key)
             .map_err(|e| HtlcError::Network(format!("invalid Cashu signing key: {e}")))?;
@@ -850,6 +886,13 @@ impl NetworkRouterAdapter for CashuAdapter {
         self.add_balance(new_proofs)
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
+        self.span.in_scope(|| {
+            tracing::info!(
+                target: "cassis_cashu",
+                "htlc claimed for {}: {total_sat} sat swapped to unrestricted proofs",
+                payment_hash.short(),
+            );
+        });
 
         // Drop the receiver's wait registration.
         let mut incoming = self.incoming.lock().await;
@@ -976,7 +1019,15 @@ impl NetworkRouterAdapter for CashuAdapter {
                 }
                 let mut out = [0u8; 32];
                 out.copy_from_slice(&bytes);
-                return Ok(Bytes32(out));
+                let preimage = Bytes32(out);
+                self.span.in_scope(|| {
+                    tracing::info!(
+                        target: "cassis_cashu",
+                        "preimage revealed in mint witness for {}: preimage={preimage}",
+                        payment_hash.short(),
+                    );
+                });
+                return Ok(preimage);
             }
             if now_unix_secs() >= deadline {
                 return Err(WatchError::DeadlineExceeded);

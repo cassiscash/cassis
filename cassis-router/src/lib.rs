@@ -135,6 +135,7 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
     let router = Arc::new(CassisRouter::new(adapters, config.span));
     let handler_router = router.clone();
     let poll_router = router.clone();
+    let server_span = router.span.clone();
 
     let (iroh_server, iroh_secret) = IrohServer::new(config.derived_keys.iroh.clone())
         .await
@@ -149,23 +150,34 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
         "iroh endpoint: {iroh_peer_id} relay: {iroh_relay}"
     );
 
-    tokio::spawn(async move {
-        let handler = Arc::new(
-            move |frame: Frame| -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<Frame, IrohError>> + Send>,
-            > {
-                let router = handler_router.clone();
-                Box::pin(async move { router.handle_frame(frame).await })
-            },
-        );
-        if let Err(e) = iroh_server.run(handler).await {
-            error!(target: "cassis_router", "iroh server error: {e}");
+    tokio::spawn(
+        async move {
+            let handler = Arc::new(
+                move |frame: Frame| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<Frame, IrohError>> + Send>,
+                > {
+                    let router = handler_router.clone();
+                    Box::pin(async move { router.handle_frame(frame).await })
+                },
+            );
+            if let Err(e) = iroh_server.run(handler).await {
+                error!(target: "cassis_router", "iroh server error: {e}");
+            }
         }
-    });
+        .instrument(server_span),
+    );
 
-    tokio::spawn(async move {
-        poll_router.run_poll_loop().await;
-    });
+    // Instrumented with the node span: the poll loop is where every
+    // preimage-reveal and incoming-claim log comes from, and without
+    // this they are emitted with no span in scope and so render with no
+    // node name at all.
+    let poll_span = router.span.clone();
+    tokio::spawn(
+        async move {
+            poll_router.run_poll_loop().await;
+        }
+        .instrument(poll_span),
+    );
 
     publish_route_announcements(
         &router.adapters,
@@ -379,6 +391,8 @@ struct DispatchedHop {
 
 pub struct CassisRouter {
     pub adapters: HashMap<NetworkId, NetworkEntry>,
+    /// Identifies the owning node in logs. Every task the router spawns
+    /// must be instrumented with this, or its logs lose the node name.
     span: Span,
     prepared: Arc<Mutex<Vec<PreparedEntry>>>,
     dispatched: Arc<Mutex<HashMap<Bytes32, DispatchedHop>>>,
@@ -505,13 +519,35 @@ impl CassisRouter {
         if let Err(e) = outgoing_entry.adapter.can_route(prepare.amount_msat).await {
             warn!(
                 target: "cassis_router",
-                "PREPARE rejected: payment_hash={} reason=can_route failed: {e}",
+                "PREPARE rejected: payment_hash={} reason=can_route failed on {}: {e}",
                 prepare.payment_hash.short(),
+                prepare.outgoing_network,
             );
             return Ok(HopPrepared {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some(format!("can_route failed: {e}")),
+                claim_pubkey: None,
+            });
+        }
+
+        // Symmetric check on the incoming side. `can_route` above only
+        // proves we can *fund* the outgoing HTLC; on networks where
+        // claiming costs something itself (rootstock gas) we would
+        // otherwise lock the outgoing HTLC and only then discover we
+        // cannot claim what we are owed — committed downstream,
+        // unclaimable upstream until the timelock expires.
+        if let Err(e) = incoming_entry.adapter.can_claim(prepare.amount_msat).await {
+            warn!(
+                target: "cassis_router",
+                "PREPARE rejected: payment_hash={} reason=can_claim failed on {}: {e}",
+                prepare.payment_hash.short(),
+                prepare.incoming_network,
+            );
+            return Ok(HopPrepared {
+                payment_hash: prepare.payment_hash,
+                accepted: false,
+                reason: Some(format!("can_claim failed: {e}")),
                 claim_pubkey: None,
             });
         }
@@ -759,9 +795,10 @@ impl CassisRouter {
                 Ok(preimage) => {
                     info!(
                         target: "cassis_router",
-                        "  preimage revealed for {} on {}, preparing incoming claim",
-                        payment_hash.short(),
+                        "  preimage revealed by downstream on {} for {}: preimage={}",
                         prepare.outgoing_network,
+                        payment_hash.short(),
+                        preimage,
                     );
                     self.claim_incoming(payment_hash, &prepare, preimage).await;
                 }
@@ -798,9 +835,10 @@ impl CassisRouter {
         };
         info!(
             target: "cassis_router",
-            "  claiming incoming HTLC for {} on {}",
+            "  claiming incoming HTLC for {} on {} with preimage={}",
             payment_hash.short(),
             prepare.incoming_network,
+            preimage,
         );
         match incoming_entry
             .adapter
@@ -818,7 +856,8 @@ impl CassisRouter {
             Err(err) => {
                 error!(
                     target: "cassis_router",
-                    "  claim_incoming failed for {payment_hash} on {}: {err}",
+                    "  claim_incoming failed for {} on {} with preimage={preimage}: {err}",
+                    payment_hash.short(),
                     prepare.incoming_network,
                 );
             }
