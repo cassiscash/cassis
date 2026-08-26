@@ -138,6 +138,17 @@ plus `r6` between cashu2 and `cashu.mutinynet.com` (payee grace).
 | router killed as payee claims, restarted | payer paid; restarted router finds the downstream claim on chain (fix 2) and settles |
 | expired HTLCs | every stopped payment (payee offline, router killed, claim failed) refunded at every hop: routers on their own on cashu, rootstock, fedimint and arkade::mutinynet; the payer (3 payments, 3015 sat) once serving |
 
+Arkade → cashu → rootstock → fedimint (2026-11-03, `henry ─arkade(ours)─
+r7 ─cashu2─ r2 ─rootstock─ r3 ─fedimint─ dave`; r4/r5 stopped and the
+relay restarted so the shorter arkade route is not announced):
+
+| Test | Result |
+|---|---|
+| 3 hops arkade → fedimint | paid, 127s |
+| r3 SIGKILLed right after accepting PREPARE | payer fails at hop 3 (connect timeout); r7 (cashu) and r2 (rootstock) refund on their own at expiry |
+| payee SIGKILLed after every hop locked | r7 (cashu), r2 (rootstock), r3 (fedimint) refund on their own at expiry |
+| payer's own arkade refunds (both tests) | **failed**: our arkd swept the VHTLC VTXOs at batch expiry (~1h, `ARKD_VTXO_TREE_EXPIRY=3584`) before the refunds opened (~1.5h); 2009 sat stuck, finding l |
+
 ### Fixed
 
 1. **Rootstock claims ran out of gas.** `claim()` had a fixed 30k limit
@@ -195,3 +206,14 @@ j. `invoice --expires-in 1` fails ("must be in the future") because
 k. cashu.mutinynet.com rate-limits per IP (`Rate limit exceeded`), and
    cdk-cli's quote wait polls fast enough to trip it indefinitely: a
    cassis wallet polling a public mint for long could hit the same.
+l. Arkade ignores VTXO batch expiry. An outgoing VHTLC inherits the
+   expiry of the VTXOs that funded it; if the operator sweeps them before
+   the refund opens, `refund_outgoing_htlc` keeps failing ("no unspent
+   VTXO found at the VHTLC address"), `check_outgoing_htlc` stays
+   `Pending`, and the payment never ends. Likewise a receiver can accept
+   a VHTLC that is swept before it can claim. The sender should refresh
+   its VTXOs (or refuse) when their expiry is not well past the HTLC's,
+   the receiver should reject such VHTLCs, and swept VHTLCs need a
+   recovery path (an intent spending the refund leaf). Wallet VTXOs
+   are swept too: henry's 4985 sat change read as 0 until `onboard`
+   settled it into a new batch; nothing renews them automatically.
