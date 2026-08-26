@@ -17,7 +17,7 @@ use cassis_core::{cashu_mint_url, cashu_network_id};
 use cassis_core::{
     network_id_for_spec, normalize_network_id, Bytes32, HopCommit, HopCommitted, HopDispatch,
     HopDispatched, HopPrepare, HopPrepared, HtlcDescriptor, NetworkId, NetworkRouterAdapter,
-    PubKey, WatchError,
+    WatchError,
 };
 use cassis_iroh::{Frame, IrohError, IrohServer};
 use cassis_keys as keys;
@@ -363,7 +363,7 @@ struct DispatchedHop {
 pub struct CassisRouter {
     pub adapters: HashMap<NetworkId, NetworkEntry>,
     span: Span,
-    prepared: PreparedMap,
+    prepared: Arc<Mutex<Vec<PreparedEntry>>>,
     dispatched: Arc<Mutex<HashMap<Bytes32, DispatchedHop>>>,
 }
 
@@ -372,7 +372,7 @@ impl CassisRouter {
         Self {
             adapters,
             span,
-            prepared: Arc::new(Mutex::new(HashMap::new())),
+            prepared: Arc::new(Mutex::new(Vec::new())),
             dispatched: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -498,7 +498,19 @@ impl CassisRouter {
         }
 
         let mut prepared = self.prepared.lock().await;
-        prepared.insert(prepare.payment_hash, prepare.clone());
+        let now = unix_now();
+        prepared.retain(|entry| entry.expires_at > now);
+        if prepared.len() >= 100 {
+            return Ok(HopPrepared {
+                payment_hash: prepare.payment_hash,
+                accepted: false,
+                reason: Some("PREPARE capacity exhausted".into()),
+            });
+        }
+        prepared.push(PreparedEntry {
+            prepare: prepare.clone(),
+            expires_at: now.saturating_add(600),
+        });
         info!(
             target: "cassis_router",
             "PREPARE accepted: payment_hash={} amount_msat={} {} -> {} via {}",
@@ -523,22 +535,22 @@ impl CassisRouter {
         // Look up the matching PREPARE; the sender must have
         // PREPAREd us first.
         let prepare = {
-            let prepared = self.prepared.lock().await;
-            prepared.get(&dispatch.payment_hash).cloned()
-        };
-        let prepare = match prepare {
-            Some(p) => p,
-            None => {
-                return Err(format!(
+            let mut prepared = self.prepared.lock().await;
+            let now = unix_now();
+            prepared.retain(|entry| entry.expires_at > now);
+            let index = prepared
+                .iter()
+                .position(|entry| entry.prepare.payment_hash == dispatch.payment_hash)
+                .ok_or(format!(
                     "no matching PREPARE for payment_hash={:?}",
                     dispatch.payment_hash
-                ));
-            }
+                ))?;
+            prepared.remove(index).prepare
         };
         if prepare.incoming_network != dispatch.incoming_network
             || prepare.outgoing_network != dispatch.outgoing_network
             || prepare.amount_msat != dispatch.amount_msat
-            || prepare.recipient != dispatch.recipient
+            || prepare.recipient.to_hex() != dispatch.recipient
         {
             return Err(format!(
                 "DISPATCH specs do not match PREPARE: \
@@ -588,10 +600,7 @@ impl CassisRouter {
         }
 
         // Now create the outgoing HTLC on the next network.
-        let recipient: PubKey = match dispatch.recipient.parse() {
-            Ok(recipient) => recipient,
-            Err(err) => return Err(format!("invalid recipient pubkey: {err}")),
-        };
+        let recipient = prepare.recipient;
         match outgoing_entry
             .adapter
             .create_outgoing_htlc(
@@ -639,12 +648,6 @@ impl CassisRouter {
                 },
             );
         }
-        // Drop the prepared entry; the spec has been used.
-        {
-            let mut prepared = self.prepared.lock().await;
-            prepared.remove(&dispatch.payment_hash);
-        }
-
         info!(
             target: "cassis_router",
             "DISPATCH done: payment_hash={} amount_msat={} {} -> {} via {} \
@@ -706,6 +709,11 @@ impl CassisRouter {
     }
 
     async fn poll_once(&self) -> Result<(), String> {
+        self.prepared
+            .lock()
+            .await
+            .retain(|entry| entry.expires_at > unix_now());
+
         // Snapshot the payment hashes under the lock, then
         // drop it before doing network work.
         let snapshot: Vec<(Bytes32, HopPrepare, u64)> = {
@@ -867,7 +875,10 @@ impl CassisRouter {
     }
 }
 
-type PreparedMap = Arc<Mutex<HashMap<Bytes32, HopPrepare>>>;
+struct PreparedEntry {
+    prepare: HopPrepare,
+    expires_at: u64,
+}
 
 /// Tiny shim: lift a string rejection into an iroh-level
 /// [`IrohError`]. The frame's `payment_hash` is lost here;
@@ -890,7 +901,10 @@ impl HopDispatchExt for HopDispatch {
             outgoing_network: self.outgoing_network,
             incoming_deadline: self.incoming_deadline,
             outgoing_expiry: self.outgoing_expiry,
-            recipient: self.recipient,
+            recipient: self
+                .recipient
+                .parse()
+                .expect("DISPATCH recipient must be a valid pubkey"),
         }
     }
 }

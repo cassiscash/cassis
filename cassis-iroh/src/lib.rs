@@ -39,6 +39,10 @@ pub enum Frame {
     Dispatched(HopDispatched),
     Commit(HopCommit),
     Committed(HopCommitted),
+    Error {
+        payment_hash: Bytes32,
+        message: String,
+    },
 }
 
 impl Frame {
@@ -50,6 +54,7 @@ impl Frame {
             Frame::Dispatched(m) => m.payment_hash,
             Frame::Commit(m) => m.payment_hash,
             Frame::Committed(m) => m.payment_hash,
+            Frame::Error { payment_hash, .. } => *payment_hash,
         }
     }
 }
@@ -192,6 +197,7 @@ impl IrohClient {
             .await?;
         match reply {
             Frame::Prepared(m) => Ok(m),
+            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
             other => Err(IrohError::Protocol(format!(
                 "send_prepare: unexpected reply frame {:?}",
                 other
@@ -209,6 +215,7 @@ impl IrohClient {
             .await?;
         match reply {
             Frame::Dispatched(m) => Ok(m),
+            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
             other => Err(IrohError::Protocol(format!(
                 "send_dispatch: unexpected reply frame {:?}",
                 other
@@ -226,6 +233,7 @@ impl IrohClient {
             .await?;
         match reply {
             Frame::Committed(m) => Ok(m),
+            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
             other => Err(IrohError::Protocol(format!(
                 "send_commit: unexpected reply frame {:?}",
                 other
@@ -382,11 +390,15 @@ async fn handle_conn(
         "decoded frame, dispatching to handler (payment_hash={})",
         frame.payment_hash()
     );
+    let payment_hash = frame.payment_hash();
     let response = match handler(frame).await {
         Ok(frame) => frame,
         Err(e) => {
             error!(target: "iroh_server", "handler returned error: {e}");
-            return Err(e);
+            Frame::Error {
+                payment_hash,
+                message: e.to_string(),
+            }
         }
     };
 

@@ -350,7 +350,7 @@ pub struct HopPrepare {
     pub outgoing_network: NetworkId,
     pub incoming_deadline: u64,
     pub outgoing_expiry: u64,
-    pub recipient: String,
+    pub recipient: PubKey,
 }
 
 /// Reply to [`HopPrepare`]. `accepted=true` means the hop has
