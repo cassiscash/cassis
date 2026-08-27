@@ -1,10 +1,10 @@
 use cassis_core::{
-    Bytes32, HopCommit, HopCommitted, HopDispatch, HopDispatched, HopPrepare, HopPrepared,
-    HtlcDescriptor, NetworkId,
+    Bytes32, HopCommit, HopCommitted, HopDiscard, HopDiscarded, HopDispatch, HopDispatched,
+    HopPrepare, HopPrepared, HtlcDescriptor, NetworkId,
 };
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
 use std::future::Future;
@@ -28,9 +28,9 @@ pub enum IrohError {
 /// Every message the hop protocol carries on the wire. The
 /// `Direction` tag discriminates sender vs receiver roles; the
 /// router (intermediate hop) handles `Prepare`, `Prepared`,
-/// `Dispatch`, `Dispatched`; the payee (final hop) handles
-/// `Commit` and `Committed`. Both peers run the same
-/// [`IrohServer`] and dispatch by the tag.
+/// `Dispatch`, `Dispatched`, `Discard` and `Discarded`; the payee
+/// (final hop) handles `Commit` and `Committed`. Both peers run the
+/// same [`IrohServer`] and dispatch by the tag.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
     Prepare(HopPrepare),
@@ -39,6 +39,8 @@ pub enum Frame {
     Dispatched(HopDispatched),
     Commit(HopCommit),
     Committed(HopCommitted),
+    Discard(HopDiscard),
+    Discarded(HopDiscarded),
     Error {
         payment_hash: Bytes32,
         message: String,
@@ -54,6 +56,8 @@ impl Frame {
             Frame::Dispatched(m) => m.payment_hash,
             Frame::Commit(m) => m.payment_hash,
             Frame::Committed(m) => m.payment_hash,
+            Frame::Discard(m) => m.payment_hash,
+            Frame::Discarded(m) => m.payment_hash,
             Frame::Error { payment_hash, .. } => *payment_hash,
         }
     }
@@ -91,6 +95,18 @@ pub fn node_addr_from_invoice(
 
 /// Default iroh relay URL when the node has no home relay.
 pub const DEFAULT_IROH_RELAY: &str = "https://euw1-1.relay.iroh.network";
+
+pub use iroh::{EndpointId, PublicKey};
+
+/// Per-request handler. The second argument is the authenticated
+/// remote endpoint identity of the connection the frame arrived on,
+/// so handlers can bind protocol state (e.g. PREPARE reservations) to
+/// the peer that created it.
+pub type RequestHandler = Arc<
+    dyn Fn(Frame, PublicKey) -> Pin<Box<dyn Future<Output = Result<Frame, IrohError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone, Debug)]
 pub struct IrohClient {
@@ -223,6 +239,27 @@ impl IrohClient {
         }
     }
 
+    /// Best-effort reservation release. The payer never treats a
+    /// failure here as a payment error; it just means the hop keeps
+    /// its reservation until its own expiry.
+    pub async fn send_discard(
+        &self,
+        addr: EndpointAddr,
+        discard: HopDiscard,
+    ) -> Result<HopDiscarded, IrohError> {
+        let reply = self
+            .round_trip(addr, Frame::Discard(discard), "send_discard")
+            .await?;
+        match reply {
+            Frame::Discarded(m) => Ok(m),
+            Frame::Error { message, .. } => Err(IrohError::Protocol(message)),
+            other => Err(IrohError::Protocol(format!(
+                "send_discard: unexpected reply frame {:?}",
+                other
+            ))),
+        }
+    }
+
     pub async fn send_commit(
         &self,
         addr: EndpointAddr,
@@ -315,14 +352,7 @@ impl IrohServer {
         self.home_relay.as_deref()
     }
 
-    pub async fn run(
-        self,
-        handler: Arc<
-            dyn Fn(Frame) -> Pin<Box<dyn Future<Output = Result<Frame, IrohError>> + Send>>
-                + Send
-                + Sync,
-        >,
-    ) -> Result<(), IrohError> {
+    pub async fn run(self, handler: RequestHandler) -> Result<(), IrohError> {
         debug!(target: "iroh_server", "entering accept loop");
         loop {
             debug!(target: "iroh_server", "waiting for incoming connection...");
@@ -362,14 +392,7 @@ impl IrohServer {
     }
 }
 
-async fn handle_conn(
-    conn: Connection,
-    handler: Arc<
-        dyn Fn(Frame) -> Pin<Box<dyn Future<Output = Result<Frame, IrohError>> + Send>>
-            + Send
-            + Sync,
-    >,
-) -> Result<(), IrohError> {
+async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), IrohError> {
     debug!(target: "iroh_server", "accept_bi waiting for stream...");
     let (mut writer, mut reader) = conn
         .accept_bi()
@@ -391,7 +414,11 @@ async fn handle_conn(
         frame.payment_hash()
     );
     let payment_hash = frame.payment_hash();
-    let response = match handler(frame).await {
+    // Authenticated transport identity of the requester: iroh's
+    // handshake already tied this connection to the peer key, so this
+    // is the authoritative "who sent it" for peer-binding checks.
+    let remote = conn.remote_id();
+    let response = match handler(frame, remote).await {
         Ok(frame) => frame,
         Err(e) => {
             error!(target: "iroh_server", "handler returned error: {e}");

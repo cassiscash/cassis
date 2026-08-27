@@ -6,7 +6,7 @@ pub mod seed_store;
 pub mod store;
 
 use cassis_core::{
-    Bytes32, HopCommit, HopDispatch, HopPrepare, HtlcDescriptor, Invoice, NetworkId,
+    Bytes32, HopCommit, HopDiscard, HopDispatch, HopPrepare, HtlcDescriptor, Invoice, NetworkId,
     NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment, PaymentResult, PaymentStatus,
     RouteHop, SendError,
 };
@@ -15,7 +15,7 @@ use cassis_routing::{
     build_graph, compute_hop_expiries, fallback_incoming_delta, fallback_transit_slack,
     fetch_announcements, find_route as find_route_in_graph,
 };
-use futures::future::try_join_all;
+use futures::future::join_all;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use std::collections::HashMap;
@@ -244,6 +244,12 @@ impl CassisClient {
                 )
             })
             .collect();
+        // All PREPAREs run concurrently. Every future is joined —
+        // never cancelled mid-flight — because the only reliable set
+        // of hops to DISCARD afterwards is "the ones whose reply was
+        // actually read": a hop may have reserved while its reply died
+        // in transport, and once a reply is lost that hop is
+        // unreachable from here on.
         let prepared_futures = prepares.iter().cloned().map(|(idx, p)| {
             let peer = route[idx].node.node_pubkey;
             let addr = addrs[idx].clone();
@@ -279,26 +285,34 @@ impl CassisClient {
                 reply
             }
         });
-        let prepared_result = try_join_all(prepared_futures).await;
-        let prepared: Vec<cassis_core::HopPrepared> = match prepared_result {
-            Ok(p) => p,
-            Err(err) => {
-                // One hop failed. Drop every PREPARE future still
-                // in flight; `try_join_all` has already cancelled
-                // them on the first error. No cancellation message
-                // is sent — the surviving routers' reservations
-                // are simply abandoned and left to their own
-                // deadline.
-                return Err(PayError::from(err));
+        let replies = join_all(prepared_futures).await;
+
+        // Reserve-list = hops that answered accepted=true; error = the
+        // first failure in route order (rejection or transport). The
+        // whole list is scanned even after a failure so late-accepting
+        // hops are not forgotten when it is time to DISCARD.
+        let mut acks: Vec<cassis_core::HopPrepared> = Vec::new();
+        let mut reserved_idx: Vec<usize> = Vec::new();
+        let mut first_failure: Option<PayError> = None;
+        for (idx, reply) in replies.into_iter().enumerate() {
+            match reply {
+                Ok(ack) if ack.accepted => {
+                    reserved_idx.push(idx);
+                    acks.push(ack);
+                }
+                Ok(ack) => {
+                    let reason = ack.reason.clone().unwrap_or_else(|| "unknown".to_string());
+                    first_failure.get_or_insert(PayError::HopRejected { index: idx, reason });
+                }
+                Err(err) => {
+                    first_failure.get_or_insert(PayError::Io(err.to_string()));
+                }
             }
-        };
-        for (i, ack) in prepared.iter().enumerate() {
-            if !ack.accepted {
-                return Err(PayError::HopRejected {
-                    index: i,
-                    reason: ack.reason.clone().unwrap_or_else(|| "unknown".to_string()),
-                });
-            }
+        }
+        if let Some(err) = first_failure {
+            self.discard_reservations(&addrs, invoice.payment_hash, &reserved_idx)
+                .await;
+            return Err(err);
         }
 
         // Resolve who each HTLC must be locked to. Every hop reports
@@ -318,22 +332,43 @@ impl CassisClient {
         // caused HTLCs to be locked to unclaimable identities, and the
         // failure only surfaced on-chain after funds were committed.
         let mut recipients: Vec<cassis_core::PubKey> = Vec::with_capacity(route.len() + 1);
-        for (idx, ack) in prepared.iter().enumerate() {
-            recipients.push(ack.claim_pubkey.ok_or_else(|| PayError::HopRejected {
-                index: idx,
-                reason: "hop accepted the PREPARE but reported no claim identity".to_string(),
-            })?);
+        for (idx, ack) in acks.iter().enumerate() {
+            match ack.claim_pubkey {
+                Some(k) => recipients.push(k),
+                None => {
+                    // Every hop accepted, so every hop is holding a
+                    // reservation; none was DISPATCHed yet.
+                    let reserved = (0..route.len()).collect::<Vec<usize>>();
+                    self.discard_reservations(&addrs, invoice.payment_hash, &reserved)
+                        .await;
+                    return Err(PayError::HopRejected {
+                        index: idx,
+                        reason: "hop accepted the PREPARE but reported no claim identity"
+                            .to_string(),
+                    });
+                }
+            }
         }
         recipients.push(invoice.claim_pubkey_for(&dest_network));
+
+        // From here until the first DISPATCH succeeds, every route hop
+        // holds exactly one unused reservation. Any abort in this
+        // window releases the full set.
+        let all_hops: Vec<usize> = (0..route.len()).collect();
 
         // Step 2: pay the first hop. The sender adapter creates
         // the first HTLC and returns the OutgoingPayment
         // descriptor (cashu proofs, etc.).
-        let sender = self
-            .senders
-            .get(&sender_network)
-            .ok_or_else(|| PayError::Route("sender network adapter missing".to_string()))?
-            .clone();
+        let sender = match self.senders.get(&sender_network) {
+            Some(s) => s.clone(),
+            None => {
+                self.discard_reservations(&addrs, invoice.payment_hash, &all_hops)
+                    .await;
+                return Err(PayError::Route(
+                    "sender network adapter missing".to_string(),
+                ));
+            }
+        };
         // The sender's outgoing HTLC is the first hop's *incoming*,
         // so it must not expire before the first hop's incoming
         // deadline (expiries[0]).
@@ -342,7 +377,7 @@ impl CassisClient {
         // its announced node key: those are different keys whenever the
         // network claims with a dedicated per-network key (rootstock).
         let first_recipient = recipients[0];
-        let first_payment: OutgoingPayment = sender
+        let first_payment: OutgoingPayment = match sender
             .pay_invoice(
                 invoice.payment_hash,
                 invoice.amount_msat,
@@ -354,15 +389,31 @@ impl CassisClient {
                 first_outgoing_expiry,
             )
             .await
-            .map_err(|err| PayError::Io(err.to_string()))?;
+        {
+            Ok(p) => p,
+            Err(err) => {
+                // Nothing funded yet on any hop; free every reservation.
+                self.discard_reservations(&addrs, invoice.payment_hash, &all_hops)
+                    .await;
+                return Err(PayError::Io(err.to_string()));
+            }
+        };
         // The descriptor of the first HTLC is the descriptor
         // the sender adapter hands to the first router. We get
         // it via the router trait method; the blanket impl
         // does the lookup.
-        let first_descriptor: HtlcDescriptor = sender
-            .outgoing_htlc_descriptor(invoice.payment_hash)
-            .await
-            .map_err(|e| PayError::Io(e.to_string()))?;
+        let first_descriptor: HtlcDescriptor =
+            match sender.outgoing_htlc_descriptor(invoice.payment_hash).await {
+                Ok(d) => d,
+                Err(e) => {
+                    // The first HTLC exists (its own unwind stays with
+                    // the sender adapter's refund path), but no router
+                    // has been DISPATCHed: free their reservations.
+                    self.discard_reservations(&addrs, invoice.payment_hash, &all_hops)
+                        .await;
+                    return Err(PayError::Io(e.to_string()));
+                }
+            };
 
         // Step 3: walk the route. `descriptor` carries the
         // HTLC info for the *incoming* side of the next hop.
@@ -401,19 +452,27 @@ impl CassisClient {
                 i+1,
                 hop.incoming, hop.outgoing, invoice.amount_msat
             );
-            let reply = self
-                .iroh_client
-                .send_dispatch(addr, dispatch)
-                .await
-                .map_err(|e| {
+            let reply = match self.iroh_client.send_dispatch(addr, dispatch).await {
+                Ok(r) => r,
+                Err(e) => {
                     info!(
                         target: "cassis_client",
                         "DISPATCH hop {}/{}: peer={peer} error={e}",
                         i+1,
                         route.len(),
                     );
-                    e
-                })?;
+                    // Hops 0..i were DISPATCHed successfully (their
+                    // reservations became funded HTLCs; DISCARD is a
+                    // no-op there and is not sent). This hop may have
+                    // consumed its reservation before failing — or not
+                    // heard from us at all — so the safe set to free is
+                    // this hop plus everything downstream.
+                    let pending: Vec<usize> = (i..route.len()).collect();
+                    self.discard_reservations(&addrs, invoice.payment_hash, &pending)
+                        .await;
+                    return Err(PayError::Io(e.to_string()));
+                }
+            };
             info!(
                 target: "cassis_client",
                 "DISPATCH hop {}/{}: peer={peer} outgoing_descriptor={:?}",
@@ -503,6 +562,52 @@ impl CassisClient {
             status: PaymentStatus::Completed,
             preimage: Some(preimage),
         })
+    }
+
+    /// Fire DISCARD at the given hops to release their PREPARE
+    /// reservations, concurrently and best-effort: replies are logged
+    /// (`released: false` covers already-consumed / aged-out /
+    /// never-existed), failures do not alter the payment error. A hop
+    /// that received no reply is simply unreachable; its reservation
+    /// ages out on its own deadline.
+    async fn discard_reservations(
+        &self,
+        addrs: &[EndpointAddr],
+        payment_hash: Bytes32,
+        hop_indices: &[usize],
+    ) {
+        if hop_indices.is_empty() {
+            return;
+        }
+        info!(
+            target: "cassis_client",
+            "payment aborted: sending DISCARD for payment_hash={} to {} hop(s)",
+            payment_hash.short(),
+            hop_indices.len(),
+        );
+        let futs = hop_indices.iter().map(|&i| {
+            let addr = addrs[i].clone();
+            async move {
+                match self
+                    .iroh_client
+                    .send_discard(addr, HopDiscard { payment_hash })
+                    .await
+                {
+                    Ok(ack) => debug!(
+                        target: "cassis_client",
+                        "DISCARD hop {}: released={}",
+                        i + 1,
+                        ack.released,
+                    ),
+                    Err(e) => warn!(
+                        target: "cassis_client",
+                        "DISCARD hop {} failed (best effort): {e}",
+                        i + 1,
+                    ),
+                }
+            }
+        });
+        join_all(futs).await;
     }
 
     pub async fn find_route(
