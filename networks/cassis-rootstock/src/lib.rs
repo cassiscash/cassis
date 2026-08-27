@@ -83,10 +83,12 @@ const ROOTSTOCK_TESTNET_CHAIN_ID: u64 = 31;
 const ROOTSTOCK_MAINNET_CONTRACT: &str = "0x3612e393cA2fbB8874854B88fFCf04307a518239";
 const ROOTSTOCK_TESTNET_CONTRACT: &str = "0x165f8e654b3fe310a854805323718d51977ad95f";
 
-/// Upper bound on the gas an `EtherSwap.lock()` or `.claim()` consumes,
-/// used to reserve a transaction's worth of gas before committing to a
-/// route. Both calls are well below this.
-const HTLC_TX_GAS_LIMIT: u64 = 200_000;
+/// Gas a `EtherSwap.lock()` consumes, used to reserve gas before
+/// committing to a route and to cap the lock transaction itself.
+const LOCK_TX_GAS: u64 = 50_000;
+/// Gas an `EtherSwap.claim()` consumes; the reserve for the incoming
+/// side of a route.
+const CLAIM_TX_GAS: u64 = 30_000;
 
 const RSK_BLOCK_TIME_SECS: u64 = 30;
 const POLL_INTERVAL_SECS: u64 = 5;
@@ -284,7 +286,7 @@ impl RootstockAdapter {
     /// The lock side lives in [`NetworkRouterAdapter::can_route`], which
     /// reserves the same gas on top of the HTLC value.
     fn ensure_claim_gas(&self, balance: U256, gas_price: u128) -> Result<(), HtlcError> {
-        let reserve = gas_reserve(gas_price);
+        let reserve = gas_reserve(CLAIM_TX_GAS, gas_price);
         if balance < reserve {
             return Err(HtlcError::InvalidParams(format!(
                 "account {} cannot afford claim gas on {}: \
@@ -551,6 +553,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .to(self.contract)
             .value(amount_wei)
             .gas_price(gas_price)
+            .gas_limit(LOCK_TX_GAS)
             .input(
                 IEtherSwap::lockCall {
                     preimageHash: preimage_hash,
@@ -673,6 +676,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         let request = TransactionRequest::default()
             .to(slot.contract)
             .gas_price(gas_price)
+            .gas_limit(CLAIM_TX_GAS)
             .input(
                 IEtherSwap::claimCall {
                     preimage: B256::from_slice(preimage.as_ref()),
@@ -837,7 +841,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .gas_price_wei()
             .await
             .map_err(|e| HtlcError::Network(e.to_string()))?;
-        let gas = gas_reserve(gas_price);
+        let gas = gas_reserve(LOCK_TX_GAS, gas_price);
         let needed = Self::msat_to_wei(amount_msat).saturating_add(gas);
         if balance < needed {
             return Err(HtlcError::InvalidParams(format!(
@@ -1164,9 +1168,9 @@ pub fn evm_address_from_pubkey(pubkey: &PubKey) -> Address {
     Address::from_slice(&alloy::primitives::keccak256(&uncompressed[1..]).0[12..])
 }
 
-/// Wei to reserve for one HTLC transaction at `gas_price`.
-fn gas_reserve(gas_price: u128) -> U256 {
-    U256::from(gas_price).saturating_mul(U256::from(HTLC_TX_GAS_LIMIT))
+/// Wei to reserve for an HTLC transaction of `gas` units at `gas_price`.
+fn gas_reserve(gas: u64, gas_price: u128) -> U256 {
+    U256::from(gas).saturating_mul(U256::from(gas_price))
 }
 
 /// Parse a hex-encoded `0x`-prefixed (or bare) EVM address.
