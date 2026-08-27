@@ -52,6 +52,7 @@ pub async fn create_invoice(
             network: network.id(),
             target,
             incoming_delta_secs: Some(network.incoming_delta_secs()),
+            max_incoming_lifetime_secs: network.max_incoming_lifetime_secs(),
         });
     }
     let invoice = Invoice {

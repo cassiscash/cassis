@@ -69,6 +69,18 @@ impl Home {
         self.store.put(SETTINGS, NETWORKS, &networks)
     }
 
+    /// Longest an HTLC received on `network` may run, when set by hand
+    /// (see [`Network::max_incoming_lifetime_secs`]).
+    pub fn max_incoming_lifetime(&self, network: &NetworkId) -> Result<Option<u64>, String> {
+        self.store
+            .get(SETTINGS, &format!("max_incoming_lifetime:{network}"))
+    }
+
+    pub fn set_max_incoming_lifetime(&self, network: &NetworkId, secs: u64) -> Result<(), String> {
+        self.store
+            .put(SETTINGS, &format!("max_incoming_lifetime:{network}"), &secs)
+    }
+
     #[cfg(feature = "lightning")]
     pub fn lnd_config(&self) -> Result<Option<cassis_lnd::LndConfig>, String> {
         self.store.get(SETTINGS, LND)
@@ -177,7 +189,10 @@ impl Home {
                 ))
             }
         };
-        Ok(opened)
+        Ok(match self.max_incoming_lifetime(network)? {
+            Some(secs) => cassis_core::with_max_incoming_lifetime(opened, secs),
+            None => opened,
+        })
     }
 
     pub async fn open_networks(

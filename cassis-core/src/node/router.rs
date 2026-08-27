@@ -100,6 +100,7 @@ impl Node {
                     fee_ppm: policy.fee_ppm,
                     incoming_delta_secs: incoming.incoming_delta_secs(),
                     transit_slack_secs: policy.transit_slack_secs,
+                    max_incoming_lifetime_secs: incoming.max_incoming_lifetime_secs(),
                 });
             }
         }
@@ -176,6 +177,13 @@ impl Node {
             return Err(format!(
                 "incoming expiry must be at least {delta}s after the outgoing expiry"
             ));
+        }
+        if let Some(max) = incoming.max_incoming_lifetime_secs() {
+            if prepare.incoming_expiry > now.saturating_add(max) {
+                return Err(format!(
+                    "incoming expiry is more than the accepted {max}s away"
+                ));
+            }
         }
         if let Some(reason) = policy.prepare_veto.as_ref().and_then(|veto| veto(prepare)) {
             return Err(reason);

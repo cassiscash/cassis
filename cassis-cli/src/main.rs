@@ -57,6 +57,11 @@ enum Command {
         lnd_tls_cert: Option<PathBuf>,
         #[arg(long)]
         lnd_macaroon: Option<PathBuf>,
+        /// Longest an HTLC received on these networks may run, instead
+        /// of what the network derives (e.g. from an arkade operator's
+        /// batch lifetime).
+        #[arg(long, value_name = "SECS")]
+        max_incoming_lifetime: Option<u64>,
     },
     /// Remove networks from this node.
     Disable {
@@ -155,6 +160,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             lnd_rest_url,
             lnd_tls_cert,
             lnd_macaroon,
+            max_incoming_lifetime,
         } => {
             let mut enabled = home.networks()?;
             for spec in &networks {
@@ -166,6 +172,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                         lnd_tls_cert.clone(),
                         lnd_macaroon.clone(),
                     )?;
+                }
+                if let Some(secs) = max_incoming_lifetime {
+                    home.set_max_incoming_lifetime(&network, secs)?;
                 }
                 // Fail early on networks this binary cannot open.
                 home.open_network(&network, &span).await?;
@@ -297,13 +306,16 @@ async fn run(cli: Cli) -> Result<(), String> {
             nostr_relays,
         } => {
             let announcements = routing::fetch_announcements(&relays(nostr_relays)).await?;
-            let route = routing::find_route(
-                &announcements,
-                &NetworkId::parse(&from)?,
-                &NetworkId::parse(&to)?,
+            let to = NetworkId::parse(&to)?;
+            let route =
+                routing::find_route(&announcements, &NetworkId::parse(&from)?, &to, amount_msat)?;
+            let plan = routing::plan_route(
+                &route,
                 amount_msat,
+                to.default_incoming_delta(),
+                None,
+                cassis_core::unix_now(),
             )?;
-            let plan = routing::plan_route(&route, amount_msat, 0, 0)?;
             println!("{} msat over {} hop(s)", plan.amounts[0], route.len());
             for (i, hop) in route.iter().enumerate() {
                 println!(

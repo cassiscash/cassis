@@ -77,6 +77,7 @@ impl Node {
             &route,
             invoice.amount_msat,
             invoice.incoming_delta_for(&payee_network),
+            invoice.max_incoming_lifetime_for(&payee_network),
             unix_now(),
         )?;
         let hops: Vec<Hop> = route
@@ -247,6 +248,8 @@ impl Node {
             return Ok((Vec::new(), from.clone()));
         }
         let announcements = routing::fetch_announcements(relays).await?;
+        // Why the last route found could not be planned, if any was.
+        let mut unplannable = None;
         invoice
             .networks
             .iter()
@@ -254,14 +257,25 @@ impl Node {
                 let route =
                     routing::find_route(&announcements, from, &entry.network, invoice.amount_msat)
                         .ok()?;
-                let cost = routing::plan_route(&route, invoice.amount_msat, 0, 0)
-                    .ok()?
-                    .amounts[0];
-                Some((cost, route, entry.network.clone()))
+                // Fails when a leg runs longer than its receiver accepts.
+                let plan = routing::plan_route(
+                    &route,
+                    invoice.amount_msat,
+                    invoice.incoming_delta_for(&entry.network),
+                    invoice.max_incoming_lifetime_for(&entry.network),
+                    unix_now(),
+                )
+                .map_err(|error| unplannable = Some(format!("route to {}: {error}", entry.network)))
+                .ok()?;
+                Some((plan.amounts[0], route, entry.network.clone()))
             })
             .min_by_key(|(cost, _, _)| *cost)
             .map(|(_, route, network)| (route, network))
-            .ok_or_else(|| format!("no route from {from} to any network of the invoice"))
+            .ok_or_else(|| {
+                unplannable.unwrap_or_else(|| {
+                    format!("no route from {from} to any network of the invoice")
+                })
+            })
     }
 
     /// Send `request` to `peer` again and again while it answers

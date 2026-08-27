@@ -61,6 +61,11 @@ pub struct InvoiceNetwork {
     /// least this long after COMMIT. The network's default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_delta_secs: Option<u64>,
+    /// Longest the payee lets its HTLC on this network run (see
+    /// [`crate::Network::max_incoming_lifetime_secs`]); no limit when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_incoming_lifetime_secs: Option<u64>,
 }
 
 impl Invoice {
@@ -79,6 +84,14 @@ impl Invoice {
             .find(|entry| entry.network == *network)
             .and_then(|entry| entry.incoming_delta_secs)
             .unwrap_or_else(|| network.default_incoming_delta())
+    }
+
+    /// Longest the payee lets its HTLC on `network` run.
+    pub fn max_incoming_lifetime_for(&self, network: &NetworkId) -> Option<u64> {
+        self.networks
+            .iter()
+            .find(|entry| entry.network == *network)
+            .and_then(|entry| entry.max_incoming_lifetime_secs)
     }
 }
 

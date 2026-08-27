@@ -49,6 +49,9 @@ pub struct RouteAnnouncement {
     pub incoming_delta_secs: u64,
     /// Seconds of slack the router asks payers to add per leg.
     pub transit_slack_secs: u64,
+    /// Longest the router lets its incoming HTLC run (see
+    /// `Network::max_incoming_lifetime_secs`); `None` for no limit.
+    pub max_incoming_lifetime_secs: Option<u64>,
 }
 
 impl RouteAnnouncement {
@@ -71,23 +74,30 @@ impl RouteAnnouncement {
     fn to_event_template(&self) -> EventTemplate {
         let mut iroh = vec!["iroh".to_string(), self.iroh_peer_id.clone()];
         iroh.extend(self.iroh_relay.clone());
+        let mut tags = vec![
+            vec!["d".to_string(), self.d_tag()],
+            iroh,
+            vec!["fee_base_msat".to_string(), self.fee_base_msat.to_string()],
+            vec!["fee_ppm".to_string(), self.fee_ppm.to_string()],
+            vec![
+                "incoming_delta_secs".to_string(),
+                self.incoming_delta_secs.to_string(),
+            ],
+            vec![
+                "transit_slack_secs".to_string(),
+                self.transit_slack_secs.to_string(),
+            ],
+        ];
+        if let Some(max) = self.max_incoming_lifetime_secs {
+            tags.push(vec![
+                "max_incoming_lifetime_secs".to_string(),
+                max.to_string(),
+            ]);
+        }
         EventTemplate {
             created_at: Timestamp::now(),
             kind: Kind(ROUTE_ANNOUNCEMENT_KIND),
-            tags: Tags(vec![
-                vec!["d".to_string(), self.d_tag()],
-                iroh,
-                vec!["fee_base_msat".to_string(), self.fee_base_msat.to_string()],
-                vec!["fee_ppm".to_string(), self.fee_ppm.to_string()],
-                vec![
-                    "incoming_delta_secs".to_string(),
-                    self.incoming_delta_secs.to_string(),
-                ],
-                vec![
-                    "transit_slack_secs".to_string(),
-                    self.transit_slack_secs.to_string(),
-                ],
-            ]),
+            tags: Tags(tags),
             content: String::new(),
         }
     }
@@ -116,6 +126,7 @@ impl RouteAnnouncement {
             transit_slack_secs: number("transit_slack_secs")
                 .filter(|slack| *slack > 0)
                 .unwrap_or(DEFAULT_TRANSIT_SLACK_SECS),
+            max_incoming_lifetime_secs: number("max_incoming_lifetime_secs"),
             from,
             to,
         })
@@ -266,16 +277,19 @@ pub struct RoutePlan {
 }
 
 /// Plan `route` delivering `amount_msat` to a payee who needs
-/// `payee_delta_secs` to claim, starting at `now`.
+/// `payee_delta_secs` to claim and accepts HTLCs running at most
+/// `payee_max_lifetime_secs`, starting at `now`.
 ///
 /// Expiries decrease from payer to payee: each hop gets its announced
 /// delta plus slack between its outgoing and incoming leg, and the
 /// payee leg starts after every hop has had one slack period to
-/// execute, so it is still claimable when the payee gets COMMIT.
+/// execute, so it is still claimable when the payee gets COMMIT. Fails
+/// when a leg would run longer than its receiver accepts.
 pub fn plan_route(
     route: &[RouteAnnouncement],
     amount_msat: u64,
     payee_delta_secs: u64,
+    payee_max_lifetime_secs: Option<u64>,
     now: u64,
 ) -> Result<RoutePlan, String> {
     let n = route.len();
@@ -293,6 +307,20 @@ pub fn plan_route(
         .saturating_add(DEFAULT_TRANSIT_SLACK_SECS);
     for i in (0..n).rev() {
         expiries[i] = expiries[i + 1].saturating_add(route[i].timelock_delta());
+    }
+    // Leg `i < n` is received by hop `i`, leg `n` by the payee.
+    let limits = route
+        .iter()
+        .map(|hop| hop.max_incoming_lifetime_secs)
+        .chain(std::iter::once(payee_max_lifetime_secs));
+    for (leg, max) in limits.enumerate() {
+        let lifetime = expiries[leg].saturating_sub(now);
+        if let Some(max) = max.filter(|max| lifetime > *max) {
+            let receiver = route.get(leg).map_or("the payee", |_| "its router");
+            return Err(format!(
+                "leg {leg} would run {lifetime}s, {receiver} accepts at most {max}s"
+            ));
+        }
     }
     Ok(RoutePlan { amounts, expiries })
 }
@@ -312,6 +340,7 @@ mod tests {
             fee_ppm,
             incoming_delta_secs: 30,
             transit_slack_secs: 60,
+            max_incoming_lifetime_secs: None,
         }
     }
 
@@ -361,7 +390,7 @@ mod tests {
     #[test]
     fn plan_adds_fees_upstream_and_timelocks_decrease() {
         let graph = [hop(1, "a", "b", 100, 10_000), hop(2, "b", "c", 100, 10_000)];
-        let plan = plan_route(&graph, 1_000, 30, 1_000).unwrap();
+        let plan = plan_route(&graph, 1_000, 30, None, 1_000).unwrap();
         assert_eq!(plan.amounts, vec![1_221, 1_110, 1_000]);
         // Payee leg: now + 2 * 60 setup + 30 delta + 60 slack.
         assert_eq!(plan.expiries, vec![1_390, 1_300, 1_210]);
@@ -369,9 +398,22 @@ mod tests {
 
     #[test]
     fn plan_without_hops_only_has_the_payee_leg() {
-        let plan = plan_route(&[], 5_000, 30, 1_000).unwrap();
+        let plan = plan_route(&[], 5_000, 30, None, 1_000).unwrap();
         assert_eq!(plan.amounts, vec![5_000]);
         assert_eq!(plan.expiries, vec![1_090]);
+    }
+
+    #[test]
+    fn plan_rejects_legs_longer_than_their_receiver_accepts() {
+        // Expiries are [1_390, 1_300, 1_210]: legs run 390s, 300s, 210s.
+        let mut graph = [hop(1, "a", "b", 0, 0), hop(2, "b", "c", 0, 0)];
+        assert!(plan_route(&graph, 1_000, 30, Some(210), 1_000).is_ok());
+        assert!(plan_route(&graph, 1_000, 30, Some(209), 1_000).is_err());
+        graph[1].max_incoming_lifetime_secs = Some(299);
+        assert!(plan_route(&graph, 1_000, 30, None, 1_000).is_err());
+        graph[1].max_incoming_lifetime_secs = Some(300);
+        graph[0].max_incoming_lifetime_secs = Some(390);
+        assert!(plan_route(&graph, 1_000, 30, None, 1_000).is_ok());
     }
 
     /// fedimint -> router -> cashu -> router -> arkade, with the default
@@ -387,7 +429,7 @@ mod tests {
             ..hop(1, &from.0, &to.0, 0, 0)
         };
         let route = [announce(&fedimint, &cashu), announce(&cashu, &arkade)];
-        let plan = plan_route(&route, 1_000, arkade.default_incoming_delta(), 0).unwrap();
+        let plan = plan_route(&route, 1_000, arkade.default_incoming_delta(), None, 0).unwrap();
         // The payee's leg also gets one default slack, for COMMIT.
         let payee = 20 * 60 + DEFAULT_TRANSIT_SLACK_SECS;
         assert_eq!(
