@@ -23,6 +23,7 @@ use cassis_iroh::{Frame, IrohError, IrohServer, PublicKey};
 use cassis_keys as keys;
 use ritualistic::{EventTemplate, Kind, Network, Tags, Timestamp};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -54,6 +55,10 @@ pub struct RouterConfig {
     pub derived_keys: keys::DerivedKeys,
     /// Span identifying node that owns router and its adapter calls.
     pub span: Span,
+    /// Parent directory for persistent Liquid wallet state.
+    /// Each Liquid network gets its own child directory.
+    #[cfg(feature = "liquid")]
+    pub liquid_store_dir: Option<std::path::PathBuf>,
     /// Persistence backend for cashu wallet proofs. The cashu
     /// adapter reads and writes every held proof through this,
     /// so balances survive router restarts. Required only when
@@ -102,6 +107,8 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
             config.span.clone(),
             #[cfg(feature = "cashu")]
             &config.cashu_store,
+            #[cfg(feature = "liquid")]
+            config.liquid_store_dir.as_deref(),
         )
         .await
         {
@@ -238,6 +245,7 @@ async fn build_adapter(
     derived: &keys::DerivedKeys,
     span: Span,
     #[cfg(feature = "cashu")] cashu_store: &Arc<dyn cassis_cashu::CashuProofStore>,
+    #[cfg(feature = "liquid")] liquid_store_dir: Option<&Path>,
 ) -> Result<NetworkEntry, String> {
     let (kind, param) = cassis_core::split_spec(spec);
 
@@ -309,6 +317,10 @@ async fn build_adapter(
                 derived.invoice.pubkey(),
                 span.clone(),
             );
+            let mut cfg = cfg;
+            cfg.persist_dir = liquid_store_dir.map(|dir| {
+                dir.join(network_id.0.replace("::", "_"))
+            });
             let adapter: Arc<dyn NetworkRouterAdapter> = cassis_liquid::LiquidAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("liquid adapter init failed: {e}"))?;

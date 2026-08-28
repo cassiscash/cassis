@@ -98,12 +98,18 @@ async fn build_pair(
         }
         #[cfg(feature = "liquid")]
         NetSpec::Liquid { .. } => {
-            let cfg = cassis_liquid::default_config(
+            let mut cfg = cassis_liquid::default_config(
                 network_id.clone(),
                 network_sk(derived, &network_id)?,
                 derived.invoice.pubkey(),
                 span.clone(),
             );
+            let persist_dir = store_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("liquid")
+                .join(network_id.0.replace("::", "_"));
+            cfg.persist_dir = Some(persist_dir);
             let adapter = cassis_liquid::LiquidAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("liquid adapter init failed: {e}"))?;
@@ -205,6 +211,7 @@ pub async fn build_cashu_adapter(
 pub async fn build_liquid_adapter(
     spec: &NetSpec,
     derived: &DerivedKeys,
+    store_path: &Path,
     span: Span,
 ) -> Result<Arc<cassis_liquid::LiquidAdapter>, String> {
     let NetSpec::Liquid { .. } = spec else {
@@ -212,7 +219,13 @@ pub async fn build_liquid_adapter(
     };
     let network_id = spec.network_id();
     let sk = network_sk(derived, &network_id)?;
-    let cfg = cassis_liquid::default_config(network_id, sk, derived.invoice.pubkey(), span);
+    let mut cfg = cassis_liquid::default_config(network_id, sk, derived.invoice.pubkey(), span);
+    let persist_dir = store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("liquid")
+        .join(cfg.network_id.0.replace("::", "_"));
+    cfg.persist_dir = Some(persist_dir);
     cassis_liquid::LiquidAdapter::new(cfg)
         .await
         .map_err(|e| format!("liquid adapter init failed: {e}"))
