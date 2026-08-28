@@ -13,6 +13,13 @@
 //! * **Refund**: once the chain tip's block time passes the absolute
 //!   `refund_locktime` timestamp, the sender spends via the "refund
 //!   without receiver" path, again co-signed by the operator.
+//! * **Batch expiry**: VTXOs, VHTLCs included, expire with the batch
+//!   (commitment transaction) they descend from, after which the
+//!   operator may sweep it and they can no longer be spent offchain.
+//!   An HTLC must therefore be over [`SWEEP_MARGIN_SECS`] before its
+//!   VHTLC's batch expires: receivers check it, senders refresh coins
+//!   into a new batch before locking them, and routers announce the
+//!   longest HTLC the operator's batch lifetime allows.
 //! * **Preimage observation** (for routing): when the counterparty
 //!   claims our outgoing VHTLC, the preimage is embedded in the spend
 //!   transaction's PSBT under the `condition` unknown field; we poll
@@ -39,6 +46,7 @@ use ark_core::send::sign_checkpoint_transaction;
 use ark_core::send::OffchainTransactions;
 use ark_core::send::SendReceiver;
 use ark_core::send::VtxoInput;
+use ark_core::server::GetVtxosRequestFilter;
 use ark_core::server::VirtualTxOutPoint;
 use ark_core::vhtlc::VhtlcOptions;
 use ark_core::vhtlc::VhtlcScript;
@@ -69,6 +77,7 @@ use cassis_core::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Once;
 use std::time::Duration;
 use tracing::{debug, info, Span};
@@ -86,6 +95,11 @@ const TESTNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
 /// time out after the intent was already registered (and leaves the
 /// input locked to that intent).
 const BATCH_TIMEOUT_SECS: u64 = 300;
+
+/// How long before its VHTLC's batch expires an HTLC must be over:
+/// after the expiry the sender still has to get its refund co-signed
+/// by the operator, before the batch can be swept.
+pub const SWEEP_MARGIN_SECS: u64 = 20 * 60;
 
 // The operator re-validates every tapscript leaf of a VHTLC whenever
 // a spend of it is registered, and unless it is itself configured
@@ -163,6 +177,8 @@ struct UnspentVtxo {
     outpoint: bitcoin::OutPoint,
     amount: bitcoin::Amount,
     assets: Vec<Asset>,
+    /// When its batch expires (unix seconds).
+    expires_at: u64,
 }
 
 pub struct ArkadeAdapter {
@@ -183,6 +199,9 @@ pub struct ArkadeAdapter {
     dust: bitcoin::Amount,
     client: Arc<ArkClient>,
     chain: Arc<esplora::EsploraBlockchain>,
+    /// How long the operator's batches last, at least (see
+    /// [`Self::learn_batch_lifetime`]); `None` until a VTXO is seen.
+    batch_lifetime_secs: Mutex<Option<u64>>,
 }
 
 impl ArkadeAdapter {
@@ -252,7 +271,7 @@ impl ArkadeAdapter {
             .map_err(|e| format!("operator info: {e}"))?;
         let span = cassis_core::network_span(span, &id);
         debug!(parent: &span, "arkade wallet ready: operator={server_url} signer={}", info.signer_pk);
-        Ok(Self {
+        let adapter = Self {
             id,
             network,
             server_url,
@@ -264,7 +283,79 @@ impl ArkadeAdapter {
             dust: info.dust,
             client: Arc::new(client),
             chain,
-        })
+            batch_lifetime_secs: Mutex::new(None),
+        };
+        adapter.learn_batch_lifetime().await;
+        Ok(adapter)
+    }
+
+    /// Learn how long the operator's batches last (it does not
+    /// advertise it) from the VTXOs this wallet ever held: each expires
+    /// at most a lifetime after its creation, exactly one when created
+    /// in a batch rather than by an offchain send.
+    async fn learn_batch_lifetime(&self) {
+        let vtxos = match self.client.list_vtxos().await {
+            Ok(vtxos) => vtxos,
+            Err(error) => {
+                debug!(parent: &self.span, "listing VTXOs for the batch lifetime: {error}");
+                return;
+            }
+        };
+        let seen = vtxos
+            .all()
+            .map(|entry| entry.vtxo())
+            .filter_map(|vtxo| u64::try_from(vtxo.expires_at - vtxo.created_at).ok())
+            .max();
+        let mut lifetime = self
+            .batch_lifetime_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if seen > *lifetime {
+            *lifetime = seen;
+            info!(parent: &self.span, "operator batches last {}s", seen.unwrap_or(0));
+        }
+    }
+
+    /// Settle into a new batch every spendable VTXO whose batch expires
+    /// before `deadline`: an offchain send's outputs expire with its
+    /// inputs' batch, so a VHTLC funded by them would expire too early.
+    async fn refresh_vtxos_expiring_before(&self, deadline: u64) -> Result<(), NetworkError> {
+        let expiring = || async {
+            let vtxos = self
+                .client
+                .list_vtxos_filtered(GetVtxosRequestFilter::Spendable)
+                .await
+                .map_err(|e| NetworkError::network(format!("list VTXOs: {e}")))?;
+            Ok::<_, NetworkError>(
+                vtxos
+                    .spendable_offchain()
+                    .map(|entry| entry.vtxo())
+                    .filter(|vtxo| expiry_secs(vtxo.expires_at) < deadline)
+                    .map(|vtxo| vtxo.outpoint)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let outpoints = expiring().await?;
+        if outpoints.is_empty() {
+            return Ok(());
+        }
+        info!(
+            parent: &self.span,
+            "refreshing {} VTXO(s) whose batch expires before {deadline}",
+            outpoints.len()
+        );
+        let mut rng = rand::rngs::OsRng;
+        self.client
+            .settle_vtxos(&mut rng, &outpoints, &[])
+            .await
+            .map_err(|e| NetworkError::network(format!("refresh VTXOs: {e}")))?;
+        self.learn_batch_lifetime().await;
+        if !expiring().await?.is_empty() {
+            return Err(NetworkError::invalid(format!(
+                "the operator's batches expire before {deadline}, even refreshed"
+            )));
+        }
+        Ok(())
     }
 
     fn claim_target(&self) -> HtlcTarget {
@@ -459,6 +550,7 @@ impl ArkadeAdapter {
                 outpoint: o.outpoint,
                 amount: o.amount,
                 assets: o.assets,
+                expires_at: expiry_secs(o.expires_at),
             })
             .collect();
         match unspent.len() {
@@ -898,6 +990,16 @@ impl Network for ArkadeAdapter {
         self.id.clone()
     }
 
+    /// The operator's batch lifetime less [`SWEEP_MARGIN_SECS`]: a
+    /// sender refreshing its coins right before locking can make the
+    /// VHTLC's batch last at most that long. No limit until learnt.
+    fn max_incoming_lifetime_secs(&self) -> Option<u64> {
+        self.batch_lifetime_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|lifetime| lifetime.saturating_sub(SWEEP_MARGIN_SECS))
+    }
+
     async fn receive_target(
         &self,
         _payment_hash: Bytes32,
@@ -925,6 +1027,12 @@ impl Network for ArkadeAdapter {
         let vtxo = self.unspent_vtxo_at(&options).await?;
         if vtxo.amount < sat_amount(htlc.amount_msat) {
             return Err(NetworkError::invalid("VHTLC is worth less than the HTLC"));
+        }
+        if vtxo.expires_at < htlc.expiry.saturating_add(SWEEP_MARGIN_SECS) {
+            return Err(NetworkError::invalid(format!(
+                "VHTLC's batch expires at {}, less than {SWEEP_MARGIN_SECS}s after the HTLC",
+                vtxo.expires_at
+            )));
         }
         Ok(())
     }
@@ -961,6 +1069,8 @@ impl Network for ArkadeAdapter {
             )));
         }
         let options = self.build_options_for_outgoing(&payment_hash, receiver, expiry)?;
+        self.refresh_vtxos_expiring_before(expiry.saturating_add(SWEEP_MARGIN_SECS))
+            .await?;
         let address = self.script_for(&options)?.address();
         let txid = self
             .client
@@ -1032,6 +1142,11 @@ impl Network for ArkadeAdapter {
 // ---------------------------------------------------------------------------
 // Helpers below keep module-private concerns out of the trait impl.
 // ---------------------------------------------------------------------------
+
+/// A VTXO's `expires_at` as unix seconds (0 if unset).
+fn expiry_secs(expires_at: i64) -> u64 {
+    u64::try_from(expires_at).unwrap_or(0)
+}
 
 /// Whether a failed batch join may have left an intent queued at the
 /// operator (as opposed to failing before registration).

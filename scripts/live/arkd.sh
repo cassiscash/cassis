@@ -12,6 +12,12 @@
 #   scripts/live/arkd.sh give <node> <sats>
 #       issue an arknote and redeem it into <node>'s wallet
 #
+# Batches last `$ARKD_VTXO_TREE_EXPIRY` seconds (a multiple of 512),
+# 4h by default: longer than the HTLCs of the live routes, which must
+# be over before their VTXOs' batch expires. arkd keeps the settings it
+# first started with in its database, so `start` writes it there too
+# (needs sqlite3).
+#
 # Uses `$CASSIS_ARKD` or <workspace>/target/arkd-light, building it with
 # scripts/live/arkd/build.sh (needs go) when missing.
 set -euo pipefail
@@ -36,6 +42,9 @@ case "${1:-}" in
     [ -x "$ARKD" ] || "$LIVE_SCRIPTS/arkd/build.sh" "$ARKD"
     mkdir -p "$DATA"
     [ -f "$DATA/signer.key" ] || od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > "$DATA/signer.key"
+    TREE_EXPIRY="${ARKD_VTXO_TREE_EXPIRY:-14336}"
+    [ -f "$DATA/db/sqlite.db" ] &&
+      sqlite3 "$DATA/db/sqlite.db" "UPDATE settings SET vtxo_tree_expiry = $TREE_EXPIRY"
     ARKD_DATADIR="$DATA" \
     ARKD_PORT="$PORT" \
     ARKD_ADMIN_PORT=7071 \
@@ -53,7 +62,7 @@ case "${1:-}" in
     ARKD_PUBLIC_UNILATERAL_EXIT_DELAY=512 \
     ARKD_CHECKPOINT_EXIT_DELAY=512 \
     ARKD_BOARDING_EXIT_DELAY=1024 \
-    ARKD_VTXO_TREE_EXPIRY=3584 \
+    ARKD_VTXO_TREE_EXPIRY="$TREE_EXPIRY" \
       nohup "$ARKD" > "$DATA/arkd.log" 2>&1 &
     echo $! > "$DATA/arkd.pid"
     until admin GET /wallet/status > /dev/null 2>&1; do sleep 0.5; done
