@@ -7,22 +7,22 @@ edition.workspace = true
 default = []
 
 [dependencies]
-async-trait = "0.1.91"
-cassis-core = { path = "../../cassis-core" }
-tracing = "0.1.44"
-thiserror = "1.0.69"
-tokio = { version = "1.46.1", features = ["sync", "time", "rt"] }
-futures = "0.3.33"
-rand = "0.8.7"
+async-trait = { workspace = true }
+cassis-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+futures = { workspace = true }
+rand = { workspace = true }
 
 # Arkade Rust SDK (`ark-rs`). `ark-client` is the high-level wallet
 # (coin selection, offchain send/claim flows, VTXO listings); it
 # re-exports the gRPC transport used to talk to the operator.
-ark-client = { version = "0.10", default-features = false, features = ["tls-webpki-roots"] }
-ark-core = "0.10"
+ark-client = { workspace = true }
+ark-core = { workspace = true }
 # bdk-backed onchain wallet required by the ark-client type bounds.
-ark-bdk-wallet = "0.10"
-esplora-client = { version = "0.10", features = ["async-https"] }
+ark-bdk-wallet = { workspace = true }
+esplora-client = { workspace = true, features = ["async-https"] }
 
-bitcoin = "0.32"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+bitcoin = { workspace = true }
+rustls = { workspace = true, default-features = false, features = ["ring"] }

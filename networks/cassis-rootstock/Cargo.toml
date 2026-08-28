@@ -7,29 +7,16 @@ edition.workspace = true
 default = []
 
 [dependencies]
-async-trait = "0.1.91"
-cassis-core = { path = "../../cassis-core" }
+async-trait = { workspace = true }
+cassis-core = { workspace = true }
 # Needed to normalize a secret key to its even-Y form so the x-only
 # pubkey -> EVM address mapping is well defined (see `normalize_sk`).
-secp256k1 = { version = "0.31", features = ["std"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.40"
-sha2 = "0.10"
-thiserror = "1.0.69"
-tokio = { version = "1.46.1", features = ["sync", "time", "rt"] }
-tracing = "0.1.44"
+secp256k1 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+tracing = { workspace = true }
 
-alloy = { version = "2.4", default-features = false, features = [
-  "std",
-  "reqwest",
-  "reqwest-rustls-tls",
-  "provider-http",
-  "rpc-types",
-  "signer-local",
-  "contract",
-  "json-abi",
-  "sol-types",
-  "network",
-  "eips",
-  "rlp",
-] }
+alloy = { workspace = true }

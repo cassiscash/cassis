@@ -7,31 +7,31 @@ edition.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-cassis-core = { path = "../cassis-core" }
-cassis-iroh = { path = "../cassis-iroh" }
-cassis-keys = { path = "../cassis-keys" }
-cassis-routing = { path = "../cassis-routing" }
-iroh = "1.0.3"
-lowercase-hex = "0.1.1"
-ritualistic = "0.1.1"
-thiserror = "1.0.69"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
-tracing = "0.1.44"
+cassis-core = { workspace = true }
+cassis-iroh = { workspace = true }
+cassis-keys = { workspace = true }
+cassis-routing = { workspace = true }
+iroh = { workspace = true }
+lowercase-hex = { workspace = true }
+ritualistic = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tracing = { workspace = true }
 
 [dependencies.cassis-cashu]
-path = "../networks/cassis-cashu"
+workspace = true
 optional = true
 
 [dependencies.cassis-arkade]
-path = "../networks/cassis-arkade"
+workspace = true
 optional = true
 
 [dependencies.cassis-rootstock]
-path = "../networks/cassis-rootstock"
+workspace = true
 optional = true
 
 [dependencies.cassis-liquid]
-path = "../networks/cassis-liquid"
+workspace = true
 optional = true
 
 [features]

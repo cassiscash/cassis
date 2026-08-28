@@ -7,18 +7,18 @@ edition.workspace = true
 default = []
 
 [dependencies]
-async-trait = "0.1.91"
-base64 = "0.22.1"
-cassis-core = { path = "../../cassis-core" }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+cassis-core = { workspace = true }
 # cdk re-exports the full `cashu` type surface (cdk::nuts,
 # cdk::Amount, cdk::MintUrl, cdk::dhke, ...) and provides the
 # wallet HTTP client (cdk::wallet::HttpClient implementing
 # cdk::wallet::MintConnector). `wallet` is enabled so the
 # HTTP client is available.
-cdk = { version = "0.17.3", features = ["wallet"] }
-lowercase-hex = "0.1.1"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-thiserror = "1.0.69"
-tokio = { version = "1.53.1", features = ["sync"] }
-tracing = "0.1.44"
+cdk = { workspace = true }
+lowercase-hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
