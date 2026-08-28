@@ -1,7 +1,9 @@
 //! Thin CLI over `cassis-client`. Each command delegates the heavy
-//! lifting (seed init, adapter building, invoice persistence, route
-//! lookup, pay dispatch, receive daemon) to `cassis-client` so the GUI
-//! and the CLI share exactly the same logic.
+//! lifting (adapter building, invoice persistence, route lookup, pay
+//! dispatch, receive daemon) to `cassis-client` so the GUI and the
+//! CLI share exactly the same logic. The seed is generated on first
+//! use: any command that needs keys initializes the home directory's
+//! seed automatically when it is missing.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -85,7 +87,6 @@ async fn main() {
             }
         },
         Commands::Seed { command } => match command {
-            cli::SeedCommands::Init { force } => cmd_seed_init(force),
             cli::SeedCommands::Show => cmd_seed_show(),
         },
         Commands::Cashu { command } => match command {
@@ -159,28 +160,28 @@ fn derive_for(mnemonic: &str, specs: &[NetSpec]) -> Result<keys::DerivedKeys, St
 }
 
 // ============================================================================
-// seed init / show
+// seed show (auto-init)
 // ============================================================================
 
-fn cmd_seed_init(force: bool) -> Result<(), String> {
-    let home = cassis_home();
+/// Read the home directory's seed, generating and persisting a fresh
+/// 12-word mnemonic when the seed file does not exist yet. Every
+/// command that needs keys funnels through here, so a fresh home is
+/// usable without a separate init step.
+fn read_or_init_mnemonic() -> Result<String, String> {
+    let home = node_home();
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let p = seed_path(&home);
-    if p.exists() && !force {
-        return Err(format!(
-            "seed already exists at {}; use --force to overwrite",
-            p.display()
-        ));
+    if !p.exists() {
+        let mn = keys::generate_mnemonic().map_err(|e| e.to_string())?;
+        write_mnemonic(&p, &mn, true).map_err(|e| e.to_string())?;
+        println!("generated new seed at {}", p.display());
+        println!("backup this phrase — losing it means losing access to all derived keys.");
     }
-    let mn = keys::generate_mnemonic().map_err(|e| e.to_string())?;
-    write_mnemonic(&p, &mn, true).map_err(|e| e.to_string())?;
-    println!("wrote 12-word mnemonic to {}", p.display());
-    println!("backup this phrase — losing it means losing access to all derived keys.");
-    Ok(())
+    read_mnemonic(&p).map_err(|e| e.to_string())
 }
 
 fn cmd_seed_show() -> Result<(), String> {
-    let mn = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
+    let mn = read_or_init_mnemonic()?;
     println!("{mn}");
     Ok(())
 }
@@ -264,7 +265,7 @@ async fn cmd_pay(invoice: String, from: String, nostr_relay: Vec<String>) -> Res
         nostr_relay
     };
     let net_spec = NetSpec::parse(&dest_network.0)?;
-    let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
+    let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&net_spec))?;
     let senders = build_senders(
         &[net_spec],
@@ -323,7 +324,7 @@ async fn cmd_invoice(
     info!("waiting for COMMIT or upstream fund (timeout={timeout}s)...");
     let now = unix_now();
     let deadline = now.saturating_add(timeout);
-    let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
+    let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
     let receivers = build_receivers(
         std::slice::from_ref(&spec),
@@ -546,7 +547,7 @@ fn cmd_cashu_balance(network: Option<String>) -> Result<(), String> {
 async fn cmd_rootstock_send(network: String, to: String, amount_msat: u64) -> Result<(), String> {
     let testnet = network == "rootstock::testnet";
     let spec = NetSpec::Rootstock { testnet };
-    let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
+    let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
     let adapter =
         build_rootstock_adapter(&spec, &derived, info_span!("node", node = "cassis-cli")).await?;
@@ -575,7 +576,7 @@ async fn build_cli_arkade_adapter(
         ));
     }
     let spec = cassis_client::netspec::NetSpec::Arkade { testnet };
-    let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
+    let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
     let adapter = build_arkade_adapter(&spec, &derived, info_span!("node", node = "cassis-cli"))
         .await
@@ -651,7 +652,7 @@ async fn build_cli_liquid_adapter(
         ));
     }
     let spec = NetSpec::Liquid { testnet };
-    let mnemonic = read_mnemonic(&seed_path(&node_home())).map_err(|e| e.to_string())?;
+    let mnemonic = read_or_init_mnemonic()?;
     let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
     let adapter = build_liquid_adapter(&spec, &derived, info_span!("node", node = "cassis-cli"))
         .await

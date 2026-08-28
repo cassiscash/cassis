@@ -71,7 +71,7 @@ pub enum Commands {
         #[command(subcommand)]
         command: NodeCommands,
     },
-    /// Seed management
+    /// Show the node's seed phrase (generated on first use).
     Seed {
         #[command(subcommand)]
         command: SeedCommands,
@@ -215,10 +215,6 @@ pub enum NodeCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum SeedCommands {
-    Init {
-        #[arg(long)]
-        force: bool,
-    },
     Show,
 }
 
