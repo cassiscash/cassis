@@ -1,3 +1,4 @@
+use crate::{arkade, cashu, liquid, rootstock};
 use clap::{Parser, Subcommand};
 
 const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
@@ -79,7 +80,7 @@ pub enum Commands {
     /// Local cashu wallet.
     Cashu {
         #[command(subcommand)]
-        command: CashuCommands,
+        command: cashu::CashuCommands,
     },
     /// Manage a node's Arkade funds.
     Arkade {
@@ -87,7 +88,7 @@ pub enum Commands {
         #[arg(long, default_value = "arkade")]
         network: String,
         #[command(subcommand)]
-        command: ArkadeCommands,
+        command: arkade::ArkadeCommands,
     },
     /// Manage a node's Liquid (LWK) funds.
     Liquid {
@@ -95,7 +96,7 @@ pub enum Commands {
         #[arg(long, default_value = "liquid")]
         network: String,
         #[command(subcommand)]
-        command: LiquidCommands,
+        command: liquid::LiquidCommands,
     },
     /// Register a network to participate in. The argument format
     /// mirrors `cassis-router`: `cashu::host`, `rootstock`,
@@ -110,7 +111,7 @@ pub enum Commands {
         #[arg(long, default_value = "rootstock")]
         network: String,
         #[command(subcommand)]
-        command: RootstockCommands,
+        command: rootstock::RootstockCommands,
     },
     /// Run the multi-network routing daemon. Replaced by the GUI.
     Router {
@@ -118,81 +119,6 @@ pub enum Commands {
         network: Vec<String>,
         #[arg(long, action = clap::ArgAction::Append, value_name = "URL")]
         nostr_relay: Vec<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum CashuCommands {
-    Send {
-        #[arg(long)]
-        network: String,
-        #[arg(long)]
-        amount: u64,
-    },
-    Receive {
-        #[arg(long = "proof")]
-        proof: String,
-    },
-    Balance {
-        #[arg(long)]
-        network: Option<String>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum LiquidCommands {
-    /// Show the node's L-BTC balance.
-    Balance,
-    /// Print the confidential deposit address.
-    Deposit,
-    /// Send L-BTC to another confidential address.
-    Send {
-        /// Destination Liquid address.
-        #[arg(long)]
-        to: String,
-        #[arg(long)]
-        amount_msat: u64,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ArkadeCommands {
-    /// Show the node's offchain Arkade balance.
-    Balance,
-    /// Submit confirmed boarding outputs to the next batch swap.
-    Onboard,
-    /// Print deposit addresses (boarding / on-chain / arkade).
-    Deposit,
-    /// Send VTXOs to another Arkade address.
-    Send {
-        /// Destination Arkade address (`ark1...` / `tark1...`).
-        #[arg(long)]
-        to: String,
-        #[arg(long)]
-        amount_msat: u64,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum RootstockCommands {
-    Send {
-        #[arg(long)]
-        to: String,
-        #[arg(long, default_value_t = 0)]
-        amount_msat: u64,
-        #[arg(long)]
-        data: Option<String>,
-        #[arg(long)]
-        args: Option<String>,
-    },
-    Info,
-    Read {
-        #[arg(long)]
-        to: String,
-        #[arg(long)]
-        data: String,
-        #[arg(long)]
-        args: String,
     },
 }
 

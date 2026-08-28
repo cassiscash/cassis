@@ -9,11 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(feature = "arkade")]
-use cassis_client::adapters::build_arkade_adapter;
-#[cfg(feature = "liquid")]
-use cassis_client::adapters::build_liquid_adapter;
-use cassis_client::adapters::{build_receivers, build_rootstock_adapter, build_senders};
+use cassis_client::adapters::{build_receivers, build_senders};
 use cassis_client::netspec::NetSpec;
 use cassis_client::ops::{create_invoice_for, node_store_path, start_receive, unix_now};
 use cassis_client::paths::{cassis_home, set_home_override, store_path};
@@ -25,12 +21,12 @@ use cassis_keys as keys;
 use clap::Parser;
 use tracing::{error, info, info_span};
 
+mod arkade;
+mod cashu;
 mod cli;
-#[cfg(feature = "arkade")]
-use cli::ArkadeCommands;
-#[cfg(feature = "liquid")]
-use cli::LiquidCommands;
-use cli::{CashuCommands, Cli, Commands, RootstockCommands};
+mod liquid;
+mod rootstock;
+use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() {
@@ -89,49 +85,21 @@ async fn main() {
         Commands::Seed { command } => match command {
             cli::SeedCommands::Show => cmd_seed_show(),
         },
-        Commands::Cashu { command } => match command {
-            CashuCommands::Send { network, amount } => cmd_cashu_send_stub(network, amount),
-            CashuCommands::Receive { proof } => cmd_cashu_receive_stub(proof),
-            CashuCommands::Balance { network } => cmd_cashu_balance(network),
-        },
+        Commands::Cashu { command } => cashu::run(command),
         #[cfg(feature = "arkade")]
-        Commands::Arkade { command, network } => match command {
-            ArkadeCommands::Balance {} => cmd_arkade_balance(network).await,
-            ArkadeCommands::Onboard {} => cmd_arkade_onboard(network).await,
-            ArkadeCommands::Deposit {} => cmd_arkade_deposit(network).await,
-            ArkadeCommands::Send { to, amount_msat } => {
-                cmd_arkade_send(network, to, amount_msat).await
-            }
-        },
+        Commands::Arkade { command, network } => arkade::run(network, command).await,
         #[cfg(not(feature = "arkade"))]
         Commands::Arkade { .. } => {
             Err("'cassis-cli arkade' requires building with the 'arkade' feature".to_string())
         }
         #[cfg(feature = "liquid")]
-        Commands::Liquid { command, network } => match command {
-            LiquidCommands::Balance {} => cmd_liquid_balance(network).await,
-            LiquidCommands::Deposit {} => cmd_liquid_deposit(network).await,
-            LiquidCommands::Send { to, amount_msat } => {
-                cmd_liquid_send(network, to, amount_msat).await
-            }
-        },
+        Commands::Liquid { command, network } => liquid::run(network, command).await,
         #[cfg(not(feature = "liquid"))]
         Commands::Liquid { .. } => {
             Err("'cassis-cli liquid' requires building with the 'liquid' feature".to_string())
         }
         Commands::Register { network } => cmd_register(network),
-        Commands::Rootstock { network, command } => match command {
-            RootstockCommands::Send {
-                to,
-                amount_msat,
-                data: _,
-                args: _,
-            } => cmd_rootstock_send(network, to, amount_msat).await,
-            RootstockCommands::Info => cmd_rootstock_info(network).await,
-            RootstockCommands::Read { to, data, args } => {
-                cmd_rootstock_read(network, to, data, args).await
-            }
-        },
+        Commands::Rootstock { network, command } => rootstock::run(network, command).await,
         Commands::Router { .. } => {
             Err("'router' is now integrated into the GUI; run `cargo run -p cassis-gui`".into())
         }
@@ -484,231 +452,4 @@ fn parse_payment_hash(s: &str) -> Result<Bytes32, String> {
         out[i] = u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
     }
     Ok(Bytes32(out))
-}
-
-// ============================================================================
-// cashu wallet
-//
-// `cashu send`/`cashu receive` need NUT-00 token encode/decode (via
-// `cdk`), which lives in the GUI. `cashu balance` is a pure store query.
-// ============================================================================
-
-fn cmd_cashu_send_stub(_network: String, _amount: u64) -> Result<(), String> {
-    Err("'cassis-cli cashu send' is implemented in `cassis-gui`.".to_string())
-}
-
-fn cmd_cashu_receive_stub(_proof: String) -> Result<(), String> {
-    Err("'cassis-cli cashu receive' is implemented in `cassis-gui`.".to_string())
-}
-
-fn cmd_cashu_balance(network: Option<String>) -> Result<(), String> {
-    let mut store = open_store()?;
-    match network {
-        Some(spec_str) => {
-            let net_id = NetSpec::parse(&spec_str)?.network_id();
-            let mint_url = cassis_core::cashu_mint_url(&net_id).map_err(|e| e.to_string())?;
-            let total = store.cashu_balance(&mint_url).map_err(|e| e.to_string())?;
-            let rows = store
-                .list_cashu_proofs(&mint_url)
-                .map_err(|e| e.to_string())?;
-            println!("mint:        {mint_url}");
-            println!("balance_sat: {total}");
-            println!("proofs:      {}", rows.len());
-        }
-        None => {
-            let registered = load_registered_networks(&mut store)?;
-            let mut any = false;
-            for raw in &registered {
-                let spec = match NetSpec::parse(raw) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if let NetSpec::Cashu { mint_url, .. } = &spec {
-                    let total = store.cashu_balance(mint_url).map_err(|e| e.to_string())?;
-                    let rows = store
-                        .list_cashu_proofs(mint_url)
-                        .map_err(|e| e.to_string())?;
-                    println!("{mint_url}  {total} sat ({} proof(s))", rows.len());
-                    any = true;
-                }
-            }
-            if !any {
-                println!("(no registered cashu mints)");
-            }
-        }
-    }
-    Ok(())
-}
-
-// ============================================================================
-// rootstock
-// ============================================================================
-
-async fn cmd_rootstock_send(network: String, to: String, amount_msat: u64) -> Result<(), String> {
-    let testnet = network == "rootstock::testnet";
-    let spec = NetSpec::Rootstock { testnet };
-    let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let adapter =
-        build_rootstock_adapter(&spec, &derived, info_span!("node", node = "cassis-cli")).await?;
-    let tx_hash = adapter
-        .transfer(&to, amount_msat)
-        .await
-        .map_err(|e| format!("rootstock send: {e}"))?;
-    println!("status:      ok");
-    println!("network:     {network}");
-    println!("tx_hash:     {tx_hash}");
-    Ok(())
-}
-
-#[cfg(feature = "arkade")]
-// ============================================================================
-// arkade
-// ============================================================================
-#[cfg(feature = "arkade")]
-async fn build_cli_arkade_adapter(
-    network: &str,
-) -> Result<(NetSpec, std::sync::Arc<cassis_arkade::ArkadeAdapter>), String> {
-    let testnet = network == "arkade::testnet";
-    if !testnet && network != "arkade" {
-        return Err(format!(
-            "network 'arkade' only accepts no parameter or 'testnet', got '{network}'"
-        ));
-    }
-    let spec = cassis_client::netspec::NetSpec::Arkade { testnet };
-    let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let adapter = build_arkade_adapter(&spec, &derived, info_span!("node", node = "cassis-cli"))
-        .await
-        .map_err(|e| format!("arkade adapter init failed: {e}"))?;
-    Ok((spec, adapter))
-}
-
-#[cfg(feature = "arkade")]
-async fn cmd_arkade_balance(network: String) -> Result<(), String> {
-    let (spec, adapter) = build_cli_arkade_adapter(&network).await?;
-    let balance_msat = adapter.balance_msat().await.map_err(|e| e.to_string())?;
-    println!("status:      ok");
-    println!("network:     {}", spec.network_id());
-    println!("balance_msat:{balance_msat:>13}");
-    Ok(())
-}
-
-#[cfg(feature = "arkade")]
-async fn cmd_arkade_onboard(network: String) -> Result<(), String> {
-    let (spec, adapter) = build_cli_arkade_adapter(&network).await?;
-    let commitment_txid = adapter.onboard().await.map_err(|e| e.to_string())?;
-    println!("status:      ok");
-    println!("network:     {}", spec.network_id());
-    match commitment_txid {
-        Some(txid) => println!("commitment_txid: {txid}"),
-        None => println!("message:     no boarding outputs ready"),
-    }
-    Ok(())
-}
-
-#[cfg(feature = "arkade")]
-async fn cmd_arkade_deposit(network: String) -> Result<(), String> {
-    let (spec, adapter) = build_cli_arkade_adapter(&network).await?;
-    let (boarding, onchain, arkade) = adapter
-        .deposit_addresses()
-        .await
-        .map_err(|e| e.to_string())?;
-    println!("status:      ok");
-    println!("network:     {}", spec.network_id());
-    println!("boarding:    {boarding}");
-    println!("onchain:     {onchain}");
-    println!("arkade:      {arkade}");
-    Ok(())
-}
-
-#[cfg(feature = "arkade")]
-async fn cmd_arkade_send(network: String, to: String, amount_msat: u64) -> Result<(), String> {
-    let (spec, adapter) = build_cli_arkade_adapter(&network).await?;
-    let txid = adapter
-        .transfer_to_ark_address(&to, amount_msat)
-        .await
-        .map_err(|e| format!("arkade send: {e}"))?;
-    println!("status:      ok");
-    println!("network:     {}", spec.network_id());
-    println!("to:          {to}");
-    println!("amount_msat: {amount_msat}");
-    println!("txid:        {txid}");
-    Ok(())
-}
-
-#[cfg(feature = "liquid")]
-// ============================================================================
-// liquid
-// ============================================================================
-#[cfg(feature = "liquid")]
-async fn build_cli_liquid_adapter(
-    network: &str,
-) -> Result<(NetSpec, std::sync::Arc<cassis_liquid::LiquidAdapter>), String> {
-    let testnet = network == "liquid::testnet";
-    if !testnet && network != "liquid" {
-        return Err(format!(
-            "network 'liquid' only accepts no parameter or 'testnet', got '{network}'"
-        ));
-    }
-    let spec = NetSpec::Liquid { testnet };
-    let mnemonic = read_or_init_mnemonic()?;
-    let derived = derive_for(&mnemonic, std::slice::from_ref(&spec))?;
-    let adapter = build_liquid_adapter(
-        &spec,
-        &derived,
-        &node_store_path(&node_home()),
-        info_span!("node", node = "cassis-cli"),
-    )
-    .await
-    .map_err(|e| format!("liquid adapter init failed: {e}"))?;
-    Ok((spec, adapter))
-}
-
-#[cfg(feature = "liquid")]
-async fn cmd_liquid_balance(network: String) -> Result<(), String> {
-    let (spec, adapter) = build_cli_liquid_adapter(&network).await?;
-    let balance_msat = adapter.balance_msat().await.map_err(|e| e.to_string())?;
-    println!("status:      ok");
-    println!("network:     {}", spec.network_id());
-    println!("balance_msat:{balance_msat:>13}");
-    Ok(())
-}
-
-#[cfg(feature = "liquid")]
-async fn cmd_liquid_deposit(network: String) -> Result<(), String> {
-    let (spec, adapter) = build_cli_liquid_adapter(&network).await?;
-    let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
-    println!("status:      ok");
-    println!("network:     {}", spec.network_id());
-    println!("address:     {address}");
-    Ok(())
-}
-
-#[cfg(feature = "liquid")]
-async fn cmd_liquid_send(network: String, to: String, amount_msat: u64) -> Result<(), String> {
-    let (spec, adapter) = build_cli_liquid_adapter(&network).await?;
-    let txid = adapter
-        .transfer_to_address(&to, amount_msat)
-        .await
-        .map_err(|e| format!("liquid send: {e}"))?;
-    println!("status:      ok");
-    println!("network:     {}", spec.network_id());
-    println!("to:          {to}");
-    println!("amount_msat: {amount_msat}");
-    println!("txid:        {txid}");
-    Ok(())
-}
-
-async fn cmd_rootstock_info(_network: String) -> Result<(), String> {
-    Err("'cassis-cli rootstock info' is implemented in `cassis-gui`.".to_string())
-}
-
-async fn cmd_rootstock_read(
-    _network: String,
-    _to: String,
-    _data: String,
-    _args: String,
-) -> Result<(), String> {
-    Err("'cassis-cli rootstock read' is implemented in `cassis-gui`.".to_string())
 }
