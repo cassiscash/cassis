@@ -216,7 +216,12 @@ pub struct NetworkEntry {
 ///
 /// Gated to exactly the features whose arms call it, so it disappears
 /// rather than needing a blanket dead-code allow.
-#[cfg(any(feature = "cashu", feature = "rootstock", feature = "arkade"))]
+#[cfg(any(
+    feature = "cashu",
+    feature = "rootstock",
+    feature = "arkade",
+    feature = "liquid"
+))]
 fn network_sk(derived: &keys::DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32], String> {
     derived
         .networks
@@ -284,16 +289,29 @@ async fn build_adapter(
 
         #[cfg(feature = "liquid")]
         "liquid" => {
-            if param.is_some() {
-                return Err("network 'liquid' does not take a parameter".into());
-            }
-            let network_id = NetworkId("liquid".to_string());
-            let adapter: Arc<dyn NetworkRouterAdapter> =
-                Arc::new(cassis_liquid::LiquidAdapter::new(
-                    network_id.clone(),
-                    derived.invoice.pubkey(),
-                    span.clone(),
-                ));
+            let network_id = match param {
+                None => NetworkId("liquid".to_string()),
+                Some("testnet") => NetworkId("liquid::testnet".to_string()),
+                Some(other) => {
+                    return Err(format!(
+                        "network 'liquid' only accepts no parameter or 'testnet', got '{other}'"
+                    ));
+                }
+            };
+            // Liquid claims happen with the dedicated even-Y claim key
+            // derived from the per-network key; the adapter
+            // self-reports its x-only half via `claim_pubkey()` so
+            // upstream hops lock to it.
+            let sk = network_sk(derived, &network_id)?;
+            let cfg = cassis_liquid::default_config(
+                network_id.clone(),
+                sk,
+                derived.invoice.pubkey(),
+                span.clone(),
+            );
+            let adapter: Arc<dyn NetworkRouterAdapter> = cassis_liquid::LiquidAdapter::new(cfg)
+                .await
+                .map_err(|e| format!("liquid adapter init failed: {e}"))?;
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,

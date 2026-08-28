@@ -757,6 +757,17 @@ impl ArkadeAdapter {
         Ok(total_sats.saturating_mul(MSAT_PER_SAT))
     }
 
+    /// Include confirmed boarding outputs in the next batch swap.
+    /// Returns the commitment transaction ID, or `None` when no
+    /// boarding output or recoverable VTXO is ready to settle.
+    pub async fn onboard(&self) -> Result<Option<bitcoin::Txid>, HtlcError> {
+        let mut rng = rand::thread_rng();
+        self.client
+            .settle(&mut rng)
+            .await
+            .map_err(|e| HtlcError::Network(format!("onboard: {e}")))
+    }
+
     /// Addresses for manual funding, returned as
     /// `(boarding, onchain, arkade)` strings. VTXOs sent to the
     /// boarding address settle into spendable offchain coins after

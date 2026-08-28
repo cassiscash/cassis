@@ -111,7 +111,7 @@ pub fn fedimint_network_id(invite_code: &str) -> NetworkId {
 }
 
 /// Build the canonical `NetworkId` for a kind without a parameter
-/// (liquid, arkade, arkade::testnet, rootstock).
+/// (liquid, liquid::testnet, arkade, arkade::testnet, rootstock).
 pub fn simple_network_id(kind: &str) -> NetworkId {
     NetworkId(kind.to_string())
 }
@@ -119,7 +119,7 @@ pub fn simple_network_id(kind: &str) -> NetworkId {
 /// Pass-through used by the router to canonicalize `HopInstruction`
 /// network ids before adapter lookup. Only the canonical on-the-wire
 /// form (`cashu::<host>`, `fedimint::<invite>`, or the simple kinds
-/// `liquid` / `arkade` / `arkade::testnet` / `rootstock` /
+/// `liquid` / `liquid::testnet` / `arkade` / `arkade::testnet` / `rootstock` /
 /// `rootstock::testnet`) round-trips;
 /// anything else is returned unchanged so the adapter lookup rejects it.
 pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
@@ -134,6 +134,7 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
         }
     }
     if id.0 == "liquid"
+        || id.0 == "liquid::testnet"
         || id.0 == "arkade"
         || id.0 == "arkade::testnet"
         || id.0 == "rootstock"
@@ -206,12 +207,13 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
         ),
 
         #[cfg(feature = "liquid")]
-        "liquid" => {
-            if param.is_some() {
-                return Err("network 'liquid' does not take a parameter".into());
-            }
-            Ok(NetworkId("liquid".to_string()))
-        }
+        "liquid" => match param {
+            None => Ok(NetworkId("liquid".to_string())),
+            Some("testnet") => Ok(NetworkId("liquid::testnet".to_string())),
+            Some(other) => Err(format!(
+                "network 'liquid' only accepts no parameter or 'testnet', got '{other}'"
+            )),
+        },
         #[cfg(not(feature = "liquid"))]
         "liquid" => Err(
             "network 'liquid' requested but cassis-core was not compiled with the 'liquid' feature"
@@ -565,8 +567,31 @@ pub enum HtlcDescriptor {
     /// NUT-14 HTLC locked ecash proofs, one base64-encoded JSON
     /// NUT-00 [`Proof`] per element.
     Cashu { proofs_b64: Vec<String> },
-    /// Stub for liquid: no on-wire shape yet.
-    Liquid {},
+    /// Liquid HTLC: a P2WSH output on the Liquid sidechain whose
+    /// witness script is the claim leaf
+    /// `OP_HASH160 <preimage_hash> OP_EQUALVERIFY <claim_pubkey> OP_CHECKSIG`,
+    /// claimable by revealing the preimage and signing with the
+    /// receiver's per-network key; the refund leaf
+    /// `<refund_locktime> OP_CLTV OP_DROP <refund_pubkey> OP_CHECKSIG`
+    /// lets the sender recover the funds after the absolute block
+    /// height. The lockup output is unblinded (explicit), so the
+    /// receiver can see the amount without any blinding key and the
+    /// claim spend needs no blinders either.
+    Liquid {
+        /// Hex-encoded 33-byte compressed pubkey the receiver claims
+        /// with (even-Y representative of its x-only claim identity).
+        claim_pubkey: String,
+        /// Hex RIPEMD160(SHA256(preimage)) == RIPEMD160(payment_hash),
+        /// the 20-byte value burned into the claim script.
+        preimage_hash: String,
+        /// Hex witness script of the claim path; its P2WSH hash is the
+        /// lockup address the sender funds.
+        claim_script: String,
+        /// Hex witness script of the CLTV-gated refund path.
+        refund_script: String,
+        /// Absolute Liquid block height enabling the refund path.
+        refund_locktime: u32,
+    },
     /// Arkade VHTLC. Carries every [`ark_core::vhtlc::VhtlcOptions`]
     /// field the receiver needs to rebuild the VHTLC taproot script,
     /// find the locked VTXO at its address, and claim it:
@@ -1254,7 +1279,9 @@ mod tests {
 
     #[cfg(feature = "liquid")]
     #[test]
-    fn network_id_for_liquid_spec_rejects_parameter() {
+    fn network_id_for_liquid_testnet_spec_uses_canonical_form() {
+        let id = network_id_for_spec("liquid::testnet").unwrap();
+        assert_eq!(id.0, "liquid::testnet");
         assert!(network_id_for_spec("liquid::foo").is_err());
     }
 
@@ -1418,6 +1445,10 @@ mod tests {
         assert_eq!(
             canonicalize_network_id(&NetworkId("liquid".to_string())).0,
             "liquid"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("liquid::testnet".to_string())).0,
+            "liquid::testnet"
         );
         assert_eq!(
             canonicalize_network_id(&NetworkId("arkade".to_string())).0,
