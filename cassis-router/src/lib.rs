@@ -42,7 +42,7 @@ const POLL_INTERVAL_SECS: u64 = 30;
 pub struct RouterConfig {
     /// Network specs in the same `--network` format the old
     /// `cassis-router` binary accepted (`cashu::host`,
-    /// `fedimint::invite`, `liquid`, `ark`, `rootstock`).
+    /// `fedimint::invite`, `liquid`, `rootstock`).
     pub network_specs: Vec<String>,
     /// Nostr relays to publish route announcements to. When
     /// empty, [`DEFAULT_NOSTR_RELAYS`] is used.
@@ -216,7 +216,7 @@ pub struct NetworkEntry {
 ///
 /// Gated to exactly the features whose arms call it, so it disappears
 /// rather than needing a blanket dead-code allow.
-#[cfg(any(feature = "cashu", feature = "rootstock"))]
+#[cfg(any(feature = "cashu", feature = "rootstock", feature = "arkade"))]
 fn network_sk(derived: &keys::DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32], String> {
     derived
         .networks
@@ -308,18 +308,30 @@ async fn build_adapter(
                 .into(),
         ),
 
-        #[cfg(feature = "ark")]
-        "ark" => {
-            if param.is_some() {
-                return Err("network 'ark' does not take a parameter".into());
-            }
-            let network_id = NetworkId("ark".to_string());
-            let adapter: Arc<dyn NetworkRouterAdapter> =
-                Arc::new(cassis_arkade::ArkAdapter::new(
-                    network_id.clone(),
-                    derived.invoice.pubkey(),
-                    span.clone(),
-                ));
+        #[cfg(feature = "arkade")]
+        "arkade" => {
+            let network_id = match param {
+                None => NetworkId("arkade".to_string()),
+                Some("testnet") => NetworkId("arkade::testnet".to_string()),
+                Some(other) => {
+                    return Err(format!(
+                        "network 'arkade' only accepts no parameter or 'testnet', got '{other}'"
+                    ));
+                }
+            };
+            // Arkade claims happen with the dedicated per-network
+            // key's x-only identity; the adapter self-reports it via
+            // `claim_pubkey()` so upstream hops lock to it.
+            let sk = network_sk(derived, &network_id)?;
+            let cfg = cassis_arkade::default_config(
+                network_id.clone(),
+                sk,
+                derived.invoice.pubkey(),
+                span.clone(),
+            );
+            let adapter: Arc<dyn NetworkRouterAdapter> = cassis_arkade::ArkadeAdapter::new(cfg)
+                .await
+                .map_err(|e| format!("arkade adapter init failed: {e}"))?;
             let incoming_delta_secs = adapter.incoming_delta_secs();
             Ok(NetworkEntry {
                 network_id,
@@ -328,9 +340,9 @@ async fn build_adapter(
             })
         }
 
-        #[cfg(not(feature = "ark"))]
-        "ark" => Err(
-            "network 'ark' requested but cassis-router was not compiled with the 'ark' feature"
+        #[cfg(not(feature = "arkade"))]
+        "arkade" => Err(
+            "network 'arkade' requested but cassis-router was not compiled with the 'arkade' feature"
                 .into(),
         ),
 

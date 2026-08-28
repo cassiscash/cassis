@@ -598,7 +598,6 @@ mod tests {
 
     #[test]
     fn fallback_known_networks() {
-        assert_eq!(fallback_incoming_delta(&NetworkId("ark".into())), 10);
         assert_eq!(fallback_incoming_delta(&NetworkId("fedimint".into())), 30);
         assert_eq!(fallback_incoming_delta(&NetworkId("cashu".into())), 30);
         assert_eq!(fallback_incoming_delta(&NetworkId("liquid".into())), 300);

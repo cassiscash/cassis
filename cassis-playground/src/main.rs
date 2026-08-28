@@ -89,6 +89,11 @@ const NETWORKS: &[NetworkDef] = &[
         spec: "rootstock::testnet",
         mint_url: None,
     },
+    NetworkDef {
+        id: "arkade_testnet",
+        spec: "arkade::testnet",
+        mint_url: None,
+    },
 ];
 
 const NODE_NAMES: &[&str] = &[
@@ -448,7 +453,12 @@ impl Playground {
                     .sum::<u64>()
                     .saturating_mul(1000)
             }
-            None => {
+            _ if network.spec == "arkade::testnet" => {
+                let adapter =
+                    cassis_client::adapters::build_arkade_adapter(&spec, &derived, span).await?;
+                adapter.balance_msat().await.map_err(|e| e.to_string())?
+            }
+            _ => {
                 let adapter =
                     cassis_client::adapters::build_rootstock_adapter(&spec, &derived, span).await?;
                 adapter.balance_msat().await.map_err(|e| e.to_string())?
@@ -499,6 +509,7 @@ fn colored_network_name(name: &str) -> String {
         // Both the playground's own id and the wire `NetworkId`, since
         // adapter spans carry the latter.
         "rootstock_testnet" | "rootstock::testnet" => 97,
+        "arkade_testnet" | "arkade::testnet" => 94,
         _ => 37,
     };
     format!("\x1b[{background};{foreground}m{name}\x1b[0m")
@@ -539,10 +550,36 @@ async fn command_fund(
     let net = network(network_id)?.clone();
     ensure_membership(playground, node_id, network_id).await?;
     let span = playground.node_span(node_id).await;
-    match net.mint_url {
-        Some(mint_url) => fund_cashu(node_id, network_id, mint_url, amount, span).await,
-        None => fund_rootstock(node_id, amount * 1000, span).await,
+    if net.mint_url.is_some() {
+        return fund_cashu(node_id, network_id, net.mint_url.unwrap(), amount, span).await;
     }
+    if net.spec == "arkade::testnet" {
+        return fund_arkade(node_id, span).await;
+    }
+    fund_rootstock(node_id, amount * 1000, span).await
+}
+
+/// Arkade has no API faucet on public operators, so funding prints the
+/// node's addresses (boarding / on-chain / arkade) for a manual top-up
+/// via the mutinynet faucet at https://mutinynet.arkade.money or any
+/// funded wallet; rerun `balance` afterwards to confirm arrival.
+async fn fund_arkade(node_id: &str, span: Span) -> Result<(), String> {
+    let spec = NetSpec::parse("arkade::testnet")?;
+    let home = node_home(node_id);
+    let derived = load_and_derive(&home, vec![spec.network_id()])?;
+    let adapter = cassis_client::adapters::build_arkade_adapter(&spec, &derived, span).await?;
+    let (boarding, onchain, arkade) = adapter
+        .deposit_addresses()
+        .await
+        .map_err(|e| e.to_string())?;
+    info!(
+        "fund {node_id} on {}: send test coins to boarding {} (or onchain {},          Arkade {} for direct VTXO transfers), then check `balance`",
+        colored_network_name("arkade_testnet"),
+        boarding,
+        onchain,
+        arkade
+    );
+    Ok(())
 }
 
 async fn ensure_membership(
@@ -673,6 +710,8 @@ async fn command_router(
         .iter()
         .map(|s| match s {
             NetSpec::Cashu { host, .. } => format!("cashu::{host}"),
+            NetSpec::Arkade { testnet: true } => "arkade::testnet".into(),
+            NetSpec::Arkade { testnet: false } => "arkade".into(),
             NetSpec::Rootstock { testnet: true } => "rootstock::testnet".into(),
             NetSpec::Rootstock { testnet: false } => "rootstock".into(),
         })

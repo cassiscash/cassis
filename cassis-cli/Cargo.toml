@@ -7,7 +7,7 @@ edition.workspace = true
 default = []
 cashu = ["dep:cassis-cashu", "dep:cdk", "cassis-router/cashu", "cassis-core/cashu"]
 fedimint = ["dep:cassis-fedimint"]
-ark = ["dep:cassis-arkade"]
+arkade = ["dep:cassis-arkade", "cassis-client/arkade", "cassis-router/arkade", "cassis-core/arkade"]
 liquid = ["dep:cassis-liquid"]
 rootstock = ["dep:cassis-rootstock", "cassis-router/rootstock", "cassis-core/rootstock"]
 

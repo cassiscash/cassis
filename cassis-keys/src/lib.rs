@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn derives_deterministic_keys() {
-        let ids = vec![NetworkId("liquid".into()), NetworkId("ark".into())];
+        let ids = vec![NetworkId("liquid".into()), NetworkId("arkade".into())];
         let a = derive_keys(TEST_MNEMONIC, ids.clone()).unwrap();
         let b = derive_keys(TEST_MNEMONIC, ids.clone()).unwrap();
         assert_eq!(a.nostr.as_bytes(), b.nostr.as_bytes());
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn different_networks_get_different_keys() {
-        let ids = vec![NetworkId("liquid".into()), NetworkId("ark".into())];
+        let ids = vec![NetworkId("liquid".into()), NetworkId("arkade".into())];
         let keys = derive_keys(TEST_MNEMONIC, ids.clone()).unwrap();
         assert_ne!(
             keys.networks.get(&ids[0]).unwrap().as_bytes(),

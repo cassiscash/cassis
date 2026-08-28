@@ -112,6 +112,23 @@ async fn build_pair(
                 sender: adapter,
             })
         }
+        #[cfg(feature = "arkade")]
+        NetSpec::Arkade { .. } => {
+            let cfg = cassis_arkade::default_config(
+                network_id.clone(),
+                network_sk(derived, &network_id)?,
+                derived.invoice.pubkey(),
+                span.clone(),
+            );
+            let adapter = cassis_arkade::ArkadeAdapter::new(cfg)
+                .await
+                .map_err(|e| format!("arkade adapter init failed: {e}"))?;
+            Ok(AdapterPair {
+                network_id,
+                receiver: adapter.clone(),
+                sender: adapter,
+            })
+        }
         #[allow(unreachable_patterns)]
         _ => Err(format!(
             "network kind '{}' requested but cassis-client was not compiled with that feature",
@@ -183,6 +200,26 @@ pub async fn build_rootstock_adapter(
     cassis_rootstock::RootstockAdapter::new(cfg)
         .await
         .map_err(|e| format!("rootstock adapter init failed: {e}"))
+}
+
+/// Build a concrete `cassis_arkade::ArkadeAdapter` for an arkade
+/// spec (for the wallet/CLI `balance` / `deposit` / `send`
+/// subcommands).
+#[cfg(feature = "arkade")]
+pub async fn build_arkade_adapter(
+    spec: &NetSpec,
+    derived: &DerivedKeys,
+    span: Span,
+) -> Result<Arc<cassis_arkade::ArkadeAdapter>, String> {
+    let NetSpec::Arkade { .. } = spec else {
+        return Err(format!("expected an arkade spec, got {}", spec.kind_name()));
+    };
+    let network_id = spec.network_id();
+    let sk = network_sk(derived, &network_id)?;
+    let cfg = cassis_arkade::default_config(network_id, sk, derived.invoice.pubkey(), span);
+    cassis_arkade::ArkadeAdapter::new(cfg)
+        .await
+        .map_err(|e| format!("arkade adapter init failed: {e}"))
 }
 
 /// Build a concrete cashu adapter from a raw mint URL (used by the

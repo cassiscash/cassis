@@ -81,6 +81,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: CashuCommands,
     },
+    /// Manage a node's Arkade funds.
+    Arkade {
+        /// Network spec, `arkade` (default) or `arkade::testnet`.
+        #[arg(long, default_value = "arkade")]
+        network: String,
+        #[command(subcommand)]
+        command: ArkadeCommands,
+    },
     /// Register a network to participate in. The argument format
     /// mirrors `cassis-router`: `cashu::host`, `rootstock`,
     /// `rootstock::testnet`.
@@ -120,6 +128,22 @@ pub enum CashuCommands {
     Balance {
         #[arg(long)]
         network: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ArkadeCommands {
+    /// Show the node's offchain Arkade balance.
+    Balance,
+    /// Print deposit addresses (boarding / on-chain / arkade).
+    Deposit,
+    /// Send VTXOs to another Arkade address.
+    Send {
+        /// Destination Arkade address (`ark1...` / `tark1...`).
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount_msat: u64,
     },
 }
 
