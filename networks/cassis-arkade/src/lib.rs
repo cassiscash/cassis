@@ -1130,6 +1130,17 @@ impl Network for ArkadeAdapter {
                 "need {needed} msat, wallet has {available} msat"
             )));
         }
+        // Every VTXO holds at least the dust limit, so coin selection
+        // only leaves sub-dust change when nothing else is left to add,
+        // and the operator rejects that output.
+        let change = available - needed;
+        let dust = self.dust.to_sat() * MSAT_PER_SAT;
+        if change > 0 && change < dust {
+            return Err(NetworkError::invalid(format!(
+                "sending {needed} msat of {available} msat would leave change below the \
+                 operator's dust limit of {dust} msat"
+            )));
+        }
         Ok(())
     }
 
