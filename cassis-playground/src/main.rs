@@ -33,7 +33,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 const ROOT: &str = "/tmp/cassis-playground";
 const COMMAND_HISTORY: &str = "commands.history";
 const RELAY: &str = "ws://localhost:10000";
-const RSK_SEED: &str = "tmp/rsk-seed";
+const ROOTSTOCK_SEED: &str = "tmp/rootstock-seed";
+const ARKADE_SEED: &str = "tmp/arkade-seed";
+const LIQUID_SEED: &str = "tmp/liquid-seed";
 const DEFAULT_FUND_AMOUNT: u64 = 1000;
 
 #[derive(Clone)]
@@ -554,6 +556,13 @@ fn cdk_dir(id: &str) -> PathBuf {
     PathBuf::from(ROOT).join("cdk").join(id)
 }
 
+fn read_funding_seed(dir: &str) -> Result<String, String> {
+    let path = Path::new(dir).join("seed");
+    std::fs::read_to_string(&path)
+        .map(|seed| seed.trim().to_string())
+        .map_err(|e| format!("read {}: {e}", path.display()))
+}
+
 async fn command_fund(
     playground: &Playground,
     node_id: &str,
@@ -570,20 +579,27 @@ async fn command_fund(
         return fund_cashu(node_id, network_id, net.mint_url.unwrap(), amount, span).await;
     }
     if net.spec == "arkade::testnet" {
-        return fund_arkade(node_id, span).await;
+        return fund_arkade(node_id, amount, span).await;
     }
     if net.spec == "liquid::testnet" {
-        return fund_liquid(node_id, span).await;
+        return fund_liquid(node_id, amount, span).await;
     }
     fund_rootstock(node_id, amount * 1000, span).await
 }
 
-/// Liquid testnet L-BTC has a web faucet; print the node's
-/// confidential address for a manual top-up (e.g. via
-/// https://liquidtestnet.com), then check `balance` once the tx
-/// confirms and the wallet rescans.
-async fn fund_liquid(node_id: &str, span: Span) -> Result<(), String> {
+async fn fund_liquid(node_id: &str, amount_sat: u64, span: Span) -> Result<(), String> {
     let spec = NetSpec::parse("liquid::testnet")?;
+    let source_home = PathBuf::from(LIQUID_SEED);
+    let source_mnemonic = read_funding_seed(LIQUID_SEED)?;
+    let source_keys = cassis_keys::derive_keys(&source_mnemonic, vec![spec.network_id()])
+        .map_err(|e| e.to_string())?;
+    let source = cassis_client::adapters::build_liquid_adapter(
+        &spec,
+        &source_keys,
+        &node_store_path(&source_home),
+        span.clone(),
+    )
+    .await?;
     let home = node_home(node_id);
     let derived = load_and_derive(&home, vec![spec.network_id()])?;
     let adapter = cassis_client::adapters::build_liquid_adapter(
@@ -594,32 +610,38 @@ async fn fund_liquid(node_id: &str, span: Span) -> Result<(), String> {
     )
     .await?;
     let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
+    let txid = source
+        .transfer_to_address(&address, amount_sat.saturating_mul(1000))
+        .await
+        .map_err(|e| e.to_string())?;
     info!(
-        "fund {node_id} on {}: send test L-BTC to {address}, then check `balance`",
+        "funded {node_id} on {}: {amount_sat} sat, tx {txid}",
         colored_network_name("liquid_testnet"),
     );
     Ok(())
 }
 
-/// Arkade has no API faucet on public operators, so funding prints the
-/// node's addresses (boarding / on-chain / arkade) for a manual top-up
-/// via the mutinynet faucet at https://mutinynet.arkade.money or any
-/// funded wallet; rerun `balance` afterwards to confirm arrival.
-async fn fund_arkade(node_id: &str, span: Span) -> Result<(), String> {
+async fn fund_arkade(node_id: &str, amount_sat: u64, span: Span) -> Result<(), String> {
     let spec = NetSpec::parse("arkade::testnet")?;
+    let source_mnemonic = read_funding_seed(ARKADE_SEED)?;
+    let source_keys = cassis_keys::derive_keys(&source_mnemonic, vec![spec.network_id()])
+        .map_err(|e| e.to_string())?;
+    let source =
+        cassis_client::adapters::build_arkade_adapter(&spec, &source_keys, span.clone()).await?;
     let home = node_home(node_id);
     let derived = load_and_derive(&home, vec![spec.network_id()])?;
     let adapter = cassis_client::adapters::build_arkade_adapter(&spec, &derived, span).await?;
-    let (boarding, onchain, arkade) = adapter
+    let (_, _, arkade) = adapter
         .deposit_addresses()
         .await
         .map_err(|e| e.to_string())?;
+    let txid = source
+        .transfer_to_ark_address(&arkade, amount_sat.saturating_mul(1000))
+        .await
+        .map_err(|e| e.to_string())?;
     info!(
-        "fund {node_id} on {}: send test coins to boarding {} (or onchain {},          Arkade {} for direct VTXO transfers), then check `balance`",
+        "funded {node_id} on {}: {amount_sat} sat, tx {txid}",
         colored_network_name("arkade_testnet"),
-        boarding,
-        onchain,
-        arkade
     );
     Ok(())
 }
@@ -702,8 +724,7 @@ async fn fund_cashu(
 }
 
 async fn fund_rootstock(node_id: &str, amount_msat: u64, span: Span) -> Result<(), String> {
-    let source_mnemonic =
-        std::fs::read_to_string(RSK_SEED).map_err(|e| format!("read {RSK_SEED}: {e}"))?;
+    let source_mnemonic = read_funding_seed(ROOTSTOCK_SEED)?;
     let source_spec = NetSpec::parse("rootstock::testnet")?;
     let source_keys = cassis_keys::derive_keys(&source_mnemonic, vec![source_spec.network_id()])
         .map_err(|e| e.to_string())?;
@@ -1094,7 +1115,7 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             _ => info!("usage: route <sender> <target> <amount_msat>"),
         },
         Some("help") => info!(
-            "fund <node> <network> [amount] (cashu: sats, rootstock: msats) | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
+            "fund <node> <network> [amount_sat] | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
         ),
         Some("quit") | Some("exit") => info!("use Ctrl-C to exit"),
         Some(other) => info!("unknown command '{other}'; try help"),
@@ -1141,7 +1162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("summary:\n{}", playground.summary().await);
     info!(
-        "fund <node> <network> [amount] (cashu: sats, rootstock: msats) | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
+        "fund <node> <network> [amount_sat] | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
     );
 
     loop {
