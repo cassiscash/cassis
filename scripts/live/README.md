@@ -147,7 +147,14 @@ relay restarted so the shorter arkade route is not announced):
 | 3 hops arkade → fedimint | paid, 127s |
 | r3 SIGKILLed right after accepting PREPARE | payer fails at hop 3 (connect timeout); r7 (cashu) and r2 (rootstock) refund on their own at expiry |
 | payee SIGKILLed after every hop locked | r7 (cashu), r2 (rootstock), r3 (fedimint) refund on their own at expiry |
-| payer's own arkade refunds (both tests) | **failed**: our arkd swept the VHTLC VTXOs at batch expiry (~1h, `ARKD_VTXO_TREE_EXPIRY=3584`) before the refunds opened (~1.5h); 2009 sat stuck, finding l |
+| payer's own arkade refunds (both tests) | **failed**: our arkd swept the VHTLC VTXOs at batch expiry (~1h, `ARKD_VTXO_TREE_EXPIRY=3584`) before the refunds opened (~1.5h); 2009 sat stuck, fix 7 |
+| after fix 7, 1h batches | r7 announces 2270s; payer refuses before locking: `leg 0 would run 5520s, its router accepts at most 2270s` |
+| after fix 7, 4h batches, r7 `--max-incoming-lifetime 13136` | paid, 74s |
+| after fix 7, payee SIGKILLed after every hop locked | everyone refunds at expiry, the payer's arkade lock included (its batch outlived it by 2.4h) |
+| alice → r1 → r7 → frank (arkade), r7 holding one 1005 sat VTXO | lock failed: 4 sat change, below the 330 sat dust limit (fix 8) |
+| the same after fix 8, change would be 310 sat | refused at PREPARE, nothing locked, 4s |
+| the same, 1000 sat of r7's 1005 + 2005 sat VTXOs | paid, 4s |
+| the same 1.6h later, r7's 2010 sat change expiring 10 min before the HTLC deadline + margin | r7 refreshes it into a new batch (expiring 3.5h later), then locks: paid, 6s |
 
 ### Fixed
 
@@ -176,6 +183,23 @@ relay restarted so the shorter arkade route is not announced):
    claim, claimed the incoming HTLC a second time (`Token Already
    Spent`, `swap has no Ether locked`), overwrote `Settled` and retried
    until expiry, ending `Failed`. No funds lost; it now reloads the hop.
+7. **Arkade HTLCs could outlive their batch.** An offchain VTXO expires
+   with the batch it descends from, after which the operator sweeps it
+   and it can no longer be spent offchain: a VHTLC locked for longer
+   could neither be refunded nor claimed (arkd: `VTXO_RECOVERABLE`), and
+   the payer's payment stayed `Pending` forever. Now an HTLC must be
+   over 20 minutes before its VHTLC's batch expires: receivers reject
+   VHTLCs that are not, senders refresh soon-expiring coins into a new
+   batch before locking, and routers announce
+   `max_incoming_lifetime_secs` (the operator's batch lifetime, learnt
+   from the wallet's VTXOs, less the margin; or `enable
+   --max-incoming-lifetime`), which payers plan within and PREPARE
+   enforces.
+8. **Arkade sends could leave dust change.** The SDK's coin selection
+   adds one more VTXO when the change would be below the operator's
+   dust limit, but fails (`AMOUNT_TOO_LOW`) when there is none left,
+   after the router had accepted PREPARE and the upstream HTLC was
+   locked. `can_send` now refuses such amounts at PREPARE.
 
 ### Open findings
 
@@ -206,14 +230,14 @@ j. `invoice --expires-in 1` fails ("must be in the future") because
 k. cashu.mutinynet.com rate-limits per IP (`Rate limit exceeded`), and
    cdk-cli's quote wait polls fast enough to trip it indefinitely: a
    cassis wallet polling a public mint for long could hit the same.
-l. Arkade ignores VTXO batch expiry. An outgoing VHTLC inherits the
-   expiry of the VTXOs that funded it; if the operator sweeps them before
-   the refund opens, `refund_outgoing_htlc` keeps failing ("no unspent
-   VTXO found at the VHTLC address"), `check_outgoing_htlc` stays
-   `Pending`, and the payment never ends. Likewise a receiver can accept
-   a VHTLC that is swept before it can claim. The sender should refresh
-   its VTXOs (or refuse) when their expiry is not well past the HTLC's,
-   the receiver should reject such VHTLCs, and swept VHTLCs need a
-   recovery path (an intent spending the refund leaf). Wallet VTXOs
-   are swept too: henry's 4985 sat change read as 0 until `onboard`
-   settled it into a new batch; nothing renews them automatically.
+l. Wallet VTXOs expire with their batch too and nothing renews them
+   unless an HTLC is about to be locked: a swept wallet VTXO reads as 0
+   until `onboard` settles it into a new batch (henry's 4985 sat, r7's
+   2005 sat). The two VHTLCs swept before fix 7 (2009 sat) stay
+   recoverable at our arkd; spending them needs a batch intent, which
+   ark-client 0.12 does not expose for custom scripts.
+m. Redeeming an arknote into a wallet that already holds a live VTXO
+   fails (`mismatch between VTXO count (2) and connector count (1)`):
+   the SDK settles the note together with the VTXO and arkd builds a
+   connector for the VTXO only. `arkd.sh give` only works on wallets
+   without live VTXOs.
