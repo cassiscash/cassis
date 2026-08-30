@@ -33,9 +33,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 const ROOT: &str = "/tmp/cassis-playground";
 const COMMAND_HISTORY: &str = "commands.history";
 const RELAY: &str = "ws://localhost:10000";
-const ROOTSTOCK_SEED: &str = "tmp/rootstock-seed";
-const ARKADE_SEED: &str = "tmp/arkade-seed";
-const LIQUID_SEED: &str = "tmp/liquid-seed";
+const DEFAULT_PREFUND_SEED: &str =
+    "position emerge strong hawk clog educate suspect sport vast forward gesture absorb";
 const DEFAULT_FUND_AMOUNT: u64 = 1000;
 
 #[derive(Clone)]
@@ -238,16 +237,20 @@ struct Playground {
     children: Mutex<Vec<Child>>,
     relay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     balances: Mutex<HashMap<(String, String), BalanceMsat>>,
+    prefund_seed: String,
 }
 
 impl Playground {
-    async fn new() -> Result<Arc<Self>, String> {
+    async fn new(prefund_seed: String) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(Path::new(ROOT)).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(prefund_store_path().parent().unwrap_or(Path::new(ROOT)))
+            .map_err(|e| e.to_string())?;
         let playground = Arc::new(Self {
             nodes: Mutex::new(HashMap::new()),
             children: Mutex::new(Vec::new()),
             relay_task: Mutex::new(None),
             balances: Mutex::new(HashMap::new()),
+            prefund_seed,
         });
         let network_ids = NETWORKS
             .iter()
@@ -556,11 +559,8 @@ fn cdk_dir(id: &str) -> PathBuf {
     PathBuf::from(ROOT).join("cdk").join(id)
 }
 
-fn read_funding_seed(dir: &str) -> Result<String, String> {
-    let path = Path::new(dir).join("seed");
-    std::fs::read_to_string(&path)
-        .map(|seed| seed.trim().to_string())
-        .map_err(|e| format!("read {}: {e}", path.display()))
+fn prefund_store_path() -> PathBuf {
+    PathBuf::from(ROOT).join("prefund").join("store.db")
 }
 
 async fn command_fund(
@@ -579,24 +579,27 @@ async fn command_fund(
         return fund_cashu(node_id, network_id, net.mint_url.unwrap(), amount, span).await;
     }
     if net.spec == "arkade::testnet" {
-        return fund_arkade(node_id, amount, span).await;
+        return fund_arkade(&playground.prefund_seed, node_id, amount, span).await;
     }
     if net.spec == "liquid::testnet" {
-        return fund_liquid(node_id, amount, span).await;
+        return fund_liquid(&playground.prefund_seed, node_id, amount, span).await;
     }
-    fund_rootstock(node_id, amount * 1000, span).await
+    fund_rootstock(&playground.prefund_seed, node_id, amount * 1000, span).await
 }
 
-async fn fund_liquid(node_id: &str, amount_sat: u64, span: Span) -> Result<(), String> {
+async fn fund_liquid(
+    prefund_seed: &str,
+    node_id: &str,
+    amount_sat: u64,
+    span: Span,
+) -> Result<(), String> {
     let spec = NetSpec::parse("liquid::testnet")?;
-    let source_home = PathBuf::from(LIQUID_SEED);
-    let source_mnemonic = read_funding_seed(LIQUID_SEED)?;
-    let source_keys = cassis_keys::derive_keys(&source_mnemonic, vec![spec.network_id()])
+    let source_keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
         .map_err(|e| e.to_string())?;
     let source = cassis_client::adapters::build_liquid_adapter(
         &spec,
         &source_keys,
-        &node_store_path(&source_home),
+        &prefund_store_path(),
         span.clone(),
     )
     .await?;
@@ -621,10 +624,14 @@ async fn fund_liquid(node_id: &str, amount_sat: u64, span: Span) -> Result<(), S
     Ok(())
 }
 
-async fn fund_arkade(node_id: &str, amount_sat: u64, span: Span) -> Result<(), String> {
+async fn fund_arkade(
+    prefund_seed: &str,
+    node_id: &str,
+    amount_sat: u64,
+    span: Span,
+) -> Result<(), String> {
     let spec = NetSpec::parse("arkade::testnet")?;
-    let source_mnemonic = read_funding_seed(ARKADE_SEED)?;
-    let source_keys = cassis_keys::derive_keys(&source_mnemonic, vec![spec.network_id()])
+    let source_keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
         .map_err(|e| e.to_string())?;
     let source =
         cassis_client::adapters::build_arkade_adapter(&spec, &source_keys, span.clone()).await?;
@@ -723,10 +730,14 @@ async fn fund_cashu(
     Ok(())
 }
 
-async fn fund_rootstock(node_id: &str, amount_msat: u64, span: Span) -> Result<(), String> {
-    let source_mnemonic = read_funding_seed(ROOTSTOCK_SEED)?;
+async fn fund_rootstock(
+    prefund_seed: &str,
+    node_id: &str,
+    amount_msat: u64,
+    span: Span,
+) -> Result<(), String> {
     let source_spec = NetSpec::parse("rootstock::testnet")?;
-    let source_keys = cassis_keys::derive_keys(&source_mnemonic, vec![source_spec.network_id()])
+    let source_keys = cassis_keys::derive_keys(prefund_seed, vec![source_spec.network_id()])
         .map_err(|e| e.to_string())?;
     let source =
         cassis_client::adapters::build_rootstock_adapter(&source_spec, &source_keys, span.clone())
@@ -743,6 +754,57 @@ async fn fund_rootstock(node_id: &str, amount_msat: u64, span: Span) -> Result<(
         "funded {node_id} on {}: tx {tx}",
         colored_network_name("rootstock_testnet")
     );
+    Ok(())
+}
+
+/// Show the prefund wallet addresses per network so test coins can be
+/// sent to them manually (faucets, another wallet, ...); the `fund`
+/// command then spends them from here into nodes.
+async fn command_prefund(prefund_seed: &str) -> Result<(), String> {
+    let span = info_span!("prefund");
+    let mut output = format!("prefund seed: {prefund_seed}\n");
+
+    let spec = NetSpec::parse("rootstock::testnet")?;
+    let keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
+        .map_err(|e| e.to_string())?;
+    let adapter =
+        cassis_client::adapters::build_rootstock_adapter(&spec, &keys, span.clone()).await?;
+    output.push_str(&format!(
+        "{}: {}\n",
+        colored_network_name("rootstock_testnet"),
+        adapter.address()
+    ));
+
+    let spec = NetSpec::parse("liquid::testnet")?;
+    let keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
+        .map_err(|e| e.to_string())?;
+    let adapter = cassis_client::adapters::build_liquid_adapter(
+        &spec,
+        &keys,
+        &prefund_store_path(),
+        span.clone(),
+    )
+    .await?;
+    let address = adapter.deposit_address().await.map_err(|e| e.to_string())?;
+    output.push_str(&format!(
+        "{}: {address}\n",
+        colored_network_name("liquid_testnet"),
+    ));
+
+    let spec = NetSpec::parse("arkade::testnet")?;
+    let keys = cassis_keys::derive_keys(prefund_seed, vec![spec.network_id()])
+        .map_err(|e| e.to_string())?;
+    let adapter = cassis_client::adapters::build_arkade_adapter(&spec, &keys, span).await?;
+    let (boarding, onchain, arkade) = adapter
+        .deposit_addresses()
+        .await
+        .map_err(|e| e.to_string())?;
+    output.push_str(&format!(
+        "{}:\n  boarding: {boarding}\n  onchain: {onchain}\n  arkade: {arkade}\n",
+        colored_network_name("arkade_testnet"),
+    ));
+
+    info!("send test coins to:\n{output}");
     Ok(())
 }
 
@@ -906,7 +968,7 @@ impl Completer for CommandHelper {
         let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
         let word = &line[start..pos];
         let candidates = [
-            "fund", "router", "pay", "route", "summary", "help", "quit", "exit",
+            "fund", "router", "pay", "route", "summary", "prefund", "help", "quit", "exit",
         ]
         .into_iter()
         .chain(NODE_NAMES.iter().copied())
@@ -1097,6 +1159,16 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             }
             _ => info!("usage: pay <node_id_sender> <node_id_target> <amount_msat>"),
         },
+        Some("prefund") => {
+            let seed = playground.prefund_seed.clone();
+            async {
+                if let Err(e) = command_prefund(&seed).await {
+                    warn!("prefund failed: {e}");
+                }
+            }
+            .instrument(info_span!("prefund"))
+            .await;
+        }
         Some("summary") => {}
         Some("route") => match (
             parts.next(),
@@ -1115,7 +1187,7 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
             _ => info!("usage: route <sender> <target> <amount_msat>"),
         },
         Some("help") => info!(
-            "fund <node> <network> [amount_sat] | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | quit"
+            "fund <node> <network> [amount_sat] | router <node> [network...] | pay <sender> <target> <amount_msat> | summary | route <sender> <target> <amount_msat> | prefund | quit"
         ),
         Some("quit") | Some("exit") => info!("use Ctrl-C to exit"),
         Some(other) => info!("unknown command '{other}'; try help"),
@@ -1130,8 +1202,29 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
     }
 }
 
+fn parse_prefund_seed_arg() -> Result<String, String> {
+    let mut args = std::env::args().skip(1);
+    let mut prefund_seed = DEFAULT_PREFUND_SEED.to_string();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--prefund-seed" => {
+                prefund_seed = args
+                    .next()
+                    .ok_or("--prefund-seed requires a seed phrase argument")?;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument '{other}'; usage: cassis-playground [--prefund-seed <mnemonic>]"
+                ));
+            }
+        }
+    }
+    Ok(prefund_seed)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let prefund_seed = parse_prefund_seed_arg()?;
     let logs = Arc::new(StdMutex::new(VecDeque::new()));
     let printer = Arc::new(StdMutex::new(None));
     tracing_subscriber::registry()
@@ -1143,7 +1236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             printer: printer.clone(),
         })
         .init();
-    let playground = Playground::new().await?;
+    let playground = Playground::new(prefund_seed).await?;
 
     let mut editor = Editor::<CommandHelper, rustyline::history::DefaultHistory>::new()?;
     editor.set_helper(Some(CommandHelper));
