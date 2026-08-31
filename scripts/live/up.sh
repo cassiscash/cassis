@@ -7,7 +7,7 @@ set -euo pipefail
 source "$(dirname "$0")/env.sh"
 S="$LIVE_SCRIPTS"
 
-ROUTERS="${ROUTERS:-r1 r2 r3 r4 r5 r6}"
+ROUTERS="${ROUTERS:-r1 r2 r3 r4 r5 r6 r7}"
 
 "$S/relay.sh" start
 "$S/mint.sh" start 1

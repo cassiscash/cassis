@@ -48,6 +48,7 @@ node's home):
 | `node.sh` | `route`/`serve`/`stop` nodes in the background, `pay`, `route-of` |
 | `pay.sh` | one payment with the payee serving its invoice, plus an optional failure hook |
 | `up.sh` / `down.sh` | bring everything up / down again |
+| `hooks/` | `pay.sh` failure hooks: `kill-router.sh`, `kill-payee.sh` |
 | `arkd/build.sh` | builds `target/arkd-light` (needs go) |
 
 Needs on `PATH`: `cdk-mintd`, `cdk-cli`, `nak`, `curl`; and
@@ -90,10 +91,22 @@ scripts/live/mint.sh fund-external cashu.mutinynet.com r6 20000          # print
 scripts/live/mint.sh fund-external cashu.mutinynet.com r6 20000 <quote>  # after paying
 cassis grace enable $MM
 
-for r in r1 r2 r3 r4 r5 r6; do scripts/live/node.sh route $r; done
+# Arkade-first routes: henry pays from our arkd, r7 bridges it to mint 2.
+cassis henry enable $AL;         scripts/live/arkd.sh give henry 6000
+cassis r7 enable $AL $M2;        scripts/live/mint.sh fund 2 r7 10000; scripts/live/arkd.sh give r7 6000
+
+for r in r1 r2 r3 r4 r5 r6 r7; do scripts/live/node.sh route $r; done
 ```
 
-Afterwards `scripts/live/up.sh` / `down.sh` restart it all.
+Afterwards `scripts/live/up.sh` / `down.sh` restart it all;
+`ROUTERS="r1 r2 r3" scripts/live/up.sh` starts only some routers.
+
+`arkd.sh give` only works on a wallet without live VTXOs (finding m):
+fund a wallet once, then move sats with `cassis <node> arkade send`.
+Our arkd's batches last 4h (`ARKD_VTXO_TREE_EXPIRY`, see `arkd.sh`):
+coins older than that are swept and read as 0 until
+`cassis <node> arkade --network $AL onboard` settles them into a new
+batch.
 
 ## Running payments
 
@@ -106,12 +119,50 @@ scripts/live/pay.sh alice $M1 erin 1000000               # 4 hops (→ arkade::m
 scripts/live/pay.sh alice $M1 frank 1000000              # 5 hops (→ our arkade)
 scripts/live/pay.sh alice $M1 grace 1000000              # 2 hops (→ cashu.mutinynet.com)
 scripts/live/pay.sh grace $MM dave 500000                # 3 hops out of the public mint
-scripts/live/pay.sh alice $M1 dave 1000000 ./hook.sh     # hook gets the short hash
+scripts/live/pay.sh henry $AL dave 1000000              # 4 hops (arkade → cashu → rootstock → fedimint)
 ```
+
+The payer takes the cheapest announced route, so stop the routers of
+a shorter one to force a longer one: for henry's route, `node.sh stop
+r4; node.sh stop r5`, then restart the relay (`relay.sh stop; relay.sh
+start`, it forgets their announcements) and the remaining routers.
 
 Inspect state with `cassis <node> payments|invoices|hops` and the
 routers' logs (`tmp/live/nodes/<router>.log`). Expired HTLCs are only
 refunded by a serving node: `node.sh serve alice` for a payer.
+
+## Failure and refund tests
+
+`pay.sh`'s fifth argument is a hook run in the background with the
+payment's short hash (its last 7 hex digits, as logs print it), to break
+the payment midway:
+
+```sh
+H=scripts/live/hooks
+# A router dies after accepting PREPARE: the payer fails at that hop,
+# the routers before it refund at expiry.
+ROUTER=r3 scripts/live/pay.sh henry $AL dave 1000000 $H/kill-router.sh
+# A router dies after forwarding (AT=execute): restart it with
+# `node.sh route r3`; it must settle or refund on its own.
+AT=execute ROUTER=r3 scripts/live/pay.sh henry $AL dave 1000000 $H/kill-router.sh
+# The payee dies once every hop is locked: everything refunds at expiry.
+LAST=r3 PAYEE=dave scripts/live/pay.sh henry $AL dave 1000000 $H/kill-payee.sh
+```
+
+Then, for each test:
+
+1. `scripts/live/node.sh serve henry`: the payer refunds its own HTLC
+   only while serving (routers already are).
+2. Note each lock's expiry: `locked … until <unix time>` in the routers'
+   logs, and the payer's in `tmp/live/nodes/henry.pay.log`. The first
+   leg expires last, over an hour later on long routes; rootstock and
+   fedimint refunds wait for a few more blocks after it.
+3. Once past it, every hop should log `<hash> refunded on <network>`:
+   `grep <hash> tmp/live/nodes/*.log`, and `cassis <node> hops` shows
+   `Refunded` on routers, `cassis henry payments` on the payer.
+
+Restart killed routers with `node.sh route <router>` before the next
+test.
 
 ## Results (2026-11-03)
 
