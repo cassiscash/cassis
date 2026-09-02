@@ -78,11 +78,28 @@ pub fn load_and_derive(home: &Path, ids: Vec<NetworkId>) -> Result<keys::Derived
 /// Generates the preimage locally and persists the row in the node's
 /// store. Returns the Invoice (with the local iroh peer id baked in)
 /// ready for the payer to consume.
+///
+/// The caller may pass pre-resolved claim pubkeys (taken from an
+/// already-open receiver adapter) to avoid reopening network wallets
+/// just to read `claim_pubkey()`. When empty, receivers are built for
+/// the sole purpose of resolving the claim identity.
 pub async fn create_invoice_for(
     home: &Path,
     network_id: NetworkId,
     spec: NetSpec,
     amount_msat: u64,
+) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
+    create_invoice_with_claim_pubkeys(home, network_id, amount_msat, Vec::new(), Some(spec)).await
+}
+
+/// Same as [`create_invoice_for`] but with claim pubkeys resolved by
+/// the caller (or empty to fall back to [`Invoice::payee`]).
+pub async fn create_invoice_with_claim_pubkeys(
+    home: &Path,
+    network_id: NetworkId,
+    amount_msat: u64,
+    claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)>,
+    spec_for_resolution: Option<NetSpec>,
 ) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
     let mnemonic = read_mnemonic(&seed_path(home)).map_err(|e| e.to_string())?;
     let ids = vec![network_id.clone()];
@@ -94,19 +111,26 @@ pub async fn create_invoice_for(
     // rootstock claims on-chain with a dedicated per-network EVM
     // account, so the last hop has to lock to *that* key or the payee
     // cannot claim.
-    let claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)> = {
-        let receivers = build_receivers(
-            std::slice::from_ref(&spec),
-            &derived,
-            &store_path,
-            Span::current(),
-        )
-        .await?;
-        receivers
-            .get(&network_id)
-            .and_then(|r| r.claim_pubkey())
-            .map(|pubkey| vec![(network_id.clone(), pubkey)])
-            .unwrap_or_default()
+    let claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)> = if !claim_pubkeys.is_empty() {
+        claim_pubkeys
+    } else {
+        match spec_for_resolution {
+            Some(spec) => {
+                let receivers = build_receivers(
+                    std::slice::from_ref(&spec),
+                    &derived,
+                    &store_path,
+                    Span::current(),
+                )
+                .await?;
+                receivers
+                    .get(&network_id)
+                    .and_then(|r| r.claim_pubkey())
+                    .map(|pubkey| vec![(network_id.clone(), pubkey)])
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        }
     };
     let now = unix_now();
     let ttl = 600u64;
@@ -261,7 +285,20 @@ pub async fn start_receive(
     let derived = load_and_derive(home, ids)?;
     let receivers =
         build_receivers(networks, &derived, &node_store_path(home), span.clone()).await?;
-    let receivers: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>> = Arc::new(receivers);
+    start_receive_with(home, Arc::new(receivers), networks, span).await
+}
+
+/// [`start_receive`] with caller-supplied receiver adapters, so an
+/// already-open wallet set can be reused instead of reopened (some
+/// networks hold exclusive locks on their wallet state).
+pub async fn start_receive_with(
+    home: &Path,
+    receivers: Arc<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>>,
+    networks: &[NetSpec],
+    span: Span,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    let ids: Vec<NetworkId> = networks.iter().map(|s| s.network_id()).collect();
+    let derived = load_and_derive(home, ids)?;
 
     let (iroh_server, iroh_secret) = IrohServer::new(derived.iroh.clone())
         .await
