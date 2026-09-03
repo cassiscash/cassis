@@ -10,9 +10,9 @@
 //! * **Claim** (incoming HTLC): the receiver reveals the preimage in
 //!   the witness and signs; the operator co-signs the collaborative
 //!   claim path during submitTx/finalizeTx.
-//! * **Refund**: after the absolute `refund_locktime` block height,
-//!   the sender spends via the "refund without receiver" path, again
-//!   co-signed by the operator.
+//! * **Refund**: once the chain tip's block time passes the absolute
+//!   `refund_locktime` timestamp, the sender spends via the "refund
+//!   without receiver" path, again co-signed by the operator.
 //! * **Preimage observation** (for routing): when the counterparty
 //!   claims our outgoing VHTLC, the preimage is embedded in the spend
 //!   transaction's PSBT under the `condition` unknown field; we poll
@@ -36,7 +36,6 @@ use ark_core::send::sign_checkpoint_transaction;
 use ark_core::send::OffchainTransactions;
 use ark_core::send::SendReceiver;
 use ark_core::send::VtxoInput;
-use ark_core::server::parse_sequence_number;
 use ark_core::server::VirtualTxOutPoint;
 use ark_core::vhtlc::VhtlcOptions;
 use ark_core::vhtlc::VhtlcScript;
@@ -52,6 +51,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::key::Keypair;
 use bitcoin::key::Secp256k1;
 use bitcoin::psbt;
+use bitcoin::relative;
 use bitcoin::secp256k1::schnorr;
 use bitcoin::secp256k1::Message;
 use bitcoin::taproot::LeafVersion;
@@ -77,22 +77,36 @@ pub const TESTNET_SERVER_URL: &str = "https://mutinynet.arkade.sh";
 const MAINNET_ESPLORA_URL: &str = "https://mempool.space/api";
 const TESTNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
 
-const MAINNET_BLOCK_TIME_SECS: u64 = 600;
-const MUTINYNET_BLOCK_TIME_SECS: u64 = 30;
+// The operator re-validates every tapscript leaf of a VHTLC whenever
+// a spend of it is registered, and unless it is itself configured
+// with a block-based batch expiry -- the public Arkade operators are
+// seconds-based -- it rejects block-based timelocks outright
+// ("INVALID_VTXO_SCRIPT ... block type not allowed"). Every timelock
+// below is therefore expressed in seconds: the CSV delays as BIP68
+// seconds-type sequences, the refund CLTV as a unix timestamp.
 
-/// CSV delay (blocks) for the unilateral claim path of HTLCs locked
+/// CSV delay (seconds) for the unilateral claim path of HTLCs locked
 /// by us: how long the downstream hop must wait to claim without
-/// operator cooperation. Small enough that it is not a burden, large
-/// enough to be a meaningful escape hatch (~a day of mainnet blocks).
-const UNILATERAL_CLAIM_DELAY_BLOCKS: u16 = 144;
-/// CSV delay (blocks) for the sender+receiver joint refund path.
-const UNILATERAL_REFUND_DELAY_BLOCKS: u16 = 144;
-/// CSV delay (blocks) before the sender alone can refund.
-const UNILATERAL_REFUND_WITHOUT_RECEIVER_DELAY_BLOCKS: u16 = 72;
-/// Extra block-height headroom added on top of the expiry-derived
-/// refund locktime so clock skew between lockup and the chain cannot
-/// make the CLTV land too early.
-const REFUND_LOCKTIME_SLACK_BLOCKS: u64 = 6;
+/// operator cooperation after unilaterally exiting. Small enough
+/// that it is not a burden, large enough to be a meaningful escape
+/// hatch.
+const UNILATERAL_CLAIM_DELAY_SECS: u32 = 12 * 60 * 60;
+/// How much later (seconds) the sender-alone unilateral refund path
+/// opens compared to the receiver's unilateral claim path. The
+/// receiver needs a strict head start: with the operator gone, a
+/// refund path opening at or before the claim path would let the
+/// sender race the receiver for funds the preimage already entitles
+/// the receiver to.
+const UNILATERAL_REFUND_GAP_SECS: u32 = 12 * 60 * 60;
+/// Extra headroom (seconds) added on top of the route expiry for the
+/// refund CLTV, so miner timestamp skew (block times may run ahead of
+/// wall-clock time) cannot open the refund path while the receiver's
+/// claim window is still running.
+const REFUND_LOCKTIME_SLACK_SECS: u64 = 3600;
+/// `nLockTime` values below this threshold are block heights, values
+/// at or above it unix timestamps (Bitcoin consensus rule; the
+/// operator applies the same cutoff to the refund CLTV).
+const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
 
 const POLL_INTERVAL_SECS: u64 = 5;
 const RPC_TIMEOUT_SECS: u64 = 30;
@@ -133,10 +147,6 @@ pub struct ArkadeConfig {
     /// gRPC endpoint of the operator (e.g. `https://mutinynet.arkade.sh`).
     pub server_url: String,
     pub esplora_url: String,
-    /// Seconds between blocks on the operator's chain; used to map a
-    /// unix-seconds route expiry onto an absolute-block-height refund
-    /// locktime.
-    pub block_time_secs: u64,
     /// 32-byte secret key derived from `cassis/network/<network_id>`.
     /// The adapter claims incoming VHTLCs with its x-only pubkey.
     pub sk: [u8; 32],
@@ -157,7 +167,6 @@ pub fn default_config(
             network_id,
             server_url: TESTNET_SERVER_URL.to_string(),
             esplora_url: TESTNET_ESPLORA_URL.to_string(),
-            block_time_secs: MUTINYNET_BLOCK_TIME_SECS,
             sk,
             invoice_pubkey,
             span: span.clone(),
@@ -166,7 +175,6 @@ pub fn default_config(
             network_id,
             server_url: MAINNET_SERVER_URL.to_string(),
             esplora_url: MAINNET_ESPLORA_URL.to_string(),
-            block_time_secs: MAINNET_BLOCK_TIME_SECS,
             sk,
             invoice_pubkey,
             span,
@@ -187,6 +195,18 @@ fn bitcoin_network(network_id: &NetworkId) -> bitcoin::Network {
 /// payment hash is SHA256(preimage).
 fn vhtlc_payment_hash160(payment_hash: &Bytes32) -> ripemd160::Hash {
     ripemd160::Hash::hash(payment_hash.as_ref())
+}
+
+/// A CSV delay measured the way the operator compares exit delays
+/// when validating a VTXO script: seconds-type sequences count their
+/// real seconds (512-second granularity), height-type ones a nominal
+/// one second per block.
+fn exit_delay_secs(delay: Sequence) -> u32 {
+    match delay.to_relative_lock_time() {
+        Some(relative::LockTime::Time(time)) => u32::from(time.value()) * 512,
+        Some(relative::LockTime::Blocks(height)) => u32::from(height.value()),
+        None => 0,
+    }
 }
 
 fn msat_to_sat_amount(amount_msat: u64) -> Result<bitcoin::Amount, HtlcError> {
@@ -232,7 +252,10 @@ pub struct ArkadeAdapter {
     network_id: NetworkId,
     invoice_pubkey: PubKey,
     span: Span,
-    block_time_secs: u64,
+    /// The operator rejects scripts whose smallest exit (CSV) delay is
+    /// shorter than its advertised unilateral exit delay, measured via
+    /// [`exit_delay_secs`]; our delays are floored at this.
+    exit_delay_floor_secs: u32,
     keypair: Keypair,
     claim_xonly: XOnlyPublicKey,
     claim_pubkey: PubKey,
@@ -302,16 +325,18 @@ impl ArkadeAdapter {
             .await
             .map_err(|e| Error::Client(format!("get_info: {e}")))?;
         let server_pk_xonly = XOnlyPublicKey::from(info.signer_pk);
+        let exit_delay_floor_secs = exit_delay_secs(info.unilateral_exit_delay);
 
         let span = cassis_core::network_span(&config.span, &config.network_id);
         span.in_scope(|| {
             debug!(
                 target: "cassis_arkade",
-                "adapter ready: operator={} signer={} claim={} dust={} sats",
+                "adapter ready: operator={} signer={} claim={} dust={} sats exit_floor={}s",
                 config.server_url,
                 server_pk_xonly,
                 claim_xonly,
                 info.dust.to_sat(),
+                exit_delay_floor_secs,
             );
         });
 
@@ -319,7 +344,7 @@ impl ArkadeAdapter {
             network_id: config.network_id.clone(),
             invoice_pubkey: config.invoice_pubkey,
             span,
-            block_time_secs: config.block_time_secs,
+            exit_delay_floor_secs,
             keypair,
             claim_xonly,
             claim_pubkey,
@@ -376,9 +401,17 @@ impl ArkadeAdapter {
             };
             Ok(ripemd160::Hash::from_byte_array(arr))
         };
+        // The descriptor carries consensus sequence numbers, so they
+        // round-trip bit-for-bit (seconds-type sequences set bit 22 and
+        // would be mangled by any blocks-vs-seconds heuristic).
         let parse_sequence = |u: u32| -> Result<Sequence, HtlcError> {
-            parse_sequence_number(i64::from(u))
-                .map_err(|e| HtlcError::InvalidParams(format!("invalid CSV delay {u}: {e}")))
+            let sequence = Sequence::from_consensus(u);
+            if !sequence.is_relative_lock_time() {
+                return Err(HtlcError::InvalidParams(format!(
+                    "invalid CSV delay: {u} is not a relative locktime"
+                )));
+            }
+            Ok(sequence)
         };
 
         Ok(VhtlcOptions {
@@ -415,7 +448,6 @@ impl ArkadeAdapter {
         payment_hash: &Bytes32,
         recipient: &PubKey,
         expiry: u64,
-        current_height: u64,
     ) -> Result<VhtlcOptions, HtlcError> {
         let now = Self::unix_now();
         if expiry <= now {
@@ -423,35 +455,65 @@ impl ArkadeAdapter {
         }
         let recipient_xonly = XOnlyPublicKey::from_str(recipient.to_hex().as_str())
             .map_err(|e| HtlcError::InvalidParams(format!("invalid recipient pubkey: {e}")))?;
-        // Map the remaining route lifetime onto an absolute block
-        // height for the CLTV-gated refund paths.
-        let remaining_blocks = expiry.saturating_sub(now) / self.block_time_secs;
-        let refund_locktime = (current_height + remaining_blocks + REFUND_LOCKTIME_SLACK_BLOCKS)
-            .min(u64::from(u32::MAX - 1));
+        // The refund CLTV takes the route expiry directly: cassis
+        // expiries are unix seconds, and the operator checks timestamp
+        // locktimes against the chain tip's block time.
+        let refund_locktime = u32::try_from(expiry.saturating_add(REFUND_LOCKTIME_SLACK_SECS))
+            .map_err(|_| {
+                HtlcError::InvalidParams(format!("expiry {expiry} overflows nLockTime"))
+            })?;
+        if refund_locktime < MIN_TIMESTAMP_LOCKTIME {
+            return Err(HtlcError::InvalidParams(format!(
+                "expiry {expiry} is not an absolute unix timestamp"
+            )));
+        }
+
+        let unilateral_claim_delay = self.exit_delay(UNILATERAL_CLAIM_DELAY_SECS)?;
+        // The sender-alone exit opens a strict gap after the
+        // receiver's claim exit (see [`UNILATERAL_REFUND_GAP_SECS`]),
+        // measured from the claim delay's actual (floored, 512s-
+        // granular) value so the ordering survives any operator floor.
+        let unilateral_refund_without_receiver_delay = Sequence::from_seconds_ceil(
+            exit_delay_secs(unilateral_claim_delay).saturating_add(UNILATERAL_REFUND_GAP_SECS),
+        )
+        .map_err(|e| HtlcError::InvalidParams(format!("CSV delay out of range: {e}")))?;
 
         Ok(VhtlcOptions {
             sender: self.claim_xonly,
             receiver: recipient_xonly,
             server: self.server_pk_xonly,
+            // `payment_hash160` is HASH160(preimage), represented by
+            // the RIPEMD160 of cassis' SHA256 payment hash.
             preimage_hash: vhtlc_payment_hash160(payment_hash),
-            refund_locktime: refund_locktime as u32,
-            unilateral_claim_delay: Sequence::from_height(UNILATERAL_CLAIM_DELAY_BLOCKS),
-            unilateral_refund_delay: Sequence::from_height(UNILATERAL_REFUND_DELAY_BLOCKS),
-            unilateral_refund_without_receiver_delay: Sequence::from_height(
-                UNILATERAL_REFUND_WITHOUT_RECEIVER_DELAY_BLOCKS,
-            ),
+            refund_locktime,
+            unilateral_claim_delay,
+            // The joint sender+receiver refund needs the receiver's
+            // signature, so it is safe at the earliest delay the
+            // operator accepts; only the sender-alone path must wait
+            // out the receiver's head start.
+            unilateral_refund_delay: unilateral_claim_delay,
+            unilateral_refund_without_receiver_delay,
         })
+    }
+
+    /// A seconds-type CSV sequence of at least `secs`, floored at the
+    /// operator's minimum exit delay.
+    fn exit_delay(&self, secs: u32) -> Result<Sequence, HtlcError> {
+        Sequence::from_seconds_ceil(secs.max(self.exit_delay_floor_secs))
+            .map_err(|e| HtlcError::InvalidParams(format!("CSV delay out of range: {e}")))
     }
 
     fn script_for(&self, options: &VhtlcOptions) -> Result<VhtlcScript, HtlcError> {
         VhtlcScript::new(options.clone(), bitcoin_network(&self.network_id)).map_err(htlc)
     }
 
-    async fn current_height(&self) -> Result<u64, Error> {
+    /// Timestamp of the chain tip block: what the operator holds
+    /// timestamp CLTVs against (not the wall clock).
+    async fn tip_time(&self) -> Result<u64, Error> {
         self.chain
-            .client_height()
+            .tip_time()
             .await
-            .map_err(|e| Error::Client(format!("esplora get_height: {e}")))
+            .map_err(|e| Error::Client(format!("esplora tip_time: {e}")))
     }
 
     /// All VTXO outpoints (spent or not) at the given VHTLC address.
@@ -889,8 +951,7 @@ impl NetworkRouterAdapter for ArkadeAdapter {
                 self.dust.to_sat()
             )));
         }
-        let height = self.current_height().await.map_err(htlc)?;
-        let options = self.build_options_for_outgoing(&payment_hash, &recipient, expiry, height)?;
+        let options = self.build_options_for_outgoing(&payment_hash, &recipient, expiry)?;
         let destination = self.script_for(&options)?.address();
 
         self.span.in_scope(|| {
@@ -951,11 +1012,13 @@ impl NetworkRouterAdapter for ArkadeAdapter {
         // Refunds use the CLTV-gated "without receiver" leaf; until the
         // locktime passes only a cooperative (receiver-signed) refund
         // could move the funds, which the routing protocol never asks
-        // us for.
-        let tip = self.current_height().await.map_err(htlc)?;
-        if u64::from(options.refund_locktime) > tip {
+        // us for. The operator checks the timestamp CLTV against the
+        // chain tip's block time, so gate on that too and let the
+        // router retry until a late-enough block lands.
+        let tip_time = self.tip_time().await.map_err(htlc)?;
+        if u64::from(options.refund_locktime) > tip_time {
             return Err(HtlcError::InvalidParams(format!(
-                "timelock not reached: tip={tip} refund_locktime={}",
+                "timelock not reached: tip_time={tip_time} refund_locktime={}",
                 options.refund_locktime
             )));
         }
@@ -1091,6 +1154,54 @@ impl NetworkRouterAdapter for ArkadeAdapter {
             )));
         }
 
+        // The operator re-validates every leaf of the VHTLC script each
+        // time a spend of it is registered, so leaves it would reject
+        // make the VTXO unclaimable for us. Check the timelock shapes
+        // up front and fail the DISPATCH before anything is locked
+        // downstream.
+        if options.refund_locktime < MIN_TIMESTAMP_LOCKTIME {
+            return Err(HtlcError::InvalidParams(format!(
+                "refund locktime {} is a block height; the operator only \
+                 accepts unix-timestamp refund CLTVs",
+                options.refund_locktime
+            )));
+        }
+        for (name, delay) in [
+            ("unilateral claim", options.unilateral_claim_delay),
+            ("unilateral refund", options.unilateral_refund_delay),
+            (
+                "unilateral refund without receiver",
+                options.unilateral_refund_without_receiver_delay,
+            ),
+        ] {
+            if !delay.is_time_locked() {
+                return Err(HtlcError::InvalidParams(format!(
+                    "{name} delay {delay} is block-based; the operator only \
+                     accepts seconds-type CSV delays"
+                )));
+            }
+            if exit_delay_secs(delay) < self.exit_delay_floor_secs {
+                return Err(HtlcError::InvalidParams(format!(
+                    "{name} delay {delay} is below the operator's minimum \
+                     exit delay of {} seconds",
+                    self.exit_delay_floor_secs
+                )));
+            }
+        }
+        // As receiver we need a strict head start on the operator-less
+        // exit paths: if the sender's lone refund opened at or before
+        // our claim, a dead operator would leave us racing the sender
+        // for funds the preimage already entitles us to.
+        if exit_delay_secs(options.unilateral_refund_without_receiver_delay)
+            <= exit_delay_secs(options.unilateral_claim_delay)
+        {
+            return Err(HtlcError::InvalidParams(format!(
+                "unilateral refund delay {} must open after the unilateral \
+                 claim delay {}",
+                options.unilateral_refund_without_receiver_delay, options.unilateral_claim_delay
+            )));
+        }
+
         let vhtlc = self.script_for(&options)?;
         let has_coins = self
             .outpoints_at_address(&vhtlc)
@@ -1119,6 +1230,15 @@ impl NetworkRouterAdapter for ArkadeAdapter {
                 "incoming HTLC is locked to {}, which this node cannot claim; \
                  expected {} (upstream hop locked to the wrong identity)",
                 options.receiver, self.claim_xonly
+            )));
+        }
+
+        // The upstream lock must not become refundable while our claim
+        // window is still open, or the sender could race our claim.
+        if u64::from(options.refund_locktime) < deadline {
+            return Err(HtlcError::InvalidParams(format!(
+                "refund locktime {} precedes the claim deadline {deadline}",
+                options.refund_locktime
             )));
         }
 
