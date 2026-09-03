@@ -2525,6 +2525,7 @@ dependencies = [
  "async-trait",
  "cassis-core",
  "fs2",
+ "futures",
  "hmac",
  "lwk_common",
  "lwk_signer",
@@ -2535,6 +2536,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tracing",
 ]
 

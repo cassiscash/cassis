@@ -544,7 +544,9 @@ impl NetworkRouterAdapter for RootstockAdapter {
         let blocks_ahead = remaining.div_ceil(RSK_BLOCK_TIME_SECS);
         let timelock = latest.saturating_add(blocks_ahead);
 
-        let preimage_hash = B256::from_slice(payment_hash.as_ref());
+        // EtherSwap calls it `preimageHash` (ABI-fixed), but it is
+        // the route's payment hash: SHA256(preimage).
+        let payment_hash_word = B256::from_slice(payment_hash.as_ref());
         let gas_price = self
             .gas_price_wei()
             .await
@@ -556,7 +558,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
             .gas_limit(LOCK_TX_GAS)
             .input(
                 IEtherSwap::lockCall {
-                    preimageHash: preimage_hash,
+                    preimageHash: payment_hash_word,
                     claimAddress: claim_address,
                     timelock: U256::from(timelock),
                 }
