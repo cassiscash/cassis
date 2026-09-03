@@ -137,12 +137,19 @@ impl EsploraBlockchain {
 }
 
 impl EsploraBlockchain {
-    /// Current block height of the chain behind this explorer.
-    pub async fn client_height(&self) -> Result<u64, String> {
-        self.client
-            .get_height()
+    /// Timestamp of the current chain tip block. The operator
+    /// validates timestamp CLTVs against this, not the wall clock.
+    pub async fn tip_time(&self) -> Result<u64, String> {
+        let tip_hash = self
+            .client
+            .get_tip_hash()
             .await
-            .map(u64::from)
-            .map_err(|e| format!("get_height: {e}"))
+            .map_err(|e| format!("get_tip_hash: {e}"))?;
+        let header = self
+            .client
+            .get_header_by_hash(&tip_hash)
+            .await
+            .map_err(|e| format!("get_header_by_hash: {e}"))?;
+        Ok(u64::from(header.time))
     }
 }
