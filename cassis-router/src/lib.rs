@@ -66,6 +66,10 @@ pub struct RouterConfig {
     /// the router is built with the `cashu` feature.
     #[cfg(feature = "cashu")]
     pub cashu_store: Arc<dyn cassis_cashu::CashuProofStore>,
+    /// Connection to the external LND REST API. LND is deliberately
+    /// configured outside the Cassis node rather than embedded in it.
+    #[cfg(feature = "lightning")]
+    pub lnd_config: Option<cassis_lightning::LndConfig>,
     /// Adapter instances the caller already opened (e.g. a
     /// long-running wallet process holding exclusive Liquid
     /// wallet state). When an entry's [`NetworkId`] matches a
@@ -130,6 +134,8 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
                 &config.cashu_store,
                 #[cfg(feature = "liquid")]
                 config.liquid_store_dir.as_deref(),
+                #[cfg(feature = "lightning")]
+                config.lnd_config.as_ref(),
             )
             .await
             {
@@ -267,6 +273,7 @@ async fn build_adapter(
     span: Span,
     #[cfg(feature = "cashu")] cashu_store: &Arc<dyn cassis_cashu::CashuProofStore>,
     #[cfg(feature = "liquid")] liquid_store_dir: Option<&Path>,
+    #[cfg(feature = "lightning")] lnd_config: Option<&cassis_lightning::LndConfig>,
 ) -> Result<NetworkEntry, String> {
     let (kind, param) = cassis_core::split_spec(spec);
 
@@ -434,6 +441,33 @@ async fn build_adapter(
         #[cfg(not(feature = "rootstock"))]
         "rootstock" => Err(
             "network 'rootstock' requested but cassis-router was not compiled with the 'rootstock' feature"
+                .into(),
+        ),
+
+        #[cfg(feature = "lightning")]
+        "lightning" => {
+            let config = lnd_config.ok_or_else(|| {
+                "network 'lightning' requires an LND REST configuration".to_string()
+            })?;
+            let network_id = NetworkId("lightning".to_string());
+            let adapter = cassis_lightning::LndAdapter::new(
+                network_id.clone(),
+                config.clone(),
+                span.clone(),
+            )
+            .await
+            .map_err(|error| format!("LND adapter init failed: {error}"))?;
+            let adapter: Arc<dyn NetworkRouterAdapter> = adapter;
+            let incoming_delta_secs = adapter.incoming_delta_secs();
+            Ok(NetworkEntry {
+                network_id,
+                adapter,
+                incoming_delta_secs,
+            })
+        }
+        #[cfg(not(feature = "lightning"))]
+        "lightning" => Err(
+            "network 'lightning' requested but cassis-router was not compiled with the 'lightning' feature"
                 .into(),
         ),
 
@@ -624,6 +658,7 @@ impl CassisRouter {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some(format!("can_route failed: {e}")),
+                incoming_descriptor: None,
                 claim_pubkey: None,
             });
         }
@@ -645,18 +680,56 @@ impl CassisRouter {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some(format!("can_claim failed: {e}")),
+                incoming_descriptor: None,
                 claim_pubkey: None,
             });
         }
+
+        // Register the incoming HTLC before the payer funds it. Networks
+        // backed by an external Lightning node (LND hold invoices) must
+        // exist before any upstream payment is attempted; other adapters
+        // use the default no-remote-registration path.
+        let incoming_descriptor = match incoming_entry
+            .adapter
+            .register_incoming_htlc(
+                prepare.payment_hash,
+                prepare.amount_msat,
+                prepare.incoming_deadline,
+            )
+            .await
+        {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                warn!(
+                    target: "cassis_router",
+                    "PREPARE rejected: payment_hash={} reason=register_incoming failed on {}: {error}",
+                    prepare.payment_hash.short(),
+                    prepare.incoming_network,
+                );
+                return Ok(HopPrepared {
+                    payment_hash: prepare.payment_hash,
+                    accepted: false,
+                    reason: Some(format!("register_incoming failed: {error}")),
+                    incoming_descriptor: None,
+                    claim_pubkey: None,
+                });
+            }
+        };
 
         let mut prepared = self.prepared.lock().await;
         let now = unix_now();
         prepared.retain(|entry| entry.expires_at > now);
         if prepared.len() >= 100 {
+            incoming_entry
+                .adapter
+                .cancel_incoming_htlc(prepare.payment_hash)
+                .await
+                .ok();
             return Ok(HopPrepared {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some("PREPARE capacity exhausted".into()),
+                incoming_descriptor: None,
                 claim_pubkey: None,
             });
         }
@@ -677,6 +750,7 @@ impl CassisRouter {
             payment_hash: prepare.payment_hash,
             accepted: true,
             reason: None,
+            incoming_descriptor,
             // Tell the upstream party which identity to lock our
             // incoming HTLC to. Self-reporting it keeps lock and claim
             // in agreement without the payer having to guess which of
@@ -745,11 +819,12 @@ impl CassisRouter {
         let recipient = dispatch.recipient;
         match outgoing_entry
             .adapter
-            .create_outgoing_htlc(
+            .create_outgoing_htlc_with_descriptor(
                 prepare.payment_hash,
                 prepare.amount_msat,
                 prepare.outgoing_expiry,
                 recipient,
+                dispatch.outgoing_target.as_ref(),
             )
             .await
         {
@@ -761,6 +836,11 @@ impl CassisRouter {
                 );
             }
             Err(err) => {
+                incoming_entry
+                    .adapter
+                    .cancel_incoming_htlc(prepare.payment_hash)
+                    .await
+                    .ok();
                 return Err(format!(
                     "create_outgoing_htlc failed on {}: {err}",
                     prepare.outgoing_network
@@ -842,7 +922,14 @@ impl CassisRouter {
                         );
                         false
                     } else {
-                        prepared.remove(index);
+                        let entry = prepared.remove(index);
+                        if let Some(adapter) = self.adapters.get(&entry.prepare.incoming_network) {
+                            adapter
+                                .adapter
+                                .cancel_incoming_htlc(entry.prepare.payment_hash)
+                                .await
+                                .ok();
+                        }
                         true
                     }
                 }

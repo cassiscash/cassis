@@ -680,6 +680,9 @@ impl Playground {
             NetSpec::Rootstock { .. } => NodeWallet::Rootstock(
                 cassis_client::adapters::build_rootstock_adapter(spec, &derived, span).await?,
             ),
+            NetSpec::Lightning => {
+                return Err("playground does not support the 'lightning' network yet".into());
+            }
         };
         Ok(wallet)
     }
@@ -804,6 +807,7 @@ async fn command_fund(
         NetSpec::Rootstock { .. } => {
             fund_rootstock(&playground.prefund_rootstock, node_id, &wallet, amount).await
         }
+        NetSpec::Lightning => Err("playground does not support funding 'lightning'".into()),
     }
 }
 

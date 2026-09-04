@@ -8,6 +8,7 @@ cashu = []
 liquid = []
 arkade = []
 rootstock = []
+lightning = []
 
 [dependencies]
 async-trait = { workspace = true }

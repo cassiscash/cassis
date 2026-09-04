@@ -15,15 +15,31 @@ use tracing::Span;
 use crate::netspec::NetSpec;
 use crate::store::CashuProofDb;
 
+#[derive(Clone, Debug, Default)]
+pub struct AdapterConfig {
+    #[cfg(feature = "lightning")]
+    pub lnd: Option<cassis_lightning::LndConfig>,
+}
+
 pub async fn build_receivers(
     specs: &[NetSpec],
     derived: &DerivedKeys,
     store_path: &Path,
     span: Span,
 ) -> Result<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>, String> {
+    build_receivers_with_config(specs, derived, store_path, span, &AdapterConfig::default()).await
+}
+
+pub async fn build_receivers_with_config(
+    specs: &[NetSpec],
+    derived: &DerivedKeys,
+    store_path: &Path,
+    span: Span,
+    config: &AdapterConfig,
+) -> Result<HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>>, String> {
     let mut out: HashMap<NetworkId, Arc<dyn NetworkReceiverAdapter>> = HashMap::new();
     for spec in specs {
-        let entry = build_pair(spec, derived, store_path, span.clone()).await?;
+        let entry = build_pair(spec, derived, store_path, span.clone(), config).await?;
         out.insert(entry.network_id.clone(), entry.receiver);
     }
     Ok(out)
@@ -35,9 +51,19 @@ pub async fn build_senders(
     store_path: &Path,
     span: Span,
 ) -> Result<HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>, String> {
+    build_senders_with_config(specs, derived, store_path, span, &AdapterConfig::default()).await
+}
+
+pub async fn build_senders_with_config(
+    specs: &[NetSpec],
+    derived: &DerivedKeys,
+    store_path: &Path,
+    span: Span,
+    config: &AdapterConfig,
+) -> Result<HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>>, String> {
     let mut out: HashMap<NetworkId, Arc<dyn NetworkSenderAdapter>> = HashMap::new();
     for spec in specs {
-        let entry = build_pair(spec, derived, store_path, span.clone()).await?;
+        let entry = build_pair(spec, derived, store_path, span.clone(), config).await?;
         out.insert(entry.network_id.clone(), entry.sender);
     }
     Ok(out)
@@ -73,6 +99,7 @@ async fn build_pair(
     derived: &DerivedKeys,
     store_path: &Path,
     span: Span,
+    config: &AdapterConfig,
 ) -> Result<AdapterPair, String> {
     let network_id = spec.network_id();
     match spec {
@@ -129,6 +156,21 @@ async fn build_pair(
             let adapter = cassis_rootstock::RootstockAdapter::new(cfg)
                 .await
                 .map_err(|e| format!("rootstock adapter init failed: {e}"))?;
+            Ok(AdapterPair {
+                network_id,
+                receiver: adapter.clone(),
+                sender: adapter,
+            })
+        }
+        #[cfg(feature = "lightning")]
+        NetSpec::Lightning => {
+            let lnd = config
+                .lnd
+                .as_ref()
+                .ok_or_else(|| "network 'lightning' requires LND configuration".to_string())?;
+            let adapter = cassis_lightning::LndAdapter::new(network_id.clone(), lnd.clone(), span)
+                .await
+                .map_err(|error| format!("LND adapter init failed: {error}"))?;
             Ok(AdapterPair {
                 network_id,
                 receiver: adapter.clone(),

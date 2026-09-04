@@ -9,6 +9,7 @@ members = [
   "networks/cassis-arkade",
   "networks/cassis-rootstock",
   "networks/cassis-liquid",
+  "networks/cassis-lightning",
   "cassis-router",
   "cassis-client",
   "cassis-cli",
@@ -93,5 +94,6 @@ cassis-fedimint = { path = "networks/cassis-fedimint" }
 cassis-arkade = { path = "networks/cassis-arkade" }
 cassis-rootstock = { path = "networks/cassis-rootstock" }
 cassis-liquid = { path = "networks/cassis-liquid" }
+cassis-lightning = { path = "networks/cassis-lightning" }
 cassis-router = { path = "cassis-router" }
 cassis-client = { path = "cassis-client" }

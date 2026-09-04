@@ -2405,6 +2405,7 @@ dependencies = [
  "cassis-fedimint",
  "cassis-iroh",
  "cassis-keys",
+ "cassis-lightning",
  "cassis-liquid",
  "cassis-rootstock",
  "cassis-router",
@@ -2433,6 +2434,7 @@ dependencies = [
  "cassis-core",
  "cassis-iroh",
  "cassis-keys",
+ "cassis-lightning",
  "cassis-liquid",
  "cassis-rootstock",
  "cassis-router",
@@ -2519,6 +2521,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cassis-lightning"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "cassis-core",
+ "lightning-invoice 0.33.3",
+ "lowercase-hex",
+ "reqwest 0.12.28",
+ "secp256k1 0.31.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cassis-liquid"
 version = "0.1.0"
 dependencies = [
@@ -2590,6 +2611,7 @@ dependencies = [
  "cassis-core",
  "cassis-iroh",
  "cassis-keys",
+ "cassis-lightning",
  "cassis-liquid",
  "cassis-rootstock",
  "cassis-routing",

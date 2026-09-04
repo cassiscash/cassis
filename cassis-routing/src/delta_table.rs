@@ -10,6 +10,7 @@ use cassis_core::NetworkId;
 ///   - cashu: 30
 ///   - liquid: 300 (`liquid` and `liquid::testnet`)
 ///   - rootstock: 600 (both mainnet and `rootstock::testnet`)
+///   - lightning: 30
 ///
 /// The default (30 s) matches the most common adapter and is used for
 /// any network not in the table.
@@ -20,6 +21,7 @@ pub fn fallback_incoming_delta(network: &NetworkId) -> u64 {
         "cashu" => 30,
         "liquid" | "liquid::testnet" => 300,
         "rootstock" | "rootstock::testnet" => 600,
+        "lightning" => 30,
         _ => 30,
     }
 }
@@ -59,6 +61,7 @@ mod tests {
             fallback_incoming_delta(&NetworkId("rootstock::testnet".into())),
             600
         );
+        assert_eq!(fallback_incoming_delta(&NetworkId("lightning".into())), 30);
     }
 
     #[test]

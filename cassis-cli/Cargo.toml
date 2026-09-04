@@ -10,6 +10,7 @@ fedimint = ["dep:cassis-fedimint"]
 arkade = ["dep:cassis-arkade", "cassis-client/arkade", "cassis-router/arkade", "cassis-core/arkade"]
 liquid = ["dep:cassis-liquid", "cassis-client/liquid", "cassis-router/liquid", "cassis-core/liquid"]
 rootstock = ["dep:cassis-rootstock", "cassis-router/rootstock", "cassis-core/rootstock"]
+lightning = ["dep:cassis-lightning", "cassis-client/lightning", "cassis-router/lightning", "cassis-core/lightning"]
 
 [dependencies]
 cassis-client = { workspace = true }
@@ -56,5 +57,9 @@ workspace = true
 optional = true
 
 [dependencies.cassis-rootstock]
+workspace = true
+optional = true
+
+[dependencies.cassis-lightning]
 workspace = true
 optional = true

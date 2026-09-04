@@ -120,7 +120,7 @@ pub fn simple_network_id(kind: &str) -> NetworkId {
 /// network ids before adapter lookup. Only the canonical on-the-wire
 /// form (`cashu::<host>`, `fedimint::<invite>`, or the simple kinds
 /// `liquid` / `liquid::testnet` / `arkade` / `arkade::testnet` / `rootstock` /
-/// `rootstock::testnet`) round-trips;
+/// `rootstock::testnet` / `lightning`) round-trips;
 /// anything else is returned unchanged so the adapter lookup rejects it.
 pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
     if let Some(rest) = id.0.strip_prefix(CASHU_NETWORK_ID_PREFIX) {
@@ -139,6 +139,7 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
         || id.0 == "arkade::testnet"
         || id.0 == "rootstock"
         || id.0 == "rootstock::testnet"
+        || id.0 == "lightning"
     {
         return id.clone();
     }
@@ -245,6 +246,19 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
         #[cfg(not(feature = "rootstock"))]
         "rootstock" => Err(
             "network 'rootstock' requested but cassis-core was not compiled with the 'rootstock' feature"
+                .to_string(),
+        ),
+
+        #[cfg(feature = "lightning")]
+        "lightning" => match param {
+            None => Ok(NetworkId("lightning".to_string())),
+            Some(other) => Err(format!(
+                "network 'lightning' does not accept a parameter, got '{other}'"
+            )),
+        },
+        #[cfg(not(feature = "lightning"))]
+        "lightning" => Err(
+            "network 'lightning' requested but cassis-core was not compiled with the 'lightning' feature"
                 .to_string(),
         ),
 
@@ -357,6 +371,11 @@ pub struct Invoice {
     /// aren't known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay: Option<String>,
+    /// Native invoice/payment request for networks that need an encoded
+    /// invoice to initiate payment, such as Lightning. Other networks leave
+    /// this unset and continue using the hash plus claim identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_request: Option<String>,
 }
 
 impl Invoice {
@@ -425,6 +444,10 @@ pub struct HopPrepared {
     pub payment_hash: Bytes32,
     pub accepted: bool,
     pub reason: Option<String>,
+    /// Optional handle the upstream payer must use to fund this hop's
+    /// incoming side. Lightning uses this for the LND hold invoice created
+    /// during PREPARE; other networks leave it unset.
+    pub incoming_descriptor: Option<HtlcDescriptor>,
     /// The identity this hop will claim its *incoming* HTLC with, as
     /// reported by its incoming adapter
     /// ([`NetworkRouterAdapter::claim_pubkey`]).
@@ -455,6 +478,10 @@ pub struct HopDispatch {
     pub payment_hash: Bytes32,
     /// Network-specific handle to the deployed incoming HTLC.
     pub incoming_descriptor: HtlcDescriptor,
+    /// Optional target handle for the outgoing network. Lightning routers
+    /// receive the downstream hop's hold invoice here; the outgoing adapter
+    /// pays this exact invoice rather than constructing a raw hash-only send.
+    pub outgoing_target: Option<HtlcDescriptor>,
     /// Identity the hop must lock its *outgoing* HTLC to: the
     /// downstream party's `claim_pubkey` for that network (the next
     /// hop's [`HopPrepared::claim_pubkey`], or the payee's entry from
@@ -657,6 +684,10 @@ pub enum HtlcDescriptor {
     /// counter-party must pay. Fedimint "sells its own preimage" so
     /// the descriptor is the invoice, not a proof set.
     Fedimint { invoice: String },
+    /// LND BOLT11 hold invoice. The receiving LND created this invoice
+    /// against the route payment hash; the sender must pay this exact
+    /// request so the payment secret is preserved.
+    Lightning { payment_request: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -794,6 +825,36 @@ pub trait NetworkRouterAdapter: Send + Sync {
         deadline: u64,
     ) -> Result<IncomingHtlc, WatchError>;
 
+    /// Register an incoming HTLC before the payer funds it. The default
+    /// implementation reuses the existing watch path and optionally exposes
+    /// a network-specific funding descriptor.
+    async fn register_incoming_htlc(
+        &self,
+        payment_hash: Bytes32,
+        min_amount_msat: u64,
+        deadline: u64,
+    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+        self.watch_incoming_htlc(payment_hash, min_amount_msat, deadline)
+            .await
+            .map_err(|e| HtlcError::Network(e.to_string()))?;
+        self.incoming_htlc_descriptor(payment_hash).await
+    }
+
+    /// Return the handle a payer needs to fund a previously registered
+    /// incoming HTLC. Most networks need no extra handle.
+    async fn incoming_htlc_descriptor(
+        &self,
+        _payment_hash: Bytes32,
+    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+        Ok(None)
+    }
+
+    /// Cancel an incoming registration that was prepared but never funded.
+    /// Most adapters have no remote registration to cancel.
+    async fn cancel_incoming_htlc(&self, _payment_hash: Bytes32) -> Result<(), HtlcError> {
+        Ok(())
+    }
+
     async fn create_outgoing_htlc(
         &self,
         payment_hash: Bytes32,
@@ -801,6 +862,22 @@ pub trait NetworkRouterAdapter: Send + Sync {
         expiry: u64,
         recipient: PubKey,
     ) -> Result<OutgoingHtlc, HtlcError>;
+
+    /// Variant used when the destination network needs a wire-level target
+    /// in addition to the generic claim identity. LND uses the downstream
+    /// hold invoice here; existing adapters inherit the legacy behavior.
+    async fn create_outgoing_htlc_with_descriptor(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+        recipient: PubKey,
+        target: Option<&HtlcDescriptor>,
+    ) -> Result<OutgoingHtlc, HtlcError> {
+        let _ = target;
+        self.create_outgoing_htlc(payment_hash, amount_msat, expiry, recipient)
+            .await
+    }
 
     async fn claim_incoming(
         &self,
@@ -932,7 +1009,21 @@ pub trait NetworkReceiverAdapter: Send + Sync {
         description: Option<String>,
     ) -> Result<Invoice, ReceiveError>;
 
-    /// Wait for the upstream hop to fund the invoice. Returns the
+    /// Register a caller-selected payment hash for an invoice. Networks
+    /// whose native invoice is externally encoded may return that request so
+    /// the payer can carry it through the Cassis route.
+    async fn register_invoice(
+        &self,
+        _payment_hash: Bytes32,
+        _amount_msat: u64,
+        _expiry: u64,
+        _description: Option<String>,
+    ) -> Result<Option<String>, ReceiveError> {
+        Ok(None)
+    }
+
+    /// Wait for the upstream hop to fund the invoice.
+
     /// preimage if the receiver holds it (hash-locked networks); for
     /// "sells its own preimage" networks the network owns the
     /// preimage and this just blocks until funding is observed.
@@ -992,7 +1083,30 @@ pub trait NetworkSenderAdapter: Send + Sync {
         expiry: u64,
     ) -> Result<OutgoingPayment, SendError>;
 
-    /// Block until the payment reaches a terminal state. On success
+    /// Variant used when the destination network supplied an invoice or
+    /// another wire-level funding handle during route preparation.
+    async fn pay_invoice_with_descriptor(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        destination_pubkey: PubKey,
+        destination_network: &NetworkId,
+        expiry: u64,
+        target: Option<&HtlcDescriptor>,
+    ) -> Result<OutgoingPayment, SendError> {
+        let _ = target;
+        self.pay_invoice(
+            payment_hash,
+            amount_msat,
+            destination_pubkey,
+            destination_network,
+            expiry,
+        )
+        .await
+    }
+
+    /// Block until the payment reaches a terminal state.
+
     /// returns the preimage; on failure or refund returns an error.
     async fn watch_payment(
         &self,
@@ -1075,6 +1189,13 @@ where
             WatchError::DeadlineExceeded => ReceiveError::DeadlineExceeded,
             other => ReceiveError::Network(other.to_string()),
         })?;
+        let descriptor = NetworkRouterAdapter::incoming_htlc_descriptor(self, htlc.payment_hash)
+            .await
+            .map_err(|e| ReceiveError::Network(e.to_string()))?;
+        let payment_request = match descriptor {
+            Some(HtlcDescriptor::Lightning { payment_request }) => Some(payment_request),
+            _ => None,
+        };
         Ok(Invoice {
             payment_hash: htlc.payment_hash,
             amount_msat,
@@ -1085,6 +1206,24 @@ where
             description,
             iroh_peer_id: None,
             iroh_relay: None,
+            payment_request,
+        })
+    }
+
+    async fn register_invoice(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+        _description: Option<String>,
+    ) -> Result<Option<String>, ReceiveError> {
+        let descriptor =
+            NetworkRouterAdapter::register_incoming_htlc(self, payment_hash, amount_msat, expiry)
+                .await
+                .map_err(|e| ReceiveError::Network(e.to_string()))?;
+        Ok(match descriptor {
+            Some(HtlcDescriptor::Lightning { payment_request }) => Some(payment_request),
+            _ => None,
         })
     }
 
@@ -1161,6 +1300,37 @@ where
         Ok(OutgoingPayment {
             payment_hash: htlc.payment_hash,
             amount_msat,
+            destination_pubkey: destination_pubkey.to_hex(),
+            destination_network: destination_network.clone(),
+            expiry,
+        })
+    }
+
+    async fn pay_invoice_with_descriptor(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        destination_pubkey: PubKey,
+        destination_network: &NetworkId,
+        expiry: u64,
+        target: Option<&HtlcDescriptor>,
+    ) -> Result<OutgoingPayment, SendError> {
+        let htlc = NetworkRouterAdapter::create_outgoing_htlc_with_descriptor(
+            self,
+            payment_hash,
+            amount_msat,
+            expiry,
+            destination_pubkey,
+            target,
+        )
+        .await
+        .map_err(|e| match e {
+            HtlcError::InvalidParams(msg) => SendError::InvalidParams(msg),
+            other => SendError::Network(other.to_string()),
+        })?;
+        Ok(OutgoingPayment {
+            payment_hash: htlc.payment_hash,
+            amount_msat: htlc.amount_msat,
             destination_pubkey: destination_pubkey.to_hex(),
             destination_network: destination_network.clone(),
             expiry,
