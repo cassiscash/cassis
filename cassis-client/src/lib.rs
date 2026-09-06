@@ -167,16 +167,12 @@ impl CassisClient {
             .map_err(|err| PayError::Route(err.to_string()))?;
 
         if route.is_empty() {
-            // No router hops: payer == payee. Just send COMMIT
-            // to the payee (ourselves or another cassis-cli
-            // instance) and claim via the local receiver
-            // adapter. The CLI side is responsible for setting
-            // up the local receive flow; here we just pass the
-            // invoice through.
-            return Err(PayError::Route(
-                "empty route: same-network pay not implemented; use the receiver adapter directly"
-                    .to_string(),
-            ));
+            // No router hops: payer and payee share a network. Shortcut
+            // the routing cascade — create the HTLC directly on that
+            // network and COMMIT straight to the payee.
+            return self
+                .pay_same_network(&invoice, &dest_network, &sender_network)
+                .await;
         }
 
         // Validate the chain of networks before reserving capacity on
@@ -558,6 +554,111 @@ impl CassisClient {
         // best-effort claim result. We do not block the
         // caller on the sender-side watch because the
         // preimage is already proven by the payee.
+        match sender
+            .watch_payment(first_payment.clone(), first_payment.expiry)
+            .await
+        {
+            Ok(_) => {}
+            Err(SendError::DeadlineExceeded) => {
+                warn!(
+                    target: "cassis_client",
+                    "  sender-side watch timed out (preimage already proven by COMMIT)"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target: "cassis_client",
+                    "  sender-side watch error: {err} (preimage already proven by COMMIT)"
+                );
+            }
+        }
+
+        Ok(PaymentResult {
+            status: PaymentStatus::Completed,
+            preimage: Some(preimage),
+        })
+    }
+
+    /// Same-network shortcut: payer and payee share a network, so there
+    /// are no router hops to PREPARE/DISPATCH. Create the HTLC directly
+    /// on that network, COMMIT straight to the payee, and settle on the
+    /// returned preimage. Mirrors steps 2/4/5 of [`Self::pay`] without
+    /// the route walk.
+    async fn pay_same_network(
+        &self,
+        invoice: &Invoice,
+        dest_network: &NetworkId,
+        sender_network: &NetworkId,
+    ) -> Result<PaymentResult, PayError> {
+        let sender = self
+            .senders
+            .get(sender_network)
+            .ok_or_else(|| PayError::Route("sender network adapter missing".to_string()))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let delta = fallback_incoming_delta(dest_network);
+        let slack = fallback_transit_slack(dest_network);
+        let outgoing_expiry = now.saturating_add(delta).saturating_add(slack);
+
+        let recipient = invoice.claim_pubkey_for(dest_network);
+        let target = invoice
+            .payment_request
+            .clone()
+            .map(|payment_request| HtlcDescriptor::Lightning { payment_request });
+
+        let first_payment = sender
+            .pay_invoice_with_descriptor(
+                invoice.payment_hash,
+                invoice.amount_msat,
+                recipient,
+                sender_network,
+                outgoing_expiry,
+                target.as_ref(),
+            )
+            .await
+            .map_err(|e| PayError::Io(e.to_string()))?;
+
+        let descriptor = sender
+            .outgoing_htlc_descriptor(invoice.payment_hash)
+            .await
+            .map_err(|e| PayError::Io(e.to_string()))?;
+
+        let peer_id = invoice
+            .iroh_peer_id
+            .as_deref()
+            .ok_or_else(|| PayError::Commit("invoice missing payee iroh_peer_id".to_string()))?;
+        let payee_addr = node_addr_from_invoice(peer_id, invoice.iroh_relay.as_deref())
+            .map_err(|e| PayError::Commit(format!("payee addr: {e}")))?;
+        let commit = HopCommit {
+            payment_hash: invoice.payment_hash,
+            amount_msat: invoice.amount_msat,
+            network: dest_network.clone(),
+            incoming_deadline: invoice.expires_at,
+            incoming_descriptor: descriptor,
+        };
+        info!(
+            target: "cassis_client",
+            "sending same-network COMMIT to payee for payment_hash={} on {}",
+            invoice.payment_hash.short(),
+            dest_network,
+        );
+        let committed = self.iroh_client.send_commit(payee_addr, commit).await?;
+        let preimage = committed.preimage;
+        if preimage.0 == [0u8; 32] {
+            return Err(PayError::Commit(
+                "payee returned zero preimage (misroute or commit handler missing)".to_string(),
+            ));
+        }
+        if !preimage_matches(&preimage, &invoice.payment_hash) {
+            return Err(PayError::Commit(format!(
+                "payee preimage does not hash to payment hash {}",
+                invoice.payment_hash
+            )));
+        }
+
         match sender
             .watch_payment(first_payment.clone(), first_payment.expiry)
             .await
