@@ -1,9 +1,12 @@
 use cassis_core::{NetworkId, RouteAnnouncement};
 use ritualistic::{Filter, Kind, Network, SubscriptionOptions, Timestamp};
 use serde::{Deserialize, Serialize};
+// `tokio_with_wasm::alias` is the real `tokio` on native targets and a
+// JS-gluing shim on wasm32, so `tokio::time::timeout` works in the browser.
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
+use tokio_with_wasm::alias as tokio;
 use tracing::{debug, info};
 
 mod delta_table;
@@ -147,11 +150,7 @@ pub async fn fetch_announcements_with_timeout(
     let filter = Filter {
         kinds: Some(vec![Kind(KIND_ROUTE_ANNOUNCEMENT)]),
         since: Some(Timestamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0)
-                .saturating_sub(ANNOUNCEMENTS_MAX_AGE_SECS),
+            unix_now_secs().saturating_sub(ANNOUNCEMENTS_MAX_AGE_SECS),
         )),
         limit: Some(1000),
         ..Default::default()
@@ -234,6 +233,25 @@ pub async fn fetch_announcements_with_timeout(
     }
 
     Ok(announcements)
+}
+
+/// Current unix time in seconds, portable across native and wasm.
+///
+/// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown`
+/// ("time not implemented on this platform"), so on wasm we read
+/// `Date.now()` through `js-sys`; everywhere else we use `SystemTime`.
+fn unix_now_secs() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (js_sys::Date::now() / 1000.0) as u32
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
+    }
 }
 
 /// Parse a `d` tag value of the form `<network_from>-><network_to>`.
