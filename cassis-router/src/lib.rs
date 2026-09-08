@@ -263,6 +263,7 @@ pub struct NetworkEntry {
 /// rather than needing a blanket dead-code allow.
 #[cfg(any(
     feature = "cashu",
+    feature = "fedimint",
     feature = "rootstock",
     feature = "arkade",
     feature = "liquid"
@@ -328,9 +329,34 @@ async fn build_adapter(
                 .into(),
         ),
 
+        #[cfg(feature = "fedimint")]
+        "fedimint" => {
+            let invite = param.ok_or_else(|| {
+                "network 'fedimint' requires an invite code, e.g. fedimint::fed1q...".to_string()
+            })?;
+            let network_id = NetworkId(format!("fedimint::{invite}"));
+            // The fedimint adapter derives its static even-parity
+            // claim keypair from this per-network key and advertises
+            // the matching x-only identity via `claim_pubkey()`, so
+            // upstream hops lock contracts to a key we can actually
+            // claim with.
+            let sk = network_sk(derived, &network_id)?;
+            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
+                cassis_fedimint::FedimintAdapter::new(network_id.clone(), invite.to_string(), sk)
+                    .await
+                    .map_err(|e| format!("fedimint adapter init failed: {e}"))?,
+            );
+            let incoming_delta_secs = adapter.incoming_delta_secs();
+            Ok(NetworkEntry {
+                network_id,
+                adapter,
+                incoming_delta_secs,
+            })
+        }
+
+        #[cfg(not(feature = "fedimint"))]
         "fedimint" => Err(
-            "network 'fedimint' is not supported by cassis-router; \
-             use cassis-cli to receive on a fedimint federation"
+            "network 'fedimint' requested but cassis-router was not compiled with the 'fedimint' feature"
                 .into(),
         ),
 

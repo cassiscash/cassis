@@ -524,7 +524,10 @@ mod tests {
             network: NetworkId("fedimint::x".into()),
             incoming_deadline: 1_786_000_000,
             incoming_descriptor: HtlcDescriptor::Fedimint {
-                invoice: "lnbc...".into(),
+                claim_pubkey: "02aa".into(),
+                funding_txid: None,
+                funding_out_idx: None,
+                contract: None,
             },
         });
         let bytes = postcard::to_allocvec(&commit).expect("encode commit");
@@ -533,7 +536,10 @@ mod tests {
             Frame::Commit(c) => assert_eq!(
                 c.incoming_descriptor,
                 HtlcDescriptor::Fedimint {
-                    invoice: "lnbc...".into(),
+                    claim_pubkey: "02aa".into(),
+                    funding_txid: None,
+                    funding_out_idx: None,
+                    contract: None,
                 }
             ),
             other => panic!("unexpected frame: {other:?}"),
