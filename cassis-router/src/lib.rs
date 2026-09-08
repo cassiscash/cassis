@@ -76,6 +76,13 @@ pub struct RouterConfig {
     /// spec below it is used instead of building a fresh
     /// adapter for that network.
     pub prebuilt_adapters: Vec<Arc<dyn NetworkRouterAdapter>>,
+    /// Optional hook run before a PREPARE is accepted, so a caller
+    /// (e.g. a test) can veto a payment for arbitrary reasons. When it
+    /// returns `Some(reason)`, the PREPARE is rejected with that reason;
+    /// `None` lets the normal checks proceed. Runs *after* the built-in
+    /// validation but *before* any reservation is recorded, so a vetoed
+    /// PREPARE reserves nothing.
+    pub prepare_veto: Option<Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>>,
 }
 
 /// Run the router daemon. Blocks until Ctrl-C. The caller
@@ -166,7 +173,11 @@ pub async fn run_router(config: RouterConfig) -> Result<(), String> {
         config.nostr_relays.clone()
     };
 
-    let router = Arc::new(CassisRouter::new(adapters, config.span));
+    let router = Arc::new(CassisRouter::new(
+        adapters,
+        config.span,
+        config.prepare_veto.clone(),
+    ));
     let handler_router = router.clone();
     let poll_router = router.clone();
     let server_span = router.span.clone();
@@ -495,15 +506,22 @@ pub struct CassisRouter {
     span: Span,
     prepared: Arc<Mutex<Vec<PreparedEntry>>>,
     dispatched: Arc<Mutex<HashMap<Bytes32, DispatchedHop>>>,
+    /// See [`RouterConfig::prepare_veto`].
+    prepare_veto: Option<Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>>,
 }
 
 impl CassisRouter {
-    pub fn new(adapters: HashMap<NetworkId, NetworkEntry>, span: Span) -> Self {
+    pub fn new(
+        adapters: HashMap<NetworkId, NetworkEntry>,
+        span: Span,
+        prepare_veto: Option<Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>>,
+    ) -> Self {
         Self {
             adapters,
             span,
             prepared: Arc::new(Mutex::new(Vec::new())),
             dispatched: Arc::new(Mutex::new(HashMap::new())),
+            prepare_veto,
         }
     }
 
@@ -630,6 +648,30 @@ impl CassisRouter {
             );
         }
         self.validate_prepare(&prepare)?;
+
+        // Caller-supplied veto hook: lets a test (or an operator policy)
+        // reject a PREPARE for arbitrary reasons before any reservation
+        // is recorded. Runs after validation so a vetoed request still
+        // has to be well-formed.
+        if let Some(veto) = &self.prepare_veto {
+            if let Some(reason) = veto(&prepare) {
+                warn!(
+                    target: "cassis_router",
+                    "PREPARE vetoed: payment_hash={} amount_msat={} {} -> {} reason={reason}",
+                    prepare.payment_hash.short(),
+                    prepare.amount_msat,
+                    prepare.incoming_network,
+                    prepare.outgoing_network,
+                );
+                return Ok(HopPrepared {
+                    payment_hash: prepare.payment_hash,
+                    accepted: false,
+                    reason: Some(reason),
+                    incoming_descriptor: None,
+                    claim_pubkey: None,
+                });
+            }
+        }
 
         // Resolved up front: the reply has to carry the identity the
         // upstream party must lock our incoming HTLC to.
