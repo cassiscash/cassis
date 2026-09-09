@@ -6,9 +6,9 @@ pub mod seed_store;
 pub mod store;
 
 use cassis_core::{
-    Bytes32, HopCommit, HopDiscard, HopDispatch, HopPrepare, HtlcDescriptor, Invoice, NetworkId,
-    NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment, PaymentResult, PaymentStatus,
-    RouteHop, SendError,
+    Bytes32, HopCommit, HopCommitted, HopDiscard, HopDispatch, HopPrepare, HtlcDescriptor, Invoice,
+    NetworkId, NetworkReceiverAdapter, NetworkSenderAdapter, OutgoingPayment, PaymentResult,
+    PaymentStatus, RouteHop, SendError,
 };
 use cassis_iroh::{node_addr_from_announcement, node_addr_from_invoice, IrohClient};
 use cassis_routing::{
@@ -790,6 +790,14 @@ impl CassisClient {
             )));
         }
 
+        // Fan the revealed preimage out to every router hop so each can
+        // claim its incoming HTLC now, rather than waiting for the poll
+        // loop to observe the preimage on its downstream network.
+        // Best-effort: a hop that misses the fanout still settles via
+        // its own watch/refund loop.
+        self.fanout_preimage(&addrs, invoice.payment_hash, preimage)
+            .await;
+
         persist_payment_proof(&self.payment_store_path, &invoice, preimage)
             .await
             .map_err(PayError::Io)?;
@@ -1014,6 +1022,47 @@ impl CassisClient {
                     Err(e) => warn!(
                         target: "cassis_client",
                         "DISCARD hop {} failed (best effort): {e}",
+                        i + 1,
+                    ),
+                }
+            }
+        });
+        join_all(futs).await;
+    }
+
+    /// Push an already-revealed preimage to every router hop, so each
+    /// can claim its incoming HTLC without waiting for its poll loop to
+    /// observe the preimage on the downstream network. Concurrent and
+    /// best-effort: a hop that misses the fanout still settles via its
+    /// own watch/refund loop, so failures only log here.
+    async fn fanout_preimage(
+        &self,
+        addrs: &[EndpointAddr],
+        payment_hash: Bytes32,
+        preimage: Bytes32,
+    ) {
+        info!(
+            target: "cassis_client",
+            "fanning preimage out to {} hop(s) for payment_hash={}",
+            addrs.len(),
+            payment_hash.short(),
+        );
+        let futs = addrs.iter().enumerate().map(|(i, addr)| {
+            let addr = addr.clone();
+            let committed = HopCommitted {
+                payment_hash,
+                preimage,
+            };
+            async move {
+                match self.iroh_client.send_committed(addr, committed).await {
+                    Ok(_) => debug!(
+                        target: "cassis_client",
+                        "COMMITTED fanout to hop {}: acknowledged",
+                        i + 1,
+                    ),
+                    Err(e) => warn!(
+                        target: "cassis_client",
+                        "COMMITTED fanout to hop {} failed (best effort): {e}",
                         i + 1,
                     ),
                 }

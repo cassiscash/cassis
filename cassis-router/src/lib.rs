@@ -609,6 +609,13 @@ impl CassisRouter {
                     c.payment_hash.short(), c.amount_msat, c.network,
                 );
             }
+            Frame::Committed(c) => {
+                info!(
+                    target: "cassis_router",
+                    "received COMMITTED preimage fanout from peer={remote}: payment_hash={}",
+                    c.payment_hash.short(),
+                );
+            }
             other => {
                 warn!(
                     target: "cassis_router",
@@ -636,6 +643,11 @@ impl CassisRouter {
                 .map_err(internal),
             Frame::Commit(c) => self
                 .handle_commit(c)
+                .await
+                .map(Frame::Committed)
+                .map_err(internal),
+            Frame::Committed(c) => self
+                .handle_committed(c)
                 .await
                 .map(Frame::Committed)
                 .map_err(internal),
@@ -1037,6 +1049,46 @@ impl CassisRouter {
             payment_hash: commit.payment_hash,
             preimage: Bytes32([0u8; 32]),
         })
+    }
+
+    /// COMMITTED preimage fanout. After the payee reveals the preimage
+    /// to the payer, the payer pushes it to every hop so each can claim
+    /// its incoming HTLC immediately instead of waiting for the poll
+    /// loop to observe the preimage on the downstream network. The
+    /// preimage is validated against the route hash before any claim is
+    /// attempted, so a bogus fanout cannot burn the hop's dispatch
+    /// state; the poll loop remains the fallback when the fanout never
+    /// arrives.
+    async fn handle_committed(&self, committed: HopCommitted) -> Result<HopCommitted, String> {
+        let prepare = {
+            let dispatched = self.dispatched.lock().await;
+            dispatched
+                .get(&committed.payment_hash)
+                .map(|hop| hop.prepare.clone())
+        }
+        .ok_or_else(|| {
+            format!(
+                "no dispatched hop for payment_hash={:?}",
+                committed.payment_hash
+            )
+        })?;
+
+        if !committed.payment_hash.matches_preimage(&committed.preimage) {
+            return Err(format!(
+                "preimage does not hash to payment_hash={}",
+                committed.payment_hash
+            ));
+        }
+
+        info!(
+            target: "cassis_router",
+            "preimage fanout: claiming incoming HTLC for {} on {}",
+            committed.payment_hash.short(),
+            prepare.incoming_network,
+        );
+        self.claim_incoming(committed.payment_hash, &prepare, committed.preimage)
+            .await;
+        Ok(committed)
     }
 
     /// Background task: every [`POLL_INTERVAL_SECS`] seconds,

@@ -13,6 +13,19 @@ impl Bytes32 {
     pub fn short(&self) -> String {
         format!("…{}", self)[60..].to_string()
     }
+
+    /// True when `preimage` is a SHA-256 preimage of this hash. Cheap
+    /// local check used wherever a preimage is received from a peer
+    /// before it is burned on a claim.
+    pub fn matches_preimage(&self, preimage: &Bytes32) -> bool {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(preimage.0);
+        let out = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&out);
+        hash == self.0
+    }
 }
 
 /// Build the per-network child span an adapter should hold and enter
