@@ -59,8 +59,8 @@ use bitcoin::Sequence;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
-    WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, PubKey, WatchError,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -98,11 +98,6 @@ const UNILATERAL_CLAIM_DELAY_SECS: u32 = 12 * 60 * 60;
 /// sender race the receiver for funds the preimage already entitles
 /// the receiver to.
 const UNILATERAL_REFUND_GAP_SECS: u32 = 12 * 60 * 60;
-/// Extra headroom (seconds) added on top of the route expiry for the
-/// refund CLTV, so miner timestamp skew (block times may run ahead of
-/// wall-clock time) cannot open the refund path while the receiver's
-/// claim window is still running.
-const REFUND_LOCKTIME_SLACK_SECS: u64 = 3600;
 /// `nLockTime` values below this threshold are block heights, values
 /// at or above it unix timestamps (Bitcoin consensus rule; the
 /// operator applies the same cutoff to the refund CLTV).
@@ -458,10 +453,9 @@ impl ArkadeAdapter {
         // The refund CLTV takes the route expiry directly: cassis
         // expiries are unix seconds, and the operator checks timestamp
         // locktimes against the chain tip's block time.
-        let refund_locktime = u32::try_from(expiry.saturating_add(REFUND_LOCKTIME_SLACK_SECS))
-            .map_err(|_| {
-                HtlcError::InvalidParams(format!("expiry {expiry} overflows nLockTime"))
-            })?;
+        let refund_locktime = u32::try_from(expiry).map_err(|_| {
+            HtlcError::InvalidParams(format!("expiry {expiry} overflows nLockTime"))
+        })?;
         if refund_locktime < MIN_TIMESTAMP_LOCKTIME {
             return Err(HtlcError::InvalidParams(format!(
                 "expiry {expiry} is not an absolute unix timestamp"
@@ -981,6 +975,26 @@ impl NetworkRouterAdapter for ArkadeAdapter {
             recipient: recipient.to_hex(),
             network: self.network_id.clone(),
         })
+    }
+
+    async fn restore_outgoing_htlc(
+        &self,
+        payment: &OutgoingPayment,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), HtlcError> {
+        let options = Self::parse_vhtlc_options(descriptor.ok_or(HtlcError::Unimplemented)?)?;
+        let recipient = PubKey::from_str(&payment.destination_pubkey)
+            .map_err(|e| HtlcError::InvalidParams(format!("invalid recipient pubkey: {e}")))?;
+        if options.preimage_hash != vhtlc_payment_hash160(&payment.payment_hash) {
+            return Err(HtlcError::InvalidParams(
+                "Arkade descriptor hash does not match outgoing payment".into(),
+            ));
+        }
+        self.outgoing
+            .lock()
+            .await
+            .insert(payment.payment_hash, PendingOutgoing { options, recipient });
+        Ok(())
     }
 
     async fn claim_incoming(

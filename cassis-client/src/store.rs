@@ -1,4 +1,4 @@
-use cassis_core::{Bytes32, NetworkId};
+use cassis_core::{Bytes32, HtlcDescriptor, Invoice, NetworkId, OutgoingPayment};
 use minisqlite::{Connection, Error as SqlError, Value};
 
 /// Re-export of `minisqlite::Value` so callers can pattern-match SQL
@@ -23,6 +23,29 @@ CREATE TABLE IF NOT EXISTS invoices (
 );
 CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices(status);
 
+CREATE TABLE IF NOT EXISTS outgoing_payments (
+    payment_hash       TEXT PRIMARY KEY,
+    invoice_json       TEXT NOT NULL,
+    sender_network     TEXT NOT NULL,
+    amount_msat        INTEGER NOT NULL,
+    destination_pubkey TEXT NOT NULL,
+    destination_network TEXT NOT NULL,
+    expiry             INTEGER NOT NULL,
+    descriptor_json    TEXT,
+    status             TEXT NOT NULL,
+    created_at         INTEGER NOT NULL,
+    resolved_at        INTEGER
+);
+CREATE INDEX IF NOT EXISTS outgoing_payments_status_idx
+    ON outgoing_payments(status);
+
+CREATE TABLE IF NOT EXISTS payment_proofs (
+    payment_hash TEXT PRIMARY KEY,
+    invoice_json TEXT NOT NULL,
+    preimage     BLOB NOT NULL,
+    paid_at      INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cashu_proofs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     mint_url     TEXT NOT NULL,
@@ -39,6 +62,25 @@ pub enum InvoiceStatus {
     Pending,
     Claimed,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutgoingPaymentStatus {
+    Pending,
+    Completed,
+    Refunded,
+    Failed,
+}
+
+impl OutgoingPaymentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Completed => "completed",
+            Self::Refunded => "refunded",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 impl InvoiceStatus {
@@ -72,6 +114,22 @@ pub struct InvoiceRow {
     pub status: InvoiceStatus,
     pub created_at: u64,
     pub claimed_at: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingOutgoingPayment {
+    pub invoice: Invoice,
+    pub payment: OutgoingPayment,
+    pub sender_network: NetworkId,
+    pub descriptor: Option<HtlcDescriptor>,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaymentProof {
+    pub invoice: Invoice,
+    pub preimage: Bytes32,
+    pub paid_at: u64,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -157,6 +215,121 @@ impl Store {
         Ok(())
     }
 
+    pub fn insert_outgoing_payment(
+        &mut self,
+        invoice: &Invoice,
+        payment: &OutgoingPayment,
+        sender_network: &NetworkId,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), StoreError> {
+        let invoice_json = serde_json::to_string(invoice)
+            .map_err(|e| StoreError::Invalid(format!("encode invoice: {e}")))?;
+        let descriptor_json = descriptor
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StoreError::Invalid(format!("encode descriptor: {e}")))?;
+        self.conn.execute(&format!(
+            "INSERT OR REPLACE INTO outgoing_payments \
+             (payment_hash, invoice_json, sender_network, amount_msat, destination_pubkey, \
+              destination_network, expiry, descriptor_json, status, created_at, resolved_at) \
+             VALUES ('{}', {}, {}, {}, {}, {}, {}, {}, '{}', {}, NULL);",
+            payment.payment_hash,
+            escape_sql_string(&invoice_json),
+            escape_sql_string(&sender_network.0),
+            payment.amount_msat,
+            escape_sql_string(&payment.destination_pubkey),
+            escape_sql_string(&payment.destination_network.0),
+            payment.expiry,
+            option_sql_string(&descriptor_json),
+            OutgoingPaymentStatus::Pending.as_str(),
+            unix_now(),
+        ))?;
+        Ok(())
+    }
+
+    pub fn update_outgoing_descriptor(
+        &mut self,
+        payment_hash: &Bytes32,
+        descriptor: &HtlcDescriptor,
+    ) -> Result<(), StoreError> {
+        let descriptor_json = serde_json::to_string(descriptor)
+            .map_err(|e| StoreError::Invalid(format!("encode descriptor: {e}")))?;
+        self.conn.execute(&format!(
+            "UPDATE outgoing_payments SET descriptor_json={} WHERE payment_hash='{}';",
+            escape_sql_string(&descriptor_json),
+            payment_hash,
+        ))?;
+        Ok(())
+    }
+
+    pub fn list_pending_outgoing(&mut self) -> Result<Vec<PendingOutgoingPayment>, StoreError> {
+        let result = self.conn.query(
+            "SELECT invoice_json, payment_hash, sender_network, amount_msat, \
+                    destination_pubkey, destination_network, expiry, descriptor_json, created_at \
+             FROM outgoing_payments WHERE status='pending' ORDER BY created_at ASC;",
+        )?;
+        result
+            .rows
+            .iter()
+            .map(|row| pending_outgoing_from_values(row.as_slice()))
+            .collect()
+    }
+
+    pub fn mark_outgoing_status(
+        &mut self,
+        payment_hash: &Bytes32,
+        status: OutgoingPaymentStatus,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(&format!(
+            "UPDATE outgoing_payments SET status='{}', resolved_at={} WHERE payment_hash='{}';",
+            status.as_str(),
+            unix_now(),
+            payment_hash,
+        ))?;
+        Ok(())
+    }
+
+    pub fn record_payment_proof(
+        &mut self,
+        invoice: &Invoice,
+        preimage: Bytes32,
+    ) -> Result<(), StoreError> {
+        let invoice_json = serde_json::to_string(invoice)
+            .map_err(|e| StoreError::Invalid(format!("encode invoice: {e}")))?;
+        self.conn.execute(&format!(
+            "INSERT OR REPLACE INTO payment_proofs \
+             (payment_hash, invoice_json, preimage, paid_at) \
+             VALUES ('{}', {}, X'{}', {});",
+            invoice.payment_hash,
+            escape_sql_string(&invoice_json),
+            hex::encode(preimage.0),
+            unix_now(),
+        ))?;
+        Ok(())
+    }
+
+    pub fn get_payment_proof(
+        &mut self,
+        payment_hash: &Bytes32,
+    ) -> Result<PaymentProof, StoreError> {
+        let result = self.conn.query(&format!(
+            "SELECT invoice_json, preimage, paid_at FROM payment_proofs \
+             WHERE payment_hash='{}';",
+            payment_hash,
+        ))?;
+        let row = result
+            .rows
+            .first()
+            .ok_or_else(|| StoreError::NotFound(payment_hash.to_string()))?;
+        let invoice = serde_json::from_str(&text_at(row, 0, "invoice_json")?)
+            .map_err(|e| StoreError::Invalid(format!("invoice_json: {e}")))?;
+        Ok(PaymentProof {
+            invoice,
+            preimage: Bytes32(blob_at(row, 1, "preimage")?),
+            paid_at: int_at(row, 2, "paid_at")? as u64,
+        })
+    }
+
     pub fn get(&mut self, payment_hash: &Bytes32) -> Result<InvoiceRow, StoreError> {
         let result = self.conn.query(&format!(
             "SELECT payment_hash, preimage, amount_msat, network_id, payee, description, \
@@ -220,6 +393,44 @@ fn row_from_values(row: &[Value]) -> Result<InvoiceRow, StoreError> {
         status,
         created_at,
         claimed_at,
+    })
+}
+
+fn pending_outgoing_from_values(row: &[Value]) -> Result<PendingOutgoingPayment, StoreError> {
+    let invoice: Invoice = serde_json::from_str(&text_at(row, 0, "invoice_json")?)
+        .map_err(|e| StoreError::Invalid(format!("invoice_json: {e}")))?;
+    let payment_hash = parse_payment_hash_bytes(&text_at(row, 1, "payment_hash")?)
+        .ok_or_else(|| StoreError::Invalid("payment_hash".into()))?;
+    let sender_network = NetworkId(text_at(row, 2, "sender_network")?);
+    let amount_msat = int_at(row, 3, "amount_msat")? as u64;
+    let destination_pubkey = text_at(row, 4, "destination_pubkey")?;
+    let destination_network = NetworkId(text_at(row, 5, "destination_network")?);
+    let expiry = int_at(row, 6, "expiry")? as u64;
+    let descriptor = match row.get(7) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(
+            serde_json::from_str(value)
+                .map_err(|e| StoreError::Invalid(format!("descriptor_json: {e}")))?,
+        ),
+        other => {
+            return Err(StoreError::Invalid(format!(
+                "descriptor_json: expected nullable text, got {other:?}"
+            )))
+        }
+    };
+    let created_at = int_at(row, 8, "created_at")? as u64;
+    Ok(PendingOutgoingPayment {
+        invoice,
+        payment: OutgoingPayment {
+            payment_hash,
+            amount_msat,
+            destination_pubkey,
+            destination_network,
+            expiry,
+        },
+        sender_network,
+        descriptor,
+        created_at,
     })
 }
 

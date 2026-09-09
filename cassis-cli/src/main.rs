@@ -78,6 +78,7 @@ async fn main() {
             .await
         }
         Commands::Receive => cmd_receive(&adapter_config).await,
+        Commands::Watch => cmd_watch(&adapter_config).await,
         Commands::Invoices { command } => match command {
             cli::InvoicesCommands::List { status } => cmd_invoices_list(status),
             cli::InvoicesCommands::Show { payment_hash } => cmd_invoices_show(payment_hash),
@@ -284,7 +285,7 @@ async fn cmd_pay(
         adapter_config,
     )
     .await?;
-    let client = CassisClient::new(senders, relays).await;
+    let client = CassisClient::with_store_path(senders, relays, store_path()).await;
     info!(
         "paying {} msat via '{}' route",
         invoice_struct.amount_msat, from
@@ -299,6 +300,41 @@ async fn cmd_pay(
         cassis_core::PaymentStatus::Failed => println!("status: failed"),
     }
     Ok(())
+}
+
+async fn cmd_watch(adapter_config: &AdapterConfig) -> Result<(), String> {
+    let pending = {
+        let mut store = open_store()?;
+        store.list_pending_outgoing().map_err(|e| e.to_string())?
+    };
+    if pending.is_empty() {
+        println!("no pending outgoing HTLCs");
+        return Ok(());
+    }
+
+    let mut specs = Vec::new();
+    for row in &pending {
+        let spec = NetSpec::parse(&row.sender_network.0)?;
+        if !specs
+            .iter()
+            .any(|existing: &NetSpec| existing.network_id() == spec.network_id())
+        {
+            specs.push(spec);
+        }
+    }
+    let mnemonic = read_or_init_mnemonic()?;
+    let derived = derive_for(&mnemonic, &specs)?;
+    let senders = build_senders_with_config(
+        &specs,
+        &derived,
+        &node_store_path(&node_home()),
+        info_span!("node", node = "cassis-cli"),
+        adapter_config,
+    )
+    .await?;
+    let client =
+        CassisClient::with_store_path(senders, cli::default_nostr_relays(), store_path()).await;
+    client.watch_pending().await
 }
 
 // ============================================================================

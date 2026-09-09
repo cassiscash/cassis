@@ -1089,9 +1089,10 @@ impl CassisRouter {
                     continue;
                 }
             };
-            // Use a short poll deadline so the loop keeps
-            // making progress even when nothing has settled.
-            let poll_deadline = now.saturating_add(POLL_INTERVAL_SECS);
+            // Watch preimage until the outgoing HTLC's actual expiry.
+            // Cap the short poll window there so an adapter cannot
+            // keep us past the point where refund focus must begin.
+            let poll_deadline = outgoing_deadline.min(now.saturating_add(POLL_INTERVAL_SECS));
             match outgoing_entry
                 .adapter
                 .watch_preimage(payment_hash, poll_deadline)
@@ -1170,11 +1171,6 @@ impl CassisRouter {
         self.drop_dispatched(payment_hash).await;
     }
 
-    /// Refund the outgoing HTLC of an expired dispatch. Transient
-    /// (network) failures keep the dispatch row so the next poll tick
-    /// retries — e.g. on Liquid the CLTV refund path only opens a few
-    /// blocks after the route deadline, so the first attempts
-    /// legitimately fail — while permanent errors drop the row.
     async fn refund_dispatched(&self, payment_hash: Bytes32, prepare: &HopPrepare) {
         if let Some(entry) = self.adapters.get(&prepare.outgoing_network) {
             if let Err(e) = entry.adapter.refund_outgoing(payment_hash).await {

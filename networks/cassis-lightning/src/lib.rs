@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
-    WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, PubKey, WatchError,
 };
 use lightning_invoice::Bolt11Invoice;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -450,6 +450,26 @@ impl LndAdapter {
         *pending.state.lock().await = state;
         pending.changed.notify_waiters();
     }
+
+    async fn track_payment(&self, payment_hash: Bytes32, pending: PendingOutgoing) {
+        let result = async {
+            let response = self
+                .client
+                .get(self.endpoint(&format!("v2/router/track/{payment_hash}")))
+                .send()
+                .await
+                .map_err(|error| Error::Http(error.to_string()))?;
+            let body = ensure_success_body(response).await?;
+            parse_payment_stream(&body, payment_hash)
+        }
+        .await;
+        let state = match result {
+            Ok(preimage) => OutgoingState::Succeeded(preimage),
+            Err(error) => OutgoingState::Failed(error.to_string()),
+        };
+        *pending.state.lock().await = state;
+        pending.changed.notify_waiters();
+    }
 }
 
 #[async_trait]
@@ -563,6 +583,36 @@ impl NetworkRouterAdapter for LndAdapter {
             recipient: recipient.to_hex(),
             network: self.network_id.clone(),
         })
+    }
+
+    async fn restore_outgoing_htlc(
+        &self,
+        payment: &OutgoingPayment,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), HtlcError> {
+        let payment_request = self
+            .parse_target(
+                descriptor.ok_or(HtlcError::Unimplemented)?,
+                payment.payment_hash,
+                payment.amount_msat,
+            )
+            .map_err(HtlcError::from)?;
+        let pending = PendingOutgoing {
+            amount_msat: payment.amount_msat,
+            expiry: payment.expiry,
+            payment_request,
+            state: Arc::new(Mutex::new(OutgoingState::Pending)),
+            changed: Arc::new(Notify::new()),
+            cancel: Arc::new(Notify::new()),
+        };
+        let payment_hash = payment.payment_hash;
+        self.outgoing
+            .lock()
+            .await
+            .insert(payment_hash, pending.clone());
+        let adapter = self.clone_for_task();
+        tokio::spawn(async move { adapter.track_payment(payment_hash, pending).await });
+        Ok(())
     }
 
     async fn claim_incoming(

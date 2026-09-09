@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
-    WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, PubKey, WatchError,
 };
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
@@ -14,6 +14,7 @@ use cdk::nuts::nut10::SpendingConditions;
 use cdk::nuts::nut12::ProofDleq;
 use cdk::nuts::nut14::HTLCWitness;
 use cdk::nuts::{CurrencyUnit, KeySetInfo, KeysetResponse, Witness};
+use cdk::secp256k1::hashes::Hash as _;
 use cdk::wallet::MintConnector;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -772,6 +773,60 @@ impl NetworkRouterAdapter for CashuAdapter {
     /// the mint with `preimage` attached as a witness. The
     /// locktime is irrelevant on this path (the receiver is
     /// always allowed to spend per NUT-14).
+    async fn restore_outgoing_htlc(
+        &self,
+        payment: &OutgoingPayment,
+        descriptor: Option<&HtlcDescriptor>,
+    ) -> Result<(), HtlcError> {
+        let proofs = proofs_from_descriptor(descriptor.ok_or(HtlcError::Unimplemented)?)?;
+        if proofs.is_empty() {
+            return Err(HtlcError::InvalidParams(
+                "empty Cashu HTLC descriptor".into(),
+            ));
+        }
+        let conditions = SpendingConditions::try_from(&proofs[0].secret)
+            .map_err(|e| HtlcError::InvalidParams(format!("decode Cashu conditions: {e}")))?;
+        let locktime = match &conditions {
+            SpendingConditions::HTLCConditions {
+                data,
+                conditions: Some(conditions),
+            } => {
+                if data.as_byte_array() != &payment.payment_hash.0 {
+                    return Err(HtlcError::InvalidParams(
+                        "Cashu descriptor hash does not match outgoing payment".into(),
+                    ));
+                }
+                conditions.locktime.ok_or_else(|| {
+                    HtlcError::InvalidParams("Cashu HTLC has no refund locktime".into())
+                })?
+            }
+            _ => {
+                return Err(HtlcError::InvalidParams(
+                    "descriptor is not a Cashu HTLC".into(),
+                ))
+            }
+        };
+        let amount_sat: u64 = proofs.iter().map(|proof| u64::from(proof.amount)).sum();
+        if amount_sat < payment.amount_msat.div_ceil(1000) {
+            return Err(HtlcError::InvalidParams(
+                "Cashu descriptor amount is below outgoing payment".into(),
+            ));
+        }
+        let keyset_id = proofs[0].keyset_id;
+        self.outgoing.lock().await.insert(
+            payment.payment_hash,
+            PendingOutgoing {
+                amount_sat,
+                locktime,
+                conditions,
+                keyset_id,
+                proofs: Mutex::new(proofs),
+                recipient: payment.destination_pubkey.clone(),
+            },
+        );
+        Ok(())
+    }
+
     async fn claim_incoming(
         &self,
         payment_hash: Bytes32,
