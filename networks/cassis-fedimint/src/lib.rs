@@ -70,8 +70,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter, PubKey,
-    WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, PubKey, WatchError,
 };
 
 /// Per-hop delta the routing layer gets on fedimint legs. Contract
@@ -521,36 +520,6 @@ impl NetworkRouterAdapter for FedimintAdapter {
     async fn cancel_incoming_htlc(&self, payment_hash: Bytes32) -> Result<(), HtlcError> {
         self.incoming.lock().await.remove(&payment_hash);
         Ok(())
-    }
-
-    /// Watch for an incoming HTLC. Like cashu, the fedimint
-    /// receiver side cannot poll for an arbitrary contract — it
-    /// learns the funding outpoint out of band via DISPATCH — so
-    /// this registers the hash and returns immediately; the actual
-    /// wait happens at [`NetworkRouterAdapter::claim_incoming`]
-    /// time.
-    async fn watch_incoming_htlc(
-        &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
-    ) -> Result<IncomingHtlc, WatchError> {
-        let mut incoming = self.incoming.lock().await;
-        incoming
-            .entry(payment_hash)
-            .or_insert_with(|| PendingIncoming {
-                min_amount_msat,
-                deadline,
-                funded: None,
-                claim_op: None,
-            });
-        Ok(IncomingHtlc {
-            payment_hash,
-            amount_msat: min_amount_msat,
-            expiry: deadline,
-            sender: String::new(),
-            network: self.network_id.clone(),
-        })
     }
 
     /// DISPATCH-time verify: does `descriptor` decode to a contract

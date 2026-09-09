@@ -710,15 +710,6 @@ pub enum HtlcDescriptor {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IncomingHtlc {
-    pub payment_hash: Bytes32,
-    pub amount_msat: u64,
-    pub expiry: u64,
-    pub sender: String,
-    pub network: NetworkId,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutgoingHtlc {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
@@ -810,7 +801,8 @@ pub enum SendError {
 /// methods are keyed by `payment_hash` only; implementations are
 /// expected to look up any other HTLC fields (amount, expiry,
 /// sender, etc.) from their own per-payment state, populated by
-/// the matching `watch_incoming_htlc` / `create_outgoing_htlc` call.
+/// the matching `register_incoming_htlc` / `accept_incoming_htlc` /
+/// `create_outgoing_htlc` call.
 #[async_trait]
 pub trait NetworkRouterAdapter: Send + Sync {
     fn network_id(&self) -> NetworkId;
@@ -837,26 +829,24 @@ pub trait NetworkRouterAdapter: Send + Sync {
 
     fn incoming_delta_secs(&self) -> u64;
 
-    async fn watch_incoming_htlc(
-        &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
-    ) -> Result<IncomingHtlc, WatchError>;
-
-    /// Register an incoming HTLC before the payer funds it. The default
-    /// implementation reuses the existing watch path and optionally exposes
-    /// a network-specific funding descriptor.
+    /// Register an incoming HTLC before the payer funds it (PREPARE
+    /// time). Nothing is watched or polled here — the adapter only
+    /// parks whatever per-payment state its network needs so the
+    /// later [`NetworkRouterAdapter::accept_incoming_htlc`] (DISPATCH)
+    /// and [`NetworkRouterAdapter::claim_incoming`] calls can find it.
+    /// Adapters that also expose a network-specific funding handle
+    /// (LND hold invoice, fedimint claim key) return it as the
+    /// descriptor; the payer routes it upstream.
+    ///
+    /// The default is "no registration, no descriptor" — adapters
+    /// needing pre-funding state must override.
     async fn register_incoming_htlc(
         &self,
-        payment_hash: Bytes32,
-        min_amount_msat: u64,
-        deadline: u64,
+        _payment_hash: Bytes32,
+        _min_amount_msat: u64,
+        _deadline: u64,
     ) -> Result<Option<HtlcDescriptor>, HtlcError> {
-        self.watch_incoming_htlc(payment_hash, min_amount_msat, deadline)
-            .await
-            .map_err(|e| HtlcError::Network(e.to_string()))?;
-        self.incoming_htlc_descriptor(payment_hash).await
+        Ok(None)
     }
 
     /// Return the handle a payer needs to fund a previously registered
@@ -1183,12 +1173,11 @@ where
         Some(NetworkRouterAdapter::claim_pubkey(self))
     }
 
-    /// Register an incoming contract with the router adapter. We pass
-    /// a fresh random payment hash as a placeholder; "sells its own
-    /// preimage" networks (e.g. cashu) substitute their own and
-    /// return the network's hash on the `IncomingHtlc`. The
-    /// `payment_hash` on the returned `Invoice` is the one the
-    /// upstream hop funds.
+    /// Register an incoming contract with the router adapter. The
+    /// payment hash is locally generated; the receiver learns the
+    /// matching preimage from its own invoice store and claims via
+    /// COMMIT. The `payment_hash` on the returned `Invoice` is the
+    /// one the upstream hop funds.
     async fn create_invoice(
         &self,
         amount_msat: u64,
@@ -1196,27 +1185,17 @@ where
         description: Option<String>,
     ) -> Result<Invoice, ReceiveError> {
         let network_id = self.network_id();
-        let local_payment_hash = Bytes32(rand::random::<[u8; 32]>());
-        let htlc = NetworkRouterAdapter::watch_incoming_htlc(
-            self,
-            local_payment_hash,
-            amount_msat,
-            expiry,
-        )
-        .await
-        .map_err(|e| match e {
-            WatchError::DeadlineExceeded => ReceiveError::DeadlineExceeded,
-            other => ReceiveError::Network(other.to_string()),
-        })?;
-        let descriptor = NetworkRouterAdapter::incoming_htlc_descriptor(self, htlc.payment_hash)
-            .await
-            .map_err(|e| ReceiveError::Network(e.to_string()))?;
+        let payment_hash = Bytes32(rand::random::<[u8; 32]>());
+        let descriptor =
+            NetworkRouterAdapter::register_incoming_htlc(self, payment_hash, amount_msat, expiry)
+                .await
+                .map_err(|e| ReceiveError::Network(e.to_string()))?;
         let payment_request = match descriptor {
             Some(HtlcDescriptor::Lightning { payment_request }) => Some(payment_request),
             _ => None,
         };
         Ok(Invoice {
-            payment_hash: htlc.payment_hash,
+            payment_hash,
             amount_msat,
             payee: self.invoice_pubkey(),
             expires_at: expiry,
@@ -1246,11 +1225,11 @@ where
         })
     }
 
-    /// No-op for the router auto-impl: `create_invoice` already
-    /// delegated to `watch_incoming_htlc`, which did any wait. We
-    /// return a zero preimage as a sentinel; the network owns the
-    /// preimage for "sells its own preimage" adapters and the
-    /// routing layer only cares that the wait completed.
+    /// No-op for the router auto-impl: registration (PREPARE) and
+    /// acceptance (DISPATCH) already happened on other paths, and the
+    /// payee originates the preimage itself. We return a zero
+    /// preimage as a sentinel; the routing layer only cares that the
+    /// wait completed.
     async fn watch_incoming(
         &self,
         _payment_hash: Bytes32,

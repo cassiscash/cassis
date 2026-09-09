@@ -11,8 +11,8 @@ use alloy::sol_types::SolCall;
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, IncomingHtlc, NetworkId, NetworkRouterAdapter,
-    OutgoingHtlc, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc, PubKey,
+    WatchError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -482,14 +482,14 @@ impl NetworkRouterAdapter for RootstockAdapter {
         600
     }
 
-    async fn watch_incoming_htlc(
+    async fn register_incoming_htlc(
         &self,
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<IncomingHtlc, WatchError> {
+    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
         if deadline <= Self::unix_now() {
-            return Err(WatchError::DeadlineExceeded);
+            return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
         let arrival = Arc::new(Notify::new());
         let slot = PendingIncoming {
@@ -502,13 +502,7 @@ impl NetworkRouterAdapter for RootstockAdapter {
         };
         let mut incoming = self.incoming.lock().await;
         incoming.insert(payment_hash, slot);
-        Ok(IncomingHtlc {
-            payment_hash,
-            amount_msat: min_amount_msat,
-            expiry: deadline,
-            sender: String::new(),
-            network: self.config.network_id.clone(),
-        })
+        Ok(None)
     }
 
     async fn create_outgoing_htlc(
