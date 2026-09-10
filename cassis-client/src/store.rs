@@ -1,4 +1,4 @@
-use cassis_core::{Bytes32, HtlcDescriptor, Invoice, NetworkId, OutgoingPayment};
+use cassis_core::{Bytes32, HtlcDescriptor, HtlcTarget, Invoice, NetworkId, OutgoingPayment};
 use minisqlite::{Connection, Error as SqlError, Value};
 
 /// Re-export of `minisqlite::Value` so callers can pattern-match SQL
@@ -237,7 +237,10 @@ impl Store {
             escape_sql_string(&invoice_json),
             escape_sql_string(&sender_network.0),
             payment.amount_msat,
-            escape_sql_string(&payment.destination_pubkey),
+            escape_sql_string(
+                &serde_json::to_string(&payment.destination)
+                    .map_err(|e| StoreError::Invalid(format!("encode destination: {e}")))?
+            ),
             escape_sql_string(&payment.destination_network.0),
             payment.expiry,
             option_sql_string(&descriptor_json),
@@ -403,7 +406,8 @@ fn pending_outgoing_from_values(row: &[Value]) -> Result<PendingOutgoingPayment,
         .ok_or_else(|| StoreError::Invalid("payment_hash".into()))?;
     let sender_network = NetworkId(text_at(row, 2, "sender_network")?);
     let amount_msat = int_at(row, 3, "amount_msat")? as u64;
-    let destination_pubkey = text_at(row, 4, "destination_pubkey")?;
+    let destination = serde_json::from_str::<HtlcTarget>(&text_at(row, 4, "destination_pubkey")?)
+        .map_err(|e| StoreError::Invalid(format!("destination_pubkey: {e}")))?;
     let destination_network = NetworkId(text_at(row, 5, "destination_network")?);
     let expiry = int_at(row, 6, "expiry")? as u64;
     let descriptor = match row.get(7) {
@@ -424,7 +428,7 @@ fn pending_outgoing_from_values(row: &[Value]) -> Result<PendingOutgoingPayment,
         payment: OutgoingPayment {
             payment_hash,
             amount_msat,
-            destination_pubkey,
+            destination,
             destination_network,
             expiry,
         },

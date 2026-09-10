@@ -589,9 +589,9 @@ impl CassisRouter {
             Frame::Dispatch(d) => {
                 info!(
                     target: "cassis_router",
-                    "received DISPATCH: payment_hash={} recipient={} incoming_descriptor={:?}",
+                    "received DISPATCH: payment_hash={} addressing={:?} incoming_descriptor={:?}",
                     d.payment_hash.short(),
-                    d.recipient,
+                    d.htlc_target,
                     d.incoming_descriptor,
                 );
             }
@@ -705,8 +705,7 @@ impl CassisRouter {
                     payment_hash: prepare.payment_hash,
                     accepted: false,
                     reason: Some(reason),
-                    incoming_descriptor: None,
-                    claim_pubkey: None,
+                    htlc_target: None,
                 });
             }
         }
@@ -738,8 +737,7 @@ impl CassisRouter {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some(format!("can_route failed: {e}")),
-                incoming_descriptor: None,
-                claim_pubkey: None,
+                htlc_target: None,
             });
         }
 
@@ -760,8 +758,7 @@ impl CassisRouter {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some(format!("can_claim failed: {e}")),
-                incoming_descriptor: None,
-                claim_pubkey: None,
+                htlc_target: None,
             });
         }
 
@@ -769,7 +766,7 @@ impl CassisRouter {
         // backed by an external Lightning node (LND hold invoices) must
         // exist before any upstream payment is attempted; other adapters
         // use the default no-remote-registration path.
-        let incoming_descriptor = match incoming_entry
+        match incoming_entry
             .adapter
             .register_incoming_htlc(
                 prepare.payment_hash,
@@ -778,7 +775,7 @@ impl CassisRouter {
             )
             .await
         {
-            Ok(descriptor) => descriptor,
+            Ok(_) => {}
             Err(error) => {
                 warn!(
                     target: "cassis_router",
@@ -790,8 +787,7 @@ impl CassisRouter {
                     payment_hash: prepare.payment_hash,
                     accepted: false,
                     reason: Some(format!("register_incoming failed: {error}")),
-                    incoming_descriptor: None,
-                    claim_pubkey: None,
+                    htlc_target: None,
                 });
             }
         };
@@ -809,8 +805,7 @@ impl CassisRouter {
                 payment_hash: prepare.payment_hash,
                 accepted: false,
                 reason: Some("PREPARE capacity exhausted".into()),
-                incoming_descriptor: None,
-                claim_pubkey: None,
+                htlc_target: None,
             });
         }
         prepared.push(PreparedEntry {
@@ -826,16 +821,16 @@ impl CassisRouter {
             prepare.incoming_network,
             prepare.outgoing_network,
         );
+        let htlc_target = incoming_entry
+            .adapter
+            .htlc_target(prepare.payment_hash)
+            .await
+            .map_err(|error| format!("htlc_target failed: {error}"))?;
         Ok(HopPrepared {
             payment_hash: prepare.payment_hash,
             accepted: true,
             reason: None,
-            incoming_descriptor,
-            // Tell the upstream party which identity to lock our
-            // incoming HTLC to. Self-reporting it keeps lock and claim
-            // in agreement without the payer having to guess which of
-            // our keys signs claims on this network.
-            claim_pubkey: Some(incoming_entry.adapter.claim_pubkey()),
+            htlc_target: Some(htlc_target),
         })
     }
 
@@ -891,20 +886,14 @@ impl CassisRouter {
             return Err(format!("accept_incoming_htlc failed: {e}"));
         }
 
-        // Now create the outgoing HTLC on the next network. The
-        // recipient comes from the DISPATCH frame, not from the stored
-        // PREPARE: it is the downstream party's self-reported
-        // `claim_pubkey`, which the payer only learns once every hop has
-        // answered its (concurrent) PREPARE.
-        let recipient = dispatch.recipient;
+        // Addressing parameters come from downstream PREPARE data.
         match outgoing_entry
             .adapter
-            .create_outgoing_htlc_with_descriptor(
+            .create_outgoing_htlc(
                 prepare.payment_hash,
                 prepare.amount_msat,
                 prepare.outgoing_expiry,
-                recipient,
-                dispatch.outgoing_target.as_ref(),
+                &dispatch.htlc_target,
             )
             .await
         {
@@ -952,13 +941,13 @@ impl CassisRouter {
         }
         info!(
             target: "cassis_router",
-            "DISPATCH done: payment_hash={} amount_msat={} {} -> {} via {} \
+             "DISPATCH done: payment_hash={} amount_msat={} {} -> {} via {:?} \
              outgoing_descriptor={:?}",
             prepare.payment_hash.short(),
             prepare.amount_msat,
             prepare.incoming_network,
             prepare.outgoing_network,
-            recipient,
+            dispatch.htlc_target,
             outgoing_descriptor,
         );
         Ok(HopDispatched {

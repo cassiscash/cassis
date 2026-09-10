@@ -59,8 +59,8 @@ use bitcoin::Sequence;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
-    OutgoingPayment, PubKey, WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter, OutgoingHtlc,
+    OutgoingPayment, WatchError, XOnlyPubKey,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -145,7 +145,7 @@ pub struct ArkadeConfig {
     /// 32-byte secret key derived from `cassis/network/<network_id>`.
     /// The adapter claims incoming VHTLCs with its x-only pubkey.
     pub sk: [u8; 32],
-    pub invoice_pubkey: PubKey,
+    pub invoice_pubkey: XOnlyPubKey,
     pub span: Span,
 }
 
@@ -154,7 +154,7 @@ pub struct ArkadeConfig {
 pub fn default_config(
     network_id: NetworkId,
     sk: [u8; 32],
-    invoice_pubkey: PubKey,
+    invoice_pubkey: XOnlyPubKey,
     span: Span,
 ) -> ArkadeConfig {
     match network_id.0.as_str() {
@@ -233,7 +233,7 @@ struct PendingOutgoing {
     options: VhtlcOptions,
     /// Recorded so diagnostics can render who the lock targeted.
     #[allow(dead_code)]
-    recipient: PubKey,
+    recipient: XOnlyPubKey,
 }
 
 /// A pair built from one unspent VTXO at a VHTLC address.
@@ -245,7 +245,7 @@ struct UnspentVtxo {
 
 pub struct ArkadeAdapter {
     network_id: NetworkId,
-    invoice_pubkey: PubKey,
+    invoice_pubkey: XOnlyPubKey,
     span: Span,
     /// The operator rejects scripts whose smallest exit (CSV) delay is
     /// shorter than its advertised unilateral exit delay, measured via
@@ -253,7 +253,7 @@ pub struct ArkadeAdapter {
     exit_delay_floor_secs: u32,
     keypair: Keypair,
     claim_xonly: XOnlyPublicKey,
-    claim_pubkey: PubKey,
+    claim_pubkey: XOnlyPubKey,
     /// Operator signer key reported by GetInfo. Descriptor transfers
     /// only round-trip inside one operator, so accept-time checks
     /// compare against this.
@@ -283,7 +283,7 @@ impl ArkadeAdapter {
             .map_err(|e| Error::InvalidParams(format!("invalid secret key: {e}")))?;
         let keypair = Keypair::from_secret_key(&secp, &secret);
         let claim_xonly = keypair.x_only_public_key().0;
-        let claim_pubkey = PubKey::from_bytes(claim_xonly.serialize())
+        let claim_pubkey = XOnlyPubKey::from_bytes(claim_xonly.serialize())
             .map_err(|e| Error::InvalidParams(format!("invalid claim pubkey: {e}")))?;
 
         let chain =
@@ -376,10 +376,9 @@ impl ArkadeAdapter {
                 "unsupported htlc descriptor for arkade network: {descriptor:?}"
             )));
         };
-        let parse_xonly = |hex: &String| -> Result<XOnlyPublicKey, HtlcError> {
-            XOnlyPublicKey::from_str(hex).map_err(|e| {
-                HtlcError::InvalidParams(format!("invalid x-only pubkey '{hex}': {e}"))
-            })
+        let parse_xonly = |key: &XOnlyPubKey| -> Result<XOnlyPublicKey, HtlcError> {
+            XOnlyPublicKey::from_slice(key.as_bytes())
+                .map_err(|e| HtlcError::InvalidParams(format!("invalid x-only pubkey: {e}")))
         };
         let parse_hash = |hex: &String| -> Result<ripemd160::Hash, HtlcError> {
             let bytes = lowercase_hex_decode(hex).ok_or_else(|| {
@@ -425,9 +424,12 @@ impl ArkadeAdapter {
 
     fn descriptor_from_options(options: &VhtlcOptions) -> HtlcDescriptor {
         HtlcDescriptor::Arkade {
-            sender: options.sender.to_string(),
-            receiver: options.receiver.to_string(),
-            server: options.server.to_string(),
+            sender: XOnlyPubKey::from_bytes(options.sender.serialize())
+                .expect("Arkade sender key is valid"),
+            receiver: XOnlyPubKey::from_bytes(options.receiver.serialize())
+                .expect("Arkade receiver key is valid"),
+            server: XOnlyPubKey::from_bytes(options.server.serialize())
+                .expect("Arkade server key is valid"),
             payment_hash160: lowercase_hex_encode(options.preimage_hash.as_byte_array()),
             refund_locktime: options.refund_locktime,
             unilateral_claim_delay: options.unilateral_claim_delay.to_consensus_u32(),
@@ -441,7 +443,7 @@ impl ArkadeAdapter {
     fn build_options_for_outgoing(
         &self,
         payment_hash: &Bytes32,
-        recipient: &PubKey,
+        recipient: &XOnlyPubKey,
         expiry: u64,
     ) -> Result<VhtlcOptions, HtlcError> {
         let now = Self::unix_now();
@@ -880,14 +882,14 @@ impl ArkadeAdapter {
 
 #[async_trait]
 impl NetworkRouterAdapter for ArkadeAdapter {
-    fn invoice_pubkey(&self) -> PubKey {
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
         self.invoice_pubkey
     }
 
     /// Claims happen with the dedicated per-network key, not the
     /// invoice key, so counterparties must lock HTLCs to this x-only
     /// identity.
-    fn claim_pubkey(&self) -> PubKey {
+    fn claim_pubkey(&self) -> XOnlyPubKey {
         self.claim_pubkey
     }
 
@@ -906,7 +908,7 @@ impl NetworkRouterAdapter for ArkadeAdapter {
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+    ) -> Result<(), HtlcError> {
         if deadline <= Self::unix_now() {
             return Err(HtlcError::InvalidParams("deadline in the past".into()));
         }
@@ -921,7 +923,7 @@ impl NetworkRouterAdapter for ArkadeAdapter {
                 expected_sat,
                 deadline,
             });
-        Ok(None)
+        Ok(())
     }
 
     async fn create_outgoing_htlc(
@@ -929,8 +931,16 @@ impl NetworkRouterAdapter for ArkadeAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: PubKey,
+        htlc_target: &HtlcTarget,
     ) -> Result<OutgoingHtlc, HtlcError> {
+        let recipient = match htlc_target {
+            HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "arkade requires a pubkey target".into(),
+                ))
+            }
+        };
         let amount = msat_to_sat_amount(amount_msat)?;
         if amount < self.dust {
             return Err(HtlcError::InvalidParams(format!(
@@ -983,8 +993,14 @@ impl NetworkRouterAdapter for ArkadeAdapter {
         descriptor: Option<&HtlcDescriptor>,
     ) -> Result<(), HtlcError> {
         let options = Self::parse_vhtlc_options(descriptor.ok_or(HtlcError::Unimplemented)?)?;
-        let recipient = PubKey::from_str(&payment.destination_pubkey)
-            .map_err(|e| HtlcError::InvalidParams(format!("invalid recipient pubkey: {e}")))?;
+        let recipient = match &payment.destination {
+            HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "arkade requires a pubkey destination".into(),
+                ))
+            }
+        };
         if options.preimage_hash != vhtlc_payment_hash160(&payment.payment_hash) {
             return Err(HtlcError::InvalidParams(
                 "Arkade descriptor hash does not match outgoing payment".into(),

@@ -2,7 +2,7 @@
 //! commands. The GUI and the CLI both call these so there is no
 //! duplicated orchestration logic.
 
-use cassis_core::{Bytes32, Invoice, NetworkId, NetworkReceiverAdapter};
+use cassis_core::{Bytes32, HtlcTarget, Invoice, NetworkId, NetworkReceiverAdapter};
 use cassis_iroh::{Frame, IrohServer, PublicKey};
 use rand::RngCore;
 use serde::Serialize;
@@ -123,7 +123,7 @@ pub async fn create_invoice_with_claim_pubkeys(
     home: &Path,
     network_id: NetworkId,
     amount_msat: u64,
-    claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)>,
+    claim_pubkeys: Vec<(NetworkId, cassis_core::XOnlyPubKey)>,
     spec_for_resolution: Option<NetSpec>,
 ) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
     create_invoice_with_claim_pubkeys_and_config(
@@ -141,7 +141,7 @@ pub async fn create_invoice_with_claim_pubkeys_and_config(
     home: &Path,
     network_id: NetworkId,
     amount_msat: u64,
-    claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)>,
+    claim_pubkeys: Vec<(NetworkId, cassis_core::XOnlyPubKey)>,
     spec_for_resolution: Option<NetSpec>,
     adapter_config: &AdapterConfig,
 ) -> Result<(Invoice, Bytes32, [u8; 32]), String> {
@@ -168,7 +168,7 @@ pub async fn create_invoice_with_claim_pubkeys_and_config(
         ),
         None => None,
     };
-    let claim_pubkeys: Vec<(NetworkId, cassis_core::PubKey)> = if !claim_pubkeys.is_empty() {
+    let claim_pubkeys: Vec<(NetworkId, cassis_core::XOnlyPubKey)> = if !claim_pubkeys.is_empty() {
         claim_pubkeys
     } else {
         match &receivers {
@@ -220,17 +220,24 @@ pub async fn create_invoice_with_claim_pubkeys_and_config(
     // Bind a transient iroh endpoint so the payer can dial COMMIT.
     let (iroh_peer_id, iroh_relay) = iroh_endpoint_info(&derived.iroh).await?;
 
+    let address = match payment_request {
+        Some(payment_request) => HtlcTarget::LightningInvoice(payment_request),
+        None => claim_pubkeys
+            .iter()
+            .find(|(id, _)| id == &network_id)
+            .map(|(_, pubkey)| HtlcTarget::XOnlyPubKey(*pubkey))
+            .unwrap_or(HtlcTarget::XOnlyPubKey(derived.invoice.pubkey())),
+    };
     let invoice = Invoice {
         payment_hash: Bytes32(payment_hash),
         amount_msat,
         payee: derived.invoice.pubkey(),
         expires_at: invoice_expiry,
-        claim_pubkeys,
         networks: vec![network_id],
+        address,
         description: None,
         iroh_peer_id: Some(iroh_peer_id),
         iroh_relay: Some(iroh_relay),
-        payment_request,
     };
     Ok((invoice, Bytes32(payment_hash), preimage))
 }

@@ -60,7 +60,7 @@ use fedimint_core::core::OperationId;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleRegistry;
-use fedimint_core::{hex, secp256k1, Amount, OutPoint, TransactionId};
+use fedimint_core::{secp256k1, Amount, OutPoint, TransactionId};
 use fedimint_derive_secret::DerivableSecret;
 use fedimint_lnv2_client::common::contracts::{OutgoingContract, PaymentImage};
 use fedimint_lnv2_client::htlc::HtlcError as LnHtlcError;
@@ -70,8 +70,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use cassis_core::{
-    Bytes32, HtlcDescriptor, HtlcError, NetworkId, NetworkRouterAdapter, OutgoingPayment, PubKey,
-    WatchError,
+    Bytes32, HtlcDescriptor, HtlcError, HtlcTarget, NetworkId, NetworkRouterAdapter,
+    OutgoingPayment, PubKey, WatchError, XOnlyPubKey,
 };
 
 /// Per-hop delta the routing layer gets on fedimint legs. Contract
@@ -337,23 +337,6 @@ impl FedimintAdapter {
         Ok(client.get_first_module::<LightningClientModule>()?.module)
     }
 
-    /// Full compressed (33-byte) hex of our claim public key — the
-    /// value embedded in every descriptor we issue.
-    fn claim_pk_hex(&self) -> String {
-        hex::encode(self.claim_pk.serialize())
-    }
-
-    /// The registration descriptor for a fedimint leg: the funder
-    /// needs our claim public key so it can lock the contract to it.
-    fn registration_descriptor(&self) -> HtlcDescriptor {
-        HtlcDescriptor::Fedimint {
-            claim_pubkey: self.claim_pk_hex(),
-            funding_txid: None,
-            funding_out_idx: None,
-            contract: None,
-        }
-    }
-
     /// Convert a deadline (unix seconds) into a `tokio::time::Duration`
     /// suitable as a `tokio::time::timeout` deadline.
     fn deadline_to_timeout(deadline: u64) -> Duration {
@@ -371,14 +354,10 @@ impl FedimintAdapter {
         Ok(expiry.saturating_sub(now).div_ceil(SECS_PER_BLOCK).max(1))
     }
 
-    /// Reconstruct a claim key from the 32-byte x-only cassis pubkey.
-    /// Cassis fedimint claim keys are always even parity (see
-    /// [`Self::derive_claim_keypair`]), so the 0x02 prefix restores
-    /// the compressed form exactly.
-    fn claim_pk_from_cassis(recipient: PubKey) -> Result<secp256k1::PublicKey, HtlcError> {
+    fn claim_pk_from_cassis(recipient: XOnlyPubKey) -> Result<secp256k1::PublicKey, HtlcError> {
         let mut compressed = [0u8; 33];
         compressed[0] = 0x02;
-        compressed[1..].copy_from_slice(&recipient.0);
+        compressed[1..].copy_from_slice(recipient.as_bytes());
         secp256k1::PublicKey::from_slice(&compressed)
             .map_err(|e| HtlcError::InvalidParams(format!("invalid recipient pubkey: {e}")))
     }
@@ -415,11 +394,8 @@ impl FedimintAdapter {
             HtlcError::InvalidParams("fedimint descriptor has no contract".into())
         })?;
 
-        let claim_pk = secp256k1::PublicKey::from_slice(
-            &hex::decode(claim_pubkey)
-                .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?,
-        )
-        .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
+        let claim_pk = secp256k1::PublicKey::from_slice(claim_pubkey.as_bytes())
+            .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
         if claim_pk != self.claim_pk {
             return Err(HtlcError::InvalidParams(
                 "descriptor claim pubkey is not ours".into(),
@@ -470,11 +446,11 @@ impl NetworkRouterAdapter for FedimintAdapter {
     /// default `claim_pubkey` (which forwards to this) then equals the
     /// key we actually sign claims with, and any funder reconstructs
     /// the compressed form as `0x02 || this`.
-    fn invoice_pubkey(&self) -> PubKey {
+    fn invoice_pubkey(&self) -> XOnlyPubKey {
         let compressed = self.claim_pk.serialize();
         let mut xonly = [0u8; 32];
         xonly.copy_from_slice(&compressed[1..]);
-        PubKey(xonly)
+        XOnlyPubKey(xonly)
     }
 
     fn incoming_delta_secs(&self) -> u64 {
@@ -491,7 +467,7 @@ impl NetworkRouterAdapter for FedimintAdapter {
         payment_hash: Bytes32,
         min_amount_msat: u64,
         deadline: u64,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
+    ) -> Result<(), HtlcError> {
         let mut incoming = self.incoming.lock().await;
         incoming
             .entry(payment_hash)
@@ -505,16 +481,13 @@ impl NetworkRouterAdapter for FedimintAdapter {
             ?payment_hash,
             min_amount_msat, "fedimint incoming HTLC registered"
         );
-        Ok(Some(self.registration_descriptor()))
+        Ok(())
     }
 
     /// The descriptor a payer needs to fund a previously registered
     /// incoming HTLC: our claim public key.
-    async fn incoming_htlc_descriptor(
-        &self,
-        _payment_hash: Bytes32,
-    ) -> Result<Option<HtlcDescriptor>, HtlcError> {
-        Ok(Some(self.registration_descriptor()))
+    async fn htlc_target(&self, _payment_hash: Bytes32) -> Result<HtlcTarget, HtlcError> {
+        Ok(HtlcTarget::XOnlyPubKey(self.invoice_pubkey()))
     }
 
     /// Drop a PREPARE-time registration that will never be funded.
@@ -573,11 +546,19 @@ impl NetworkRouterAdapter for FedimintAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        recipient: PubKey,
+        htlc_target: &HtlcTarget,
     ) -> Result<cassis_core::OutgoingHtlc, HtlcError> {
         if amount_msat == 0 {
             return Err(HtlcError::InvalidParams("amount must be > 0".into()));
         }
+        let recipient = match htlc_target {
+            HtlcTarget::XOnlyPubKey(pubkey) => *pubkey,
+            HtlcTarget::PubKey(_) | HtlcTarget::LightningInvoice(_) => {
+                return Err(HtlcError::InvalidParams(
+                    "fedimint requires a pubkey target".into(),
+                ))
+            }
+        };
         let claim_pk = Self::claim_pk_from_cassis(recipient)?;
 
         let ln = Self::ln_module(&self.client)
@@ -636,7 +617,8 @@ impl NetworkRouterAdapter for FedimintAdapter {
                 HtlcError::InvalidParams(format!("no outgoing HTLC for {payment_hash:?}"))
             })?;
         Ok(HtlcDescriptor::Fedimint {
-            claim_pubkey: hex::encode(slot.contract.claim_pk.serialize()),
+            claim_pubkey: PubKey::from_bytes(slot.contract.claim_pk.serialize())
+                .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?,
             funding_txid: Some(slot.outpoint.txid.to_string()),
             funding_out_idx: Some(slot.outpoint.out_idx),
             contract: Some(
@@ -661,11 +643,8 @@ impl NetworkRouterAdapter for FedimintAdapter {
             } => (claim_pubkey, funding_txid, funding_out_idx, contract),
             _ => return Err(HtlcError::InvalidParams("not a fedimint descriptor".into())),
         };
-        let claim_pk = secp256k1::PublicKey::from_slice(
-            &hex::decode(claim_pubkey)
-                .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?,
-        )
-        .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
+        let claim_pk = secp256k1::PublicKey::from_slice(claim_pubkey.as_bytes())
+            .map_err(|e| HtlcError::InvalidParams(format!("descriptor claim pubkey: {e}")))?;
         let txid = TransactionId::from_str(funding_txid.as_deref().ok_or_else(|| {
             HtlcError::InvalidParams("fedimint descriptor has no funding txid".into())
         })?)

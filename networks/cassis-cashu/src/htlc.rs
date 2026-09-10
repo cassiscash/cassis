@@ -26,18 +26,13 @@ use cdk::Amount;
 
 use crate::errors::{CashuError, CashuResult};
 
-pub fn pubkey_from_cassis(pubkey: &cassis_core::PubKey) -> CashuResult<PublicKey> {
-    PublicKey::from_slice(&pubkey.to_ecdsa_key().serialize())
-        .map_err(|e| CashuError::Nuts(format!("invalid receiver pubkey: {e}")))
-}
-
 /// Inverse of [`pubkey_from_cassis`]: the cassis x-only identity of a
 /// 32-byte secret key, i.e. the identity a counterparty must lock
 /// HTLC proofs to for this key to be able to claim them.
 ///
 /// Used by `CashuAdapter::claim_pubkey` to advertise the key it really
 /// signs witnesses with, instead of assuming that is the invoice key.
-pub fn claim_pubkey_from_secret(secret_key: &[u8; 32]) -> CashuResult<cassis_core::PubKey> {
+pub fn claim_pubkey_from_secret(secret_key: &[u8; 32]) -> CashuResult<cassis_core::XOnlyPubKey> {
     let secret = P2pkSecretKey::from_slice(secret_key)
         .map_err(|e| CashuError::Nuts(format!("invalid signing key: {e}")))?;
     // Drop the compression prefix: cassis identities are x-only, and
@@ -48,7 +43,7 @@ pub fn claim_pubkey_from_secret(secret_key: &[u8; 32]) -> CashuResult<cassis_cor
     let xonly: [u8; 32] = compressed[1..33]
         .try_into()
         .expect("compressed key is 33 bytes");
-    cassis_core::PubKey::from_bytes(xonly)
+    cassis_core::XOnlyPubKey::from_bytes(xonly)
         .map_err(|e| CashuError::Nuts(format!("invalid x-only pubkey: {e}")))
 }
 

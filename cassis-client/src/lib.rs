@@ -543,10 +543,10 @@ impl CassisClient {
         // fallback to the announced node key: guessing is exactly what
         // caused HTLCs to be locked to unclaimable identities, and the
         // failure only surfaced on-chain after funds were committed.
-        let mut recipients: Vec<cassis_core::PubKey> = Vec::with_capacity(route.len() + 1);
+        let mut htlc_targets = Vec::with_capacity(route.len() + 1);
         for (idx, ack) in acks.iter().enumerate() {
-            match ack.claim_pubkey {
-                Some(k) => recipients.push(k),
+            match ack.htlc_target.clone() {
+                Some(target) => htlc_targets.push(target),
                 None => {
                     // Every hop accepted, so every hop is holding a
                     // reservation; none was DISPATCHed yet.
@@ -555,13 +555,13 @@ impl CassisClient {
                         .await;
                     return Err(PayError::HopRejected {
                         index: idx,
-                        reason: "hop accepted the PREPARE but reported no claim identity"
+                        reason: "hop accepted the PREPARE but reported no addressing parameters"
                             .to_string(),
                     });
                 }
             }
         }
-        recipients.push(invoice.claim_pubkey_for(&dest_network));
+        htlc_targets.push(invoice.address.clone());
 
         // From here until the first DISPATCH succeeds, every route hop
         // holds exactly one unused reservation. Any abort in this
@@ -588,22 +588,17 @@ impl CassisClient {
         // Lock to the first hop's self-reported claim identity, not to
         // its announced node key: those are different keys whenever the
         // network claims with a dedicated per-network key (rootstock).
-        let first_recipient = recipients[0];
-        // The first hop may have registered a funding handle (LND hold
-        // invoice) during PREPARE. Pass it through so an LND sender pays
-        // the exact invoice instead of attempting a hash-only send.
-        let first_target = acks.first().and_then(|ack| ack.incoming_descriptor.clone());
+        let first_target = &htlc_targets[0];
         let first_payment: OutgoingPayment = match sender
-            .pay_invoice_with_descriptor(
+            .pay_invoice(
                 invoice.payment_hash,
                 invoice.amount_msat,
-                first_recipient,
+                first_target,
                 // The HTLC is created on our own sending network, which
                 // `validate_route_networks` proved is the first hop's
                 // incoming network.
                 &sender_network,
                 first_outgoing_expiry,
-                first_target.as_ref(),
             )
             .await
         {
@@ -660,37 +655,19 @@ impl CassisClient {
 
         // Step 3: walk the route. `descriptor` carries the
         // HTLC info for the *incoming* side of the next hop.
-        // `outgoing_target` carries the downstream funding handle the hop's
-        // outgoing adapter must pay (the next hop's LND hold invoice, or the
-        // payee's for the last hop). Hops without a native invoice target
-        // receive `None` and use their legacy hash-locked path.
-        let payee_target = invoice
-            .payment_request
-            .clone()
-            .map(|payment_request| HtlcDescriptor::Lightning { payment_request });
         let mut descriptor = first_descriptor;
         for (i, hop) in route.iter().enumerate() {
-            // `recipients[i + 1]` is the party downstream of hop `i`:
-            // the next hop's claim identity, or the payee's for the last
-            // hop.
-            let recipient = recipients[i + 1];
-            let outgoing_target = if i + 1 < acks.len() {
-                acks[i + 1].incoming_descriptor.clone()
-            } else {
-                payee_target.clone()
-            };
             let dispatch = HopDispatch {
                 payment_hash: invoice.payment_hash,
                 incoming_descriptor: descriptor,
-                outgoing_target,
-                recipient,
+                htlc_target: htlc_targets[i + 1].clone(),
             };
             let peer = hop.node.node_pubkey;
             let addr = addrs[i].clone();
             info!(
                 target: "cassis_client",
-                "DISPATCH hop {}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
-                 amount_msat={} incoming_deadline={} outgoing_expiry={} recipient={} \
+                 "DISPATCH hop {}/{}: peer={peer} addr={addr:?} incoming={} outgoing={} \
+                  amount_msat={} incoming_deadline={} outgoing_expiry={} addressing={:?} \
                  payment_hash={} incoming_descriptor={:?}",
                 i+1,
                 route.len(),
@@ -699,7 +676,7 @@ impl CassisClient {
                 invoice.amount_msat,
                 expiries[i],
                 expiries[i + 1],
-                recipient,
+                 dispatch.htlc_target,
                 dispatch.payment_hash,
                 dispatch.incoming_descriptor,
             );
@@ -865,20 +842,15 @@ impl CassisClient {
         let slack = fallback_transit_slack(dest_network);
         let outgoing_expiry = now.saturating_add(delta).saturating_add(slack);
 
-        let recipient = invoice.claim_pubkey_for(dest_network);
-        let target = invoice
-            .payment_request
-            .clone()
-            .map(|payment_request| HtlcDescriptor::Lightning { payment_request });
+        let htlc_target = invoice.address.clone();
 
         let first_payment = sender
-            .pay_invoice_with_descriptor(
+            .pay_invoice(
                 invoice.payment_hash,
                 invoice.amount_msat,
-                recipient,
+                &htlc_target,
                 sender_network,
                 outgoing_expiry,
-                target.as_ref(),
             )
             .await
             .map_err(|e| PayError::Io(e.to_string()))?;
