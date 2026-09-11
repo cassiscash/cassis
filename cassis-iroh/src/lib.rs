@@ -195,7 +195,7 @@ impl IrohClient {
             .map_err(|e| IrohError::Io(e.to_string()))?;
         debug!(target: "iroh_client", "{op}: stream opened, writing frame...");
 
-        let data = postcard::to_allocvec(&send).map_err(|e| IrohError::Protocol(e.to_string()))?;
+        let data = serde_json::to_vec(&send).map_err(|e| IrohError::Protocol(e.to_string()))?;
         writer
             .write_all(&data)
             .await
@@ -221,7 +221,7 @@ impl IrohClient {
         );
 
         let frame: Frame =
-            postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
+            serde_json::from_slice(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
         Ok(frame)
     }
 
@@ -450,7 +450,7 @@ async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), Ir
     debug!(target: "iroh_server", "read {} byte(s) of payload", buf.len());
 
     let frame: Frame =
-        postcard::from_bytes(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
+        serde_json::from_slice(&buf).map_err(|e| IrohError::Protocol(e.to_string()))?;
     debug!(
         target: "iroh_server",
         "decoded frame, dispatching to handler (payment_hash={})",
@@ -472,7 +472,7 @@ async fn handle_conn(conn: Connection, handler: RequestHandler) -> Result<(), Ir
         }
     };
 
-    let data = postcard::to_allocvec(&response).map_err(|e| IrohError::Protocol(e.to_string()))?;
+    let data = serde_json::to_vec(&response).map_err(|e| IrohError::Protocol(e.to_string()))?;
     debug!(target: "iroh_server", "writing {} byte(s) of response", data.len());
     writer
         .write_all(&data)
@@ -514,14 +514,14 @@ mod tests {
     use cassis_core::HtlcTarget;
 
     #[test]
-    fn dispatch_frame_with_cashu_descriptor_round_trips_through_postcard() {
+    fn dispatch_frame_with_cashu_descriptor_round_trips_through_json() {
         // Regression: HtlcDescriptor used to be internally-tagged
         // (#[serde(tag, content)]), which postcard cannot
         // deserialize (it needs deserialize_any). DISPATCH frames
         // carry a descriptor, so any multi-hop pay would fail to
         // decode on the router with postcard's WontImplement error
         // and the connection would drop. External tagging round-trips
-        // fine.
+        // fine (and now over JSON).
         let dispatch = Frame::Dispatch(HopDispatch {
             payment_hash: Bytes32([0x42u8; 32]),
             incoming_descriptor: HtlcDescriptor::Cashu {
@@ -529,8 +529,8 @@ mod tests {
             },
             htlc_target: HtlcTarget::LightningInvoice("lnbc...".into()),
         });
-        let bytes = postcard::to_allocvec(&dispatch).expect("encode dispatch");
-        let decoded: Frame = postcard::from_bytes(&bytes).expect("decode dispatch");
+        let bytes = serde_json::to_vec(&dispatch).expect("encode dispatch");
+        let decoded: Frame = serde_json::from_slice(&bytes).expect("decode dispatch");
         match decoded {
             Frame::Dispatch(d) => {
                 assert_eq!(
@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_frame_with_fedimint_descriptor_round_trips_through_postcard() {
+    fn commit_frame_with_fedimint_descriptor_round_trips_through_json() {
         let claim_pubkey: cassis_core::PubKey =
             "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
                 .parse()
@@ -566,8 +566,8 @@ mod tests {
                 contract: None,
             },
         });
-        let bytes = postcard::to_allocvec(&commit).expect("encode commit");
-        let decoded: Frame = postcard::from_bytes(&bytes).expect("decode commit");
+        let bytes = serde_json::to_vec(&commit).expect("encode commit");
+        let decoded: Frame = serde_json::from_slice(&bytes).expect("decode commit");
         match decoded {
             Frame::Commit(c) => assert_eq!(
                 c.incoming_descriptor,

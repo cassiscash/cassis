@@ -361,7 +361,7 @@ pub struct HopInstruction {
 /// hold invoice.
 ///
 /// Crosses the wire inside the hop protocol frames, which are
-/// serialized with postcard, so like [`HtlcDescriptor`] it must stay
+/// serialized as JSON, so like [`HtlcDescriptor`] it stays
 /// externally tagged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HtlcTarget {
@@ -410,9 +410,10 @@ pub struct HopPrepared {
     /// where there is nothing to address.
     ///
     /// Deliberately carries no `skip_serializing_if`: these frames go
-    /// over postcard, which is positional and non-self-describing, so
-    /// omitting a field desynchronizes the decoder rather than falling
-    /// back to a default. Always serialized, like `reason` above.
+    /// over the wire and are decoded positionally by version-tolerant
+    /// peers, so omitting a field desynchronizes the decoder rather
+    /// than falling back to a default. Always serialized, like
+    /// `reason` above.
     pub htlc_target: Option<HtlcTarget>,
 }
 
@@ -531,10 +532,10 @@ pub struct HopReject {
 /// own preimage", to observe the settlement).
 ///
 /// This type crosses the wire inside the hop protocol frames, which
-/// are serialized with postcard. Postcard cannot deserialize
-/// internally-tagged (`#[serde(tag, content)]`) enums — they require
-/// `deserialize_any`, which postcard rejects — so the enum must stay
-/// externally tagged. Variants for networks whose adapter is still a
+/// are serialized as JSON. The enum stays externally tagged (JSON's
+/// default) so the wire shape is stable; internally-tagged
+/// (`#[serde(tag, content)]`) representations would change every
+/// encoded frame. Variants for networks whose adapter is still a
 /// stub carry no payload; they only exist so the type stays
 /// exhaustive and JSON shape is preserved across upgrades.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

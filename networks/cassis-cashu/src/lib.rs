@@ -592,7 +592,7 @@ impl NetworkRouterAdapter for CashuAdapter {
                 return Err(HtlcError::InvalidParams(
                     "cashu requires a pubkey target".into(),
                 ))
-            },
+            }
         };
         if amount_msat == 0 {
             return Err(HtlcError::InvalidParams("amount must be > 0".into()));
