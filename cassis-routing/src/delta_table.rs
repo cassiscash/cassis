@@ -17,6 +17,7 @@ use cassis_core::NetworkId;
 pub fn fallback_incoming_delta(network: &NetworkId) -> u64 {
     match network.0.as_str() {
         "arkade" | "arkade::mutinynet" => 60,
+        "bitcoin" | "bitcoin::mutinynet" => 300,
         "fedimint" => 30,
         "cashu" => 30,
         "liquid" | "liquid::testnet" => 300,

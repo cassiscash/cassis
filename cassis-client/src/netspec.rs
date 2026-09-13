@@ -1,12 +1,14 @@
 use cassis_core::{cashu_mint_url, cashu_network_id, NetworkId};
 
 /// A parsed `--network` spec, mirroring the router/CLI format:
-/// `cashu::host`, `arkade`, `arkade::mutinynet`, `liquid`,
-/// `liquid::testnet`, `rootstock`, or `rootstock::testnet`.
+/// `cashu::host`, `arkade`, `arkade::mutinynet`, `bitcoin`,
+/// `bitcoin::mutinynet`, `liquid`, `liquid::testnet`, `rootstock`, or
+/// `rootstock::testnet`.
 #[derive(Clone, Debug)]
 pub enum NetSpec {
     Cashu { mint_url: String, host: String },
     Arkade { mutinynet: bool },
+    Bitcoin { mutinynet: bool },
     Liquid { testnet: bool },
     Rootstock { testnet: bool },
     Lightning,
@@ -53,6 +55,13 @@ impl NetSpec {
                     "network 'arkade' only accepts no parameter or 'mutinynet', got '{other}'"
                 )),
             },
+            "bitcoin" => match param {
+                None => Ok(NetSpec::Bitcoin { mutinynet: false }),
+                Some("mutinynet") => Ok(NetSpec::Bitcoin { mutinynet: true }),
+                Some(other) => Err(format!(
+                    "network 'bitcoin' only accepts no parameter or 'mutinynet', got '{other}'"
+                )),
+            },
             "liquid" => match param {
                 None => Ok(NetSpec::Liquid { testnet: false }),
                 Some("testnet") => Ok(NetSpec::Liquid { testnet: true }),
@@ -70,6 +79,7 @@ impl NetSpec {
         match self {
             NetSpec::Cashu { .. } => "cashu",
             NetSpec::Arkade { .. } => "arkade",
+            NetSpec::Bitcoin { .. } => "bitcoin",
             NetSpec::Liquid { .. } => "liquid",
             NetSpec::Rootstock { .. } => "rootstock",
             NetSpec::Lightning => "lightning",
@@ -83,6 +93,11 @@ impl NetSpec {
                 "arkade::mutinynet".to_string()
             } else {
                 "arkade".to_string()
+            }),
+            NetSpec::Bitcoin { mutinynet } => NetworkId(if *mutinynet {
+                "bitcoin::mutinynet".to_string()
+            } else {
+                "bitcoin".to_string()
             }),
             NetSpec::Liquid { testnet } => NetworkId(if *testnet {
                 "liquid::testnet".to_string()
@@ -175,5 +190,16 @@ mod tests {
         let s = NetSpec::parse("arkade::mutinynet").unwrap();
         assert_eq!(s.network_id().0, "arkade::mutinynet");
         assert!(matches!(NetSpec::parse("arkade::foo"), Err(_)));
+    }
+
+    #[test]
+    fn parse_bitcoin_default_and_testnet() {
+        let s = NetSpec::parse("bitcoin").unwrap();
+        assert_eq!(s.network_id().0, "bitcoin");
+        assert_eq!(s.kind_name(), "bitcoin");
+        let s = NetSpec::parse("bitcoin::mutinynet").unwrap();
+        assert_eq!(s.network_id().0, "bitcoin::mutinynet");
+        assert!(matches!(NetSpec::parse("bitcoin::foo"), Err(_)));
+        assert!(matches!(NetSpec::parse("bitcoin::testnet"), Err(_)));
     }
 }

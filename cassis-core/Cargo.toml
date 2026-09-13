@@ -7,6 +7,7 @@ edition.workspace = true
 cashu = []
 liquid = []
 arkade = []
+bitcoin = []
 rootstock = []
 lightning = []
 

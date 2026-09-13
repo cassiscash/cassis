@@ -266,6 +266,7 @@ pub struct NetworkEntry {
     feature = "fedimint",
     feature = "rootstock",
     feature = "arkade",
+    feature = "bitcoin",
     feature = "liquid"
 ))]
 fn network_sk(derived: &keys::DerivedKeys, network_id: &NetworkId) -> Result<[u8; 32], String> {
@@ -438,6 +439,48 @@ async fn build_adapter(
         #[cfg(not(feature = "arkade"))]
         "arkade" => Err(
             "network 'arkade' requested but cassis-router was not compiled with the 'arkade' feature"
+                .into(),
+        ),
+
+        #[cfg(feature = "bitcoin")]
+        "bitcoin" => {
+            let network_id = match param {
+                None => NetworkId("bitcoin".to_string()),
+                Some("mutinynet") => NetworkId("bitcoin::mutinynet".to_string()),
+                Some(other) => {
+                    return Err(format!(
+                        "network 'bitcoin' only accepts no parameter or 'mutinynet', got '{other}'"
+                    ));
+                }
+            };
+            // The on-chain adapter claims with the even-parity key
+            // derived from the per-network key; it self-reports the
+            // x-only half via `claim_pubkey()` so upstream hops lock
+            // to it.
+            let sk = network_sk(derived, &network_id)?;
+            let cfg = cassis_bitcoin::default_config(
+                network_id.clone(),
+                sk,
+                derived.invoice.pubkey(),
+                span.clone(),
+            )
+            .map_err(|e| format!("bitcoin adapter config: {e}"))?;
+            let adapter: Arc<dyn NetworkRouterAdapter> = Arc::new(
+                cassis_bitcoin::BitcoinAdapter::new(cfg)
+                    .await
+                    .map_err(|e| format!("bitcoin adapter init failed: {e}"))?,
+            );
+            let incoming_delta_secs = adapter.incoming_delta_secs();
+            Ok(NetworkEntry {
+                network_id,
+                adapter,
+                incoming_delta_secs: incoming_delta_secs,
+            })
+        }
+
+        #[cfg(not(feature = "bitcoin"))]
+        "bitcoin" => Err(
+            "network 'bitcoin' requested but cassis-router was not compiled with the 'bitcoin' feature"
                 .into(),
         ),
 

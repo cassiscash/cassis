@@ -125,7 +125,8 @@ pub fn fedimint_network_id(invite_code: &str) -> NetworkId {
 }
 
 /// Build the canonical `NetworkId` for a kind without a parameter
-/// (liquid, liquid::testnet, arkade, arkade::mutinynet, rootstock).
+/// (liquid, liquid::testnet, arkade, arkade::mutinynet, bitcoin,
+/// bitcoin::mutinynet, rootstock).
 pub fn simple_network_id(kind: &str) -> NetworkId {
     NetworkId(kind.to_string())
 }
@@ -133,8 +134,9 @@ pub fn simple_network_id(kind: &str) -> NetworkId {
 /// Pass-through used by the router to canonicalize `HopInstruction`
 /// network ids before adapter lookup. Only the canonical on-the-wire
 /// form (`cashu::<host>`, `fedimint::<invite>`, or the simple kinds
-/// `liquid` / `liquid::testnet` / `arkade` / `arkade::mutinynet` / `rootstock` /
-/// `rootstock::testnet` / `lightning`) round-trips;
+/// `liquid` / `liquid::testnet` / `arkade` / `arkade::mutinynet` / `bitcoin` /
+/// `bitcoin::mutinynet` / `rootstock` / `rootstock::testnet` / `lightning`)
+/// round-trips;
 /// anything else is returned unchanged so the adapter lookup rejects it.
 pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
     if let Some(rest) = id.0.strip_prefix(CASHU_NETWORK_ID_PREFIX) {
@@ -151,6 +153,8 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
         || id.0 == "liquid::testnet"
         || id.0 == "arkade"
         || id.0 == "arkade::mutinynet"
+        || id.0 == "bitcoin"
+        || id.0 == "bitcoin::mutinynet"
         || id.0 == "rootstock"
         || id.0 == "rootstock::testnet"
         || id.0 == "lightning"
@@ -246,6 +250,20 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
         #[cfg(not(feature = "arkade"))]
         "arkade" => Err(
             "network 'arkade' requested but cassis-core was not compiled with the 'arkade' feature"
+                .to_string(),
+        ),
+
+        #[cfg(feature = "bitcoin")]
+        "bitcoin" => match param {
+            None => Ok(NetworkId("bitcoin".to_string())),
+            Some("mutinynet") => Ok(NetworkId("bitcoin::mutinynet".to_string())),
+            Some(other) => Err(format!(
+                "network 'bitcoin' only accepts no parameter or 'mutinynet', got '{other}'"
+            )),
+        },
+        #[cfg(not(feature = "bitcoin"))]
+        "bitcoin" => Err(
+            "network 'bitcoin' requested but cassis-core was not compiled with the 'bitcoin' feature"
                 .to_string(),
         ),
 
@@ -628,6 +646,41 @@ pub enum HtlcDescriptor {
         claim_address: String,
         refund_address: String,
         timelock: u64,
+    },
+    /// On-chain Bitcoin HTLC: a P2TR output whose taproot tree has a
+    /// single script leaf in the Liquid shape — claim path
+    /// (`OP_IF <claim_pubkey>`) spendable by revealing the preimage
+    /// and signing with the receiver's x-only claim key, and a CLTV
+    /// refund path (`OP_ELSE <refund_locktime> OP_CLTV OP_DROP
+    /// <refund_pubkey> OP_ENDIF OP_CHECKSIG`) letting the sender
+    /// recover the funds after an absolute unix locktime. Keys in the
+    /// leaf are x-only (BIP342), so the receiver's x-only network
+    /// identity goes into the script unchanged.
+    ///
+    /// The descriptor pins the lockup transaction and carries what the
+    /// receiver cannot derive itself: the sender's internal taproot
+    /// key (the refunable key-path signer, and the collaborator for
+    /// future joint settlement), the refund pubkey and locktime. The
+    /// receiver rebuilds leaf hash, tweaked output key and address
+    /// from its own x-only claim key plus these fields.
+    Bitcoin {
+        /// Hex txid (display order) of the broadcast lockup
+        /// transaction.
+        lockup_txid: String,
+        /// Index of the HTLC output within the lockup transaction.
+        lockup_vout: u8,
+        /// Hex 20-byte RIPEMD160(SHA256(preimage)) burned into the
+        /// script.
+        payment_hash160: String,
+        /// X-only key of the sender's internal taproot key: the
+        /// unpruned key path can later serve collaborative
+        /// settlement.
+        internal_key: XOnlyPubKey,
+        /// X-only pubkey of the sender's refund leaf (the witness
+        /// script's ELSE branch).
+        refund_pubkey: XOnlyPubKey,
+        /// Absolute unix timestamp opening the refund path.
+        refund_locktime: u32,
     },
     /// Fedimint LNv2 direct HTLC: a raw `OutgoingContract` funded
     /// between two federation clients with no gateway involvement
@@ -1410,6 +1463,22 @@ mod tests {
         assert!(network_id_for_spec("arkade::foo").is_err());
     }
 
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn network_id_for_bitcoin_spec_uses_canonical_form() {
+        let id = network_id_for_spec("bitcoin").unwrap();
+        assert_eq!(id.0, "bitcoin");
+        let id = network_id_for_spec("bitcoin::mutinynet").unwrap();
+        assert_eq!(id.0, "bitcoin::mutinynet");
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn network_id_for_bitcoin_spec_rejects_unknown_parameter() {
+        assert!(network_id_for_spec("bitcoin::foo").is_err());
+        assert!(network_id_for_spec("bitcoin::testnet").is_err());
+    }
+
     #[cfg(not(feature = "arkade"))]
     #[test]
     fn network_id_for_arkade_spec_reports_missing_feature() {
@@ -1553,6 +1622,14 @@ mod tests {
         assert_eq!(
             canonicalize_network_id(&NetworkId("arkade".to_string())).0,
             "arkade"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("bitcoin".to_string())).0,
+            "bitcoin"
+        );
+        assert_eq!(
+            canonicalize_network_id(&NetworkId("bitcoin::mutinynet".to_string())).0,
+            "bitcoin::mutinynet"
         );
         assert_eq!(
             canonicalize_network_id(&NetworkId("arkade::mutinynet".to_string())).0,

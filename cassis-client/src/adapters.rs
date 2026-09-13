@@ -194,6 +194,26 @@ async fn build_pair(
                 sender: adapter,
             })
         }
+        #[cfg(feature = "bitcoin")]
+        NetSpec::Bitcoin { .. } => {
+            let cfg = cassis_bitcoin::default_config(
+                network_id.clone(),
+                network_sk(derived, &network_id)?,
+                derived.invoice.pubkey(),
+                span.clone(),
+            )
+            .map_err(|e| format!("bitcoin adapter config: {e}"))?;
+            let adapter = Arc::new(
+                cassis_bitcoin::BitcoinAdapter::new(cfg)
+                    .await
+                    .map_err(|e| format!("bitcoin adapter init failed: {e}"))?,
+            );
+            Ok(AdapterPair {
+                network_id,
+                receiver: adapter.clone(),
+                sender: adapter,
+            })
+        }
         #[allow(unreachable_patterns)]
         _ => Err(format!(
             "network kind '{}' requested but cassis-client was not compiled with that feature",

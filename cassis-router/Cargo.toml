@@ -26,6 +26,10 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.cassis-bitcoin]
+workspace = true
+optional = true
+
 [dependencies.cassis-rootstock]
 workspace = true
 optional = true
@@ -44,6 +48,7 @@ optional = true
 
 [features]
 arkade = ["dep:cassis-arkade", "cassis-core/arkade"]
+bitcoin = ["dep:cassis-bitcoin", "cassis-core/bitcoin"]
 cashu = ["dep:cassis-cashu", "cassis-core/cashu"]
 fedimint = ["dep:cassis-fedimint"]
 liquid = ["dep:cassis-liquid", "cassis-core/liquid"]

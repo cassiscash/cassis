@@ -754,6 +754,11 @@ impl Playground {
             NetSpec::Arkade { .. } => NodeWallet::Arkade(
                 cassis_client::adapters::build_arkade_adapter(spec, &derived, span).await?,
             ),
+            NetSpec::Bitcoin { .. } => {
+                return Err(
+                    "bitcoin (on-chain) nodes are not wired into the playground yet".to_string(),
+                )
+            }
             NetSpec::Liquid { .. } => NodeWallet::Liquid(
                 cassis_client::adapters::build_liquid_adapter(
                     spec,
@@ -925,6 +930,9 @@ pub async fn command_fund(
         }
         NetSpec::Arkade { .. } => {
             fund_arkade(&playground.prefund_arkade, node_id, &wallet, amount).await
+        }
+        NetSpec::Bitcoin { .. } => {
+            return Err("prefunding bitcoin (on-chain) nodes is not wired yet".to_string())
         }
         NetSpec::Liquid { .. } => {
             fund_liquid(&playground.prefund_liquid, node_id, &wallet, amount).await
