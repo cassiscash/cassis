@@ -334,6 +334,27 @@ pub async fn build_arkade_adapter(
         .map_err(|e| format!("arkade adapter init failed: {e}"))
 }
 
+/// Build a concrete `cassis_bitcoin::BitcoinAdapter` for a bitcoin
+/// spec (for the wallet `transfer` / prefund flows).
+#[cfg(feature = "bitcoin")]
+pub async fn build_bitcoin_adapter(
+    spec: &NetSpec,
+    derived: &DerivedKeys,
+    span: Span,
+) -> Result<Arc<cassis_bitcoin::BitcoinAdapter>, String> {
+    let NetSpec::Bitcoin { .. } = spec else {
+        return Err(format!("expected a bitcoin spec, got {}", spec.kind_name()));
+    };
+    let network_id = spec.network_id();
+    let sk = network_sk(derived, &network_id)?;
+    let cfg = cassis_bitcoin::default_config(network_id, sk, derived.invoice.pubkey(), span)
+        .map_err(|e| e.to_string())?;
+    cassis_bitcoin::BitcoinAdapter::new(cfg)
+        .await
+        .map(Arc::new)
+        .map_err(|e| format!("bitcoin adapter init failed: {e}"))
+}
+
 /// Build a concrete cashu adapter from a raw mint URL (used by the
 /// `cashu receive` flow where the URL comes from the token, not from
 /// `--network`).

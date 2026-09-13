@@ -2567,6 +2567,7 @@ name = "cassis-playground"
 version = "0.1.0"
 dependencies = [
  "cassis-arkade",
+ "cassis-bitcoin",
  "cassis-cashu",
  "cassis-client",
  "cassis-core",

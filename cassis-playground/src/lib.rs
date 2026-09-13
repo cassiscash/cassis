@@ -86,6 +86,10 @@ const NETWORKS: &[NetworkDef] = &[
         spec: "arkade::mutinynet",
     },
     NetworkDef {
+        id: "bitcoin_mutinynet",
+        spec: "bitcoin::mutinynet",
+    },
+    NetworkDef {
         id: "liquid_testnet",
         spec: "liquid::testnet",
     },
@@ -134,6 +138,7 @@ impl Status {
 enum NodeWallet {
     Cashu(Arc<cassis_cashu::CashuAdapter>),
     Arkade(Arc<cassis_arkade::ArkadeAdapter>),
+    Bitcoin(Arc<cassis_bitcoin::BitcoinAdapter>),
     Liquid(Arc<cassis_liquid::LiquidAdapter>),
     Rootstock(Arc<cassis_rootstock::RootstockAdapter>),
 }
@@ -143,6 +148,7 @@ impl NodeWallet {
         match self {
             NodeWallet::Cashu(a) => a.clone(),
             NodeWallet::Arkade(a) => a.clone(),
+            NodeWallet::Bitcoin(a) => a.clone(),
             NodeWallet::Liquid(a) => a.clone(),
             NodeWallet::Rootstock(a) => a.clone(),
         }
@@ -152,6 +158,7 @@ impl NodeWallet {
         match self {
             NodeWallet::Cashu(a) => a.clone(),
             NodeWallet::Arkade(a) => a.clone(),
+            NodeWallet::Bitcoin(a) => a.clone(),
             NodeWallet::Liquid(a) => a.clone(),
             NodeWallet::Rootstock(a) => a.clone(),
         }
@@ -161,6 +168,7 @@ impl NodeWallet {
         match self {
             NodeWallet::Cashu(a) => a.clone(),
             NodeWallet::Arkade(a) => a.clone(),
+            NodeWallet::Bitcoin(a) => a.clone(),
             NodeWallet::Liquid(a) => a.clone(),
             NodeWallet::Rootstock(a) => a.clone(),
         }
@@ -176,6 +184,7 @@ impl NodeWallet {
                 .sum::<u64>()
                 .saturating_mul(1000)),
             NodeWallet::Arkade(a) => a.balance_msat().await.map_err(|e| e.to_string()),
+            NodeWallet::Bitcoin(a) => a.balance_msat().await.map_err(|e| e.to_string()),
             NodeWallet::Liquid(a) => a.balance_msat().await.map_err(|e| e.to_string()),
             NodeWallet::Rootstock(a) => a.balance_msat().await.map_err(|e| e.to_string()),
         }
@@ -310,6 +319,7 @@ pub struct Playground {
     prefund_seed: String,
     prefund_liquid: Arc<cassis_liquid::LiquidAdapter>,
     prefund_arkade: Arc<cassis_arkade::ArkadeAdapter>,
+    prefund_bitcoin: Arc<cassis_bitcoin::BitcoinAdapter>,
     prefund_rootstock: Arc<cassis_rootstock::RootstockAdapter>,
 }
 
@@ -321,6 +331,7 @@ pub struct Playground {
 pub struct PrefundWallets {
     pub liquid: Arc<cassis_liquid::LiquidAdapter>,
     pub arkade: Arc<cassis_arkade::ArkadeAdapter>,
+    pub bitcoin: Arc<cassis_bitcoin::BitcoinAdapter>,
     pub rootstock: Arc<cassis_rootstock::RootstockAdapter>,
 }
 
@@ -347,6 +358,13 @@ impl PrefundWallets {
             span.clone(),
         )
         .await?;
+        let bitcoin_spec = NetSpec::parse("bitcoin::mutinynet")?;
+        let bitcoin = cassis_client::adapters::build_bitcoin_adapter(
+            &bitcoin_spec,
+            &prefund_keys(seed, &bitcoin_spec)?,
+            span.clone(),
+        )
+        .await?;
         let rootstock_spec = NetSpec::parse("rootstock::testnet")?;
         let rootstock = cassis_client::adapters::build_rootstock_adapter(
             &rootstock_spec,
@@ -357,6 +375,7 @@ impl PrefundWallets {
         Ok(Self {
             liquid,
             arkade,
+            bitcoin,
             rootstock,
         })
     }
@@ -379,6 +398,10 @@ impl PrefundWallets {
             ("liquid_testnet".to_string(), liquid),
             ("arkade_testnet".to_string(), boarding),
             (
+                "bitcoin_mutinynet".to_string(),
+                self.bitcoin.deposit_address(),
+            ),
+            (
                 "rootstock_testnet".to_string(),
                 self.rootstock.address().to_string(),
             ),
@@ -391,6 +414,7 @@ impl PrefundWallets {
         match network {
             "liquid_testnet" => self.liquid.balance_msat().await.map_err(|e| e.to_string()),
             "arkade_testnet" => self.arkade.balance_msat().await.map_err(|e| e.to_string()),
+            "bitcoin_mutinynet" => self.bitcoin.balance_msat().await.map_err(|e| e.to_string()),
             "rootstock_testnet" => self
                 .rootstock
                 .balance_msat()
@@ -424,6 +448,7 @@ impl Playground {
         let prefund = PrefundWallets::build(&root, &prefund_seed).await?;
         let prefund_liquid = prefund.liquid;
         let prefund_arkade = prefund.arkade;
+        let prefund_bitcoin = prefund.bitcoin;
         let prefund_rootstock = prefund.rootstock;
         let network_ids = NETWORKS
             .iter()
@@ -469,6 +494,7 @@ impl Playground {
             prefund_seed,
             prefund_liquid,
             prefund_arkade,
+            prefund_bitcoin,
             prefund_rootstock,
         });
         playground.start_infrastructure().await?;
@@ -562,7 +588,12 @@ impl Playground {
         // The shared prefund wallet: always shown, it is where manual
         // test-coin deposits land before `fund` distributes them.
         output.push_str(&format!("{}:\n", colored_node_name("prefund")));
-        for network_id in ["arkade_testnet", "liquid_testnet", "rootstock_testnet"] {
+        for network_id in [
+            "arkade_testnet",
+            "bitcoin_mutinynet",
+            "liquid_testnet",
+            "rootstock_testnet",
+        ] {
             let balance = balances
                 .get(&("prefund".to_string(), network_id.to_string()))
                 .map(|b| b.to_string())
@@ -641,6 +672,10 @@ impl Playground {
             (
                 "arkade_testnet",
                 NodeWallet::Arkade(self.prefund_arkade.clone()),
+            ),
+            (
+                "bitcoin_mutinynet",
+                NodeWallet::Bitcoin(self.prefund_bitcoin.clone()),
             ),
             (
                 "liquid_testnet",
@@ -754,11 +789,9 @@ impl Playground {
             NetSpec::Arkade { .. } => NodeWallet::Arkade(
                 cassis_client::adapters::build_arkade_adapter(spec, &derived, span).await?,
             ),
-            NetSpec::Bitcoin { .. } => {
-                return Err(
-                    "bitcoin (on-chain) nodes are not wired into the playground yet".to_string(),
-                )
-            }
+            NetSpec::Bitcoin { .. } => NodeWallet::Bitcoin(
+                cassis_client::adapters::build_bitcoin_adapter(spec, &derived, span).await?,
+            ),
             NetSpec::Liquid { .. } => NodeWallet::Liquid(
                 cassis_client::adapters::build_liquid_adapter(
                     spec,
@@ -818,6 +851,11 @@ impl Playground {
                 .balance_msat()
                 .await
                 .map_err(|e| e.to_string()),
+            "bitcoin_mutinynet" => self
+                .prefund_bitcoin
+                .balance_msat()
+                .await
+                .map_err(|e| e.to_string()),
             "rootstock_testnet" => self
                 .prefund_rootstock
                 .balance_msat()
@@ -856,6 +894,7 @@ fn colored_network_name(name: &str) -> String {
         // adapter spans carry the latter.
         "rootstock_testnet" | "rootstock::testnet" => 97,
         "arkade_testnet" | "arkade::mutinynet" => 94,
+        "bitcoin_mutinynet" | "bitcoin::mutinynet" => 35,
         "liquid_testnet" | "liquid::testnet" => 92,
         _ => 37,
     };
@@ -932,7 +971,7 @@ pub async fn command_fund(
             fund_arkade(&playground.prefund_arkade, node_id, &wallet, amount).await
         }
         NetSpec::Bitcoin { .. } => {
-            return Err("prefunding bitcoin (on-chain) nodes is not wired yet".to_string())
+            fund_bitcoin(&playground.prefund_bitcoin, node_id, &wallet, amount).await
         }
         NetSpec::Liquid { .. } => {
             fund_liquid(&playground.prefund_liquid, node_id, &wallet, amount).await
@@ -942,6 +981,26 @@ pub async fn command_fund(
         }
         NetSpec::Lightning => Err("playground does not support funding 'lightning'".into()),
     }
+}
+
+async fn fund_bitcoin(
+    source: &cassis_bitcoin::BitcoinAdapter,
+    node_id: &str,
+    target: &NodeWallet,
+    amount_msat: u64,
+) -> Result<(), String> {
+    let NodeWallet::Bitcoin(adapter) = target else {
+        return Err("target wallet is not bitcoin".into());
+    };
+    let txid = source
+        .transfer_to_address(&adapter.deposit_address(), amount_msat)
+        .await
+        .map_err(|e| e.to_string())?;
+    info!(
+        "funded {node_id} on {}: {amount_msat} msat, tx {txid}",
+        colored_network_name("bitcoin_mutinynet"),
+    );
+    Ok(())
 }
 
 async fn fund_liquid(
@@ -1095,6 +1154,7 @@ async fn command_prefund(
     prefund_liquid: &cassis_liquid::LiquidAdapter,
     prefund_rootstock: &cassis_rootstock::RootstockAdapter,
     prefund_arkade: &cassis_arkade::ArkadeAdapter,
+    prefund_bitcoin: &cassis_bitcoin::BitcoinAdapter,
 ) -> Result<(), String> {
     let mut output = format!("prefund seed: {prefund_seed}\n");
 
@@ -1120,6 +1180,12 @@ async fn command_prefund(
     output.push_str(&format!(
         "{}: {boarding}\n",
         colored_network_name("arkade_testnet"),
+    ));
+
+    output.push_str(&format!(
+        "{}: {}\n",
+        colored_network_name("bitcoin_mutinynet"),
+        prefund_bitcoin.deposit_address(),
     ));
 
     info!("send test coins to:\n{output}");
@@ -1586,6 +1652,7 @@ async fn execute_line(playground: Arc<Playground>, line: String) {
                     &playground.prefund_liquid,
                     &playground.prefund_rootstock,
                     &playground.prefund_arkade,
+                    &playground.prefund_bitcoin,
                 )
                 .await
                 {
