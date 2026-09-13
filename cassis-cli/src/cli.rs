@@ -96,7 +96,7 @@ pub enum Commands {
     },
     /// Manage a node's Arkade funds.
     Arkade {
-        /// Network spec, `arkade` (default) or `arkade::testnet`.
+        /// Network spec, `arkade` (default) or `arkade::mutinynet`.
         #[arg(long, default_value = "arkade")]
         network: String,
         #[command(subcommand)]

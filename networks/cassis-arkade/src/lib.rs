@@ -149,7 +149,7 @@ pub struct ArkadeConfig {
     pub span: Span,
 }
 
-/// Canonical config for `arkade` (mainnet) or `arkade::testnet`
+/// Canonical config for `arkade` (mainnet) or `arkade::mutinynet`
 /// (mutinynet). Callers may override any field before constructing.
 pub fn default_config(
     network_id: NetworkId,
@@ -158,7 +158,7 @@ pub fn default_config(
     span: Span,
 ) -> ArkadeConfig {
     match network_id.0.as_str() {
-        "arkade::testnet" => ArkadeConfig {
+        "arkade::mutinynet" => ArkadeConfig {
             network_id,
             server_url: TESTNET_SERVER_URL.to_string(),
             esplora_url: TESTNET_ESPLORA_URL.to_string(),
@@ -180,7 +180,7 @@ pub fn default_config(
 fn bitcoin_network(network_id: &NetworkId) -> bitcoin::Network {
     match network_id.0.as_str() {
         // Mutinynet is signet-based (tb1.. addresses).
-        "arkade::testnet" => bitcoin::Network::Signet,
+        "arkade::mutinynet" => bitcoin::Network::Signet,
         _ => bitcoin::Network::Bitcoin,
     }
 }
@@ -872,7 +872,7 @@ impl ArkadeAdapter {
         format!(
             "{} signer={}",
             match self.network_id.0.as_str() {
-                "arkade::testnet" => TESTNET_SERVER_URL,
+                "arkade::mutinynet" => TESTNET_SERVER_URL,
                 _ => MAINNET_SERVER_URL,
             },
             self.server_pk_xonly

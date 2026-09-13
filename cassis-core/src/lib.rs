@@ -125,7 +125,7 @@ pub fn fedimint_network_id(invite_code: &str) -> NetworkId {
 }
 
 /// Build the canonical `NetworkId` for a kind without a parameter
-/// (liquid, liquid::testnet, arkade, arkade::testnet, rootstock).
+/// (liquid, liquid::testnet, arkade, arkade::mutinynet, rootstock).
 pub fn simple_network_id(kind: &str) -> NetworkId {
     NetworkId(kind.to_string())
 }
@@ -133,7 +133,7 @@ pub fn simple_network_id(kind: &str) -> NetworkId {
 /// Pass-through used by the router to canonicalize `HopInstruction`
 /// network ids before adapter lookup. Only the canonical on-the-wire
 /// form (`cashu::<host>`, `fedimint::<invite>`, or the simple kinds
-/// `liquid` / `liquid::testnet` / `arkade` / `arkade::testnet` / `rootstock` /
+/// `liquid` / `liquid::testnet` / `arkade` / `arkade::mutinynet` / `rootstock` /
 /// `rootstock::testnet` / `lightning`) round-trips;
 /// anything else is returned unchanged so the adapter lookup rejects it.
 pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
@@ -150,7 +150,7 @@ pub fn canonicalize_network_id(id: &NetworkId) -> NetworkId {
     if id.0 == "liquid"
         || id.0 == "liquid::testnet"
         || id.0 == "arkade"
-        || id.0 == "arkade::testnet"
+        || id.0 == "arkade::mutinynet"
         || id.0 == "rootstock"
         || id.0 == "rootstock::testnet"
         || id.0 == "lightning"
@@ -238,9 +238,9 @@ pub fn network_id_for_spec(spec: &str) -> Result<NetworkId, String> {
         #[cfg(feature = "arkade")]
         "arkade" => match param {
             None => Ok(NetworkId("arkade".to_string())),
-            Some("testnet") => Ok(NetworkId("arkade::testnet".to_string())),
+            Some("mutinynet") => Ok(NetworkId("arkade::mutinynet".to_string())),
             Some(other) => Err(format!(
-                "network 'arkade' only accepts no parameter or 'testnet', got '{other}'"
+                "network 'arkade' only accepts no parameter or 'mutinynet', got '{other}'"
             )),
         },
         #[cfg(not(feature = "arkade"))]
@@ -1400,8 +1400,8 @@ mod tests {
     fn network_id_for_arkade_spec_uses_canonical_form() {
         let id = network_id_for_spec("arkade").unwrap();
         assert_eq!(id.0, "arkade");
-        let id = network_id_for_spec("arkade::testnet").unwrap();
-        assert_eq!(id.0, "arkade::testnet");
+        let id = network_id_for_spec("arkade::mutinynet").unwrap();
+        assert_eq!(id.0, "arkade::mutinynet");
     }
 
     #[cfg(feature = "arkade")]
@@ -1555,8 +1555,8 @@ mod tests {
             "arkade"
         );
         assert_eq!(
-            canonicalize_network_id(&NetworkId("arkade::testnet".to_string())).0,
-            "arkade::testnet"
+            canonicalize_network_id(&NetworkId("arkade::mutinynet".to_string())).0,
+            "arkade::mutinynet"
         );
         assert_eq!(
             canonicalize_network_id(&NetworkId("rootstock".to_string())).0,

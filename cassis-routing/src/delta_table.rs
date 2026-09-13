@@ -5,7 +5,7 @@ use cassis_core::NetworkId;
 ///
 /// Values mirror the `incoming_delta_secs()` declared on each network
 /// adapter (`cassisd` and the per-network crates):
-///   - arkade: 60 (`arkade` and `arkade::testnet`)
+///   - arkade: 60 (`arkade` and `arkade::mutinynet`)
 ///   - fedimint: 30
 ///   - cashu: 30
 ///   - liquid: 300 (`liquid` and `liquid::testnet`)
@@ -16,7 +16,7 @@ use cassis_core::NetworkId;
 /// any network not in the table.
 pub fn fallback_incoming_delta(network: &NetworkId) -> u64 {
     match network.0.as_str() {
-        "arkade" | "arkade::testnet" => 60,
+        "arkade" | "arkade::mutinynet" => 60,
         "fedimint" => 30,
         "cashu" => 30,
         "liquid" | "liquid::testnet" => 300,
@@ -46,7 +46,7 @@ mod tests {
     fn known_networks_return_documented_values() {
         assert_eq!(fallback_incoming_delta(&NetworkId("arkade".into())), 60);
         assert_eq!(
-            fallback_incoming_delta(&NetworkId("arkade::testnet".into())),
+            fallback_incoming_delta(&NetworkId("arkade::mutinynet".into())),
             60
         );
         assert_eq!(fallback_incoming_delta(&NetworkId("fedimint".into())), 30);

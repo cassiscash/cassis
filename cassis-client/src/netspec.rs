@@ -1,12 +1,12 @@
 use cassis_core::{cashu_mint_url, cashu_network_id, NetworkId};
 
 /// A parsed `--network` spec, mirroring the router/CLI format:
-/// `cashu::host`, `arkade`, `arkade::testnet`, `liquid`,
+/// `cashu::host`, `arkade`, `arkade::mutinynet`, `liquid`,
 /// `liquid::testnet`, `rootstock`, or `rootstock::testnet`.
 #[derive(Clone, Debug)]
 pub enum NetSpec {
     Cashu { mint_url: String, host: String },
-    Arkade { testnet: bool },
+    Arkade { mutinynet: bool },
     Liquid { testnet: bool },
     Rootstock { testnet: bool },
     Lightning,
@@ -47,10 +47,10 @@ impl NetSpec {
                 )),
             },
             "arkade" => match param {
-                None => Ok(NetSpec::Arkade { testnet: false }),
-                Some("testnet") => Ok(NetSpec::Arkade { testnet: true }),
+                None => Ok(NetSpec::Arkade { mutinynet: false }),
+                Some("mutinynet") => Ok(NetSpec::Arkade { mutinynet: true }),
                 Some(other) => Err(format!(
-                    "network 'arkade' only accepts no parameter or 'testnet', got '{other}'"
+                    "network 'arkade' only accepts no parameter or 'mutinynet', got '{other}'"
                 )),
             },
             "liquid" => match param {
@@ -79,8 +79,8 @@ impl NetSpec {
     pub fn network_id(&self) -> NetworkId {
         match self {
             NetSpec::Cashu { host, .. } => cashu_network_id(host),
-            NetSpec::Arkade { testnet } => NetworkId(if *testnet {
-                "arkade::testnet".to_string()
+            NetSpec::Arkade { mutinynet } => NetworkId(if *mutinynet {
+                "arkade::mutinynet".to_string()
             } else {
                 "arkade".to_string()
             }),
@@ -172,8 +172,8 @@ mod tests {
         let s = NetSpec::parse("arkade").unwrap();
         assert_eq!(s.network_id().0, "arkade");
         assert_eq!(s.kind_name(), "arkade");
-        let s = NetSpec::parse("arkade::testnet").unwrap();
-        assert_eq!(s.network_id().0, "arkade::testnet");
+        let s = NetSpec::parse("arkade::mutinynet").unwrap();
+        assert_eq!(s.network_id().0, "arkade::mutinynet");
         assert!(matches!(NetSpec::parse("arkade::foo"), Err(_)));
     }
 }

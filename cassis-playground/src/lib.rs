@@ -83,7 +83,7 @@ const NETWORKS: &[NetworkDef] = &[
     },
     NetworkDef {
         id: "arkade_testnet",
-        spec: "arkade::testnet",
+        spec: "arkade::mutinynet",
     },
     NetworkDef {
         id: "liquid_testnet",
@@ -340,7 +340,7 @@ impl PrefundWallets {
             span.clone(),
         )
         .await?;
-        let arkade_spec = NetSpec::parse("arkade::testnet")?;
+        let arkade_spec = NetSpec::parse("arkade::mutinynet")?;
         let arkade = cassis_client::adapters::build_arkade_adapter(
             &arkade_spec,
             &prefund_keys(seed, &arkade_spec)?,
@@ -850,7 +850,7 @@ fn colored_network_name(name: &str) -> String {
         // Both the playground's own id and the wire `NetworkId`, since
         // adapter spans carry the latter.
         "rootstock_testnet" | "rootstock::testnet" => 97,
-        "arkade_testnet" | "arkade::testnet" => 94,
+        "arkade_testnet" | "arkade::mutinynet" => 94,
         "liquid_testnet" | "liquid::testnet" => 92,
         _ => 37,
     };
@@ -1136,7 +1136,7 @@ async fn command_onboard(
 }
 
 pub async fn command_onboard_node(playground: &Playground, node_id: &str) -> Result<(), String> {
-    let spec = NetSpec::parse("arkade::testnet")?;
+    let spec = NetSpec::parse("arkade::mutinynet")?;
     let wallet = playground
         .ensure_wallet(node_id, &spec.network_id())
         .await?;
