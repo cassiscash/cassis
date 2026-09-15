@@ -214,6 +214,23 @@ async fn build_pair(
                 sender: adapter,
             })
         }
+        #[cfg(feature = "fedimint")]
+        NetSpec::Fedimint { address } => {
+            let adapter = Arc::new(
+                cassis_fedimint::FedimintAdapter::new(
+                    network_id.clone(),
+                    address.clone(),
+                    network_sk(derived, &network_id)?,
+                )
+                .await
+                .map_err(|e| format!("fedimint adapter init failed: {e}"))?,
+            );
+            Ok(AdapterPair {
+                network_id,
+                receiver: adapter.clone(),
+                sender: adapter,
+            })
+        }
         #[allow(unreachable_patterns)]
         _ => Err(format!(
             "network kind '{}' requested but cassis-client was not compiled with that feature",
@@ -291,6 +308,27 @@ pub async fn build_liquid_adapter(
     cassis_liquid::LiquidAdapter::new(cfg)
         .await
         .map_err(|e| format!("liquid adapter init failed: {e}"))
+}
+
+/// Build a concrete `cassis_fedimint::FedimintAdapter` for a fedimint
+/// spec (for the wallet `balance` subcommand).
+#[cfg(feature = "fedimint")]
+pub async fn build_fedimint_adapter(
+    spec: &NetSpec,
+    derived: &DerivedKeys,
+) -> Result<Arc<cassis_fedimint::FedimintAdapter>, String> {
+    let NetSpec::Fedimint { address } = spec else {
+        return Err(format!(
+            "expected a fedimint spec, got {}",
+            spec.kind_name()
+        ));
+    };
+    let network_id = spec.network_id();
+    let sk = network_sk(derived, &network_id)?;
+    cassis_fedimint::FedimintAdapter::new(network_id, address.clone(), sk)
+        .await
+        .map(Arc::new)
+        .map_err(|e| format!("fedimint adapter init failed: {e}"))
 }
 
 /// Build a concrete `cassis_rootstock::RootstockAdapter` for a
