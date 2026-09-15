@@ -1030,7 +1030,6 @@ pub trait NetworkReceiverAdapter: Send + Sync {
     }
 
     /// Wait for the upstream hop to fund the invoice.
-
     /// preimage if the receiver holds it (hash-locked networks); for
     /// "sells its own preimage" networks the network owns the
     /// preimage and this just blocks until funding is observed.
@@ -1092,7 +1091,6 @@ pub trait NetworkSenderAdapter: Send + Sync {
     ) -> Result<OutgoingPayment, SendError>;
 
     /// Block until the payment reaches a terminal state.
-
     /// returns the preimage; on failure or refund returns an error.
     async fn watch_payment(
         &self,
@@ -1347,7 +1345,7 @@ where
 /// underlying `T` to use `Arc<T>` from trait objects. Kept here for
 /// downstream code that wants `Arc<dyn NetworkRouterAdapter>` etc.
 #[allow(dead_code)]
-fn _assert_send_sync<T: Send + Sync + ?Sized>() {
+fn _assert_send_sync() {
     fn assert<T: Send + Sync + ?Sized>() {}
     assert::<dyn NetworkRouterAdapter>();
     assert::<dyn NetworkReceiverAdapter>();

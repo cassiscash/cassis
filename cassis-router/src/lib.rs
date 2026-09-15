@@ -32,6 +32,10 @@ use tracing::{debug, error, info, warn, Instrument, Span};
 
 const NOSTR_KIND_ROUTE_ANNOUNCEMENT: u16 = 35515;
 
+/// Optional PREPARE veto hook: returns a rejection reason, or `None`
+/// to let the normal checks proceed.
+pub type PrepareVeto = Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>;
+
 const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
 
 /// How often the per-dispatch poll task wakes up to check
@@ -82,7 +86,7 @@ pub struct RouterConfig {
     /// `None` lets the normal checks proceed. Runs *after* the built-in
     /// validation but *before* any reservation is recorded, so a vetoed
     /// PREPARE reserves nothing.
-    pub prepare_veto: Option<Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>>,
+    pub prepare_veto: Option<PrepareVeto>,
 }
 
 /// Run the router daemon. Blocks until Ctrl-C. The caller
@@ -474,7 +478,7 @@ async fn build_adapter(
             Ok(NetworkEntry {
                 network_id,
                 adapter,
-                incoming_delta_secs: incoming_delta_secs,
+                incoming_delta_secs,
             })
         }
 
@@ -576,14 +580,14 @@ pub struct CassisRouter {
     prepared: Arc<Mutex<Vec<PreparedEntry>>>,
     dispatched: Arc<Mutex<HashMap<Bytes32, DispatchedHop>>>,
     /// See [`RouterConfig::prepare_veto`].
-    prepare_veto: Option<Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>>,
+    prepare_veto: Option<PrepareVeto>,
 }
 
 impl CassisRouter {
     pub fn new(
         adapters: HashMap<NetworkId, NetworkEntry>,
         span: Span,
-        prepare_veto: Option<Arc<dyn Fn(&HopPrepare) -> Option<String> + Send + Sync>>,
+        prepare_veto: Option<PrepareVeto>,
     ) -> Self {
         Self {
             adapters,

@@ -41,6 +41,10 @@ use htlc::{
 };
 pub use store::CashuProofStore;
 
+/// Per-output blinding triple from a mint/swap: `(secret, r,
+/// amount)`.
+type BlindingTriple = (Secret, cdk::nuts::nut01::SecretKey, Amount);
+
 /// Receiver-side state for an outstanding incoming HTLC.
 pub struct PendingIncoming {
     /// SHA-256 of the preimage, hex-encoded the way the cashu
@@ -304,10 +308,7 @@ impl CashuAdapter {
         n: usize,
         keyset_id: KeysetId,
         amounts: &[Amount],
-    ) -> CashuResult<(
-        Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)>,
-        Vec<BlindedMessage>,
-    )> {
+    ) -> CashuResult<(Vec<BlindingTriple>, Vec<BlindedMessage>)> {
         let mut triples = Vec::with_capacity(n);
         let mut outputs = Vec::with_capacity(n);
         for &amount in amounts {
@@ -324,7 +325,7 @@ impl CashuAdapter {
     /// list of `(secret, r, amount)` triples.
     fn unblind_response(
         response: cdk::nuts::nut03::SwapResponse,
-        triples: Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)>,
+        triples: Vec<BlindingTriple>,
         keys: &cdk::nuts::Keys,
     ) -> CashuResult<Proofs> {
         let mut proofs = Vec::with_capacity(response.signatures.len());
@@ -708,7 +709,7 @@ impl NetworkRouterAdapter for CashuAdapter {
         // secrets and blinding factors; the response carries the
         // mint's blind signatures. HTLC premints come first,
         // change triples after.
-        let mut triples: Vec<(Secret, cdk::nuts::nut01::SecretKey, Amount)> = outputs
+        let mut triples: Vec<BlindingTriple> = outputs
             .premints
             .into_iter()
             .map(|p| (p.secret, p.r, p.amount))

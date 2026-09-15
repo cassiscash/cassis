@@ -448,7 +448,7 @@ impl BitcoinAdapter {
         address: &str,
         amount_msat: u64,
     ) -> Result<bitcoin::Txid, HtlcError> {
-        if amount_msat % MSAT_PER_SAT != 0 {
+        if !amount_msat.is_multiple_of(MSAT_PER_SAT) {
             return Err(HtlcError::InvalidParams(format!(
                 "amount {amount_msat} msat is not a whole number of satoshis"
             )));
@@ -546,7 +546,7 @@ impl BitcoinAdapter {
                 .map_err(|e| HtlcError::Network(format!("taproot sighash: {e}")))?;
             let msg = bitcoin::secp256k1::Message::from_digest(*sh.as_ref());
             sigs.push(
-                secp.sign_schnorr_no_aux_rand(&msg, &tweaked_pair.as_keypair())
+                secp.sign_schnorr_no_aux_rand(&msg, tweaked_pair.as_keypair())
                     .serialize(),
             );
         }
@@ -747,7 +747,7 @@ impl BitcoinAdapter {
                     .map_err(|e| HtlcError::Network(format!("taproot sighash: {e}")))?;
                 let msg = bitcoin::secp256k1::Message::from_digest(*sh.as_ref());
                 sigs.push(
-                    secp.sign_schnorr_no_aux_rand(&msg, &tweaked_pair.as_keypair())
+                    secp.sign_schnorr_no_aux_rand(&msg, tweaked_pair.as_keypair())
                         .serialize()
                         .to_vec(),
                 );
@@ -883,15 +883,11 @@ impl BitcoinAdapter {
         };
         // BIP342: a script-path CHECKSIG signs with the leaf key
         // tweaked on its own (no branch commitment).
-        let signing_pair = if is_claim {
-            claim_pair
-        } else {
-            wallet_pair.clone()
-        };
+        let signing_pair = if is_claim { claim_pair } else { wallet_pair };
         let tweaked = signing_pair.tap_tweak(&signing_secp, None);
         let msg = bitcoin::secp256k1::Message::from_digest(*sighash.as_ref());
         let sig = signing_secp
-            .sign_schnorr_no_aux_rand(&msg, &tweaked.as_keypair())
+            .sign_schnorr_no_aux_rand(&msg, tweaked.as_keypair())
             .serialize()
             .to_vec();
         // Witness items land on the stack in order: the signature sits
@@ -1058,7 +1054,7 @@ impl NetworkRouterAdapter for BitcoinAdapter {
                 ))
             }
         };
-        if amount_msat % MSAT_PER_SAT != 0 {
+        if !amount_msat.is_multiple_of(MSAT_PER_SAT) {
             return Err(HtlcError::InvalidParams(format!(
                 "amount {amount_msat} msat is not a whole number of satoshis"
             )));
@@ -1376,7 +1372,7 @@ mod tests {
         );
         let tweaked = pair.tap_tweak(&secp, None);
         let msg = bitcoin::secp256k1::Message::from_digest([6u8; 32]);
-        let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.as_keypair());
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, tweaked.as_keypair());
         let pubkey: bitcoin::XOnlyPublicKey = tweaked.public_parts().0.into();
         secp.verify_schnorr(&sig, &msg, &pubkey).unwrap();
     }

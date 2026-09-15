@@ -323,8 +323,8 @@ impl RootstockAdapter {
         let msat: u128 = msat
             .try_into()
             .map_err(|_| Error::InvalidParams("balance overflows u128".into()))?;
-        Ok(u64::try_from(msat)
-            .map_err(|_| Error::InvalidParams("balance exceeds u64::MAX msat".into()))?)
+        u64::try_from(msat)
+            .map_err(|_| Error::InvalidParams("balance exceeds u64::MAX msat".into()))
     }
 
     /// Send `amount_msat` worth of RBTC to `to` as a plain
@@ -1249,7 +1249,7 @@ pub fn parse_hex(s: &str) -> Result<Vec<u8>, Error> {
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
-    if stripped.len() % 2 != 0 {
+    if !stripped.len().is_multiple_of(2) {
         return Err(Error::InvalidParams(format!(
             "hex string has odd length ({} chars)",
             stripped.len()

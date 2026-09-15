@@ -262,7 +262,7 @@ pub async fn build_cashu_adapter(
         store,
         span,
     )
-    .map(|a| Arc::new(a))
+    .map(Arc::new)
     .map_err(|e| format!("cashu adapter init failed: {e}"))
 }
 

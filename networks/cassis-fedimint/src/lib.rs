@@ -304,7 +304,7 @@ impl FedimintAdapter {
                 seed = sha256::Hash::hash(&seed.to_byte_array());
                 continue;
             };
-            let keypair = sk.keypair(&secp256k1::SECP256K1);
+            let keypair = sk.keypair(secp256k1::SECP256K1);
             if keypair.public_key().serialize()[0] == 0x02 {
                 return keypair;
             }
@@ -333,7 +333,7 @@ impl FedimintAdapter {
     /// Borrow the LNv2 client module from a client handle. The
     /// returned reference is tied to the input borrow; safe to use
     /// across `await` points since `Arc<ClientHandle>` is `Sync`.
-    fn ln_module<'c>(client: &'c ClientHandleArc) -> anyhow::Result<&'c LightningClientModule> {
+    fn ln_module(client: &ClientHandleArc) -> anyhow::Result<&LightningClientModule> {
         Ok(client.get_first_module::<LightningClientModule>()?.module)
     }
 
@@ -760,11 +760,9 @@ impl NetworkRouterAdapter for FedimintAdapter {
                 // settlement, so a failed settle retries the settle —
                 // never the submission (which the federation would
                 // reject as a duplicate operation).
-                self.incoming
-                    .lock()
-                    .await
-                    .get_mut(&payment_hash)
-                    .map(|slot| slot.claim_op = Some(operation_id));
+                if let Some(slot) = self.incoming.lock().await.get_mut(&payment_hash) {
+                    slot.claim_op = Some(operation_id);
+                }
                 operation_id
             }
         };
@@ -812,11 +810,9 @@ impl NetworkRouterAdapter for FedimintAdapter {
                             // awaiting its settlement, so a failed
                             // settle retries the settle — never the
                             // submission.
-                            self.outgoing
-                                .lock()
-                                .await
-                                .get_mut(&payment_hash)
-                                .map(|slot| slot.refund_op = Some(operation_id));
+                            if let Some(slot) = self.outgoing.lock().await.get_mut(&payment_hash) {
+                                slot.refund_op = Some(operation_id);
+                            }
                             break operation_id;
                         }
                         Err(LnHtlcError::NotExpired(missing)) => {
