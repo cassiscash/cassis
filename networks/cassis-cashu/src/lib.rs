@@ -1,16 +1,17 @@
 //! Cashu network: NUT-14 HTLCs on one mint.
 //!
 //! * **Lock**: swap wallet proofs at the mint for proofs whose secret is
-//!   a NUT-14 HTLC (payment hash, receiver key, refund locktime). The
-//!   proofs themselves are the descriptor handed to the receiver.
+//!   a NUT-14 HTLC (payment hash, receiver key, refund key, refund
+//!   locktime). The proofs themselves are the descriptor handed to the
+//!   receiver.
 //! * **Verify**: the proofs are locked to us and the hash, carry the
 //!   mint's DLEQ signature proof, and the mint reports them unspent.
 //! * **Claim**: swap them at the mint with the preimage and our
 //!   signature as witness.
 //! * **Watch**: the mint reports the spent proof's witness, which holds
 //!   the preimage.
-//! * **Refund**: after the locktime anyone holding the proofs can swap
-//!   them; the sender does.
+//! * **Refund**: after the locktime the sender swaps them back, signing
+//!   as the refund key: holding the proofs alone is not enough.
 //!
 //! Wallet proofs live in `<data_dir>/proofs.json`.
 
@@ -33,7 +34,7 @@ use cdk::nuts::nut12::ProofDleq;
 use cdk::nuts::nut14::HTLCWitness;
 use cdk::nuts::{CurrencyUnit, KeySetInfo, Token, Witness};
 use cdk::wallet::MintConnector;
-use htlc::{htlc_outputs, HtlcTerms};
+use htlc::{htlc_outputs, sign_refund, HtlcTerms};
 use std::path::Path;
 use std::str::FromStr;
 use tokio::sync::Mutex;
@@ -396,6 +397,7 @@ impl Network for CashuAdapter {
         let terms = HtlcTerms {
             payment_hash,
             receiver: cashu_key(receiver)?,
+            refund: cashu_key(&self.claim_pubkey)?,
             locktime: expiry,
         };
         let proofs = self.take(sats_for_msat(amount_msat), Some(&terms)).await?;
@@ -425,9 +427,11 @@ impl Network for CashuAdapter {
     }
 
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        self.redeem(decode_proofs(&htlc.descriptor)?)
-            .await
-            .map(|_| ())
+        let mut proofs = decode_proofs(&htlc.descriptor)?;
+        for proof in &mut proofs {
+            sign_refund(proof, &self.secret_key)?;
+        }
+        self.redeem(proofs).await.map(|_| ())
     }
 
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
