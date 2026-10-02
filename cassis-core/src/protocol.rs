@@ -40,11 +40,6 @@ pub struct Invoice {
     /// payer must lock to there.
     pub networks: Vec<InvoiceNetwork>,
     pub description: Option<String>,
-    /// When `true` the payee releases the preimage as soon as its HTLC
-    /// is funded, without waiting for COMMIT. Not implemented yet by
-    /// cassis payees; carried for wire compatibility.
-    #[serde(default)]
-    pub autocommit: bool,
     /// Iroh endpoint of the payee, where COMMIT is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_peer_id: Option<String>,
@@ -204,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn invoice_autocommit_defaults_to_false() {
+    fn invoice_decodes_without_optional_fields() {
         let decoded: Invoice = serde_json::from_str(
             r#"{
                 "payment_hash": "0000000000000000000000000000000000000000000000000000000000000001",
@@ -219,7 +214,6 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(!decoded.autocommit);
         assert!(decoded
             .target_for(&NetworkId("cashu::localhost".into()))
             .is_some());

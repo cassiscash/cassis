@@ -62,7 +62,6 @@ pub async fn create_invoice(
         expires_at,
         networks: targets,
         description,
-        autocommit: false,
         iroh_peer_id: Some(iroh::SecretKey::from(keys.iroh).public().to_string()),
         iroh_relay,
     };

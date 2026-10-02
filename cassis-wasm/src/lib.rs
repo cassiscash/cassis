@@ -69,7 +69,6 @@ export interface Invoice {
   expires_at: number;
   networks: InvoiceNetwork[];
   description: string | null;
-  autocommit: boolean;
   iroh_peer_id?: string;
   iroh_relay?: string;
 }
