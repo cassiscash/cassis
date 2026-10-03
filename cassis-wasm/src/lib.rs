@@ -5,7 +5,8 @@
 //! JS equivalent:
 //!
 //! * an iroh [`CassisEndpoint`] (relay-only in browsers), to send
-//!   `cassis-hop` requests to a payee, to answer COMMITs as a payee and
+//!   `cassis-hop` requests to a payee, to answer PREPAREs and COMMITs as
+//!   a payee and
 //!   to open Cassis Order Protocol streams to an order server;
 //! * the wire types, parsed and checked by `cassis-core` so the JS side
 //!   cannot drift from the Rust protocol: every request leaving and
@@ -69,6 +70,8 @@ export interface Invoice {
   expires_at: number;
   networks: InvoiceNetwork[];
   description: string | null;
+  /** Base64, at most 128 KiB; handed back with PREPARE and COMMIT. */
+  metadata?: string;
   iroh_peer_id?: string;
   iroh_relay?: string;
 }
@@ -77,10 +80,23 @@ export interface Commit {
   network: NetworkId;
   expiry: number;
   descriptor: HtlcDescriptor;
+  metadata?: string;
 }
-/** Only COMMIT is used without routers; the other requests are routing. */
-export type Request = { Commit: Commit } | { [kind: string]: unknown };
+/** Announces the payee's HTLC before anything is funded. */
+export interface PreparePayee {
+  payment_hash: string;
+  network: NetworkId;
+  expiry: number;
+  metadata?: string;
+}
+/** Only PreparePayee and COMMIT are used without routers; the other
+ * requests are routing. */
+export type Request =
+  | { PreparePayee: PreparePayee }
+  | { Commit: Commit }
+  | { [kind: string]: unknown };
 export type Response =
+  | { PayeePrepared: { Ok: null } | { Err: string } }
   | { Committed: string }
   | "Pending"
   | { Error: string }

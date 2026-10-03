@@ -232,7 +232,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let invoice = if wait {
                 let node = serve(&home, &span).await?;
                 let invoice = node
-                    .create_invoice(&networks, amount_msat, expires_at, description)
+                    .create_invoice(&networks, amount_msat, expires_at, description, None)
                     .await?;
                 serving = Some(node);
                 invoice
@@ -246,6 +246,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     amount_msat,
                     expires_at,
                     description,
+                    None,
                 )
                 .await?
             };

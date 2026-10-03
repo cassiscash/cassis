@@ -5,7 +5,8 @@
 //!   the first HTLC, EXECUTEs the hops in order and COMMITs to the payee.
 //! * **Router**: reserves hops on PREPARE, and on EXECUTE verifies the
 //!   incoming HTLC before funding the outgoing one.
-//! * **Payee**: on COMMIT verifies the final HTLC and claims it.
+//! * **Payee**: on PREPARE checks it still expects the payment, on
+//!   COMMIT verifies the final HTLC and claims it.
 //!
 //! Every HTLC this node funds or must claim is journaled in the
 //! [`Store`] before or right after the network call, and a settlement
@@ -264,6 +265,7 @@ impl Node {
     async fn handle(&self, request: Request, peer: String) -> Response {
         match request {
             Request::Prepare(prepare) => Response::Prepared(self.prepare(prepare, peer).await),
+            Request::PreparePayee(prepare) => Response::PayeePrepared(self.prepare_payee(prepare)),
             Request::Execute(execute) => self.execute(execute, peer).await,
             Request::Discard(discard) => {
                 self.discard(discard, peer).await;

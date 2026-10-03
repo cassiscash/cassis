@@ -2408,6 +2408,7 @@ name = "cassis-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bip32",
  "bip39",
  "futures",

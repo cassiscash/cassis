@@ -1,10 +1,10 @@
-//! Payee role: issue invoices, claim on COMMIT.
+//! Payee role: issue invoices, vet PREPARE, claim on COMMIT.
 
 use super::{InvoiceRecord, InvoiceStatus, Node, INLINE_WAIT, INVOICES, VERIFY_RETRY_INTERVAL};
 use crate::keys::NodeKeys;
-use crate::network::{Htlc, Network, NetworkError};
+use crate::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId};
 use crate::primitives::{unix_now, Bytes32};
-use crate::protocol::{Commit, Invoice, InvoiceNetwork, Response};
+use crate::protocol::{Commit, Invoice, InvoiceNetwork, Metadata, PreparePayee, Response};
 use crate::store::Store;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +17,8 @@ pub(super) enum CommitState {
     Failed(String),
 }
 
-/// Create and record an invoice payable on each of `networks`.
+/// Create and record an invoice payable on each of `networks`, carrying
+/// `metadata` back to this node with every PREPARE and COMMIT.
 ///
 /// Needs no running node: the payee endpoint is derived from `keys`, so
 /// an invoice can be issued while the node that will claim it is
@@ -30,6 +31,7 @@ pub async fn create_invoice(
     amount_msat: u64,
     expires_at: u64,
     description: Option<String>,
+    metadata: Option<Metadata>,
 ) -> Result<Invoice, String> {
     if amount_msat == 0 {
         return Err("invoice amount must be positive".into());
@@ -62,6 +64,7 @@ pub async fn create_invoice(
         expires_at,
         networks: targets,
         description,
+        metadata,
         iroh_peer_id: Some(iroh::SecretKey::from(keys.iroh).public().to_string()),
         iroh_relay,
     };
@@ -88,6 +91,7 @@ impl Node {
         amount_msat: u64,
         expires_at: u64,
         description: Option<String>,
+        metadata: Option<Metadata>,
     ) -> Result<Invoice, String> {
         let networks = networks
             .iter()
@@ -102,8 +106,64 @@ impl Node {
             amount_msat,
             expires_at,
             description,
+            metadata,
         )
         .await
+    }
+
+    /// Whether this node expects the HTLC `prepare` announces. Nothing
+    /// is reserved: COMMIT checks everything again.
+    pub(super) fn prepare_payee(&self, prepare: PreparePayee) -> Result<(), String> {
+        let hash = prepare.payment_hash;
+        let result = self.check_prepare_payee(&prepare);
+        match &result {
+            Ok(()) => info!(
+                "PREPARE {} accepted as payee on {}",
+                hash.short(),
+                prepare.network
+            ),
+            Err(reason) => warn!("PREPARE {} rejected as payee: {reason}", hash.short()),
+        }
+        result
+    }
+
+    fn check_prepare_payee(&self, prepare: &PreparePayee) -> Result<(), String> {
+        let record: InvoiceRecord = self
+            .store()
+            .get(INVOICES, &prepare.payment_hash.to_string())?
+            .ok_or("unknown invoice")?;
+        if record.status == InvoiceStatus::Claimed {
+            return Err("invoice already paid".into());
+        }
+        self.payable_on(&record, &prepare.network, prepare.expiry)
+            .map(|_| ())
+    }
+
+    /// What paying `record` with an HTLC on `network` expiring at
+    /// `expiry` needs: the invoice's target there, the network, and the
+    /// time by which the claim must start. Fails when the invoice or
+    /// the HTLC would not allow claiming.
+    fn payable_on(
+        &self,
+        record: &InvoiceRecord,
+        network: &NetworkId,
+        expiry: u64,
+    ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
+        if record.status == InvoiceStatus::Expired || record.invoice.expires_at <= unix_now() {
+            return Err("invoice expired".into());
+        }
+        let target = record
+            .invoice
+            .target_for(network)
+            .cloned()
+            .ok_or_else(|| format!("invoice is not payable on {network}"))?;
+        let network = self.network(network)?;
+        // The claim itself must land before the HTLC expires.
+        let claim_by = expiry.saturating_sub(network.incoming_delta_secs());
+        if claim_by <= unix_now() {
+            return Err("HTLC expires too soon to claim it".into());
+        }
+        Ok((target, network, claim_by))
     }
 
     /// Start claiming the HTLC of `commit`, or report on a claim
@@ -173,25 +233,11 @@ impl Node {
             .ok_or("this invoice is already being claimed")?;
         let mut record: InvoiceRecord =
             self.store().get(INVOICES, &key)?.ok_or("unknown invoice")?;
-        match record.status {
-            InvoiceStatus::Claimed => return Ok(()),
-            InvoiceStatus::Expired => return Err("invoice expired".into()),
-            InvoiceStatus::Pending => {}
+        if record.status == InvoiceStatus::Claimed {
+            return Ok(());
         }
-        if record.invoice.expires_at <= unix_now() {
-            return Err("invoice expired".into());
-        }
-        let target = record
-            .invoice
-            .target_for(&commit.network)
-            .cloned()
-            .ok_or_else(|| format!("invoice is not payable on {}", commit.network))?;
-        let network = self.network(&commit.network)?;
-        // The claim itself must land before the HTLC expires.
-        let claim_by = commit.expiry.saturating_sub(network.incoming_delta_secs());
-        if claim_by <= unix_now() {
-            return Err("HTLC expires too soon to claim it".into());
-        }
+        let (target, network, claim_by) =
+            self.payable_on(&record, &commit.network, commit.expiry)?;
         let htlc = Htlc {
             payment_hash: commit.payment_hash,
             amount_msat: record.invoice.amount_msat,

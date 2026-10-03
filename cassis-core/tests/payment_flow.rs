@@ -9,6 +9,7 @@ use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{
     HopRecord, HopState, Node, NodeConfig, PaymentRecord, PaymentStatus, RoutingPolicy,
 };
+use cassis_core::protocol::Metadata;
 use cassis_core::store::Store;
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
@@ -248,8 +249,15 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     }
 
     // Happy path: the payee claims, the router learns the preimage.
+    let metadata = Metadata::new(b"order 42".to_vec()).unwrap();
     let invoice = payee
-        .create_invoice(&[NetworkId(b.into())], 100_000, unix_now() + 600, None)
+        .create_invoice(
+            &[NetworkId(b.into())],
+            100_000,
+            unix_now() + 600,
+            None,
+            Some(metadata),
+        )
         .await
         .unwrap();
     let preimage = payer
@@ -271,13 +279,36 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .all(|lock| lock.state == LockState::Claimed(preimage));
     assert!(claimed_upstream);
 
-    // The payee never answers COMMIT: the payment fails after funding
-    // and both funded HTLCs stay journaled for refund.
-    let mut unreachable = payee
-        .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None)
+    // The endpoint named for the payee does not know the invoice: it
+    // refuses at PREPARE, before anything is funded.
+    let mut misdirected = payee
+        .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
         .await
         .unwrap();
-    unreachable.iroh_peer_id = Some(router.iroh_peer_id());
+    misdirected.iroh_peer_id = Some(router.iroh_peer_id());
+    let error = payer
+        .pay(&misdirected, &NetworkId(a.into()), &[RELAY.into()])
+        .await
+        .unwrap_err();
+    assert!(error.contains("payee refused: unknown invoice"), "{error}");
+    assert!(payer
+        .store()
+        .get::<PaymentRecord>("payments", &misdirected.payment_hash.to_string())
+        .unwrap()
+        .is_none());
+
+    // The payer locks to a key the payee does not claim with: PREPARE
+    // passes, COMMIT fails after funding, and both funded HTLCs stay
+    // journaled for refund.
+    let mut unreachable = payee
+        .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
+        .await
+        .unwrap();
+    unreachable.networks[0].target = HtlcTarget::XOnlyPubKey(
+        ritualistic::SecretKey::from_bytes([9; 32])
+            .unwrap()
+            .pubkey(),
+    );
     let error = payer
         .pay(&unreachable, &NetworkId(a.into()), &[RELAY.into()])
         .await

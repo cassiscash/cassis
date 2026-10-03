@@ -322,6 +322,7 @@ impl Flow {
                                 total_sats(&order) * 1000,
                                 unix_now() + INVOICE_TTL_SECS,
                                 Some(description),
+                                None,
                             )
                             .await?
                     }

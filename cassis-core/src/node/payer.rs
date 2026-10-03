@@ -3,7 +3,9 @@
 use super::{Node, PaymentRecord, PaymentStatus, PAYMENTS};
 use crate::network::{Htlc, NetworkId};
 use crate::primitives::{unix_now, Bytes32, OperationId};
-use crate::protocol::{Commit, Discard, Execute, Invoice, Prepare, Request, Response, Settle};
+use crate::protocol::{
+    Commit, Discard, Execute, Invoice, Prepare, PreparePayee, Request, Response, Settle,
+};
 use crate::routing::{self, RouteAnnouncement};
 use crate::transport::PeerAddr;
 use futures::future::join_all;
@@ -107,13 +109,22 @@ impl Node {
             hops.len()
         );
 
-        // PREPARE every hop at once. All replies are awaited, so every
-        // hop that might hold a reservation is known when aborting.
-        let replies = join_all(hops.iter().map(|hop| async move {
-            let prepare = Request::Prepare(hop.prepare.clone());
-            self.0.transport.request(&hop.peer, &prepare).await
-        }))
-        .await;
+        // PREPARE every hop, and the payee, at once. All replies are
+        // awaited, so every hop that might hold a reservation is known
+        // when aborting.
+        let payee_prepare = Request::PreparePayee(PreparePayee {
+            payment_hash: hash,
+            network: payee_network.clone(),
+            expiry: plan.expiries[hops.len()],
+            metadata: invoice.metadata.clone(),
+        });
+        let (replies, payee_reply) = futures::join!(
+            join_all(hops.iter().map(|hop| async move {
+                let prepare = Request::Prepare(hop.prepare.clone());
+                self.0.transport.request(&hop.peer, &prepare).await
+            })),
+            self.0.transport.request(&payee, &payee_prepare),
+        );
         let mut targets = Vec::with_capacity(hops.len() + 1);
         for (i, reply) in replies.into_iter().enumerate() {
             match reply {
@@ -126,6 +137,17 @@ impl Node {
                     self.discard_hops(&hops).await;
                     return Err(format!("hop {}: {}", i + 1, unexpected(other)));
                 }
+            }
+        }
+        match payee_reply {
+            Ok(Response::PayeePrepared(Ok(()))) => {}
+            Ok(Response::PayeePrepared(Err(reason))) => {
+                self.discard_hops(&hops).await;
+                return Err(format!("payee refused: {reason}"));
+            }
+            other => {
+                self.discard_hops(&hops).await;
+                return Err(format!("payee: {}", unexpected(other)));
             }
         }
         targets.push(payee_target);
@@ -196,6 +218,7 @@ impl Node {
             network: payee_network,
             expiry: plan.expiries[hops.len()],
             descriptor,
+            metadata: invoice.metadata.clone(),
         };
         let deadline = commit.expiry;
         let preimage = match self

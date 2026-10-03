@@ -4,7 +4,9 @@
 //!
 //! 1. **PREPARE** every router concurrently. Each checks the terms and
 //!    its liquidity, and answers with the [`HtlcTarget`] its incoming
-//!    HTLC must be locked to.
+//!    HTLC must be locked to. The payee gets a [`PreparePayee`] at the
+//!    same time, announcing the HTLC it will be COMMITted, and may
+//!    refuse the payment before anything is funded.
 //! 2. The payer funds the first HTLC, then **EXECUTE**s the routers in
 //!    order: each verifies its incoming HTLC, funds its outgoing one to
 //!    the next target and returns that HTLC's descriptor.
@@ -23,10 +25,59 @@
 
 use crate::network::{HtlcDescriptor, HtlcTarget, NetworkId};
 use crate::primitives::{Bytes32, OperationId, XOnlyPubKey};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Protocol identifier negotiated on every connection.
-pub const ALPN: &[u8] = b"cassis-hop/4";
+pub const ALPN: &[u8] = b"cassis-hop/5";
+
+/// Most bytes [`Metadata`] may hold.
+pub const MAX_METADATA_BYTES: usize = 128 * 1024;
+
+/// Arbitrary payload the payee attaches to an invoice, handed back to it
+/// with PREPARE and COMMIT. Base64 on the wire; at most
+/// [`MAX_METADATA_BYTES`], checked when decoding too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Metadata(Vec<u8>);
+
+impl Metadata {
+    pub fn new(bytes: Vec<u8>) -> Result<Self, String> {
+        if bytes.len() > MAX_METADATA_BYTES {
+            return Err(format!(
+                "metadata is {} bytes, at most {MAX_METADATA_BYTES} allowed",
+                bytes.len()
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Serialize for Metadata {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Metadata {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        // Refuse oversized payloads before decoding them.
+        if encoded.len() > MAX_METADATA_BYTES.div_ceil(3) * 4 {
+            return Err(serde::de::Error::custom(format!(
+                "metadata exceeds {MAX_METADATA_BYTES} bytes"
+            )));
+        }
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|e| serde::de::Error::custom(format!("metadata: {e}")))?;
+        Self::new(bytes).map_err(serde::de::Error::custom)
+    }
+}
 
 /// A payment request created by the payee.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,7 +91,10 @@ pub struct Invoice {
     /// payer must lock to there.
     pub networks: Vec<InvoiceNetwork>,
     pub description: Option<String>,
-    /// Iroh endpoint of the payee, where COMMIT is sent.
+    /// Handed back to the payee's endpoint with PREPARE and COMMIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
+    /// Iroh endpoint of the payee, where PREPARE and COMMIT are sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_peer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +178,20 @@ pub struct Discard {
     pub operation_id: OperationId,
 }
 
+/// Payer to payee, once a route reaching it is planned and before
+/// anything is funded: its HTLC will be on `network`, expiring at
+/// `expiry`. Informative: nothing is reserved, but the payee may refuse
+/// the payment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreparePayee {
+    pub payment_hash: Bytes32,
+    pub network: NetworkId,
+    pub expiry: u64,
+    /// The invoice's [`Invoice::metadata`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
+}
+
 /// Payer to payee: the final HTLC is funded on `network`; claim it and
 /// reveal the preimage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,6 +200,9 @@ pub struct Commit {
     pub network: NetworkId,
     pub expiry: u64,
     pub descriptor: HtlcDescriptor,
+    /// The invoice's [`Invoice::metadata`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
 }
 
 /// Payer to router: the preimage of an executed hop, so the router can
@@ -145,6 +216,7 @@ pub struct Settle {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Prepare(Prepare),
+    PreparePayee(PreparePayee),
     Execute(Execute),
     Discard(Discard),
     Commit(Commit),
@@ -156,6 +228,8 @@ pub enum Response {
     /// Target to lock the hop's incoming HTLC to, or why the hop
     /// refuses.
     Prepared(Result<HtlcTarget, String>),
+    /// The payee expects the announced HTLC, or why it refuses.
+    PayeePrepared(Result<(), String>),
     /// Descriptor of the hop's freshly funded outgoing HTLC.
     Executed(HtlcDescriptor),
     Discarded,
@@ -217,5 +291,19 @@ mod tests {
         assert!(decoded
             .target_for(&NetworkId("cashu::localhost".into()))
             .is_some());
+        assert!(decoded.metadata.is_none());
+    }
+
+    #[test]
+    fn metadata_is_base64_and_bounded() {
+        let metadata = Metadata::new(b"order 42".to_vec()).unwrap();
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert_eq!(json, r#""b3JkZXIgNDI=""#);
+        assert_eq!(serde_json::from_str::<Metadata>(&json).unwrap(), metadata);
+
+        assert!(Metadata::new(vec![0; MAX_METADATA_BYTES]).is_ok());
+        assert!(Metadata::new(vec![0; MAX_METADATA_BYTES + 1]).is_err());
+        let oversized = format!(r#""{}""#, BASE64.encode(vec![0; MAX_METADATA_BYTES + 1]));
+        assert!(serde_json::from_str::<Metadata>(&oversized).is_err());
     }
 }
