@@ -15,6 +15,9 @@ base64 = { workspace = true }
 bip32 = { workspace = true }
 bip39 = { workspace = true }
 hmac = { workspace = true }
+# Ed25519 keys of iroh endpoints, which sign invoices. Not optional:
+# invoices are checked without the node runtime too (wasm).
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 lowercase-hex = { workspace = true, features = ["alloc"] }
 rand = { workspace = true }
 ritualistic = { workspace = true }

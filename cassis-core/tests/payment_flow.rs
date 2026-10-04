@@ -186,11 +186,13 @@ impl CustomRelay for MemoryRelay {
     }
 }
 
-async fn start_node(name: &str, networks: Vec<Arc<dyn Network>>) -> Node {
+/// A serving node, and its keys to sign doctored invoices with.
+async fn start_node(name: &str, networks: Vec<Arc<dyn Network>>) -> (Node, NodeKeys) {
     let dir = std::env::temp_dir().join(format!("cassis-flow-{name}-{}", rand_suffix()));
-    Node::start(
+    let keys = NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap();
+    let node = Node::start(
         NodeConfig {
-            keys: NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap(),
+            keys: keys.clone(),
             store: Arc::new(Store::open(&dir.join("store.db")).unwrap()),
             span: Span::none(),
             serve: true,
@@ -198,7 +200,8 @@ async fn start_node(name: &str, networks: Vec<Arc<dyn Network>>) -> Node {
         networks,
     )
     .await
-    .unwrap()
+    .unwrap();
+    (node, keys)
 }
 
 fn rand_suffix() -> u64 {
@@ -224,8 +227,8 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     let chain_b = Ledger::default();
     let a = "cashu::a.example";
     let b = "cashu::b.example";
-    let payer = start_node("payer", vec![MockNetwork::new(a, 1, &chain_a)]).await;
-    let router = start_node(
+    let (payer, _) = start_node("payer", vec![MockNetwork::new(a, 1, &chain_a)]).await;
+    let (router, router_keys) = start_node(
         "router",
         vec![
             MockNetwork::new(a, 2, &chain_a),
@@ -233,7 +236,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         ],
     )
     .await;
-    let payee = start_node("payee", vec![MockNetwork::new(b, 4, &chain_b)]).await;
+    let (payee, payee_keys) = start_node("payee", vec![MockNetwork::new(b, 4, &chain_b)]).await;
     router.start_routing(RoutingPolicy {
         nostr_relays: vec![RELAY.into()],
         ..RoutingPolicy::default()
@@ -279,6 +282,24 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .all(|lock| lock.state == LockState::Claimed(preimage));
     assert!(claimed_upstream);
 
+    // An invoice changed after signing is refused before anything is
+    // funded.
+    let mut tampered = payee
+        .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
+        .await
+        .unwrap();
+    tampered.amount_msat = 40_000;
+    let error = payer
+        .pay(&tampered, &NetworkId(a.into()), &[RELAY.into()])
+        .await
+        .unwrap_err();
+    assert!(error.contains("invalid invoice signature"), "{error}");
+    assert!(payer
+        .store()
+        .get::<PaymentRecord>("payments", &tampered.payment_hash.to_string())
+        .unwrap()
+        .is_none());
+
     // The endpoint named for the payee does not know the invoice: it
     // refuses at PREPARE, before anything is funded.
     let mut misdirected = payee
@@ -286,6 +307,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .await
         .unwrap();
     misdirected.iroh_peer_id = Some(router.iroh_peer_id());
+    misdirected.sign(&router_keys.iroh).unwrap();
     let error = payer
         .pay(&misdirected, &NetworkId(a.into()), &[RELAY.into()])
         .await
@@ -309,6 +331,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
             .unwrap()
             .pubkey(),
     );
+    unreachable.sign(&payee_keys.iroh).unwrap();
     let error = payer
         .pay(&unreachable, &NetworkId(a.into()), &[RELAY.into()])
         .await

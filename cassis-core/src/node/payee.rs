@@ -57,7 +57,7 @@ pub async fn create_invoice(
             max_incoming_lifetime_secs: network.max_incoming_lifetime_secs(),
         });
     }
-    let invoice = Invoice {
+    let mut invoice = Invoice {
         payment_hash,
         amount_msat,
         payee: keys.node.pubkey(),
@@ -67,7 +67,9 @@ pub async fn create_invoice(
         metadata,
         iroh_peer_id: Some(iroh::SecretKey::from(keys.iroh).public().to_string()),
         iroh_relay,
+        signature: None,
     };
+    invoice.sign(&keys.iroh)?;
     store.put(
         INVOICES,
         &payment_hash.to_string(),

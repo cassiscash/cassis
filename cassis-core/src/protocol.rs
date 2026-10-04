@@ -28,6 +28,8 @@ use crate::primitives::{Bytes32, OperationId, XOnlyPubKey};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
 /// Protocol identifier negotiated on every connection.
 pub const ALPN: &[u8] = b"cassis-hop/5";
@@ -79,6 +81,36 @@ impl<'de> Deserialize<'de> for Metadata {
     }
 }
 
+/// Prefix of the message an [`InvoiceSignature`] signs, so it cannot be
+/// mistaken for a signature over anything else.
+const INVOICE_SIGNATURE_DOMAIN: &[u8] = b"cassis-invoice/v1\0";
+
+/// Ed25519 signature of an invoice by the iroh key of the endpoint it
+/// names (see [`Invoice::sign`]). Hex on the wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InvoiceSignature(pub [u8; 64]);
+
+impl fmt::Debug for InvoiceSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", lowercase_hex::encode(self.0))
+    }
+}
+
+impl Serialize for InvoiceSignature {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&lowercase_hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for InvoiceSignature {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut bytes = [0u8; 64];
+        lowercase_hex::decode_to_slice(String::deserialize(deserializer)?, &mut bytes)
+            .map_err(|e| serde::de::Error::custom(format!("signature: {e}")))?;
+        Ok(Self(bytes))
+    }
+}
+
 /// A payment request created by the payee.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Invoice {
@@ -99,6 +131,9 @@ pub struct Invoice {
     pub iroh_peer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay: Option<String>,
+    /// By the iroh key of `iroh_peer_id`, over everything above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<InvoiceSignature>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,6 +153,52 @@ pub struct InvoiceNetwork {
 }
 
 impl Invoice {
+    /// Sign the invoice with `iroh_secret`, the secret key of the
+    /// endpoint it names in `iroh_peer_id`.
+    pub fn sign(&mut self, iroh_secret: &[u8; 32]) -> Result<(), String> {
+        let secret = iroh_base::SecretKey::from_bytes(iroh_secret);
+        if self.endpoint_key()? != secret.public() {
+            return Err("invoice names another endpoint than the signing key's".into());
+        }
+        self.signature = Some(InvoiceSignature(
+            secret.sign(&self.signed_message()).to_bytes(),
+        ));
+        Ok(())
+    }
+
+    /// Check that the endpoint named in `iroh_peer_id` signed the
+    /// invoice exactly as it is.
+    pub fn verify_signature(&self) -> Result<(), String> {
+        let signature = self.signature.ok_or("invoice is not signed")?;
+        self.endpoint_key()?
+            .verify(
+                &self.signed_message(),
+                &iroh_base::Signature::from_bytes(&signature.0),
+            )
+            .map_err(|_| "invalid invoice signature".to_string())
+    }
+
+    fn endpoint_key(&self) -> Result<iroh_base::PublicKey, String> {
+        let peer = self
+            .iroh_peer_id
+            .as_deref()
+            .ok_or("invoice does not name the payee's endpoint")?;
+        iroh_base::PublicKey::from_str(peer).map_err(|e| format!("endpoint id {peer}: {e}"))
+    }
+
+    /// What [`InvoiceSignature`] signs: the invoice without its
+    /// signature, as JSON. Decoding drops unknown fields, so an invoice
+    /// carrying fields this version does not know fails to verify.
+    fn signed_message(&self) -> Vec<u8> {
+        let unsigned = Invoice {
+            signature: None,
+            ..self.clone()
+        };
+        let mut message = INVOICE_SIGNATURE_DOMAIN.to_vec();
+        message.extend(serde_json::to_vec(&unsigned).expect("invoices serialize"));
+        message
+    }
+
     /// Target the payer must lock to when paying on `network`.
     pub fn target_for(&self, network: &NetworkId) -> Option<&HtlcTarget> {
         self.networks
@@ -292,6 +373,63 @@ mod tests {
             .target_for(&NetworkId("cashu::localhost".into()))
             .is_some());
         assert!(decoded.metadata.is_none());
+    }
+
+    fn signed_invoice(secret: &[u8; 32]) -> Invoice {
+        let mut invoice = Invoice {
+            payment_hash: Bytes32([1; 32]),
+            amount_msat: 1000,
+            payee: ritualistic::SecretKey::from_bytes([2; 32])
+                .unwrap()
+                .pubkey(),
+            expires_at: 3000,
+            networks: vec![InvoiceNetwork {
+                network: NetworkId("cashu::localhost".into()),
+                target: HtlcTarget::XOnlyPubKey(
+                    ritualistic::SecretKey::from_bytes([3; 32])
+                        .unwrap()
+                        .pubkey(),
+                ),
+                incoming_delta_secs: None,
+                max_incoming_lifetime_secs: None,
+            }],
+            description: Some("coffee".into()),
+            metadata: Some(Metadata::new(b"order 42".to_vec()).unwrap()),
+            iroh_peer_id: Some(
+                iroh_base::SecretKey::from_bytes(secret)
+                    .public()
+                    .to_string(),
+            ),
+            iroh_relay: None,
+            signature: None,
+        };
+        invoice.sign(secret).unwrap();
+        invoice
+    }
+
+    #[test]
+    fn invoice_signature_covers_every_field() {
+        let invoice = signed_invoice(&[7; 32]);
+        invoice.verify_signature().unwrap();
+        let decoded: Invoice =
+            serde_json::from_str(&serde_json::to_string(&invoice).unwrap()).unwrap();
+        decoded.verify_signature().unwrap();
+
+        let mut tampered = invoice.clone();
+        tampered.amount_msat += 1;
+        assert!(tampered.verify_signature().is_err());
+        let mut tampered = invoice.clone();
+        tampered.metadata = None;
+        assert!(tampered.verify_signature().is_err());
+        // Pointing the invoice at another endpoint breaks the signature,
+        // and that endpoint's key cannot sign for the first one.
+        let mut redirected = invoice.clone();
+        redirected.iroh_peer_id = signed_invoice(&[8; 32]).iroh_peer_id;
+        assert!(redirected.verify_signature().is_err());
+        assert!(invoice.clone().sign(&[8; 32]).is_err());
+        let mut unsigned = invoice;
+        unsigned.signature = None;
+        assert!(unsigned.verify_signature().is_err());
     }
 
     #[test]

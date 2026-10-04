@@ -74,6 +74,8 @@ export interface Invoice {
   metadata?: string;
   iroh_peer_id?: string;
   iroh_relay?: string;
+  /** Ed25519 by the key of `iroh_peer_id`, hex; see `signInvoice`. */
+  signature?: string;
 }
 export interface Commit {
   payment_hash: string;
@@ -120,12 +122,14 @@ fn endpoint_addr(peer: &str, relay: Option<&str>) -> Result<EndpointAddr, String
 }
 
 /// Parse and check an invoice: well-formed JSON in the `cassis-core`
-/// shape, valid network ids, a positive amount, not expired. Returns it
-/// re-serialized, so callers read exactly what the Rust side would.
+/// shape, signed by the endpoint it names, valid network ids, a
+/// positive amount, not expired. Returns it re-serialized, so callers
+/// read exactly what the Rust side would.
 #[wasm_bindgen(js_name = parseInvoice, unchecked_return_type = "string")]
 pub fn parse_invoice(json: &str) -> Result<String, JsValue> {
     let invoice: Invoice =
         serde_json::from_str(json).map_err(|e| js_error(format!("invalid invoice: {e}")))?;
+    invoice.verify_signature().map_err(js_error)?;
     for entry in &invoice.networks {
         NetworkId::parse(&entry.network.0).map_err(js_error)?;
     }
@@ -202,6 +206,18 @@ impl CassisEndpoint {
     #[wasm_bindgen(getter)]
     pub fn id(&self) -> String {
         self.endpoint.id().to_string()
+    }
+
+    /// Sign an invoice (JSON) whose `iroh_peer_id` is this endpoint, as
+    /// payers require. Returns it signed.
+    #[wasm_bindgen(js_name = signInvoice, unchecked_return_type = "string")]
+    pub fn sign_invoice(&self, json: &str) -> Result<String, JsValue> {
+        let mut invoice: Invoice =
+            serde_json::from_str(json).map_err(|e| js_error(format!("invalid invoice: {e}")))?;
+        invoice
+            .sign(&self.endpoint.secret_key().to_bytes())
+            .map_err(js_error)?;
+        serde_json::to_string(&invoice).map_err(js_error)
     }
 
     /// The relay peers can reach this endpoint through, once known

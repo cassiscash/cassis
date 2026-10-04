@@ -37,6 +37,7 @@ impl Node {
         let _busy = self
             .busy(format!("pay:{hash}"))
             .ok_or("this invoice is already being paid")?;
+        invoice.verify_signature()?;
         if invoice.amount_msat == 0 {
             return Err("invoice amount is zero".into());
         }

@@ -2414,6 +2414,7 @@ dependencies = [
  "futures",
  "hmac",
  "iroh 1.0.3",
+ "iroh-base 1.0.3",
  "js-sys",
  "lowercase-hex",
  "minisqlite",
