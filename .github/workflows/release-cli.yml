@@ -1,0 +1,102 @@
+name: release-cli
+
+# Builds cassis-cli for linux with each network feature alone, each pair
+# of network features, and all of them together, then publishes every
+# binary in a GitHub release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  variants:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        shell: python
+        run: |
+          import itertools, json, os
+          features = ["arkade", "bark-lightning", "bitcoin", "cashu",
+                      "fedimint", "lightning", "liquid", "rootstock"]
+          combos = [list(c) for n in (1, 2) for c in itertools.combinations(features, n)]
+          combos.append(features)
+          variants = [
+              {
+                  "features": ",".join(c),
+                  "name": "all" if c == features else "+".join(c),
+              }
+              for c in combos
+          ]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": variants}) + "\n")
+
+  build:
+    needs: variants
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.variants.outputs.matrix) }}
+    name: build (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Build
+        run: |
+          cargo build --release --locked -p cassis-cli \
+            --no-default-features --features "${{ matrix.features }}"
+
+      - name: Package
+        run: |
+          mkdir dist
+          out="dist/cassis-cli-${{ matrix.name }}-x86_64-linux"
+          cp target/release/cassis-cli "$out"
+          strip "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cassis-cli-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cassis-cli-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum cassis-cli-* > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
