@@ -8,6 +8,7 @@ members = [
   "networks/cassis-rootstock",
   "networks/cassis-liquid",
   "networks/cassis-lnd",
+  "networks/cassis-bark-lightning",
   "cassis-cli",
   "cassis-wasm",
 ]
@@ -96,3 +97,9 @@ cassis-bitcoin = { path = "networks/cassis-bitcoin" }
 cassis-rootstock = { path = "networks/cassis-rootstock" }
 cassis-liquid = { path = "networks/cassis-liquid" }
 cassis-lnd = { path = "networks/cassis-lnd" }
+cassis-bark-lightning = { path = "networks/cassis-bark-lightning" }
+
+# Bark with hash-only lightning receives (preimage given later), from
+# our fork of https://gitlab.com/ark-bitcoin/bark.
+bark-wallet = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "96ea65bd433376597b2d4bf931f27c36d7b78f2b", default-features = false, features = ["sqlite", "native", "rand", "tls-webpki-roots"] }
+bark-bitcoin-ext = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "96ea65bd433376597b2d4bf931f27c36d7b78f2b" }

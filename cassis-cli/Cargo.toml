@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["arkade", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
+default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
 arkade = ["dep:cassis-arkade"]
+bark-lightning = ["dep:cassis-bark-lightning"]
 bitcoin = ["dep:cassis-bitcoin"]
 cashu = ["dep:cassis-cashu"]
 fedimint = ["dep:cassis-fedimint"]
@@ -24,6 +25,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", 
 tracing = { workspace = true }
 
 cassis-arkade = { workspace = true, optional = true }
+cassis-bark-lightning = { workspace = true, optional = true }
 cassis-bitcoin = { workspace = true, optional = true }
 cassis-cashu = { workspace = true, optional = true }
 cassis-fedimint = { workspace = true, optional = true }

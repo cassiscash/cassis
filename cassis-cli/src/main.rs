@@ -5,6 +5,7 @@
 
 #[cfg(not(any(
     feature = "arkade",
+    feature = "bark-lightning",
     feature = "bitcoin",
     feature = "cashu",
     feature = "fedimint",
@@ -57,6 +58,17 @@ enum Command {
         lnd_tls_cert: Option<PathBuf>,
         #[arg(long)]
         lnd_macaroon: Option<PathBuf>,
+        /// Go through a bark wallet at an Ark server instead of LND, when
+        /// enabling `lightning`: Second's server for mainnet and signet,
+        /// unless `--bark-server` names another.
+        #[arg(long)]
+        bark: bool,
+        /// Ark server URL, with `--bark`.
+        #[arg(long, value_name = "URL", requires = "bark")]
+        bark_server: Option<String>,
+        /// Esplora API of the Ark server's chain, with `--bark`.
+        #[arg(long, value_name = "URL", requires = "bark")]
+        bark_esplora: Option<String>,
         /// Longest an HTLC received on these networks may run, instead
         /// of what the network derives (e.g. from an arkade operator's
         /// batch lifetime).
@@ -160,12 +172,17 @@ async fn run(cli: Cli) -> Result<(), String> {
             lnd_rest_url,
             lnd_tls_cert,
             lnd_macaroon,
+            bark,
+            bark_server,
+            bark_esplora,
             max_incoming_lifetime,
         } => {
             let mut enabled = home.networks()?;
             for spec in &networks {
                 let network = NetworkId::parse(spec)?;
-                if network.kind() == "lightning" {
+                if network.kind() == "lightning" && bark {
+                    configure_bark(&home, &network, bark_server.clone(), bark_esplora.clone())?;
+                } else if network.kind() == "lightning" {
                     configure_lnd(
                         &home,
                         lnd_rest_url.clone(),
@@ -420,6 +437,31 @@ fn relays(relays: Vec<String>) -> Vec<String> {
     } else {
         relays
     }
+}
+
+#[allow(unused_variables, unreachable_code)]
+fn configure_bark(
+    home: &Home,
+    network: &NetworkId,
+    server: Option<String>,
+    esplora: Option<String>,
+) -> Result<(), String> {
+    #[cfg(feature = "bark-lightning")]
+    {
+        let default = cassis_bark_lightning::BarkConfig::default_for(network);
+        let config = cassis_bark_lightning::BarkConfig {
+            server_url: server
+                .or_else(|| default.as_ref().map(|d| d.server_url.clone()))
+                .ok_or_else(|| {
+                    format!("{network} has no default Ark server: pass --bark-server")
+                })?,
+            esplora_url: esplora
+                .or_else(|| default.as_ref().map(|d| d.esplora_url.clone()))
+                .ok_or_else(|| format!("{network} has no default Esplora: pass --bark-esplora"))?,
+        };
+        return home.set_bark_config(network, &config);
+    }
+    Err("this cassis-cli was built without the 'bark-lightning' feature".into())
 }
 
 #[allow(unused_variables)]

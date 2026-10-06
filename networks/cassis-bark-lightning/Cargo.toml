@@ -1,0 +1,16 @@
+[package]
+name = "cassis-bark-lightning"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+cassis-core = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+# Bark, Second's Ark wallet, with hash-only lightning receives (see the
+# crate docs): our fork at https://github.com/cassiscash/bark-hold-preimage.
+bark-wallet = { workspace = true }
+bark-bitcoin-ext = { workspace = true }

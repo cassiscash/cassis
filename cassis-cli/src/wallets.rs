@@ -50,6 +50,14 @@ pub enum Command {
         #[command(subcommand)]
         command: ChainCommand,
     },
+    /// Bark wallet of a `lightning` network enabled with `--bark`.
+    #[cfg(feature = "bark-lightning")]
+    Bark {
+        #[arg(long, default_value = "lightning")]
+        network: String,
+        #[command(subcommand)]
+        command: BarkCommand,
+    },
     /// Ecash wallet in one federation.
     #[cfg(feature = "fedimint")]
     Fedimint {
@@ -105,6 +113,19 @@ pub enum ArkadeCommand {
     /// Redeem an arknote issued by the operator into VTXOs.
     RedeemNote {
         note: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BarkCommand {
+    Balance,
+    /// Ark address to receive VTXOs at.
+    Address,
+    /// Lightning invoice to fund the wallet with; waits until it is paid
+    /// and claimed.
+    Invoice {
+        #[arg(long)]
+        amount_sat: u64,
     },
 }
 
@@ -229,6 +250,31 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                 ),
                 ArkadeCommand::RedeemNote { note } => {
                     println!("{}", wallet.redeem_note(&note).await.map_err(error)?)
+                }
+            }
+        }
+        #[cfg(feature = "bark-lightning")]
+        Command::Bark { network, command } => {
+            let network = kind(&network, "lightning")?;
+            let wallet = home.open_bark(&network, span).await?;
+            let error = |e: cassis_core::NetworkError| e.to_string();
+            match command {
+                BarkCommand::Balance => {
+                    println!("{} sat", wallet.spendable_sats().await.map_err(error)?)
+                }
+                BarkCommand::Address => println!(
+                    "{}",
+                    wallet
+                        .wallet()
+                        .new_address()
+                        .await
+                        .map_err(|e| format!("{e:#}"))?
+                ),
+                BarkCommand::Invoice { amount_sat } => {
+                    let invoice = wallet.funding_invoice(amount_sat).await.map_err(error)?;
+                    println!("{invoice}");
+                    wallet.claim_funding(&invoice).await.map_err(error)?;
+                    println!("claimed {amount_sat} sat");
                 }
             }
         }

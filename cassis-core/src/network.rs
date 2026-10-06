@@ -25,7 +25,8 @@ use std::sync::Arc;
 ///   `http`, everything else `https`)
 /// * `bitcoin`, `bitcoin::mutinynet`, `bitcoin::regtest`
 /// * `rootstock`, `rootstock::testnet`
-/// * `lightning`
+/// * `lightning`, or `lightning::signet`, `lightning::mutinynet`,
+///   `lightning::regtest` — Lightning on a test chain
 ///
 /// The same string is used on the wire, in route announcements and on
 /// the command line.
@@ -70,7 +71,7 @@ impl NetworkId {
             }
             "liquid" | "rootstock" => &["testnet"],
             "bitcoin" => &["mutinynet", "regtest"],
-            "lightning" => &[],
+            "lightning" => &["signet", "mutinynet", "regtest"],
             other => return Err(format!("unsupported network kind '{other}'")),
         };
         match param {
@@ -504,6 +505,7 @@ mod tests {
             "rootstock",
             "rootstock::testnet",
             "lightning",
+            "lightning::mutinynet",
         ] {
             assert_eq!(NetworkId::parse(spec).unwrap().0, spec);
         }

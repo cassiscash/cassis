@@ -17,6 +17,8 @@ const SETTINGS: &str = "settings";
 const NETWORKS: &str = "networks";
 #[cfg(feature = "lightning")]
 const LND: &str = "lnd";
+#[cfg(feature = "bark-lightning")]
+const BARK: &str = "bark";
 
 pub struct Home {
     pub dir: PathBuf,
@@ -89,6 +91,73 @@ impl Home {
     #[cfg(feature = "lightning")]
     pub fn set_lnd_config(&self, config: &cassis_lnd::LndConfig) -> Result<(), String> {
         self.store.put(SETTINGS, LND, config)
+    }
+
+    /// The Ark server a `lightning` network goes through instead of LND,
+    /// if any.
+    #[cfg(feature = "bark-lightning")]
+    pub fn bark_config(
+        &self,
+        network: &NetworkId,
+    ) -> Result<Option<cassis_bark_lightning::BarkConfig>, String> {
+        self.store.get(SETTINGS, &format!("{BARK}:{network}"))
+    }
+
+    #[cfg(feature = "bark-lightning")]
+    pub fn set_bark_config(
+        &self,
+        network: &NetworkId,
+        config: &cassis_bark_lightning::BarkConfig,
+    ) -> Result<(), String> {
+        self.store
+            .put(SETTINGS, &format!("{BARK}:{network}"), config)
+    }
+
+    /// The bark wallet of `network`, which must have been enabled with
+    /// `--bark`.
+    #[cfg(feature = "bark-lightning")]
+    pub async fn open_bark(
+        &self,
+        network: &NetworkId,
+        span: &Span,
+    ) -> Result<cassis_bark_lightning::BarkLightningAdapter, String> {
+        let config = self.bark_config(network)?.ok_or_else(|| {
+            format!("{network} goes through LND here: enable it with --bark to use bark")
+        })?;
+        cassis_bark_lightning::BarkLightningAdapter::open(
+            network.clone(),
+            self.secret(network),
+            &self.network_dir(network),
+            &config,
+            span,
+        )
+        .await
+    }
+
+    /// A `lightning` network goes through bark when enabled with
+    /// `--bark`, else through the LND node.
+    #[cfg(any(feature = "lightning", feature = "bark-lightning"))]
+    #[allow(unused_variables, unreachable_code)]
+    async fn open_lightning(
+        &self,
+        network: &NetworkId,
+        span: &Span,
+    ) -> Result<Arc<dyn Network>, String> {
+        #[cfg(feature = "bark-lightning")]
+        if self.bark_config(network)?.is_some() {
+            return Ok(Arc::new(self.open_bark(network, span).await?));
+        }
+        #[cfg(feature = "lightning")]
+        {
+            let config = self.lnd_config()?.ok_or(
+                "lightning needs an LND node or an Ark server: cassis-cli enable lightning \
+                 --lnd-rest-url ... or --bark",
+            )?;
+            return Ok(Arc::new(
+                cassis_lnd::LndAdapter::open(network.clone(), config, span).await?,
+            ));
+        }
+        Err("this cassis-cli was built without LND support: enable it with --bark".into())
     }
 
     #[allow(dead_code)] // unused when no compiled-in network keeps files
@@ -176,13 +245,8 @@ impl Home {
                 )
                 .await?,
             ),
-            #[cfg(feature = "lightning")]
-            "lightning" => {
-                let config = self.lnd_config()?.ok_or(
-                    "lightning needs an LND node: cassis-cli enable lightning --lnd-rest-url ...",
-                )?;
-                Arc::new(cassis_lnd::LndAdapter::open(network.clone(), config, span).await?)
-            }
+            #[cfg(any(feature = "lightning", feature = "bark-lightning"))]
+            "lightning" => self.open_lightning(network, span).await?,
             kind => {
                 return Err(format!(
                     "this cassis-cli was built without the '{kind}' feature"

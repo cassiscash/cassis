@@ -29,8 +29,14 @@ use std::time::Duration;
 use tracing::{debug, info, warn, Span};
 
 const SEND_TIMEOUT_SECS: i32 = 60;
-/// Bitcoin block interval used to turn expiries into CLTV deltas.
-const SECS_PER_BLOCK: u64 = 600;
+/// Block interval used to turn expiries into CLTV deltas: 30s on
+/// mutinynet, bitcoin's 10 minutes everywhere else.
+fn secs_per_block(id: &NetworkId) -> u64 {
+    match id.param() {
+        Some("mutinynet") => 30,
+        _ => 600,
+    }
+}
 /// LND's minimum final CLTV delta.
 const MIN_FINAL_CLTV: u64 = 18;
 /// How long a check listens to LND's payment stream.
@@ -270,7 +276,7 @@ impl LndAdapter {
             memo: "cassis".to_string(),
             expiry: seconds.max(60).to_string(),
             // LND only accepts HTLCs that stay locked this many blocks.
-            cltv_expiry: (seconds.div_ceil(SECS_PER_BLOCK) + 1)
+            cltv_expiry: (seconds.div_ceil(secs_per_block(&self.id)) + 1)
                 .max(MIN_FINAL_CLTV)
                 .to_string(),
         };
@@ -409,13 +415,14 @@ impl Network for LndAdapter {
             return Err(NetworkError::invalid("lightning HTLCs pay an invoice"));
         };
         let invoice = parse_invoice(payment_request, payment_hash)?;
-        if invoice.amount_milli_satoshis() != Some(amount_msat) {
+        // Receivers in whole sats (bark) round the amount up.
+        let invoice_msat = invoice.amount_milli_satoshis().unwrap_or(0);
+        if invoice_msat < amount_msat || invoice_msat > amount_msat.next_multiple_of(MSAT_PER_SAT) {
             return Err(NetworkError::invalid(format!(
-                "invoice amount {:?} msat is not the HTLC amount {amount_msat} msat",
-                invoice.amount_milli_satoshis()
+                "invoice amount {invoice_msat} msat is not the HTLC amount {amount_msat} msat"
             )));
         }
-        let cltv_limit = expiry.saturating_sub(unix_now()) / SECS_PER_BLOCK;
+        let cltv_limit = expiry.saturating_sub(unix_now()) / secs_per_block(&self.id);
         let request = SendPaymentRequest {
             payment_request,
             fee_limit_msat: (amount_msat / 100).max(1_000).to_string(),
