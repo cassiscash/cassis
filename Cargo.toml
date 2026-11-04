@@ -32,6 +32,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 futures = "0.3.33"
 fs2 = "0.4"
 hmac = "0.12.1"
+hypereffect = "0.6.1"
 iroh = "1.0.3"
 lightning-invoice = { version = "0.33.3", features = ["std"] }
 lowercase-hex = "0.1.1"

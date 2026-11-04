@@ -17,6 +17,7 @@ rootstock = ["dep:cassis-rootstock"]
 [dependencies]
 cassis-core = { workspace = true, features = ["node"] }
 clap = { workspace = true }
+hypereffect = { workspace = true }
 iroh = { workspace = true }
 minisqlite = { workspace = true }
 rustls = { workspace = true }
