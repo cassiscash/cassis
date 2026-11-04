@@ -8793,6 +8793,8 @@ dependencies = [
 [[package]]
 name = "orangedb"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0acf9d31b41ceb3fdda71f7111330964dc9a4db2922de0c0a9867ba7fadd4f50"
 dependencies = [
  "orangedb-macros",
  "postcard",
@@ -8805,6 +8807,8 @@ dependencies = [
 [[package]]
 name = "orangedb-macros"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef38c5603cc36508f6ddb8eb7ec346174d8d936ba2044708f354422766357b32"
 dependencies = [
  "proc-macro2",
  "quote",
