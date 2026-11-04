@@ -9,6 +9,7 @@ use crate::protocol::{
 use crate::routing::{self, RouteAnnouncement};
 use crate::transport::PeerAddr;
 use futures::future::join_all;
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -280,9 +281,14 @@ impl Node {
             .networks
             .iter()
             .filter_map(|entry| {
-                let route =
-                    routing::find_route(&announcements, from, &entry.network, invoice.amount_msat)
-                        .ok()?;
+                let route = routing::find_route(
+                    &announcements,
+                    from,
+                    &entry.network,
+                    invoice.amount_msat,
+                    &HashSet::new(),
+                )
+                .ok()?;
                 // Fails when a leg runs longer than its receiver accepts.
                 let plan = routing::plan_route(
                     &route,

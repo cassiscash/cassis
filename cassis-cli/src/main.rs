@@ -24,7 +24,7 @@ use cassis_core::node::{
     InvoiceRecord, InvoiceStatus, Node, NodeConfig, PaymentRecord, PreimageServerInvoiceRecord,
     RoutingPolicy, PREIMAGE_SERVER_INVOICES,
 };
-use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS};
+use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
 use cassis_core::transport::PeerAddr;
 use cassis_core::{unix_now, Invoice, NetworkId};
 use clap::{Parser, Subcommand};
@@ -39,6 +39,26 @@ struct Cli {
     /// Node directory. Defaults to `$CASSIS_HOME`, else `~/.cassis`.
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
+    /// Nostr relay to announce and discover routes on, instead of the
+    /// defaults (nostr.wine). Repeatable, or comma-separated in
+    /// `$CASSIS_NOSTR_RELAYS`.
+    #[arg(
+        long = "nostr-relay",
+        global = true,
+        value_name = "URL",
+        env = "CASSIS_NOSTR_RELAYS",
+        value_delimiter = ','
+    )]
+    nostr_relays: Vec<String>,
+    /// Use the relays for test money (nos.lol, relay.primal.net,
+    /// relay.damus.io) instead of the defaults.
+    #[arg(
+        long,
+        global = true,
+        env = "CASSIS_TEST_RELAYS",
+        conflicts_with = "nostr_relays"
+    )]
+    test_relays: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -93,8 +113,6 @@ enum Command {
         fee_base_msat: u64,
         #[arg(long, default_value_t = 500)]
         fee_ppm: u64,
-        #[arg(long = "nostr-relay", value_name = "URL")]
-        nostr_relays: Vec<String>,
     },
     /// Create an invoice. A running node (`run`) claims it when paid.
     Invoice {
@@ -153,8 +171,6 @@ enum Command {
         invoice: String,
         #[arg(long)]
         from: String,
-        #[arg(long = "nostr-relay", value_name = "URL")]
-        nostr_relays: Vec<String>,
     },
     /// Show the cheapest announced route between two networks.
     Route {
@@ -164,8 +180,6 @@ enum Command {
         to: String,
         #[arg(long)]
         amount_msat: u64,
-        #[arg(long = "nostr-relay", value_name = "URL")]
-        nostr_relays: Vec<String>,
     },
     /// Serve a demo Cassis Order Protocol flow (a coffee counter) with
     /// this node as the payee, printing its `cop:` URI.
@@ -195,6 +209,7 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
+    let relays = relays(&cli);
     let home = Home::open(cli.home)?;
     let span = info_span!("node", node = "cassis");
     match cli.command {
@@ -253,14 +268,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             route,
             fee_base_msat,
             fee_ppm,
-            nostr_relays,
         } => {
             let node = serve(&home, &span).await?;
             if route {
                 node.start_routing(RoutingPolicy {
                     fee_base_msat,
                     fee_ppm,
-                    nostr_relays: relays(nostr_relays),
+                    nostr_relays: relays.clone(),
                     ..RoutingPolicy::default()
                 });
             }
@@ -357,11 +371,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             preimage_server_relay,
             since,
         } => redeem(&home, &span, preimage_server, preimage_server_relay, since).await?,
-        Command::Pay {
-            invoice,
-            from,
-            nostr_relays,
-        } => {
+        Command::Pay { invoice, from } => {
             let invoice: Invoice =
                 serde_json::from_str(&invoice).map_err(|e| format!("invalid invoice: {e}"))?;
             let from = NetworkId::parse(&from)?;
@@ -376,7 +386,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 vec![sender],
             )
             .await?;
-            let preimage = node.pay(&invoice, &from, &relays(nostr_relays)).await;
+            let preimage = node.pay(&invoice, &from, &relays).await;
             node.shutdown().await;
             println!("paid; preimage {}", preimage?);
         }
@@ -384,12 +394,16 @@ async fn run(cli: Cli) -> Result<(), String> {
             from,
             to,
             amount_msat,
-            nostr_relays,
         } => {
-            let announcements = routing::fetch_announcements(&relays(nostr_relays)).await?;
+            let announcements = routing::fetch_announcements(&relays).await?;
             let to = NetworkId::parse(&to)?;
-            let route =
-                routing::find_route(&announcements, &NetworkId::parse(&from)?, &to, amount_msat)?;
+            let route = routing::find_route(
+                &announcements,
+                &NetworkId::parse(&from)?,
+                &to,
+                amount_msat,
+                &Default::default(),
+            )?;
             let plan = routing::plan_route(
                 &route,
                 amount_msat,
@@ -574,12 +588,17 @@ async fn redeem(
     Ok(())
 }
 
-fn relays(relays: Vec<String>) -> Vec<String> {
-    if relays.is_empty() {
-        DEFAULT_NOSTR_RELAYS.iter().map(|r| r.to_string()).collect()
-    } else {
-        relays
+/// `--nostr-relay`s if given, else the test or default relays.
+fn relays(cli: &Cli) -> Vec<String> {
+    if !cli.nostr_relays.is_empty() {
+        return cli.nostr_relays.clone();
     }
+    let defaults = if cli.test_relays {
+        TEST_NOSTR_RELAYS
+    } else {
+        DEFAULT_NOSTR_RELAYS
+    };
+    defaults.iter().map(|relay| relay.to_string()).collect()
 }
 
 #[allow(unused_variables, unreachable_code)]

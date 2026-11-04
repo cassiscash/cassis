@@ -13,7 +13,7 @@ use crate::primitives::XOnlyPubKey;
 use ritualistic::{EventTemplate, Filter, Kind, SubscriptionOptions, Tags, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
 // The real `tokio` on native targets and a JS shim on wasm32.
 use tokio_with_wasm::alias as tokio;
@@ -29,8 +29,16 @@ pub const ANNOUNCEMENT_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// latency and clock skew, when a router does not announce its own.
 pub const DEFAULT_TRANSIT_SLACK_SECS: u64 = 60;
 
-pub const DEFAULT_NOSTR_RELAYS: &[&str] =
-    &["wss://relay.damus.io", "wss://nos.lol", "wss://nostr.mom"];
+/// Relays route announcements are published to and fetched from.
+pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://nostr.wine"];
+
+/// Relays for nodes running on test money (mutinynet, signet, test
+/// mints...), keeping their announcements off the default relays.
+pub const TEST_NOSTR_RELAYS: &[&str] = &[
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://relay.damus.io",
+];
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -211,7 +219,8 @@ pub async fn publish_announcements(
 }
 
 /// Cheapest chain of hops carrying `amount_msat` from `from` to `to`.
-/// Empty when `from == to`.
+/// Empty when `from == to`. Hops of routers in `skip` (e.g. ones that
+/// failed an earlier attempt) are never used.
 ///
 /// Searches backwards from the destination, where the amount is known,
 /// so every hop's fee is computed on the amount it actually forwards.
@@ -220,6 +229,7 @@ pub fn find_route(
     from: &NetworkId,
     to: &NetworkId,
     amount_msat: u64,
+    skip: &HashSet<XOnlyPubKey>,
 ) -> Result<Vec<RouteAnnouncement>, String> {
     if from == to {
         return Ok(Vec::new());
@@ -250,7 +260,10 @@ pub fn find_route(
             }
             return Ok(route);
         }
-        for hop in announcements.iter().filter(|hop| hop.to == *network) {
+        for hop in announcements
+            .iter()
+            .filter(|hop| hop.to == *network && !skip.contains(&hop.node_pubkey))
+        {
             let Some(upstream) = amount.checked_add(hop.fee_msat(amount)) else {
                 continue;
             };
@@ -345,11 +358,21 @@ mod tests {
     }
 
     fn route(graph: &[RouteAnnouncement], from: &str, to: &str) -> Result<Vec<u8>, String> {
+        route_skipping(graph, from, to, &[])
+    }
+
+    fn route_skipping(
+        graph: &[RouteAnnouncement],
+        from: &str,
+        to: &str,
+        skip: &[u8],
+    ) -> Result<Vec<u8>, String> {
         find_route(
             graph,
             &NetworkId(from.into()),
             &NetworkId(to.into()),
             1_000_000,
+            &skip.iter().map(|node| XOnlyPubKey([*node; 32])).collect(),
         )
         .map(|hops| hops.iter().map(|hop| hop.node_pubkey.0[0]).collect())
     }
@@ -375,6 +398,17 @@ mod tests {
             hop(3, "b", "c", 100, 0),
         ];
         assert_eq!(route(&graph, "a", "c").unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn avoids_skipped_routers() {
+        let graph = [
+            hop(1, "a", "c", 0, 0),
+            hop(2, "a", "b", 100, 0),
+            hop(3, "b", "c", 100, 0),
+        ];
+        assert_eq!(route_skipping(&graph, "a", "c", &[1]).unwrap(), vec![2, 3]);
+        assert!(route_skipping(&graph, "a", "c", &[1, 3]).is_err());
     }
 
     #[test]
