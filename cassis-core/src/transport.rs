@@ -18,7 +18,7 @@ const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// Where to reach a peer: its iroh endpoint id plus, optionally, its
 /// home relay.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PeerAddr {
     pub id: String,
     pub relay: Option<String>,
@@ -58,6 +58,17 @@ impl Transport {
                 .alpns(vec![ALPN.to_vec()]);
         }
         let endpoint = builder
+            .bind()
+            .await
+            .map_err(|e| format!("bind iroh endpoint: {e}"))?;
+        Ok(Self { endpoint })
+    }
+
+    /// Bind a client-only endpoint with a stable identity, so the peers
+    /// it talks to can tell who is asking.
+    pub async fn bind_client(secret: [u8; 32]) -> Result<Self, String> {
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(SecretKey::from(secret))
             .bind()
             .await
             .map_err(|e| format!("bind iroh endpoint: {e}"))?;

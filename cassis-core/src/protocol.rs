@@ -294,6 +294,48 @@ pub struct Settle {
     pub preimage: Bytes32,
 }
 
+/// Payee to a preimage server it delegates PREPARE and COMMIT to, so it
+/// can stay offline: pick the preimage of a new invoice.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreimageInvoice {
+    pub amount_msat: u64,
+    pub expires_at: u64,
+    pub description: Option<String>,
+}
+
+/// The preimage server's answer to [`PreimageInvoice`]. The payee checks
+/// `preimage` against `payment_hash` and discards it; the server reveals
+/// it on COMMIT and again in [`ReceivedPayment`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreimageInvoiceTerms {
+    pub payment_hash: Bytes32,
+    pub preimage: Bytes32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
+}
+
+/// What the preimage server logged for one of the payee's invoices.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ReceivedPayment {
+    /// A COMMIT the server verified: the HTLC it named, still to be
+    /// claimed by the payee with `preimage`. `descriptor` is the
+    /// network-specific part (cashu proofs, a lockup output, ...).
+    Received {
+        payment_hash: Bytes32,
+        network: NetworkId,
+        expiry: u64,
+        descriptor: HtlcDescriptor,
+        preimage: Bytes32,
+        at: u64,
+    },
+    /// A payment the server refused or could not verify.
+    Failed {
+        payment_hash: Bytes32,
+        reason: String,
+        at: u64,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Prepare(Prepare),
@@ -302,6 +344,15 @@ pub enum Request {
     Discard(Discard),
     Commit(Commit),
     Settle(Settle),
+    /// Payee to preimage server: terms of a new invoice.
+    PreimageInvoice(PreimageInvoice),
+    /// Payee to preimage server: sign this invoice, which names the
+    /// server's endpoint and a payment hash it issued.
+    PreimageSign(Invoice),
+    /// Payee to preimage server: what it logged since unix time `since`.
+    PreimagePayments {
+        since: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,6 +372,9 @@ pub enum Response {
     /// request to learn its outcome.
     Pending,
     Error(String),
+    PreimageInvoice(Result<PreimageInvoiceTerms, String>),
+    PreimageSigned(Result<InvoiceSignature, String>),
+    PreimagePayments(Result<Vec<ReceivedPayment>, String>),
 }
 
 #[cfg(test)]

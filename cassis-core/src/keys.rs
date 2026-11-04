@@ -59,6 +59,14 @@ impl NodeKeys {
         hmac(&self.seed, b"cassis/order", None)
     }
 
+    /// Secret of the endpoint this node talks to its preimage server
+    /// from: stable, since the server keeps the node's invoices and
+    /// payments under it, and distinct from [`NodeKeys::iroh`] so it
+    /// can be used while the node runs.
+    pub fn preimage_server_client_secret(&self) -> [u8; 32] {
+        hmac(&self.seed, b"cassis/preimage-server-client", None)
+    }
+
     /// Signing key of this node on `network`: the first 32 bytes of
     /// `HMAC-SHA512(seed, "cassis/network/<id>" || counter)` that form a
     /// valid secp256k1 scalar.

@@ -16,6 +16,7 @@
 
 mod payee;
 mod payer;
+mod preimage_server;
 mod router;
 mod settle;
 
@@ -32,6 +33,10 @@ use std::time::Duration;
 use tracing::{Instrument, Span};
 
 pub use payee::create_invoice;
+pub use preimage_server::{
+    create_preimage_server_invoice, redeem_preimage_server_payments, PreimageServerInvoiceRecord,
+    RedeemReport, PREIMAGE_SERVER_INVOICES,
+};
 pub use router::{PrepareVeto, RoutingPolicy};
 
 const INVOICES: &str = "invoices";
@@ -275,6 +280,11 @@ impl Node {
             Request::Settle(settle) => {
                 self.settle_hop(settle, peer).await;
                 Response::Settled
+            }
+            Request::PreimageInvoice(_)
+            | Request::PreimageSign(_)
+            | Request::PreimagePayments { .. } => {
+                Response::Error("this node is not a preimage server".into())
             }
         }
     }

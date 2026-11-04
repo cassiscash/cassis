@@ -20,9 +20,12 @@ mod order_demo;
 mod wallets;
 
 use cassis_core::node::{
-    create_invoice, HopRecord, InvoiceRecord, Node, NodeConfig, PaymentRecord, RoutingPolicy,
+    create_invoice, create_preimage_server_invoice, redeem_preimage_server_payments, HopRecord,
+    InvoiceRecord, InvoiceStatus, Node, NodeConfig, PaymentRecord, PreimageServerInvoiceRecord,
+    RoutingPolicy, PREIMAGE_SERVER_INVOICES,
 };
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS};
+use cassis_core::transport::PeerAddr;
 use cassis_core::{unix_now, Invoice, NetworkId};
 use clap::{Parser, Subcommand};
 use home::Home;
@@ -105,8 +108,39 @@ enum Command {
         #[arg(long, default_value_t = 3600)]
         expires_in: u64,
         /// Serve the node here until the invoice is paid or expires.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "preimage_server")]
         wait: bool,
+        /// Iroh id of a preimage server to answer payers instead of this
+        /// node, which can then stay offline. It picks the payment hash
+        /// and the metadata; claim with `redeem` afterwards.
+        #[arg(long = "preimage-server", visible_alias = "ps", value_name = "ID")]
+        preimage_server: Option<String>,
+        /// Home relay of the preimage server.
+        #[arg(
+            long = "preimage-server-relay",
+            visible_alias = "ps-relay",
+            value_name = "URL",
+            requires = "preimage_server"
+        )]
+        preimage_server_relay: Option<String>,
+    },
+    /// Fetch the payments preimage servers logged for this node's
+    /// invoices and claim them, before their HTLCs expire.
+    Redeem {
+        /// Only this preimage server; by default every one with an
+        /// unclaimed invoice.
+        #[arg(long = "preimage-server", visible_alias = "ps", value_name = "ID")]
+        preimage_server: Option<String>,
+        #[arg(
+            long = "preimage-server-relay",
+            visible_alias = "ps-relay",
+            value_name = "URL",
+            requires = "preimage_server"
+        )]
+        preimage_server_relay: Option<String>,
+        /// Only payments logged since this unix time.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
     },
     /// Pay an invoice (JSON) from one of this node's networks.
     Pay {
@@ -235,6 +269,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             description,
             expires_in,
             wait,
+            preimage_server,
+            preimage_server_relay,
         } => {
             let networks = if networks.is_empty() {
                 home.networks()?
@@ -246,7 +282,22 @@ async fn run(cli: Cli) -> Result<(), String> {
             };
             let expires_at = unix_now() + expires_in;
             let mut serving = None;
-            let invoice = if wait {
+            let invoice = if let Some(id) = preimage_server {
+                let opened = home.open_networks(&networks, &span).await?;
+                create_preimage_server_invoice(
+                    &home.store,
+                    &home.keys,
+                    PeerAddr {
+                        id,
+                        relay: preimage_server_relay,
+                    },
+                    &opened,
+                    amount_msat,
+                    expires_at,
+                    description,
+                )
+                .await?
+            } else if wait {
                 let node = serve(&home, &span).await?;
                 let invoice = node
                     .create_invoice(&networks, amount_msat, expires_at, description, None)
@@ -294,6 +345,11 @@ async fn run(cli: Cli) -> Result<(), String> {
                 }
             }
         }
+        Command::Redeem {
+            preimage_server,
+            preimage_server_relay,
+            since,
+        } => redeem(&home, &span, preimage_server, preimage_server_relay, since).await?,
         Command::Pay {
             invoice,
             from,
@@ -358,6 +414,19 @@ async fn run(cli: Cli) -> Result<(), String> {
                     record.invoice.amount_msat,
                     record.status,
                     record.invoice.expires_at
+                );
+            }
+            for record in home
+                .store
+                .list::<PreimageServerInvoiceRecord>(PREIMAGE_SERVER_INVOICES)?
+            {
+                println!(
+                    "{} {:>12} msat {:?} expires {} via preimage server {}",
+                    record.invoice.payment_hash,
+                    record.invoice.amount_msat,
+                    record.status,
+                    record.invoice.expires_at,
+                    record.server.id
                 );
             }
         }
@@ -429,6 +498,73 @@ async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
             }
         }
     }
+}
+
+/// `redeem`: claim what preimage servers logged, on the networks of the
+/// invoices still unclaimed through each.
+async fn redeem(
+    home: &Home,
+    span: &Span,
+    preimage_server: Option<String>,
+    preimage_server_relay: Option<String>,
+    since: u64,
+) -> Result<(), String> {
+    let unclaimed: Vec<PreimageServerInvoiceRecord> = home
+        .store
+        .list::<PreimageServerInvoiceRecord>(PREIMAGE_SERVER_INVOICES)?
+        .into_iter()
+        .filter(|record| record.status == InvoiceStatus::Pending)
+        .collect();
+    let mut servers: Vec<PeerAddr> = Vec::new();
+    match preimage_server {
+        Some(id) => servers.push(PeerAddr {
+            id,
+            relay: preimage_server_relay,
+        }),
+        None => {
+            for record in &unclaimed {
+                if !servers.iter().any(|r| r.id == record.server.id) {
+                    servers.push(record.server.clone());
+                }
+            }
+        }
+    }
+    if servers.is_empty() {
+        println!("no unclaimed invoices through a preimage server");
+        return Ok(());
+    }
+    for preimage_server in servers {
+        let mut networks: Vec<NetworkId> = Vec::new();
+        for record in unclaimed
+            .iter()
+            .filter(|r| r.server.id == preimage_server.id)
+        {
+            for entry in &record.invoice.networks {
+                if !networks.contains(&entry.network) {
+                    networks.push(entry.network.clone());
+                }
+            }
+        }
+        let opened = home.open_networks(&networks, span).await?;
+        let report = redeem_preimage_server_payments(
+            &home.store,
+            &home.keys,
+            &preimage_server,
+            &opened,
+            since,
+        )
+        .await?;
+        for (hash, network, amount_msat) in &report.claimed {
+            println!("claimed {hash} {amount_msat:>12} msat on {network}");
+        }
+        for (hash, reason) in &report.pending {
+            println!("pending {hash}: {reason}");
+        }
+        for (hash, reason) in &report.failed {
+            println!("failed  {hash}: {reason}");
+        }
+    }
+    Ok(())
 }
 
 fn relays(relays: Vec<String>) -> Vec<String> {
