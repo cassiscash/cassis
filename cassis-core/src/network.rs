@@ -342,6 +342,18 @@ pub trait Network: Send + Sync {
     /// enough yet (e.g. unconfirmed): callers wait and verify again.
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError>;
 
+    /// [`Network::verify_incoming_htlc`] for an HTLC paying any
+    /// `htlc.target`, not only this node's: every check but whose
+    /// target it is. A preimage server runs it before revealing the
+    /// preimage of an HTLC its payee will claim later.
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let _ = htlc;
+        Err(NetworkError::invalid(format!(
+            "{} cannot verify HTLCs paying other keys",
+            self.id()
+        )))
+    }
+
     /// Claim a verified incoming HTLC by revealing `preimage`.
     async fn claim_incoming_htlc(&self, htlc: &Htlc, preimage: Bytes32)
         -> Result<(), NetworkError>;
@@ -436,6 +448,10 @@ impl Network for Overridden {
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
         self.network.verify_incoming_htlc(htlc).await
+    }
+
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        self.network.verify_htlc(htlc).await
     }
 
     async fn claim_incoming_htlc(

@@ -404,10 +404,14 @@ impl Network for FedimintAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let (outpoint, contract) = Self::contract(htlc)?;
         if htlc.target != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
+        self.verify_htlc(htlc).await
+    }
+
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let (outpoint, contract) = Self::contract(htlc)?;
         if contract.amount.msats < htlc.amount_msat {
             return Err(NetworkError::invalid(
                 "contract is worth less than the HTLC",

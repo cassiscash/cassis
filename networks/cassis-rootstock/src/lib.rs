@@ -403,10 +403,14 @@ impl Network for RootstockAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let swap = Swap::of(htlc)?;
-        if htlc.target != self.claim_target() || swap.claim_address != self.address {
+        if htlc.target != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
+        self.verify_htlc(htlc).await
+    }
+
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let swap = Swap::of(htlc)?;
         if swap.amount_wei < msat_to_wei(htlc.amount_msat) {
             return Err(NetworkError::invalid("lock is worth less than the HTLC"));
         }

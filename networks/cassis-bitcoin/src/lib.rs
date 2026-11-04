@@ -872,10 +872,14 @@ impl Network for BitcoinAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let options = HtlcOptions::of(htlc)?;
         if htlc.target != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
+        self.verify_htlc(htlc).await
+    }
+
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let options = HtlcOptions::of(htlc)?;
         // The output script is rebuilt from the payment hash and our
         // key, so an unspent output paying it is bound to both.
         let (value, confirmed) = self.unspent_lockup(&options).await?;

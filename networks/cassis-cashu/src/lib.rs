@@ -316,11 +316,20 @@ impl Network for CashuAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let proofs = decode_proofs(&htlc.descriptor)?;
         if htlc.target != HtlcTarget::XOnlyPubKey(self.claim_pubkey) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
-        let claim_key = cashu_key(&self.claim_pubkey)?;
+        self.verify_htlc(htlc).await
+    }
+
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let proofs = decode_proofs(&htlc.descriptor)?;
+        let HtlcTarget::XOnlyPubKey(receiver) = &htlc.target else {
+            return Err(NetworkError::invalid(
+                "cashu HTLCs are locked to an x-only key",
+            ));
+        };
+        let claim_key = cashu_key(receiver)?;
         for proof in &proofs {
             let terms = HtlcTerms::of(proof)?;
             if terms.payment_hash != htlc.payment_hash {

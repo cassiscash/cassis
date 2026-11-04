@@ -123,6 +123,11 @@ enum Command {
             requires = "preimage_server"
         )]
         preimage_server_relay: Option<String>,
+        /// With `--preimage-server`: how long this node may stay offline
+        /// after a payment before `redeem` must claim it. Payers and
+        /// routers lock their HTLCs that much longer.
+        #[arg(long, value_name = "SECS", default_value_t = 24 * 3600, requires = "preimage_server")]
+        claim_window: u64,
     },
     /// Fetch the payments preimage servers logged for this node's
     /// invoices and claim them, before their HTLCs expire.
@@ -271,6 +276,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             wait,
             preimage_server,
             preimage_server_relay,
+            claim_window,
         } => {
             let networks = if networks.is_empty() {
                 home.networks()?
@@ -295,6 +301,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     amount_msat,
                     expires_at,
                     description,
+                    claim_window,
                 )
                 .await?
             } else if wait {

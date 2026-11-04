@@ -281,7 +281,7 @@ impl Node {
                 self.settle_hop(settle, peer).await;
                 Response::Settled
             }
-            Request::PreimageInvoice(_)
+            Request::PreimageInvoice
             | Request::PreimageSign(_)
             | Request::PreimagePayments { .. } => {
                 Response::Error("this node is not a preimage server".into())

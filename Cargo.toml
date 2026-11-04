@@ -10,6 +10,7 @@ members = [
   "networks/cassis-lnd",
   "networks/cassis-bark-lightning",
   "cassis-cli",
+  "cassis-preimage-server",
   "cassis-wasm",
 ]
 resolver = "2"
@@ -38,6 +39,8 @@ lwk_common = "0.19"
 lwk_signer = "0.19"
 lwk_wollet = { version = "0.19", default-features = false, features = ["esplora"] }
 minisqlite = { git = "https://github.com/cursor/minisqlite" }
+# Typed entities on redb, for the preimage server's payment log.
+orangedb = { path = "../orangedb/orangedb" }
 rand = "0.8.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ritualistic = "0.1.1"

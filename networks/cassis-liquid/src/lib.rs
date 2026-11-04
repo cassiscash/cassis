@@ -875,10 +875,14 @@ impl Network for LiquidAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let (spec, outpoint) = Self::htlc_spec(htlc)?;
         if htlc.target != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
+        self.verify_htlc(htlc).await
+    }
+
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let (spec, outpoint) = Self::htlc_spec(htlc)?;
         // The script was rebuilt from the payment hash, so a lockup
         // paying it is bound to that hash.
         let value_sat = self.lockup_value(&spec, outpoint).await?;

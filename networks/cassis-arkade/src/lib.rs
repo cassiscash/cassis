@@ -1014,10 +1014,14 @@ impl Network for ArkadeAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let options = self.vhtlc_options(htlc)?;
         if htlc.target != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
+        self.verify_htlc(htlc).await
+    }
+
+    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        let options = self.vhtlc_options(htlc)?;
         // The VHTLC address is rebuilt from the payment hash, our key and
         // our operator, so coins there are bound to all three.
         self.check_timelocks(&options)?;

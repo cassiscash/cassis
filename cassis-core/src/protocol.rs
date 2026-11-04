@@ -271,6 +271,11 @@ pub struct PreparePayee {
     /// The invoice's [`Invoice::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
+    /// The whole invoice, so a payee keeping no record of it (a
+    /// preimage server) can check the payment against the terms it
+    /// signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<Invoice>,
 }
 
 /// Payer to payee: the final HTLC is funded on `network`; claim it and
@@ -284,6 +289,11 @@ pub struct Commit {
     /// The invoice's [`Invoice::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
+    /// The whole invoice, so a payee keeping no record of it (a
+    /// preimage server) can check the payment against the terms it
+    /// signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<Invoice>,
 }
 
 /// Payer to router: the preimage of an executed hop, so the router can
@@ -294,24 +304,43 @@ pub struct Settle {
     pub preimage: Bytes32,
 }
 
-/// Payee to a preimage server it delegates PREPARE and COMMIT to, so it
-/// can stay offline: pick the preimage of a new invoice.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PreimageInvoice {
-    pub amount_msat: u64,
-    pub expires_at: u64,
-    pub description: Option<String>,
+/// What a preimage server puts in the metadata of an invoice it issues
+/// a hash for: a random `nonce` and the iroh id of the payee it issued
+/// it to. It keeps no record of the invoice: its preimage is an HMAC by
+/// the server's key over both, recomputed on PREPARE and COMMIT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreimageServerMetadata {
+    pub nonce: [u8; 32],
+    /// Ed25519 key the payee talks to the server with.
+    pub payee: [u8; 32],
 }
 
-/// The preimage server's answer to [`PreimageInvoice`]. The payee checks
-/// `preimage` against `payment_hash` and discards it; the server reveals
-/// it on COMMIT and again in [`ReceivedPayment`].
+impl PreimageServerMetadata {
+    pub fn to_metadata(&self) -> Metadata {
+        Metadata([self.nonce, self.payee].concat())
+    }
+
+    pub fn from_metadata(metadata: &Metadata) -> Result<Self, String> {
+        let bytes = metadata.as_bytes();
+        if bytes.len() != 64 {
+            return Err("not the metadata of a preimage server invoice".into());
+        }
+        Ok(Self {
+            nonce: bytes[..32].try_into().expect("32 bytes"),
+            payee: bytes[32..].try_into().expect("32 bytes"),
+        })
+    }
+}
+
+/// A preimage server's answer to [`Request::PreimageInvoice`]. The payee
+/// checks `preimage` against `payment_hash` and discards it; the server
+/// reveals it on COMMIT and again in [`ReceivedPayment`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreimageInvoiceTerms {
     pub payment_hash: Bytes32,
     pub preimage: Bytes32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Metadata>,
+    /// A [`PreimageServerMetadata`], for the invoice's metadata.
+    pub metadata: Metadata,
 }
 
 /// What the preimage server logged for one of the payee's invoices.
@@ -328,7 +357,8 @@ pub enum ReceivedPayment {
         preimage: Bytes32,
         at: u64,
     },
-    /// A payment the server refused or could not verify.
+    /// A payment the server refused or could not verify. Servers may
+    /// not log these.
     Failed {
         payment_hash: Bytes32,
         reason: String,
@@ -344,8 +374,8 @@ pub enum Request {
     Discard(Discard),
     Commit(Commit),
     Settle(Settle),
-    /// Payee to preimage server: terms of a new invoice.
-    PreimageInvoice(PreimageInvoice),
+    /// Payee to preimage server: a payment hash for a new invoice.
+    PreimageInvoice,
     /// Payee to preimage server: sign this invoice, which names the
     /// server's endpoint and a payment hash it issued.
     PreimageSign(Invoice),

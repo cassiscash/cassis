@@ -67,6 +67,12 @@ impl NodeKeys {
         hmac(&self.seed, b"cassis/preimage-server-client", None)
     }
 
+    /// Key a preimage server derives its preimages with (see
+    /// [`crate::protocol::PreimageServerMetadata`]).
+    pub fn preimage_server_secret(&self) -> [u8; 32] {
+        hmac(&self.seed, b"cassis/preimage-server", None)
+    }
+
     /// Signing key of this node on `network`: the first 32 bytes of
     /// `HMAC-SHA512(seed, "cassis/network/<id>" || counter)` that form a
     /// valid secp256k1 scalar.

@@ -2761,6 +2761,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cassis-preimage-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cassis-arkade",
+ "cassis-bitcoin",
+ "cassis-cashu",
+ "cassis-core",
+ "cassis-fedimint",
+ "cassis-liquid",
+ "cassis-rootstock",
+ "clap",
+ "hmac",
+ "iroh 1.0.3",
+ "orangedb",
+ "rand 0.8.7",
+ "ritualistic",
+ "rustls",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cassis-rootstock"
 version = "0.1.0"
 dependencies = [
@@ -8704,6 +8729,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "orangedb"
+version = "0.1.0"
+dependencies = [
+ "orangedb-macros",
+ "postcard",
+ "redb",
+ "serde",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
+name = "orangedb-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "ordered-multimap"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9887,6 +9933,16 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna",
+]
+
+[[package]]
+name = "redb"
+version = "4.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
+dependencies = [
+ "libc",
+ "uuid",
 ]
 
 [[package]]

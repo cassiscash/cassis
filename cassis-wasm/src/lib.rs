@@ -83,6 +83,8 @@ export interface Commit {
   expiry: number;
   descriptor: HtlcDescriptor;
   metadata?: string;
+  /** The whole invoice; preimage servers refuse COMMITs without it. */
+  invoice?: Invoice;
 }
 /** Announces the payee's HTLC before anything is funded. */
 export interface PreparePayee {
@@ -90,6 +92,8 @@ export interface PreparePayee {
   network: NetworkId;
   expiry: number;
   metadata?: string;
+  /** The whole invoice; preimage servers refuse PREPAREs without it. */
+  invoice?: Invoice;
 }
 /** Only PreparePayee and COMMIT are used without routers; the other
  * requests are routing. */

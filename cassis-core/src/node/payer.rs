@@ -118,6 +118,7 @@ impl Node {
             network: payee_network.clone(),
             expiry: plan.expiries[hops.len()],
             metadata: invoice.metadata.clone(),
+            invoice: Some(invoice.clone()),
         });
         let (replies, payee_reply) = futures::join!(
             join_all(hops.iter().map(|hop| async move {
@@ -220,6 +221,7 @@ impl Node {
             expiry: plan.expiries[hops.len()],
             descriptor,
             metadata: invoice.metadata.clone(),
+            invoice: Some(invoice.clone()),
         };
         let deadline = commit.expiry;
         let preimage = match self

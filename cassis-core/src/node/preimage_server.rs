@@ -2,19 +2,21 @@
 //! answers PREPARE and COMMIT for this payee, so the payee can go
 //! offline.
 //!
-//! The server picks each invoice's preimage and reveals it on COMMIT.
-//! HTLCs stay locked to this node's targets, so the server cannot claim
-//! them: it logs what each COMMIT named, and [`redeem_preimage_server_payments`]
-//! later claims those HTLCs with the preimages it logged. That must
-//! happen before they expire, or the payer can refund them.
+//! The server picks each invoice's preimage and, once it verified the
+//! HTLC a COMMIT names, reveals it. HTLCs stay locked to this node's
+//! targets, so the server cannot claim them: it logs what each COMMIT
+//! named, and [`redeem_preimage_server_payments`] later claims those
+//! HTLCs with the preimages it logged. That must happen before they
+//! expire, or the payer refunds them: the claim window an invoice asks
+//! for makes payers lock them long enough.
 
 use super::InvoiceStatus;
 use crate::keys::NodeKeys;
 use crate::network::{Htlc, Network, NetworkError, NetworkId};
 use crate::primitives::{unix_now, Bytes32};
 use crate::protocol::{
-    Invoice, InvoiceNetwork, PreimageInvoice, PreimageInvoiceTerms, ReceivedPayment, Request,
-    Response,
+    Invoice, InvoiceNetwork, PreimageInvoiceTerms, PreimageServerMetadata, ReceivedPayment,
+    Request, Response,
 };
 use crate::store::Store;
 use crate::transport::{PeerAddr, Transport};
@@ -42,6 +44,15 @@ pub struct PreimageServerInvoiceRecord {
 /// The server chooses the payment hash and the metadata, and signs the
 /// invoice, which names its endpoint. The preimage it also sends is
 /// only checked against the hash.
+///
+/// HTLCs paying it must stay claimable for `claim_window_secs` after
+/// the server reveals their preimage, on top of each network's own
+/// margin: how long this node may stay offline before
+/// [`redeem_preimage_server_payments`]. Routers lock their HTLCs that
+/// much longer too, and networks whose HTLCs cannot run that long are
+/// refused. Lightning is refused: its hold invoices need this node
+/// online to be paid at all.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_preimage_server_invoice(
     store: &Store,
     keys: &NodeKeys,
@@ -50,6 +61,7 @@ pub async fn create_preimage_server_invoice(
     amount_msat: u64,
     expires_at: u64,
     description: Option<String>,
+    claim_window_secs: u64,
 ) -> Result<Invoice, String> {
     if amount_msat == 0 {
         return Err("invoice amount must be positive".into());
@@ -60,6 +72,27 @@ pub async fn create_preimage_server_invoice(
     if networks.is_empty() {
         return Err("an invoice needs at least one network".into());
     }
+    for network in networks {
+        let id = network.id();
+        if id.kind() == "lightning" {
+            return Err(format!(
+                "{id} cannot be paid through a preimage server: its hold invoices need this \
+                 node online"
+            ));
+        }
+        let delta = network
+            .incoming_delta_secs()
+            .saturating_add(claim_window_secs);
+        if let Some(max) = network
+            .max_incoming_lifetime_secs()
+            .filter(|max| *max <= delta)
+        {
+            return Err(format!(
+                "{id} takes HTLCs running at most {max}s, too short for a claim window of \
+                 {claim_window_secs}s"
+            ));
+        }
+    }
     let transport = Transport::bind_client(keys.preimage_server_client_secret()).await?;
     let result = issue(
         &transport,
@@ -69,6 +102,7 @@ pub async fn create_preimage_server_invoice(
         amount_msat,
         expires_at,
         description,
+        claim_window_secs,
     )
     .await;
     transport.close().await;
@@ -95,12 +129,9 @@ async fn issue(
     amount_msat: u64,
     expires_at: u64,
     description: Option<String>,
+    claim_window_secs: u64,
 ) -> Result<Invoice, String> {
-    let request = Request::PreimageInvoice(PreimageInvoice {
-        amount_msat,
-        expires_at,
-        description: description.clone(),
-    });
+    let request = Request::PreimageInvoice;
     let terms: PreimageInvoiceTerms = match transport.request(server, &request).await? {
         Response::PreimageInvoice(Ok(terms)) => terms,
         Response::PreimageInvoice(Err(reason)) | Response::Error(reason) => {
@@ -112,6 +143,12 @@ async fn issue(
     if !terms.payment_hash.matches_preimage(&terms.preimage) {
         return Err("preimage server sent a preimage that does not match its hash".into());
     }
+    // Payments are logged for, and fetched by, the key the metadata
+    // names: it must be ours.
+    let client = iroh::SecretKey::from(keys.preimage_server_client_secret()).public();
+    if PreimageServerMetadata::from_metadata(&terms.metadata)?.payee != *client.as_bytes() {
+        return Err("preimage server issued the hash to another payee".into());
+    }
     let payment_hash = terms.payment_hash;
     let mut targets = Vec::with_capacity(networks.len());
     for network in networks {
@@ -122,7 +159,11 @@ async fn issue(
         targets.push(InvoiceNetwork {
             network: network.id(),
             target,
-            incoming_delta_secs: Some(network.incoming_delta_secs()),
+            incoming_delta_secs: Some(
+                network
+                    .incoming_delta_secs()
+                    .saturating_add(claim_window_secs),
+            ),
             max_incoming_lifetime_secs: network.max_incoming_lifetime_secs(),
         });
     }
@@ -133,7 +174,7 @@ async fn issue(
         expires_at,
         networks: targets,
         description,
-        metadata: terms.metadata,
+        metadata: Some(terms.metadata),
         iroh_peer_id: Some(server.id.clone()),
         iroh_relay: server.relay.clone(),
         signature: None,
