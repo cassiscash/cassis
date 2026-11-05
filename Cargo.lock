@@ -10255,9 +10255,9 @@ dependencies = [
 
 [[package]]
 name = "ritualistic"
-version = "0.1.1"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97538d3921a9992840472bba0918742ae5ccfc5e2966446796c0f9e1e95fad5f"
+checksum = "7e3e5360004c405dd45b87cc8628f7a706cc1951d55c6358c6600ba79345e438"
 dependencies = [
  "base64 0.22.1",
  "bech32 0.11.1",
@@ -10267,7 +10267,6 @@ dependencies = [
  "dashmap",
  "foldhash 0.1.5",
  "futures",
- "futures-util",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "glidesort",
@@ -10278,15 +10277,15 @@ dependencies = [
  "hyper-util",
  "itertools 0.14.0",
  "js-sys",
- "lazy_static",
  "lmdb-master-sys",
  "log",
  "lowercase-hex",
+ "redb",
  "regex",
  "reqwest 0.12.28",
  "rkyv",
  "scrypt",
- "secp256k1 0.32.0-beta.2",
+ "secp256k1 0.33.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -10298,6 +10297,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
@@ -10787,16 +10787,6 @@ dependencies = [
 
 [[package]]
 name = "secp256k1"
-version = "0.32.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c5fdc7d6e800869d3fd60ff857c479bf0a83ea7bf44b389e64461e844204994"
-dependencies = [
- "rand 0.9.5",
- "secp256k1-sys 0.12.0",
-]
-
-[[package]]
-name = "secp256k1"
 version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7f404a8dab7a7a5a631e741d8699aa9c8e1d689fc26ccf897c7187565490b69"
@@ -10829,15 +10819,6 @@ name = "secp256k1-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcb913707158fadaf0d8702c2db0e857de66eb003ccfdda5924b5f5ac98efb38"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "secp256k1-sys"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d3be00697c88c00fe102af8dc316038cc2062eab8da646e7463f4c0e70ca9fd"
 dependencies = [
  "cc",
 ]

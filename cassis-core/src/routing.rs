@@ -10,7 +10,9 @@
 
 use crate::network::NetworkId;
 use crate::primitives::XOnlyPubKey;
-use ritualistic::{EventTemplate, Filter, Kind, SubscriptionOptions, Tags, Timestamp};
+use ritualistic::{
+    EventTemplate, Filter, Kind, PublishOptions, SubscriptionOptions, Tags, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -201,7 +203,9 @@ pub async fn publish_announcements(
     let mut results = Vec::with_capacity(announcements.len());
     for announcement in announcements {
         let event = announcement.to_event_template().finalize(node_key);
-        let mut replies = pool.publish_many(relays, event).await;
+        let mut replies = pool
+            .publish_many(relays, event, PublishOptions::default())
+            .await;
         let mut accepted = 0;
         while let Some(reply) = replies.recv().await {
             match reply.error {

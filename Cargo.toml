@@ -43,7 +43,7 @@ minisqlite = { git = "https://github.com/cursor/minisqlite" }
 orangedb = "0.1.0"
 rand = "0.8.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-ritualistic = "0.1.1"
+ritualistic = "0.2.4"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "aws_lc_rs"] }
 secp256k1 = { version = "0.31", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
