@@ -113,6 +113,10 @@ enum Command {
         fee_base_msat: u64,
         #[arg(long, default_value_t = 500)]
         fee_ppm: u64,
+        /// Tag route announcements as test money; implied by
+        /// `--test-relays`.
+        #[arg(long)]
+        test_money: bool,
     },
     /// Create an invoice. A running node (`run`) claims it when paid.
     Invoice {
@@ -268,6 +272,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             route,
             fee_base_msat,
             fee_ppm,
+            test_money,
         } => {
             let node = serve(&home, &span).await?;
             if route {
@@ -275,6 +280,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     fee_base_msat,
                     fee_ppm,
                     nostr_relays: relays.clone(),
+                    test_money: test_money || cli.test_relays,
                     ..RoutingPolicy::default()
                 });
             }

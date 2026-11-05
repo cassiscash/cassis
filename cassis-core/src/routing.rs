@@ -6,6 +6,10 @@
 //! recent ones, find the cheapest chain of hops from their network to
 //! one the invoice accepts, and plan per-leg amounts and expiries.
 //!
+//! Routers moving test money (test mints, signet, testnets...) add a
+//! [`TEST_MONEY_TAG`] tag, so explorers and payers can tell their
+//! routes apart from real ones even on networks whose id does not say.
+//!
 //! Kept free of the node runtime so it also builds for wasm.
 
 use crate::network::NetworkId;
@@ -42,6 +46,9 @@ pub const TEST_NOSTR_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
 ];
 
+/// Name of the valueless tag marking an announcement as test money.
+pub const TEST_MONEY_TAG: &str = "testmoney";
+
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One directed hop a router offers: receive on `from`, send on `to`.
@@ -62,6 +69,9 @@ pub struct RouteAnnouncement {
     /// Longest the router lets its incoming HTLC run (see
     /// `Network::max_incoming_lifetime_secs`); `None` for no limit.
     pub max_incoming_lifetime_secs: Option<u64>,
+    /// The router moves test money on this hop ([`TEST_MONEY_TAG`]).
+    #[serde(default)]
+    pub test_money: bool,
 }
 
 impl RouteAnnouncement {
@@ -104,6 +114,9 @@ impl RouteAnnouncement {
                 max.to_string(),
             ]);
         }
+        if self.test_money {
+            tags.push(vec![TEST_MONEY_TAG.to_string()]);
+        }
         EventTemplate {
             created_at: Timestamp::now(),
             kind: Kind(ROUTE_ANNOUNCEMENT_KIND),
@@ -137,6 +150,10 @@ impl RouteAnnouncement {
                 .filter(|slack| *slack > 0)
                 .unwrap_or(DEFAULT_TRANSIT_SLACK_SECS),
             max_incoming_lifetime_secs: number("max_incoming_lifetime_secs"),
+            test_money: event
+                .tags
+                .iter()
+                .any(|tag| tag.first().is_some_and(|name| name == TEST_MONEY_TAG)),
             from,
             to,
         })
@@ -358,6 +375,7 @@ mod tests {
             incoming_delta_secs: 30,
             transit_slack_secs: 60,
             max_incoming_lifetime_secs: None,
+            test_money: false,
         }
     }
 
@@ -379,6 +397,22 @@ mod tests {
             &skip.iter().map(|node| XOnlyPubKey([*node; 32])).collect(),
         )
         .map(|hops| hops.iter().map(|hop| hop.node_pubkey.0[0]).collect())
+    }
+
+    #[test]
+    fn announcements_round_trip_through_events() {
+        let key = ritualistic::SecretKey::generate();
+        for test_money in [false, true] {
+            let announcement = RouteAnnouncement {
+                node_pubkey: key.pubkey(),
+                iroh_relay: Some("https://relay.example".into()),
+                max_incoming_lifetime_secs: Some(3_600),
+                test_money,
+                ..hop(0, "cashu::mint.example", "liquid::testnet", 10, 20)
+            };
+            let event = announcement.to_event_template().finalize(&key);
+            assert_eq!(RouteAnnouncement::from_event(&event), Some(announcement));
+        }
     }
 
     #[test]

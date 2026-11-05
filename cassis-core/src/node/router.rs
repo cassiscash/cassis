@@ -26,6 +26,8 @@ pub struct RoutingPolicy {
     pub fee_ppm: u64,
     pub transit_slack_secs: u64,
     pub nostr_relays: Vec<String>,
+    /// Mark announcements as test money ([`routing::TEST_MONEY_TAG`]).
+    pub test_money: bool,
     /// Most PREPARE reservations held at once.
     pub max_reservations: usize,
     /// Runs after the built-in checks, before anything is reserved.
@@ -42,6 +44,7 @@ impl Default for RoutingPolicy {
                 .iter()
                 .map(|relay| relay.to_string())
                 .collect(),
+            test_money: false,
             max_reservations: 100,
             prepare_veto: None,
         }
@@ -101,6 +104,7 @@ impl Node {
                     incoming_delta_secs: incoming.incoming_delta_secs(),
                     transit_slack_secs: policy.transit_slack_secs,
                     max_incoming_lifetime_secs: incoming.max_incoming_lifetime_secs(),
+                    test_money: policy.test_money,
                 });
             }
         }
