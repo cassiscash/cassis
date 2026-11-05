@@ -51,6 +51,14 @@ pub const TEST_MONEY_TAG: &str = "testmoney";
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bytes of a node key [`RouteAnnouncement::autoname`] encodes, away
+/// from both ends so it does not echo the truncated hex shown in UIs.
+const AUTONAME_BYTES: std::ops::Range<usize> = 8..12;
+
+/// Bytes of a node key [`RouteAnnouncement::autohue`] derives from,
+/// apart from [`AUTONAME_BYTES`] so names and colors vary independently.
+const AUTOHUE_BYTES: std::ops::Range<usize> = 20..22;
+
 /// One directed hop a router offers: receive on `from`, send on `to`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAnnouncement {
@@ -85,6 +93,43 @@ impl RouteAnnouncement {
     pub fn timelock_delta(&self) -> u64 {
         self.incoming_delta_secs
             .saturating_add(self.transit_slack_secs)
+    }
+
+    /// The `name` in the node's kind-0 metadata, if it published one.
+    pub async fn name(&self) -> Option<String> {
+        let pool = ritualistic::Network::new();
+        let profile = tokio::time::timeout(
+            FETCH_TIMEOUT,
+            ritualistic::Profile::from_metadata_fetch(&pool, self.node_pubkey),
+        )
+        .await
+        .ok()?;
+        profile
+            .metadata
+            .name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// A memorable name derived from the node key, like
+    /// `misty-heron-quiet-willow`: two adjective/noun pairs, one byte
+    /// of [`AUTONAME_BYTES`] per word.
+    pub fn autoname(&self) -> String {
+        let [a, b, c, d] = self.node_pubkey.0[AUTONAME_BYTES]
+            .try_into()
+            .expect("AUTONAME_BYTES spans 4 bytes");
+        format!(
+            "{}-{}-{}-{}",
+            ADJECTIVES[a as usize], NOUNS[b as usize], ADJECTIVES[c as usize], NOUNS[d as usize]
+        )
+    }
+
+    /// A hue in degrees (`0..360`) derived from the node key, to tell
+    /// nodes apart at a glance in UIs.
+    pub fn autohue(&self) -> u16 {
+        let bytes = &self.node_pubkey.0[AUTOHUE_BYTES];
+        let value = u16::from_be_bytes([bytes[0], bytes[1]]);
+        (value as u32 * 360 / 65_536) as u16
     }
 
     fn d_tag(&self) -> String {
@@ -359,6 +404,78 @@ pub fn plan_route(
     Ok(RoutePlan { amounts, expiries })
 }
 
+#[rustfmt::skip]
+const ADJECTIVES: [&str; 256] = [
+    "amber", "ancient", "autumn", "azure", "bitter", "black", "bold", "brave",
+    "breezy", "bright", "brisk", "broken", "calm", "candid", "cedar", "chilly",
+    "clear", "clever", "cloudy", "coastal", "cold", "cool", "copper", "coral",
+    "cosmic", "crimson", "crisp", "curious", "damp", "dappled", "dark", "dawning",
+    "deep", "dewy", "distant", "dreamy", "drifting", "dry", "dusky", "dusty",
+    "eager", "early", "earthy", "east", "echoing", "elder", "empty", "faded",
+    "fair", "falling", "fast", "feral", "fiery", "fleet", "floral", "foggy",
+    "fragrant", "free", "fresh", "frosty", "gentle", "gilded", "glad", "gleaming",
+    "glowing", "golden", "grand", "grassy", "gray", "green", "hallowed", "hazy",
+    "hidden", "hollow", "honest", "humble", "hushed", "icy", "idle", "indigo",
+    "ivory", "jade", "jolly", "keen", "kind", "lacy", "late", "lazy",
+    "leafy", "light", "lilac", "little", "lively", "lone", "lonely", "long",
+    "loud", "lucky", "lunar", "mellow", "merry", "midnight", "mild", "misty",
+    "modest", "morning", "mossy", "muddy", "murky", "muted", "narrow", "nimble",
+    "noble", "north", "odd", "olive", "opal", "pale", "patient", "peaceful",
+    "pearl", "pine", "plain", "plucky", "polar", "proud", "purple", "quick",
+    "quiet", "radiant", "rainy", "rapid", "rare", "restless", "rising", "robust",
+    "rosy", "round", "royal", "ruby", "rugged", "russet", "rustic", "sacred",
+    "salty", "sandy", "scarlet", "secret", "serene", "shady", "shaggy", "sharp",
+    "shining", "shy", "silent", "silken", "silver", "simple", "sleepy", "slender",
+    "slow", "small", "smoky", "smooth", "snowy", "soft", "solar", "solemn",
+    "somber", "sonic", "south", "sparkling", "spring", "stark", "starry", "steady",
+    "steep", "still", "stony", "stormy", "sturdy", "subtle", "summer", "sunny",
+    "swift", "tall", "tame", "tawny", "tender", "thorny", "tidal", "tiny",
+    "tranquil", "twilight", "urban", "velvet", "vernal", "violet", "vivid", "wandering",
+    "warm", "wary", "watery", "wavy", "west", "whispering", "white", "wild",
+    "windy", "winter", "wise", "wistful", "withered", "witty", "wooden", "woolly",
+    "young", "zesty", "bashful", "blissful", "blooming", "blue", "bouncy", "brazen",
+    "budding", "burly", "busy", "cheerful", "cozy", "dainty", "daring", "dazzling",
+    "dizzy", "drowsy", "dutiful", "fancy", "fickle", "flinty", "fluffy", "fuzzy",
+    "giddy", "glassy", "grumpy", "happy", "hardy", "jaunty", "jumpy", "knotty",
+    "lanky", "lofty", "lush", "magic", "mighty", "nifty", "perky", "prickly",
+];
+
+#[rustfmt::skip]
+const NOUNS: [&str; 256] = [
+    "acorn", "alder", "anchor", "apple", "aspen", "aurora", "badger", "bamboo",
+    "basin", "bay", "beacon", "bear", "bee", "beetle", "birch", "bird",
+    "bison", "bloom", "blossom", "boulder", "brook", "breeze", "brush", "butterfly",
+    "canyon", "cardinal", "cave", "cedar", "cherry", "cliff", "cloud", "clover",
+    "comet", "coral", "cove", "crane", "creek", "cricket", "crow", "dawn",
+    "deer", "delta", "dew", "dove", "dragonfly", "dune", "dusk", "eagle",
+    "echo", "elm", "ember", "falcon", "fern", "field", "finch", "fir",
+    "firefly", "flame", "flower", "fog", "forest", "fox", "frog", "frost",
+    "gale", "garden", "glacier", "glade", "glen", "grove", "gull", "harbor",
+    "hare", "hawk", "hazel", "heath", "hedge", "heron", "hill", "hollow",
+    "horizon", "iris", "island", "ivy", "jay", "juniper", "kestrel", "lagoon",
+    "lake", "lantern", "lark", "laurel", "leaf", "lily", "lotus", "lynx",
+    "maple", "marsh", "meadow", "mesa", "mist", "moon", "moose", "moss",
+    "moth", "mountain", "night", "oak", "ocean", "orchid", "otter", "owl",
+    "palm", "peak", "pebble", "pine", "plain", "plum", "pond", "poppy",
+    "prairie", "puffin", "quail", "rain", "raven", "reed", "reef", "ridge",
+    "river", "robin", "rock", "rose", "sage", "salmon", "sand", "sea",
+    "shadow", "shell", "shore", "sky", "slope", "snow", "sparrow", "spring",
+    "spruce", "star", "stone", "storm", "stream", "summit", "sun", "swan",
+    "thistle", "thorn", "thrush", "thunder", "tide", "tiger", "trail", "tree",
+    "tulip", "valley", "violet", "vine", "wave", "willow", "wind", "wolf",
+    "wren", "yew", "zephyr", "abyss", "arch", "arrow", "ash", "atlas",
+    "autumn", "badland", "bark", "barley", "basil", "berry", "blaze", "bluff",
+    "bramble", "breaker", "brine", "burrow", "cactus", "cairn", "canopy", "cascade",
+    "cinder", "citrus", "clay", "cobble", "cocoa", "condor", "crag", "crest",
+    "crystal", "current", "cypress", "daisy", "dale", "den", "dingo", "dolphin",
+    "drift", "drizzle", "elk", "estuary", "fawn", "feather", "fjord", "flint",
+    "flurry", "fountain", "gecko", "geyser", "ginger", "glimmer", "gorge", "granite",
+    "grass", "grotto", "gust", "haze", "heather", "hemlock", "husk", "ibis",
+    "inlet", "jasmine", "kelp", "knoll", "koi", "lichen", "linden", "loon",
+    "magpie", "mango", "mantis", "marble", "mire", "monsoon", "nectar", "nettle",
+    "newt", "oasis", "orbit", "osprey", "panda", "pansy", "pasture", "petal",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +530,27 @@ mod tests {
             let event = announcement.to_event_template().finalize(&key);
             assert_eq!(RouteAnnouncement::from_event(&event), Some(announcement));
         }
+    }
+
+    #[test]
+    fn autoname_words_are_distinct() {
+        for words in [&ADJECTIVES, &NOUNS] {
+            let unique: HashSet<_> = words.iter().collect();
+            assert_eq!(unique.len(), words.len());
+        }
+    }
+
+    #[test]
+    fn autoname_and_autohue_read_their_own_bytes() {
+        let mut node = hop(0, "a", "b", 0, 0);
+        assert_eq!(node.autoname(), "amber-acorn-amber-acorn");
+        assert_eq!(node.autohue(), 0);
+        node.node_pubkey.0[AUTONAME_BYTES].copy_from_slice(&[255, 1, 2, 255]);
+        assert_eq!(node.autoname(), "prickly-alder-autumn-petal");
+        assert_eq!(node.autohue(), 0);
+        node.node_pubkey.0[AUTOHUE_BYTES].copy_from_slice(&[0xff, 0xff]);
+        assert_eq!(node.autohue(), 359);
+        assert_eq!(node.autoname(), "prickly-alder-autumn-petal");
     }
 
     #[test]
