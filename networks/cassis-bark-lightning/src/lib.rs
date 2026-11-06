@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 use tracing::{debug, info, Span};
 
 /// Where a bark wallet finds its Ark server and the chain.
@@ -70,6 +71,9 @@ impl BarkConfig {
         })
     }
 }
+
+/// How often a long-running node runs bark's maintenance.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 fn wallet_error(error: impl std::fmt::Display) -> NetworkError {
     NetworkError::network(format!("bark: {error:#}"))
@@ -401,6 +405,16 @@ impl Network for BarkLightningAdapter {
             .await
             .map_err(|e| NetworkError::invalid(format!("bark cannot receive it: {e:#}")))?;
         Ok(())
+    }
+
+    fn maintenance_interval(&self) -> Option<Duration> {
+        Some(MAINTENANCE_INTERVAL)
+    }
+
+    /// bark's own upkeep: sync rounds, boards and lightning payments,
+    /// and refresh VTXOs close to expiry in the next round.
+    async fn maintain(&self) -> Result<(), NetworkError> {
+        self.wallet.maintenance().await.map_err(wallet_error)
     }
 }
 

@@ -132,8 +132,9 @@ impl RouteAnnouncement {
         (value as u32 * 360 / 65_536) as u16
     }
 
-    fn d_tag(&self) -> String {
-        format!("{}->{}", self.from, self.to)
+    /// The `d` tag of this announcement: see [`route_d_tag`].
+    pub fn d_tag(&self) -> String {
+        route_d_tag(&self.from, &self.to)
     }
 
     fn to_event_template(&self) -> EventTemplate {
@@ -203,6 +204,12 @@ impl RouteAnnouncement {
             to,
         })
     }
+}
+
+/// The `d` tag a router announces the hop from `from` to `to` under,
+/// which identifies it among the router's announcements.
+pub fn route_d_tag(from: &NetworkId, to: &NetworkId) -> String {
+    format!("{from}->{to}")
 }
 
 pub fn fee_msat(base_msat: u64, ppm: u64, amount_msat: u64) -> u64 {
@@ -282,6 +289,74 @@ pub async fn publish_announcements(
         results.push((announcement.d_tag(), accepted));
     }
     results
+}
+
+/// `d` tags of every route announcement `relay` keeps from `router`,
+/// however old.
+pub async fn fetch_own_routes(relay: &str, router: XOnlyPubKey) -> Result<Vec<String>, String> {
+    let filter = Filter {
+        kinds: Some(vec![Kind(ROUTE_ANNOUNCEMENT_KIND)]),
+        authors: Some(vec![router]),
+        limit: Some(1000),
+        ..Default::default()
+    };
+    let pool = ritualistic::Network::new();
+    let events = tokio::time::timeout(
+        FETCH_TIMEOUT,
+        pool.query([relay], filter, SubscriptionOptions::default()),
+    )
+    .await
+    .map_err(|_| format!("{relay}: query timed out"))?;
+    let mut routes: Vec<String> = events
+        .iter()
+        .filter(|event| event.pubkey == router && event.verify_signature())
+        .map(|event| event.tags.get_d())
+        .collect();
+    routes.sort();
+    routes.dedup();
+    Ok(routes)
+}
+
+/// Ask `relays` to delete the router's announcements under `d_tags`
+/// (a NIP-09 deletion of their addresses). Returns how many relays
+/// accepted the deletion.
+pub async fn delete_announcements(
+    relays: &[String],
+    node_key: &ritualistic::SecretKey,
+    d_tags: &[String],
+) -> usize {
+    let pubkey = node_key.pubkey().to_hex();
+    let mut tags: Vec<Vec<String>> = d_tags
+        .iter()
+        .map(|d| {
+            vec![
+                "a".to_string(),
+                format!("{ROUTE_ANNOUNCEMENT_KIND}:{pubkey}:{d}"),
+            ]
+        })
+        .collect();
+    tags.push(vec!["k".to_string(), ROUTE_ANNOUNCEMENT_KIND.to_string()]);
+    let event = EventTemplate {
+        created_at: Timestamp::now(),
+        kind: Kind(5),
+        tags: Tags(tags),
+        content: "route no longer offered".to_string(),
+    }
+    .finalize(node_key);
+    let mut pool = ritualistic::Network::new();
+    let mut replies = pool
+        .publish_many(relays, event, PublishOptions::default())
+        .await;
+    let mut accepted = 0;
+    while let Some(reply) = replies.recv().await {
+        match reply.error {
+            None => accepted += 1,
+            Some(error) => {
+                tracing::debug!("relay {} rejected a deletion: {error}", reply.relay_url)
+            }
+        }
+    }
+    accepted
 }
 
 /// Cheapest chain of hops carrying `amount_msat` from `from` to `to`.

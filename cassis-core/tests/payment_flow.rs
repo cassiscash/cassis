@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{
-    HopRecord, HopState, Node, NodeConfig, PaymentRecord, PaymentStatus, RoutingPolicy,
+    HopRecord, HopState, Node, NodeConfig, PaymentRecord, PaymentStatus, RouteOffer, RoutingPolicy,
 };
 use cassis_core::protocol::Metadata;
 use cassis_core::store::Store;
@@ -237,8 +237,12 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     )
     .await;
     let (payee, payee_keys) = start_node("payee", vec![MockNetwork::new(b, 4, &chain_b)]).await;
-    router.start_routing(RoutingPolicy {
+    let offer = |from: &str, to: &str| RouteOffer {
         nostr_relays: vec![RELAY.into()],
+        ..RouteOffer::new(NetworkId(from.into()), NetworkId(to.into()))
+    };
+    router.start_routing(RoutingPolicy {
+        routes: vec![offer(a, b), offer(b, a)],
         ..RoutingPolicy::default()
     });
     for _ in 0..100 {

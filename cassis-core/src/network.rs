@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Canonical network identifier: `<kind>` or `<kind>::<param>`.
 ///
@@ -385,6 +386,18 @@ pub trait Network: Send + Sync {
     /// Whether this node can afford to claim an incoming HTLC of
     /// `amount_msat` (e.g. gas paid from its own balance).
     async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError>;
+
+    /// How often a long-running node should call [`Network::maintain`];
+    /// `None` when this network's wallet needs no upkeep.
+    fn maintenance_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Upkeep that keeps the wallet usable while the node runs, outside
+    /// of any payment (e.g. refreshing coins before they expire).
+    async fn maintain(&self) -> Result<(), NetworkError> {
+        Ok(())
+    }
 }
 
 /// `network` with a safety margin of `secs` instead of its own (see
@@ -488,6 +501,14 @@ impl Network for Overridden {
 
     async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError> {
         self.network.can_receive(amount_msat).await
+    }
+
+    fn maintenance_interval(&self) -> Option<Duration> {
+        self.network.maintenance_interval()
+    }
+
+    async fn maintain(&self) -> Result<(), NetworkError> {
+        self.network.maintain().await
     }
 }
 

@@ -1,0 +1,27 @@
+[package]
+name = "cassis-wallet"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
+arkade = ["cassis-networks/arkade"]
+bark-lightning = ["cassis-networks/bark-lightning"]
+bitcoin = ["cassis-networks/bitcoin"]
+cashu = ["cassis-networks/cashu"]
+fedimint = ["cassis-networks/fedimint"]
+lightning = ["cassis-networks/lightning"]
+liquid = ["cassis-networks/liquid"]
+rootstock = ["cassis-networks/rootstock"]
+
+[dependencies]
+cassis-core = { workspace = true, features = ["node"] }
+cassis-networks = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+hypereffect = { workspace = true }
+iroh = { workspace = true }
+minisqlite = { workspace = true }
+rustls = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true }

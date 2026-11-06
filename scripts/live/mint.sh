@@ -22,7 +22,7 @@ case "${1:-}" in
   start)
     n="$2"
     mkdir -p "$(dir "$n")"
-    [ -f "$(dir "$n")/seed" ] || "$CASSIS_CLI" --home "$(dir "$n")/seedgen" seed > "$(dir "$n")/seed" 2>/dev/null
+    [ -f "$(dir "$n")/seed" ] || "$CASSIS_WALLET" --home "$(dir "$n")/seedgen" seed > "$(dir "$n")/seed" 2>/dev/null
     CDK_MINTD_LISTEN_HOST=127.0.0.1 \
     CDK_MINTD_LISTEN_PORT="$(port "$n")" \
     CDK_MINTD_URL="http://127.0.0.1:$(port "$n")" \

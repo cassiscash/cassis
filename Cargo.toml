@@ -9,7 +9,9 @@ members = [
   "networks/cassis-liquid",
   "networks/cassis-lnd",
   "networks/cassis-bark-lightning",
-  "cassis-cli",
+  "cassis-networks",
+  "cassis-routerd",
+  "cassis-wallet",
   "cassis-preimage-server",
   "cassis-wasm",
 ]
@@ -51,6 +53,7 @@ serde_json = "1.0.151"
 sha2 = "0.10.9"
 thiserror = "1.0.69"
 tokio = "1.53.1"
+toml = "0.8.23"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
@@ -93,6 +96,7 @@ fedimint-walletv2-client = { git = "https://github.com/fedimint/fedimint", rev =
 fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 
 cassis-core = { path = "cassis-core", default-features = false }
+cassis-networks = { path = "cassis-networks" }
 cassis-cashu = { path = "networks/cassis-cashu" }
 cassis-fedimint = { path = "networks/cassis-fedimint" }
 cassis-arkade = { path = "networks/cassis-arkade" }

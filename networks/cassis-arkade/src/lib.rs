@@ -101,6 +101,9 @@ const BATCH_TIMEOUT_SECS: u64 = 300;
 /// by the operator, before the batch can be swept.
 pub const SWEEP_MARGIN_SECS: u64 = 20 * 60;
 
+/// Longest a node waits between two [`Network::maintain`] runs.
+const MAINTENANCE_INTERVAL_SECS: u64 = 60 * 60;
+
 // The operator re-validates every tapscript leaf of a VHTLC whenever
 // a spend of it is registered, and unless it is itself configured
 // with a block-based batch expiry -- the public Arkade operators are
@@ -1151,6 +1154,36 @@ impl Network for ArkadeAdapter {
     /// The operator co-signs claims for free.
     async fn can_receive(&self, _amount_msat: u64) -> Result<(), NetworkError> {
         Ok(())
+    }
+
+    /// A quarter of the operator's batch lifetime, so coins get several
+    /// chances to be refreshed before they expire.
+    fn maintenance_interval(&self) -> Option<Duration> {
+        let lifetime = self
+            .batch_lifetime_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(MAINTENANCE_INTERVAL_SECS * 4);
+        Some(Duration::from_secs(
+            (lifetime / 4).clamp(60, MAINTENANCE_INTERVAL_SECS),
+        ))
+    }
+
+    /// Settle confirmed boarding deposits and recoverable VTXOs, and
+    /// refresh VTXOs past half their batch lifetime, so the wallet never
+    /// holds coins the operator may sweep.
+    async fn maintain(&self) -> Result<(), NetworkError> {
+        if let Some(txid) = self.onboard().await? {
+            info!(parent: &self.span, "settled boarding outputs in {txid}");
+        }
+        let lifetime = self
+            .batch_lifetime_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(0);
+        let horizon = (lifetime / 2).max(SWEEP_MARGIN_SECS * 2);
+        self.refresh_vtxos_expiring_before(unix_now() + horizon)
+            .await
     }
 }
 

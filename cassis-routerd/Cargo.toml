@@ -1,0 +1,27 @@
+[package]
+name = "cassis-routerd"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
+arkade = ["cassis-networks/arkade"]
+bark-lightning = ["cassis-networks/bark-lightning"]
+bitcoin = ["cassis-networks/bitcoin"]
+cashu = ["cassis-networks/cashu"]
+fedimint = ["cassis-networks/fedimint"]
+lightning = ["cassis-networks/lightning"]
+liquid = ["cassis-networks/liquid"]
+rootstock = ["cassis-networks/rootstock"]
+
+[dependencies]
+cassis-core = { workspace = true, features = ["node"] }
+cassis-networks = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+lowercase-hex = { workspace = true }
+ritualistic = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }

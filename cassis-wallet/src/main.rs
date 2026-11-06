@@ -1,7 +1,8 @@
-//! `cassis-cli`: one Cassis node, living in a home directory (see
-//! [`home`]). It pays, receives, routes between its networks, and
+//! `cassis-wallet`: a Cassis wallet, living in a home directory (see
+//! [`home`]). It pays and receives Cassis invoices on its networks and
 //! manages each network's funds under a subcommand of its own. Each
 //! network is compiled in by the cargo feature of the same name.
+//! Routing is `cassis-routerd`'s job.
 
 #[cfg(not(any(
     feature = "arkade",
@@ -13,16 +14,16 @@
     feature = "liquid",
     feature = "rootstock"
 )))]
-compile_error!("cassis-cli needs at least one network feature, e.g. `--features cashu`");
+compile_error!("cassis-wallet needs at least one network feature, e.g. `--features cashu`");
 
 mod home;
 mod order_demo;
 mod wallets;
 
 use cassis_core::node::{
-    create_invoice, create_preimage_server_invoice, redeem_preimage_server_payments, HopRecord,
-    InvoiceRecord, InvoiceStatus, Node, NodeConfig, PaymentRecord, PreimageServerInvoiceRecord,
-    RoutingPolicy, PREIMAGE_SERVER_INVOICES,
+    create_invoice, create_preimage_server_invoice, redeem_preimage_server_payments, InvoiceRecord,
+    InvoiceStatus, Node, NodeConfig, PaymentRecord, PreimageServerInvoiceRecord,
+    PREIMAGE_SERVER_INVOICES,
 };
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
 use cassis_core::transport::PeerAddr;
@@ -34,7 +35,7 @@ use std::time::Duration;
 use tracing::{info, info_span, Span};
 
 #[derive(Parser)]
-#[command(name = "cassis-cli", about = "Cassis node: pay, receive, route")]
+#[command(name = "cassis-wallet", about = "Cassis wallet: pay and receive")]
 struct Cli {
     /// Node directory. Defaults to `$CASSIS_HOME`, else `~/.cassis`.
     #[arg(long, global = true, value_name = "DIR")]
@@ -69,7 +70,7 @@ enum Command {
     Seed,
     /// Print the node identity and its networks.
     Info,
-    /// Add networks this node participates in, e.g. `cashu::mint.host`,
+    /// Add networks this wallet holds funds on, e.g. `cashu::mint.host`,
     /// `liquid`, `arkade::mutinynet`, `lightning`.
     Enable {
         #[arg(required = true)]
@@ -98,28 +99,18 @@ enum Command {
         #[arg(long, value_name = "SECS")]
         max_incoming_lifetime: Option<u64>,
     },
-    /// Remove networks from this node.
+    /// Remove networks from this wallet.
     Disable {
         #[arg(required = true)]
         networks: Vec<String>,
     },
-    /// Run the node until interrupted: claim payments to its invoices,
-    /// settle and refund its HTLCs, and with `--route` route between
-    /// its networks.
-    Run {
-        #[arg(long)]
-        route: bool,
-        #[arg(long, default_value_t = 1000)]
-        fee_base_msat: u64,
-        #[arg(long, default_value_t = 500)]
-        fee_ppm: u64,
-        /// Tag route announcements as test money; implied by
-        /// `--test-relays`.
-        #[arg(long)]
-        test_money: bool,
-    },
-    /// Create an invoice. A running node (`run`) claims it when paid.
-    Invoice {
+    /// Serve the wallet until interrupted: claim payments to its
+    /// invoices and settle and refund its HTLCs.
+    Run,
+    /// Create an invoice to receive a payment. A running wallet (`run`)
+    /// claims it when paid.
+    #[command(visible_alias = "invoice")]
+    Receive {
         #[arg(long)]
         amount_msat: u64,
         /// Networks it can be paid on; all of the node's by default.
@@ -195,8 +186,6 @@ enum Command {
     Invoices,
     /// List the payments this node made.
     Payments,
-    /// List the hops this node routed.
-    Hops,
     #[command(flatten)]
     Wallet(wallets::Command),
 }
@@ -215,7 +204,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), String> {
     let relays = relays(&cli);
     let home = Home::open(cli.home)?;
-    let span = info_span!("node", node = "cassis");
+    let span = info_span!("node", node = "wallet");
     match cli.command {
         Command::Seed => println!("{}", home.mnemonic()?),
         Command::Info => {
@@ -268,27 +257,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             enabled.retain(|network| !remove.contains(network));
             home.set_networks(&enabled)?;
         }
-        Command::Run {
-            route,
-            fee_base_msat,
-            fee_ppm,
-            test_money,
-        } => {
+        Command::Run => {
             let node = serve(&home, &span).await?;
-            if route {
-                node.start_routing(RoutingPolicy {
-                    fee_base_msat,
-                    fee_ppm,
-                    nostr_relays: relays.clone(),
-                    test_money: test_money || cli.test_relays,
-                    ..RoutingPolicy::default()
-                });
-            }
             info!("running as {}; Ctrl-C to stop", node.iroh_peer_id());
             tokio::signal::ctrl_c().await.ok();
             node.shutdown().await;
         }
-        Command::Invoice {
+        Command::Receive {
             amount_msat,
             networks,
             description,
@@ -468,18 +443,6 @@ async fn run(cli: Cli) -> Result<(), String> {
                 );
             }
         }
-        Command::Hops => {
-            for record in home.store.list::<HopRecord>("hops")? {
-                println!(
-                    "{} {} -> {} {:>12} msat {:?}",
-                    record.prepare.payment_hash,
-                    record.prepare.incoming_network,
-                    record.prepare.outgoing_network,
-                    record.prepare.amount_msat,
-                    record.state
-                );
-            }
-        }
         Command::Wallet(command) => wallets::run(&home, command, &span).await?,
     }
     Ok(())
@@ -489,7 +452,7 @@ async fn run(cli: Cli) -> Result<(), String> {
 async fn serve(home: &Home, span: &Span) -> Result<Node, String> {
     let networks = home.open_networks(&home.networks()?, span).await?;
     if networks.is_empty() {
-        return Err("no networks enabled; see `cassis-cli enable`".into());
+        return Err("no networks enabled; see `cassis-wallet enable`".into());
     }
     Node::start(
         NodeConfig {
@@ -616,8 +579,8 @@ fn configure_bark(
 ) -> Result<(), String> {
     #[cfg(feature = "bark-lightning")]
     {
-        let default = cassis_bark_lightning::BarkConfig::default_for(network);
-        let config = cassis_bark_lightning::BarkConfig {
+        let default = cassis_networks::bark_lightning::BarkConfig::default_for(network);
+        let config = cassis_networks::bark_lightning::BarkConfig {
             server_url: server
                 .or_else(|| default.as_ref().map(|d| d.server_url.clone()))
                 .ok_or_else(|| {
@@ -629,7 +592,7 @@ fn configure_bark(
         };
         return home.set_bark_config(network, &config);
     }
-    Err("this cassis-cli was built without the 'bark-lightning' feature".into())
+    Err("this cassis-wallet was built without the 'bark-lightning' feature".into())
 }
 
 #[allow(unused_variables)]
@@ -641,7 +604,9 @@ fn configure_lnd(
 ) -> Result<(), String> {
     #[cfg(feature = "lightning")]
     if let Some(rest_url) = rest_url {
-        home.set_lnd_config(&cassis_lnd::LndConfig::new(rest_url, tls_cert, macaroon))?;
+        home.set_lnd_config(&cassis_networks::lnd::LndConfig::new(
+            rest_url, tls_cert, macaroon,
+        ))?;
     }
     Ok(())
 }

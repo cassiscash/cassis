@@ -37,7 +37,7 @@ pub use preimage_server::{
     create_preimage_server_invoice, redeem_preimage_server_payments, PreimageServerInvoiceRecord,
     RedeemReport, PREIMAGE_SERVER_INVOICES,
 };
-pub use router::{PrepareVeto, RoutingPolicy};
+pub use router::{PrepareVeto, RouteOffer, RoutingPolicy};
 
 const INVOICES: &str = "invoices";
 const PAYMENTS: &str = "payments";

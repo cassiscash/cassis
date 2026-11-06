@@ -19,15 +19,15 @@ MUTINYNET_ARKADE="arkade::mutinynet"
 RELAY_PORT=10547
 RELAY="ws://localhost:$RELAY_PORT"
 
-# `cassis-cli` built from this workspace.
-if [ -z "${CASSIS_CLI:-}" ]; then
-  CASSIS_CLI="$(cd "$WORKSPACE" && cargo metadata --format-version 1 --no-deps |
-    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/cassis-cli"
+# `cassis-wallet` built from this workspace.
+if [ -z "${CASSIS_WALLET:-}" ]; then
+  CASSIS_WALLET="$(cd "$WORKSPACE" && cargo metadata --format-version 1 --no-deps |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/cassis-wallet"
 fi
 
-# cassis-cli against the node home `$LIVE/nodes/<name>`.
+# cassis-wallet against the node home `$LIVE/nodes/<name>`.
 cassis() {
   local name="$1"
   shift
-  "$CASSIS_CLI" --home "$LIVE/nodes/$name" "$@"
+  "$CASSIS_WALLET" --home "$LIVE/nodes/$name" "$@"
 }

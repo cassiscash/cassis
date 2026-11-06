@@ -9,6 +9,15 @@
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::store::Store;
 use cassis_core::{Network, NetworkId};
+#[cfg(feature = "arkade")]
+use cassis_networks::arkade;
+#[cfg(feature = "bark-lightning")]
+use cassis_networks::bark_lightning;
+#[cfg(feature = "cashu")]
+use cassis_networks::cashu;
+#[cfg(feature = "lightning")]
+use cassis_networks::lnd;
+use cassis_networks::NetworkSettings;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::Span;
@@ -84,12 +93,12 @@ impl Home {
     }
 
     #[cfg(feature = "lightning")]
-    pub fn lnd_config(&self) -> Result<Option<cassis_lnd::LndConfig>, String> {
+    pub fn lnd_config(&self) -> Result<Option<lnd::LndConfig>, String> {
         self.store.get(SETTINGS, LND)
     }
 
     #[cfg(feature = "lightning")]
-    pub fn set_lnd_config(&self, config: &cassis_lnd::LndConfig) -> Result<(), String> {
+    pub fn set_lnd_config(&self, config: &lnd::LndConfig) -> Result<(), String> {
         self.store.put(SETTINGS, LND, config)
     }
 
@@ -99,7 +108,7 @@ impl Home {
     pub fn bark_config(
         &self,
         network: &NetworkId,
-    ) -> Result<Option<cassis_bark_lightning::BarkConfig>, String> {
+    ) -> Result<Option<bark_lightning::BarkConfig>, String> {
         self.store.get(SETTINGS, &format!("{BARK}:{network}"))
     }
 
@@ -107,7 +116,7 @@ impl Home {
     pub fn set_bark_config(
         &self,
         network: &NetworkId,
-        config: &cassis_bark_lightning::BarkConfig,
+        config: &bark_lightning::BarkConfig,
     ) -> Result<(), String> {
         self.store
             .put(SETTINGS, &format!("{BARK}:{network}"), config)
@@ -120,11 +129,11 @@ impl Home {
         &self,
         network: &NetworkId,
         span: &Span,
-    ) -> Result<cassis_bark_lightning::BarkLightningAdapter, String> {
+    ) -> Result<bark_lightning::BarkLightningAdapter, String> {
         let config = self.bark_config(network)?.ok_or_else(|| {
             format!("{network} goes through LND here: enable it with --bark to use bark")
         })?;
-        cassis_bark_lightning::BarkLightningAdapter::open(
+        bark_lightning::BarkLightningAdapter::open(
             network.clone(),
             self.secret(network),
             &self.network_dir(network),
@@ -134,48 +143,9 @@ impl Home {
         .await
     }
 
-    /// A `lightning` network goes through bark when enabled with
-    /// `--bark`, else through the LND node.
-    #[cfg(any(feature = "lightning", feature = "bark-lightning"))]
-    #[allow(unused_variables, unreachable_code)]
-    async fn open_lightning(
-        &self,
-        network: &NetworkId,
-        span: &Span,
-    ) -> Result<Arc<dyn Network>, String> {
-        #[cfg(feature = "bark-lightning")]
-        if self.bark_config(network)?.is_some() {
-            return Ok(Arc::new(self.open_bark(network, span).await?));
-        }
-        #[cfg(feature = "lightning")]
-        {
-            let config = self.lnd_config()?.ok_or(
-                "lightning needs an LND node or an Ark server: cassis-cli enable lightning \
-                 --lnd-rest-url ... or --bark",
-            )?;
-            return Ok(Arc::new(
-                cassis_lnd::LndAdapter::open(network.clone(), config, span).await?,
-            ));
-        }
-        Err("this cassis-cli was built without LND support: enable it with --bark".into())
-    }
-
-    #[allow(dead_code)] // unused when no compiled-in network keeps files
     /// Private directory of `network`: `<home>/<kind>/<variant>`.
     pub fn network_dir(&self, network: &NetworkId) -> PathBuf {
-        let variant: String = network
-            .param()
-            .unwrap_or("mainnet")
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.dir.join(network.kind()).join(variant)
+        cassis_networks::network_dir(&self.dir, network)
     }
 
     #[allow(dead_code)] // unused in lightning-only builds
@@ -191,9 +161,9 @@ impl Home {
         &self,
         network: &NetworkId,
         span: &Span,
-    ) -> Result<cassis_arkade::ArkadeAdapter, String> {
+    ) -> Result<arkade::ArkadeAdapter, String> {
         let esplora = std::env::var("CASSIS_ESPLORA_URL").ok();
-        cassis_arkade::ArkadeAdapter::open_with_esplora(
+        arkade::ArkadeAdapter::open_with_esplora(
             network.clone(),
             self.secret(network),
             esplora.as_deref(),
@@ -202,61 +172,35 @@ impl Home {
         .await
     }
 
+    /// What opening `network` takes, as configured with `enable`.
+    fn settings(&self, network: &NetworkId) -> Result<NetworkSettings, String> {
+        Ok(NetworkSettings {
+            secret: self.secret(network),
+            dir: self.network_dir(network),
+            max_incoming_lifetime_secs: self.max_incoming_lifetime(network)?,
+            esplora_url: match network.kind() {
+                "arkade" => std::env::var("CASSIS_ESPLORA_URL").ok(),
+                _ => None,
+            },
+            #[cfg(feature = "lightning")]
+            lnd: self.lnd_config()?,
+            #[cfg(feature = "bark-lightning")]
+            bark: self.bark_config(network)?,
+        })
+    }
+
     /// Open the adapter of `network`, if this binary was built with it.
     pub async fn open_network(
         &self,
         network: &NetworkId,
         span: &Span,
     ) -> Result<Arc<dyn Network>, String> {
-        let opened: Arc<dyn Network> = match network.kind() {
-            #[cfg(feature = "cashu")]
-            "cashu" => Arc::new(self.open_cashu(network, span)?),
-            #[cfg(feature = "liquid")]
-            "liquid" => Arc::new(
-                cassis_liquid::LiquidAdapter::open(
-                    network.clone(),
-                    self.secret(network),
-                    &self.network_dir(network),
-                    span,
-                )
-                .await?,
-            ),
-            #[cfg(feature = "bitcoin")]
-            "bitcoin" => Arc::new(cassis_bitcoin::BitcoinAdapter::open(
-                network.clone(),
-                self.secret(network),
-                span,
-            )?),
-            #[cfg(feature = "arkade")]
-            "arkade" => Arc::new(self.open_arkade(network, span).await?),
-            #[cfg(feature = "rootstock")]
-            "rootstock" => Arc::new(cassis_rootstock::RootstockAdapter::open(
-                network.clone(),
-                self.secret(network),
-                span,
-            )?),
-            #[cfg(feature = "fedimint")]
-            "fedimint" => Arc::new(
-                cassis_fedimint::FedimintAdapter::open(
-                    network.clone(),
-                    self.secret(network),
-                    &self.network_dir(network),
-                    span,
-                )
-                .await?,
-            ),
-            #[cfg(any(feature = "lightning", feature = "bark-lightning"))]
-            "lightning" => self.open_lightning(network, span).await?,
-            kind => {
-                return Err(format!(
-                    "this cassis-cli was built without the '{kind}' feature"
-                ))
-            }
-        };
-        Ok(match self.max_incoming_lifetime(network)? {
-            Some(secs) => cassis_core::with_max_incoming_lifetime(opened, secs),
-            None => opened,
-        })
+        #[cfg(feature = "cashu")]
+        if network.kind() == "cashu" && !self.network_dir(network).exists() {
+            // Import the proofs an older home kept in its database.
+            drop(self.open_cashu(network, span)?);
+        }
+        cassis_networks::open(network, &self.settings(network)?, span).await
     }
 
     pub async fn open_networks(
@@ -282,13 +226,12 @@ impl Home {
         &self,
         network: &NetworkId,
         span: &Span,
-    ) -> Result<cassis_cashu::CashuAdapter, String> {
+    ) -> Result<cashu::CashuAdapter, String> {
         let dir = self.network_dir(network);
         let fresh = !dir.exists();
-        let adapter =
-            cassis_cashu::CashuAdapter::open(network.clone(), self.secret(network), &dir, span)?;
+        let adapter = cashu::CashuAdapter::open(network.clone(), self.secret(network), &dir, span)?;
         if fresh {
-            let proofs: Vec<cassis_cashu::Proof> = legacy_query(
+            let proofs: Vec<cashu::Proof> = legacy_query(
                 &self.dir,
                 &format!(
                     "SELECT proof_blob FROM cashu_proofs WHERE mint_url = '{}';",

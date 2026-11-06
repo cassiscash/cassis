@@ -179,7 +179,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
         #[cfg(feature = "liquid")]
         Command::Liquid { network, command } => {
             let network = kind(&network, "liquid")?;
-            let wallet = cassis_liquid::LiquidAdapter::open(
+            let wallet = cassis_networks::liquid::LiquidAdapter::open(
                 network.clone(),
                 home.secret(&network),
                 &home.network_dir(&network),
@@ -206,8 +206,11 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
         #[cfg(feature = "bitcoin")]
         Command::Bitcoin { network, command } => {
             let network = kind(&network, "bitcoin")?;
-            let wallet =
-                cassis_bitcoin::BitcoinAdapter::open(network.clone(), home.secret(&network), span)?;
+            let wallet = cassis_networks::bitcoin::BitcoinAdapter::open(
+                network.clone(),
+                home.secret(&network),
+                span,
+            )?;
             let error = |e: cassis_core::NetworkError| e.to_string();
             match command {
                 ChainCommand::Balance => {
@@ -281,7 +284,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
         #[cfg(feature = "rootstock")]
         Command::Rootstock { network, command } => {
             let network = kind(&network, "rootstock")?;
-            let wallet = cassis_rootstock::RootstockAdapter::open(
+            let wallet = cassis_networks::rootstock::RootstockAdapter::open(
                 network.clone(),
                 home.secret(&network),
                 span,
@@ -297,7 +300,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
         #[cfg(feature = "fedimint")]
         Command::Fedimint { network, command } => {
             let network = kind(&network, "fedimint")?;
-            let wallet = cassis_fedimint::FedimintAdapter::open(
+            let wallet = cassis_networks::fedimint::FedimintAdapter::open(
                 network.clone(),
                 home.secret(&network),
                 &home.network_dir(&network),

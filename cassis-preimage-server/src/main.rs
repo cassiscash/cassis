@@ -110,7 +110,7 @@ async fn open_network(
             secret,
             span,
         )?),
-        // `$CASSIS_ESPLORA_URL` overrides the chain API, as in cassis-cli.
+        // `$CASSIS_ESPLORA_URL` overrides the chain API, as in cassis-wallet.
         #[cfg(feature = "arkade")]
         "arkade" => Arc::new(
             cassis_arkade::ArkadeAdapter::open_with_esplora(
@@ -147,7 +147,7 @@ async fn open_network(
     })
 }
 
-/// `<dir>/<kind>/<variant>`, as cassis-cli lays out network data.
+/// `<dir>/<kind>/<variant>`, as cassis-wallet lays out network data.
 fn network_dir(dir: &Path, network: &NetworkId) -> PathBuf {
     let variant: String = network
         .param()

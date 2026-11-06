@@ -1,6 +1,6 @@
 name: release-cli
 
-# Builds cassis-cli for linux with each network feature alone, each pair
+# Builds cassis-wallet and cassis-routerd for linux with each network feature alone, each pair
 # of network features, and all of them together, then publishes every
 # binary in a GitHub release.
 
@@ -63,19 +63,23 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --release --locked -p cassis-cli \
-            --no-default-features --features "${{ matrix.features }}"
+          for bin in cassis-wallet cassis-routerd; do
+            cargo build --release --locked -p "$bin" \
+              --no-default-features --features "${{ matrix.features }}"
+          done
 
       - name: Package
         run: |
           mkdir dist
-          out="dist/cassis-cli-${{ matrix.name }}-x86_64-linux"
-          cp target/release/cassis-cli "$out"
-          strip "$out"
+          for bin in cassis-wallet cassis-routerd; do
+            out="dist/$bin-${{ matrix.name }}-x86_64-linux"
+            cp "target/release/$bin" "$out"
+            strip "$out"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cassis-cli-${{ matrix.name }}
+          name: cassis-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
 
@@ -88,12 +92,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: cassis-cli-*
+          pattern: cassis-*
           merge-multiple: true
 
       - name: Checksums
         working-directory: dist
-        run: sha256sum cassis-cli-* > SHA256SUMS
+        run: sha256sum cassis-* > SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:

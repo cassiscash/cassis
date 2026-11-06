@@ -2,10 +2,11 @@
 //! announcements.
 
 use super::{HopRecord, HopState, Node, HOPS, INLINE_WAIT, VERIFY_RETRY_INTERVAL};
-use crate::network::{Htlc, HtlcTarget, NetworkError};
+use crate::network::{Htlc, HtlcTarget, NetworkError, NetworkId};
 use crate::primitives::{unix_now, OperationId};
 use crate::protocol::{Discard, Execute, Prepare, Response, Settle};
 use crate::routing::{self, RouteAnnouncement, DEFAULT_TRANSIT_SLACK_SECS};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -14,20 +15,51 @@ use tracing::{error, info, warn};
 const RESERVATION_TTL_SECS: u64 = 600;
 /// Announcements are republished well within
 /// [`routing::ANNOUNCEMENT_MAX_AGE_SECS`].
-const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Optional PREPARE veto: a rejection reason, or `None` to proceed.
 pub type PrepareVeto = Arc<dyn Fn(&Prepare) -> Option<String> + Send + Sync>;
 
-/// Terms this node routes under.
-#[derive(Clone)]
-pub struct RoutingPolicy {
+/// One directed hop this node offers: receive on `from`, send on `to`,
+/// under its own terms and announced on its own relays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteOffer {
+    pub from: NetworkId,
+    pub to: NetworkId,
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
     pub transit_slack_secs: u64,
     pub nostr_relays: Vec<String>,
-    /// Mark announcements as test money ([`routing::TEST_MONEY_TAG`]).
+    /// Mark the announcement as test money ([`routing::TEST_MONEY_TAG`]).
     pub test_money: bool,
+}
+
+impl RouteOffer {
+    /// `from -> to` at the default fees, on the default relays.
+    pub fn new(from: NetworkId, to: NetworkId) -> Self {
+        Self {
+            from,
+            to,
+            fee_base_msat: 1000,
+            fee_ppm: 500,
+            transit_slack_secs: DEFAULT_TRANSIT_SLACK_SECS,
+            nostr_relays: routing::DEFAULT_NOSTR_RELAYS
+                .iter()
+                .map(|relay| relay.to_string())
+                .collect(),
+            test_money: false,
+        }
+    }
+}
+
+/// Terms this node routes under.
+#[derive(Clone)]
+pub struct RoutingPolicy {
+    /// The only hops this node forwards and announces.
+    pub routes: Vec<RouteOffer>,
+    /// Relays to delete this node's announcements from when they are not
+    /// offered there (anymore), on top of every route's relays.
+    pub cleanup_relays: Vec<String>,
     /// Most PREPARE reservations held at once.
     pub max_reservations: usize,
     /// Runs after the built-in checks, before anything is reserved.
@@ -37,17 +69,19 @@ pub struct RoutingPolicy {
 impl Default for RoutingPolicy {
     fn default() -> Self {
         Self {
-            fee_base_msat: 1000,
-            fee_ppm: 500,
-            transit_slack_secs: DEFAULT_TRANSIT_SLACK_SECS,
-            nostr_relays: routing::DEFAULT_NOSTR_RELAYS
-                .iter()
-                .map(|relay| relay.to_string())
-                .collect(),
-            test_money: false,
+            routes: Vec::new(),
+            cleanup_relays: Vec::new(),
             max_reservations: 100,
             prepare_veto: None,
         }
+    }
+}
+
+impl RoutingPolicy {
+    fn route(&self, from: &NetworkId, to: &NetworkId) -> Option<&RouteOffer> {
+        self.routes
+            .iter()
+            .find(|route| route.from == *from && route.to == *to)
     }
 }
 
@@ -60,8 +94,9 @@ pub(super) struct Reservation {
 }
 
 impl Node {
-    /// Start routing between every enabled network: accept PREPAREs and
-    /// keep route announcements published.
+    /// Start routing the hops `policy` offers: accept PREPAREs for them,
+    /// keep their announcements published, and delete this node's
+    /// announcements of anything else.
     pub fn start_routing(&self, policy: RoutingPolicy) {
         *self.0.routing.write().unwrap_or_else(|e| e.into_inner()) = Some(policy);
         let node = self.clone();
@@ -85,41 +120,77 @@ impl Node {
         let Some(policy) = self.routing() else {
             return;
         };
-        let networks = self.network_ids();
         let relay = self.0.transport.home_relay().await;
-        let mut announcements = Vec::new();
-        for from in &networks {
-            let Ok(incoming) = self.network(from) else {
+        // What each relay should keep from this node, by `d` tag.
+        let mut wanted: HashMap<String, HashSet<String>> = policy
+            .cleanup_relays
+            .iter()
+            .map(|relay| (relay.clone(), HashSet::new()))
+            .collect();
+        for route in &policy.routes {
+            let d_tag = routing::route_d_tag(&route.from, &route.to);
+            for nostr_relay in &route.nostr_relays {
+                wanted
+                    .entry(nostr_relay.clone())
+                    .or_default()
+                    .insert(d_tag.clone());
+            }
+            let (Ok(incoming), Ok(_)) = (self.network(&route.from), self.network(&route.to)) else {
+                warn!(
+                    "not announcing {d_tag}: {} or {} is not open",
+                    route.from, route.to
+                );
                 continue;
             };
-            for to in networks.iter().filter(|to| *to != from) {
-                announcements.push(RouteAnnouncement {
-                    node_pubkey: self.node_pubkey(),
-                    iroh_peer_id: self.iroh_peer_id(),
-                    iroh_relay: relay.clone(),
-                    from: from.clone(),
-                    to: to.clone(),
-                    fee_base_msat: policy.fee_base_msat,
-                    fee_ppm: policy.fee_ppm,
-                    incoming_delta_secs: incoming.incoming_delta_secs(),
-                    transit_slack_secs: policy.transit_slack_secs,
-                    max_incoming_lifetime_secs: incoming.max_incoming_lifetime_secs(),
-                    test_money: policy.test_money,
-                });
+            let announcement = RouteAnnouncement {
+                node_pubkey: self.node_pubkey(),
+                iroh_peer_id: self.iroh_peer_id(),
+                iroh_relay: relay.clone(),
+                from: route.from.clone(),
+                to: route.to.clone(),
+                fee_base_msat: route.fee_base_msat,
+                fee_ppm: route.fee_ppm,
+                incoming_delta_secs: incoming.incoming_delta_secs(),
+                transit_slack_secs: route.transit_slack_secs,
+                max_incoming_lifetime_secs: incoming.max_incoming_lifetime_secs(),
+                test_money: route.test_money,
+            };
+            for (d_tag, accepted) in routing::publish_announcements(
+                &route.nostr_relays,
+                &self.0.keys.node,
+                &[announcement],
+            )
+            .await
+            {
+                info!(
+                    "announced {d_tag} to {accepted}/{} relay(s)",
+                    route.nostr_relays.len()
+                );
             }
         }
-        if announcements.is_empty() {
-            warn!("routing needs at least two networks; nothing announced");
-            return;
-        }
-        for (route, accepted) in
-            routing::publish_announcements(&policy.nostr_relays, &self.0.keys.node, &announcements)
-                .await
-        {
-            info!(
-                "announced {route} to {accepted}/{} relay(s)",
-                policy.nostr_relays.len()
-            );
+        for (nostr_relay, keep) in &wanted {
+            let stale: Vec<String> =
+                match routing::fetch_own_routes(nostr_relay, self.node_pubkey()).await {
+                    Ok(found) => found.into_iter().filter(|d| !keep.contains(d)).collect(),
+                    Err(error) => {
+                        warn!("listing own announcements: {error}");
+                        continue;
+                    }
+                };
+            if stale.is_empty() {
+                continue;
+            }
+            let accepted = routing::delete_announcements(
+                std::slice::from_ref(nostr_relay),
+                &self.0.keys.node,
+                &stale,
+            )
+            .await;
+            if accepted > 0 {
+                info!("deleted {} from {nostr_relay}", stale.join(", "));
+            } else {
+                warn!("{nostr_relay} refused to delete {}", stale.join(", "));
+            }
         }
     }
 
@@ -163,9 +234,17 @@ impl Node {
         if prepare.outgoing_amount_msat == 0 || prepare.outgoing_amount_msat > prepare.amount_msat {
             return Err("outgoing amount must be positive and at most the incoming amount".into());
         }
+        let route = policy
+            .route(&prepare.incoming_network, &prepare.outgoing_network)
+            .ok_or_else(|| {
+                format!(
+                    "this node does not route {} -> {}",
+                    prepare.incoming_network, prepare.outgoing_network
+                )
+            })?;
         let fee = routing::fee_msat(
-            policy.fee_base_msat,
-            policy.fee_ppm,
+            route.fee_base_msat,
+            route.fee_ppm,
             prepare.outgoing_amount_msat,
         );
         if prepare.amount_msat - prepare.outgoing_amount_msat < fee {

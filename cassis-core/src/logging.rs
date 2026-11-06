@@ -14,7 +14,9 @@ const BOLD: &str = "\x1b[1m";
 /// only from `warn`. `RUST_LOG` overrides this.
 const OUR_CRATES: &[&str] = &[
     "cassis_core",
-    "cassis_cli",
+    "cassis_networks",
+    "cassis_routerd",
+    "cassis_wallet",
     "cassis_arkade",
     "cassis_bitcoin",
     "cassis_cashu",
@@ -36,7 +38,7 @@ pub fn init_logging() {
         // the registry does not retain span field values on its own.
         .with(ScopeLayer)
         // Logs go to stderr so stdout stays machine-readable: commands
-        // like `cassis-cli invoice` print JSON there, and mixing debug
+        // like `cassis-wallet receive` print JSON there, and mixing debug
         // lines into it breaks every script that parses the output.
         .with(
             fmt::layer()

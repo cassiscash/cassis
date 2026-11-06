@@ -1,4 +1,4 @@
-//! `cassis-cli order-demo`: a small Cassis Order Protocol server, to try
+//! `cassis-wallet order-demo`: a small Cassis Order Protocol server, to try
 //! wallets against. It sells coffee: the payer fills a cart, pays an
 //! invoice this node issues and claims, and can ask for a refund, which
 //! the server offers with an `invoicerequest` and pays from this node.

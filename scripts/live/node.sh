@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cassis nodes of the live tests, each a home under $LIVE/nodes/<name>.
 #
-#   scripts/live/node.sh <name> <cassis-cli args...>   run a command
+#   scripts/live/node.sh <name> <cassis-wallet args...>   run a command
 #   scripts/live/node.sh route <name> [run args...]
 #       run it in the background as a router announcing on the private
 #       relay; log at $LIVE/nodes/<name>.log
@@ -18,13 +18,17 @@ background() {
   local name="$1"
   shift
   mkdir -p "$LIVE/nodes"
-  nohup "$CASSIS_CLI" --home "$LIVE/nodes/$name" run "$@" > "$LIVE/nodes/$name.log" 2>&1 &
+  nohup "$CASSIS_WALLET" --home "$LIVE/nodes/$name" run "$@" > "$LIVE/nodes/$name.log" 2>&1 &
   echo $! > "$LIVE/nodes/$name.pid"
   echo "$name running (pid $!), log at $LIVE/nodes/$name.log"
 }
 
 case "${1:-}" in
-  route) name="$2"; shift 2; background "$name" --route --nostr-relay "$RELAY" "$@" ;;
+  route)
+    # TODO: routers moved to cassis-routerd, configured by a config.toml
+    # in their data dir; these homes have no such config yet.
+    echo "routers now run under cassis-routerd; node.sh does not set them up yet" >&2
+    exit 1 ;;
   serve) background "$2" ;;
   stop) kill -INT "$(cat "$LIVE/nodes/$2.pid")" && rm "$LIVE/nodes/$2.pid" ;;
   pay) cassis "$2" pay --from "$3" --invoice "$4" --nostr-relay "$RELAY" ;;

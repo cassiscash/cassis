@@ -1,6 +1,6 @@
 # Live tests
 
-Manual end-to-end tests of `cassis-cli` routers and wallets on real
+Manual end-to-end tests of `cassis-wallet` wallets and (formerly `cassis-cli --route`) routers on real
 test networks, replacing the old `cassis-playground`. Everything runs
 on **mutinynet** (through its esplora, `https://mutinynet.com/api`; no
 bitcoind) and **Rootstock testnet**, plus local fake-wallet cashu mints.
@@ -27,7 +27,7 @@ mutinynet's 30s-block difficulty retargets.
 All state lives in `tmp/live/` (git-ignored):
 
 ```text
-tmp/live/nodes/<name>/   cassis-cli homes (seed, store.db, wallets)
+tmp/live/nodes/<name>/   cassis-wallet homes (seed, store.db, wallets)
 tmp/live/nodes/<name>.log|.pid   routers running in the background
 tmp/live/mint<n>/        local cdk-mintd
 tmp/live/fedimint/       our fedimintd (invite-code here)
@@ -57,7 +57,7 @@ Needs on `PATH`: `cdk-mintd`, `cdk-cli`, `nak`, `curl`; and
 ## First-time setup
 
 ```sh
-cargo build -p cassis-cli
+cargo build -p cassis-wallet
 scripts/live/funder.sh address       # send mutinynet sats + tRBTC here
 scripts/live/funder.sh balance
 

@@ -1,10 +1,11 @@
 [package]
-name = "cassis-cli"
+name = "cassis-networks"
 version.workspace = true
 edition.workspace = true
 
+# Opens the network adapters compiled in, one cargo feature per network,
+# for the binaries that run Cassis nodes (cassis-wallet, cassis-routerd).
 [features]
-default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
 arkade = ["dep:cassis-arkade"]
 bark-lightning = ["dep:cassis-bark-lightning"]
 bitcoin = ["dep:cassis-bitcoin"]
@@ -15,14 +16,7 @@ liquid = ["dep:cassis-liquid"]
 rootstock = ["dep:cassis-rootstock"]
 
 [dependencies]
-cassis-core = { workspace = true, features = ["node"] }
-clap = { workspace = true, features = ["env"] }
-hypereffect = { workspace = true }
-iroh = { workspace = true }
-minisqlite = { workspace = true }
-rustls = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+cassis-core = { workspace = true }
 tracing = { workspace = true }
 
 cassis-arkade = { workspace = true, optional = true }
