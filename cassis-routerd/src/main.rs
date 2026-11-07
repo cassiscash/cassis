@@ -1,6 +1,6 @@
 //! `cassis-routerd`: a Cassis router daemon. It does what
-//! `<data dir>/config.toml` says (see [`config`]): opens the networks
-//! listed there, routes and announces the hops listed there, deletes its
+//! `<data dir>/config.toml` says (see [`config`]), following it as it
+//! changes: opens the networks listed there (see [`networks`]), routes and announces the hops listed there, deletes its
 //! announcements of anything else, and keeps its wallets in shape
 //! (refreshing coins before they expire, and the like). Each
 //! network is compiled in by the cargo feature of the same name.
@@ -28,18 +28,19 @@ compile_error!("cassis-routerd needs at least one network feature, e.g. `--featu
 
 mod admin;
 mod config;
+mod networks;
 
-use admin::{Admin, Running};
+use admin::Admin;
 use cassis_core::node::{Node, NodeConfig, RoutingPolicy};
 use cassis_core::store::Store;
-use cassis_core::Network;
 use clap::Parser;
 use config::Config;
+use networks::Networks;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{info, info_span, warn};
 
 const SETTINGS: &str = "settings";
 /// Every relay the router ever announced on, so it can still delete
@@ -78,18 +79,13 @@ async fn run(cli: Cli) -> Result<(), String> {
     let store = Arc::new(Store::open(&dir.join("store.db"))?);
     let span = info_span!("node", node = "routerd");
 
-    // A network that does not open is left out, so that the admin
-    // interface can still fix its config.
+    // Networks are opened before the node starts, so that it can resume
+    // its hops on them. A network that does not open is left out, for
+    // the admin interface to fix and open later.
     let mut networks = Vec::new();
     let mut failed = BTreeMap::new();
     for network in config.network_ids()? {
-        let opened = match config.network_settings(&network, &keys, &dir) {
-            Ok(settings) => cassis_networks::open(&network, &settings, &span)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(error) => Err(error),
-        };
-        match opened {
+        match networks::open(&config, &network, &keys, &dir, &span).await {
             Ok(opened) => networks.push(opened),
             Err(error) => {
                 warn!("not opening {network}: {error}");
@@ -107,21 +103,15 @@ async fn run(cli: Cli) -> Result<(), String> {
     let admin_secret = keys.admin_endpoint_secret();
     let node = Node::start(
         NodeConfig {
-            keys,
+            keys: keys.clone(),
             store: store.clone(),
             span: span.clone(),
             serve: true,
         },
-        networks.clone(),
+        networks,
     )
     .await?;
-
-    for network in &networks {
-        if let Some(interval) = network.maintenance_interval() {
-            info!("maintaining {} every {}s", network.id(), interval.as_secs());
-            tokio::spawn(maintain(network.clone()).instrument(span.clone()));
-        }
-    }
+    let networks = Networks::new(node.clone(), keys, dir.clone(), span, &config, failed);
 
     let policy = routing_policy(&config, &store)?;
     if policy.routes.is_empty() {
@@ -134,13 +124,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         node.iroh_peer_id(),
         node.node_pubkey().to_hex()
     );
-    let running = Running {
-        networks: config.networks.clone(),
-        failed,
-        admin: config.admin.clone(),
-    };
     let admin_config = config.admin.clone();
-    let admin = Admin::new(dir, node.clone(), store, config, running);
+    let admin = Admin::new(dir, node.clone(), networks, store, config);
     admin.serve(&admin_config, admin_secret).await;
 
     let restart = tokio::select! {
@@ -204,21 +189,6 @@ fn reexec() -> String {
     match command.spawn() {
         Ok(_) => std::process::exit(0),
         Err(error) => format!("restart: {error}"),
-    }
-}
-
-/// Run the upkeep of `network` now and then every
-/// [`Network::maintenance_interval`], which may change as the wallet
-/// learns about its network.
-async fn maintain(network: Arc<dyn Network>) {
-    loop {
-        if let Err(error) = network.maintain().await {
-            warn!("maintaining {}: {error}", network.id());
-        }
-        let Some(interval) = network.maintenance_interval() else {
-            return;
-        };
-        tokio::time::sleep(interval.max(Duration::from_secs(1))).await;
     }
 }
 

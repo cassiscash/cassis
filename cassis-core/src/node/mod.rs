@@ -244,6 +244,16 @@ impl Node {
             .insert(network.id(), network);
     }
 
+    /// Stop using `id`, returning it. Tasks that hold it already keep
+    /// it until they end.
+    pub fn remove_network(&self, id: &NetworkId) -> Option<Arc<dyn Network>> {
+        self.0
+            .networks
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+    }
+
     pub fn network(&self, id: &NetworkId) -> Result<Arc<dyn Network>, String> {
         self.0
             .networks

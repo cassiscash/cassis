@@ -19,6 +19,7 @@
 //! | `network.add`         | `kind` (`arkade`, `cashu`, `liquid`, `lnd`, `bark`, `fedimint`, `bitcoin`, `rootstock`), `chain`, `mint`, `invite`, and the fields of `network.set` but `id` and `backend` |
 //! | `network.set`         | `id`, `esplora_url`, `backend` (`lnd`, `bark`, `none`), `lnd_rest_url`, `lnd_tls_cert_path`, `lnd_macaroon_path`, `bark_server_url`, `bark_esplora_url` |
 //! | `network.remove`      | `id`                                                      |
+//! | `network.open`        | `id`                                                      |
 //! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `max_incoming_lifetime_secs`, `test_money` |
 //! | `route.remove`        | `from`, `to`                                              |
 //! | `routes.announce`     |                                                           |
@@ -31,8 +32,9 @@
 //! `*.set` actions add what they name if it is missing, and change only
 //! the fields given (see [`edit::Args`]); a form's payload names its
 //! `draft` instead of the fields it edits. Config changes are written
-//! right away: routing changes apply and are announced at once, networks
-//! and the admin section on restart. The outcome of an action is the
+//! right away and apply at once: routes are announced again, and
+//! networks opened, closed or reopened in the background (see
+//! [`Networks`]); only the admin section waits for a restart. The outcome of an action is the
 //! `result` notice of the page of the session that sent it; announcing
 //! and checking the relays run in the background, and show in the
 //! announcements card of the Routes tab.
@@ -43,7 +45,8 @@ mod icon;
 mod iroh;
 mod view;
 
-use crate::config::{self, AdminConfig, Config, NetworkConfig};
+use crate::config::{self, AdminConfig, Config};
+use crate::networks::Networks;
 use cassis_core::node::Node;
 use cassis_core::routing::{autohue, autoname, fetch_published, Published};
 use cassis_core::store::Store;
@@ -68,15 +71,6 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(20);
 /// How often the relays are checked for this router's announcements.
 const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// What the daemon opened on start, which config changes apply to on
-/// restart only.
-pub struct Running {
-    pub networks: BTreeMap<String, NetworkConfig>,
-    /// Networks that failed to open, with the error.
-    pub failed: BTreeMap<String, String>,
-    pub admin: AdminConfig,
-}
-
 /// Who a session is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Access {
@@ -89,8 +83,10 @@ pub enum Access {
 pub struct Admin {
     dir: PathBuf,
     node: Node,
+    networks: Arc<Networks>,
     store: Arc<Store>,
-    running: Running,
+    /// The admin section served, which changes apply to on restart.
+    serving: AdminConfig,
     state: Mutex<State>,
     nostr: Mutex<Nostr>,
     sessions: Mutex<Vec<Arc<Session>>>,
@@ -160,16 +156,17 @@ impl Admin {
     pub fn new(
         dir: PathBuf,
         node: Node,
+        networks: Arc<Networks>,
         store: Arc<Store>,
         config: Config,
-        running: Running,
     ) -> Arc<Self> {
         let modified = modified(&dir);
         Arc::new(Self {
             dir,
             node,
+            networks,
             store,
-            running,
+            serving: config.admin.clone(),
             state: Mutex::new(State {
                 drafts: view::drafts(&config),
                 config,
@@ -213,6 +210,8 @@ impl Admin {
             loop {
                 tokio::time::sleep(REFRESH_INTERVAL).await;
                 admin.reload_if_modified();
+                // Also picks up changes left waiting for hops to settle.
+                admin.sync_networks(None);
                 admin.refresh();
             }
         });
@@ -419,7 +418,7 @@ impl Admin {
             "network.add" => {
                 let id = edit::new_network_id(args)?;
                 self.edit(|doc| edit::add_network(doc, &id, args))?;
-                Ok(format!("{id} added: it opens on restart"))
+                Ok(format!("{id} added, opening it"))
             }
             "admin.set" => {
                 self.edit(|doc| edit::admin(doc, args))?;
@@ -429,6 +428,22 @@ impl Admin {
                 let id = network()?;
                 self.edit(|doc| edit::network(doc, &id, args))?;
                 Ok(format!("{id} saved"))
+            }
+            "network.open" => {
+                let id = network()?;
+                if !lock(&self.state).config.networks.contains_key(&id.0) {
+                    return Err(format!("{id} is not under [networks]"));
+                }
+                match self.networks.in_flight(&id.0) {
+                    0 => {}
+                    hops => {
+                        return Err(format!(
+                            "{id} has {hops} hop(s) in flight: wait for them to settle"
+                        ))
+                    }
+                }
+                self.sync_networks(Some(id.0.clone()));
+                Ok(format!("Opening {id}"))
             }
             "network.remove" => {
                 let id = network()?;
@@ -537,6 +552,28 @@ impl Admin {
         if changed || renamed {
             self.nostr_job(changed);
         }
+        self.sync_networks(None);
+    }
+
+    /// Bring the open networks in step with the config, in the
+    /// background, reopening `retry` even if unchanged; announce the
+    /// routes again if a network opened or closed.
+    fn sync_networks(self: &Arc<Self>, retry: Option<String>) {
+        // The running one, or the next refresh, picks up what changed.
+        if retry.is_none() && self.networks.syncing() {
+            return;
+        }
+        let admin = self.clone();
+        tokio::spawn(async move {
+            let config = lock(&admin.state).config.clone();
+            let changed = admin
+                .networks
+                .sync(&config, retry.as_deref(), &|| admin.refresh())
+                .await;
+            if changed && !config.routes.is_empty() {
+                admin.nostr_job(true);
+            }
+        });
     }
 
     /// Pick up edits made to the config file by hand.
@@ -576,7 +613,13 @@ impl Admin {
         let name = self.name(&state.config);
         let ctx = view::Context {
             config: &state.config,
-            running: &self.running,
+            serving: &self.serving,
+            networks: self
+                .networks
+                .slots()
+                .iter()
+                .map(|(id, slot)| (id.clone(), (slot.config.clone(), slot.status.clone())))
+                .collect(),
             name: name.clone(),
             autoname: autoname(&self.node.node_pubkey()),
             open: self

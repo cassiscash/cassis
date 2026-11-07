@@ -4,8 +4,9 @@
 //! its draft, the signal `d.<draft>` (see [`drafts`]).
 
 use super::edit::{chains, KINDS};
-use super::{Access, Nostr, Running};
-use crate::config::{Config, NetworkConfig, RouteConfig};
+use super::{Access, Nostr};
+use crate::config::{AdminConfig, Config, NetworkConfig, RouteConfig};
+use crate::networks::Status;
 use cassis_core::node::{HopRecord, HopState};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
@@ -19,7 +20,11 @@ use std::collections::BTreeMap;
 /// What the page shows, besides the config.
 pub struct Context<'a> {
     pub config: &'a Config,
-    pub running: &'a Running,
+    /// The admin section served, which changes apply to on restart.
+    pub serving: &'a AdminConfig,
+    /// The networks the daemon has, with the config they were opened,
+    /// or last tried, with.
+    pub networks: BTreeMap<String, (NetworkConfig, Status)>,
     /// The name the router goes by: its own, else its autoname.
     pub name: String,
     pub autoname: String,
@@ -45,20 +50,8 @@ impl Context<'_> {
     /// What a restart would change.
     fn pending(&self) -> Vec<String> {
         let mut pending = Vec::new();
-        for (id, network) in &self.config.networks {
-            match self.running.networks.get(id) {
-                None => pending.push(format!("open {id}")),
-                Some(running) if running != network => pending.push(format!("reopen {id}")),
-                Some(_) => {}
-            }
-        }
-        for id in self.running.networks.keys() {
-            if !self.config.networks.contains_key(id) {
-                pending.push(format!("close {id}"));
-            }
-        }
-        if self.running.admin.listen != self.config.admin.listen
-            || self.running.admin.iroh != self.config.admin.iroh
+        if self.serving.listen != self.config.admin.listen
+            || self.serving.iroh != self.config.admin.iroh
         {
             pending.push("move the admin interface".into());
         }
@@ -396,12 +389,28 @@ fn networks(ctx: &Context) -> Node {
         .networks
         .iter()
         .map(|(id, network)| network_card(ctx, id, network));
-    tab("tab/networks").label("Networks").children([
-        list("networks")
-            .empty("No networks yet: add one below.")
-            .children(cards),
-        new_network(),
-    ])
+    // Removed from the config, still open for the hops through them.
+    let closing = ctx.networks.iter().filter_map(|(id, (_, status))| {
+        let Status::Waiting(hops) = status else {
+            return None;
+        };
+        (!ctx.config.networks.contains_key(id)).then(|| {
+            notice(format!("network/{id}/closing"))
+                .variant("warning")
+                .text(format!(
+                    "{id} closes once its {hops} hop(s) in flight settle."
+                ))
+        })
+    });
+    tab("tab/networks")
+        .label("Networks")
+        .children(closing)
+        .children([
+            list("networks")
+                .empty("No networks yet: add one below.")
+                .children(cards),
+            new_network(),
+        ])
 }
 
 /// The picker of a network's kind, then what that kind needs.
@@ -518,17 +527,27 @@ fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
     let d = |field: &str| format!("d.{draft}.{field}");
     let el = |part: &str| format!("network/{id}/{part}");
     let kind = id.split_once("::").map_or(id, |(kind, _)| kind);
-    let (variant, status) = if let Some(error) = ctx.running.failed.get(id) {
-        ("failure", format!("failed to open: {error}"))
-    } else if !ctx.running.networks.contains_key(id) {
-        ("warning", "opens on restart".to_string())
-    } else if ctx.running.networks.get(id) != Some(network) {
-        ("warning", "open, changes apply on restart".to_string())
-    } else if ctx.is_open(id) {
-        ("success", "open".to_string())
-    } else {
-        ("warning", "not open".to_string())
+    let status = ctx.networks.get(id).map(|(_, status)| status);
+    let applied = ctx
+        .networks
+        .get(id)
+        .is_some_and(|(opened, _)| opened == network);
+    let (variant, status_text) = match status {
+        None | Some(Status::Opening) => ("info", "opening…".to_string()),
+        Some(Status::Open) if !applied => ("info", "applying changes…".to_string()),
+        Some(Status::Open) => ("success", "open".to_string()),
+        Some(Status::Failed(error)) => ("failure", format!("failed to open: {error}")),
+        Some(Status::Waiting(hops)) => (
+            "warning",
+            format!("open, changes apply once its {hops} hop(s) in flight settle"),
+        ),
     };
+    let reopen = match status {
+        Some(Status::Failed(_)) => Some("Retry"),
+        Some(Status::Open) => Some("Reopen"),
+        _ => None,
+    }
+    .map(|label| act(el("open"), label, "network.open", json!({"id": id})));
     let fields: Vec<Node> = match kind {
         "arkade" | "bitcoin" => vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
             .placeholder("the public one")],
@@ -561,9 +580,9 @@ fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
     });
     card(format!("network/{id}"))
         .title(id)
-        .child(badge(el("status")).variant(variant).text(status))
+        .child(badge(el("status")).variant(variant).text(status_text))
         .children(fields)
-        .child(row(el("actions")).children(save).child(
+        .child(row(el("actions")).children(save).children(reopen).child(
             act(el("remove"), "Remove", "network.remove", json!({"id": id})).variant("failure"),
         ))
 }
