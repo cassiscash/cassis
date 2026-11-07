@@ -101,6 +101,51 @@ struct ChannelBalanceResponse {
     balance: Option<Value>,
 }
 
+/// `GET /v1/balance/blockchain`.
+#[derive(Deserialize)]
+struct WalletBalanceResponse {
+    confirmed_balance: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct NewAddressResponse {
+    address: String,
+}
+
+#[derive(Serialize)]
+struct AddInvoiceRequest {
+    value_msat: String,
+    memo: String,
+}
+
+#[derive(Deserialize)]
+struct AddInvoiceResponse {
+    payment_request: String,
+}
+
+#[derive(Serialize)]
+struct PayInvoiceRequest<'a> {
+    payment_request: &'a str,
+}
+
+#[derive(Deserialize)]
+struct PayInvoiceResponse {
+    #[serde(default)]
+    payment_error: String,
+}
+
+#[derive(Serialize)]
+struct SendCoinsRequest<'a> {
+    addr: &'a str,
+    amount: String,
+    target_conf: i32,
+}
+
+#[derive(Deserialize)]
+struct SendCoinsResponse {
+    txid: String,
+}
+
 #[derive(Serialize)]
 struct AddHoldInvoiceRequest {
     hash: String,
@@ -180,6 +225,73 @@ impl LndAdapter {
             info.identity_pubkey
         );
         Ok(adapter)
+    }
+
+    /// Outbound liquidity of the node's channels, in msat.
+    pub async fn channel_balance_msat(&self) -> Result<u64, NetworkError> {
+        let response: ChannelBalanceResponse = self.get_json("v1/balance/channels").await?;
+        Ok(response
+            .balance
+            .as_ref()
+            .and_then(value_as_u64)
+            .unwrap_or(0)
+            .saturating_mul(MSAT_PER_SAT))
+    }
+
+    /// Confirmed coins of the node's on-chain wallet, in msat.
+    pub async fn onchain_balance_msat(&self) -> Result<u64, NetworkError> {
+        let response: WalletBalanceResponse = self.get_json("v1/balance/blockchain").await?;
+        Ok(response
+            .confirmed_balance
+            .as_ref()
+            .and_then(value_as_u64)
+            .unwrap_or(0)
+            .saturating_mul(MSAT_PER_SAT))
+    }
+
+    /// A new on-chain address of the node's wallet.
+    pub async fn new_address(&self) -> Result<String, NetworkError> {
+        let response: NewAddressResponse =
+            self.get_json("v1/newaddress?type=TAPROOT_PUBKEY").await?;
+        Ok(response.address)
+    }
+
+    /// A plain invoice of `amount_msat` paying the node.
+    pub async fn add_invoice(&self, amount_msat: u64) -> Result<String, NetworkError> {
+        let request = AddInvoiceRequest {
+            value_msat: amount_msat.to_string(),
+            memo: "cassis".to_string(),
+        };
+        let response: AddInvoiceResponse = self.post_json("v1/invoices", &request).await?;
+        Ok(response.payment_request)
+    }
+
+    /// Pay `invoice` from the node's channels, waiting for the outcome.
+    pub async fn pay_invoice(&self, invoice: &str) -> Result<(), NetworkError> {
+        let request = PayInvoiceRequest {
+            payment_request: invoice.trim(),
+        };
+        let response: PayInvoiceResponse =
+            self.post_json("v1/channels/transactions", &request).await?;
+        if !response.payment_error.is_empty() {
+            return Err(NetworkError::network(response.payment_error));
+        }
+        Ok(())
+    }
+
+    /// Send `amount_sat` on-chain to `address`. Returns the txid.
+    pub async fn send_onchain(
+        &self,
+        address: &str,
+        amount_sat: u64,
+    ) -> Result<String, NetworkError> {
+        let request = SendCoinsRequest {
+            addr: address.trim(),
+            amount: amount_sat.to_string(),
+            target_conf: 6,
+        };
+        let response: SendCoinsResponse = self.post_json("v1/transactions", &request).await?;
+        Ok(response.txid)
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -479,13 +591,7 @@ impl Network for LndAdapter {
     }
 
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        let response: ChannelBalanceResponse = self.get_json("v1/balance/channels").await?;
-        let available = response
-            .balance
-            .as_ref()
-            .and_then(value_as_u64)
-            .unwrap_or(0)
-            .saturating_mul(MSAT_PER_SAT);
+        let available = self.channel_balance_msat().await?;
         if available < amount_msat {
             return Err(NetworkError::invalid(format!(
                 "need {amount_msat} msat of outbound liquidity, channels hold {available} msat"

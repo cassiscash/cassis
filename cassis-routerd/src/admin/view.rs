@@ -6,12 +6,14 @@
 use super::edit::{chains, KINDS};
 use super::{Access, Nostr};
 use crate::config::{AdminConfig, Config, NetworkConfig, RouteConfig};
-use crate::networks::Status;
+use crate::networks::{Funds, Status};
 use cassis_core::node::{HopRecord, HopState};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
+use cassis_networks::Can;
 use hypereffect::vtree::{
-    badge, button, card, checkbox, column, input, list, notice, row, select, tab, tabs, text, Node,
+    badge, button, card, checkbox, column, divider, input, list, notice, row, select, tab, tabs,
+    text, Node,
 };
 use hypereffect::{cel, json, Handler, Map, Value};
 use sha2::{Digest, Sha256};
@@ -22,9 +24,8 @@ pub struct Context<'a> {
     pub config: &'a Config,
     /// The admin section served, which changes apply to on restart.
     pub serving: &'a AdminConfig,
-    /// The networks the daemon has, with the config they were opened,
-    /// or last tried, with.
-    pub networks: BTreeMap<String, (NetworkConfig, Status)>,
+    /// The networks the daemon has.
+    pub networks: BTreeMap<String, Network>,
     /// The name the router goes by: its own, else its autoname.
     pub name: String,
     pub autoname: String,
@@ -40,6 +41,16 @@ pub struct Context<'a> {
     pub nostr: &'a Nostr,
     /// Unix seconds.
     pub now: u64,
+}
+
+/// One network as the daemon has it.
+pub struct Network {
+    /// The config it was opened, or last tried, with.
+    pub config: NetworkConfig,
+    pub status: Status,
+    /// What its wallet can do, while open.
+    pub can: Option<Can>,
+    pub funds: Funds,
 }
 
 impl Context<'_> {
@@ -78,6 +89,12 @@ pub fn route_draft(from: &str, to: &str) -> String {
     format!("r_{}", short_hash(&format!("{from}\n{to}")))
 }
 
+/// The signal path segment of the draft of a form of a network's
+/// wallet, `form` being the action it sends without `wallet.`.
+pub fn wallet_draft(id: &str, form: &str) -> String {
+    format!("w_{}_{form}", short_hash(id))
+}
+
 fn short_hash(text: &str) -> String {
     lowercase_hex::encode(&Sha256::digest(text.as_bytes())[..6])
 }
@@ -99,6 +116,16 @@ pub fn drafts(config: &Config) -> Map<String, Value> {
     );
     for (id, network) in &config.networks {
         drafts.insert(network_draft(id), network_values(network));
+        let forms = [
+            ("send", json!({"to": "", "amount_sat": null})),
+            ("issue", json!({"amount_sat": null})),
+            ("redeem", json!({"token": ""})),
+            ("invoice", json!({"amount_sat": null})),
+            ("pay", json!({"invoice": ""})),
+        ];
+        for (form, values) in forms {
+            drafts.insert(wallet_draft(id, form), values);
+        }
     }
     for route in &config.routes {
         drafts.insert(route_draft(&route.from, &route.to), route_values(route));
@@ -229,6 +256,22 @@ fn ago(now: u64, then: u64) -> String {
         secs @ 60..=3_599 => format!("{} min ago", secs / 60),
         secs @ 3_600..=86_399 => format!("{} h ago", secs / 3_600),
         secs => format!("{} days ago", secs / 86_400),
+    }
+}
+
+/// `msat` in sats, thousands apart.
+fn sat(msat: u64) -> String {
+    let digits = (msat / 1000).to_string();
+    let mut grouped = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    match msat % 1000 {
+        0 => format!("{grouped} sat"),
+        rest => format!("{grouped}.{rest:03} sat"),
     }
 }
 
@@ -390,8 +433,8 @@ fn networks(ctx: &Context) -> Node {
         .iter()
         .map(|(id, network)| network_card(ctx, id, network));
     // Removed from the config, still open for the hops through them.
-    let closing = ctx.networks.iter().filter_map(|(id, (_, status))| {
-        let Status::Waiting(hops) = status else {
+    let closing = ctx.networks.iter().filter_map(|(id, network)| {
+        let Status::Waiting(hops) = &network.status else {
             return None;
         };
         (!ctx.config.networks.contains_key(id)).then(|| {
@@ -527,11 +570,9 @@ fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
     let d = |field: &str| format!("d.{draft}.{field}");
     let el = |part: &str| format!("network/{id}/{part}");
     let kind = id.split_once("::").map_or(id, |(kind, _)| kind);
-    let status = ctx.networks.get(id).map(|(_, status)| status);
-    let applied = ctx
-        .networks
-        .get(id)
-        .is_some_and(|(opened, _)| opened == network);
+    let opened = ctx.networks.get(id);
+    let status = opened.map(|opened| &opened.status);
+    let applied = opened.is_some_and(|opened| opened.config == *network);
     let (variant, status_text) = match status {
         None | Some(Status::Opening) => ("info", "opening…".to_string()),
         Some(Status::Open) if !applied => ("info", "applying changes…".to_string()),
@@ -578,13 +619,229 @@ fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
             "false",
         )
     });
+    let wallet = opened
+        .and_then(|opened| Some(wallet(ctx, id, opened.can.as_ref()?, &opened.funds)))
+        .unwrap_or_default();
+    let settings = (!fields.is_empty()).then(|| divider(el("divider")));
     card(format!("network/{id}"))
         .title(id)
         .child(badge(el("status")).variant(variant).text(status_text))
+        .children(wallet)
+        .children(settings)
         .children(fields)
         .child(row(el("actions")).children(save).children(reopen).child(
             act(el("remove"), "Remove", "network.remove", json!({"id": id})).variant("failure"),
         ))
+}
+
+/// What a network's wallet holds, what it last did, and the forms that
+/// move funds in and out of it, as far as it `can`.
+fn wallet(ctx: &Context, id: &str, can: &Can, funds: &Funds) -> Vec<Node> {
+    let el = |part: &str| format!("network/{id}/wallet/{part}");
+    let busy = funds.busy.is_some();
+    // A button running an operation, sending the draft of `form` if any.
+    let run = |form: &str, label: &str, draft: bool, blocked: &str| {
+        let mut payload = json!({"id": id});
+        if draft {
+            payload["draft"] = wallet_draft(id, form).into();
+        }
+        submit(
+            el(form),
+            label,
+            &format!("wallet.{form}"),
+            payload,
+            &format!("{busy} || ({blocked})"),
+        )
+    };
+    let d = |form: &str, field: &str| format!("d.{}.{field}", wallet_draft(id, form));
+    let empty = |form: &str, field: &str| format!("s.{}.trim() == ''", d(form, field));
+    let amount = |form: &str| {
+        number(
+            el(&format!("{form}/amount_sat")),
+            "Amount (sat)",
+            &d(form, "amount_sat"),
+        )
+    };
+
+    let mut nodes = Vec::new();
+    let amounts: Vec<Node> = match &funds.balances {
+        Some(Ok(balances)) => balances
+            .iter()
+            .enumerate()
+            .map(|(i, balance)| {
+                let el = |part: &str| el(&format!("balance/{i}/{part}"));
+                column(el("")).gap("none").children([
+                    text(el("label")).variant("caption").text(balance.label),
+                    text(el("amount"))
+                        .variant(if i == 0 { "h2" } else { "h3" })
+                        .text(sat(balance.msat)),
+                ])
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let read = match (funds.reading, funds.read_at) {
+        (true, _) => "Reading…".to_string(),
+        (false, Some(at)) => format!("Read {}", ago(ctx.now, at)),
+        (false, None) => "Not read yet".to_string(),
+    };
+    nodes.push(row(el("balances")).justify("between").wrap(true).children([
+        row(el("amounts")).gap("large").wrap(true).children(amounts),
+        row(el("read")).children([
+            text(el("read/when")).variant("caption").text(read),
+            act(
+                el("refresh"),
+                "Refresh",
+                "wallet.refresh",
+                json!({"id": id}),
+            ),
+        ]),
+    ]));
+    if let Some(Err(error)) = &funds.balances {
+        nodes.push(
+            notice(el("balances/error"))
+                .variant("failure")
+                .title("Could not read the balance")
+                .text(error.as_str()),
+        );
+    }
+    let doing = funds
+        .busy
+        .map(|doing| badge(el("busy")).variant("info").text(format!("{doing}…")));
+    let waiting = (funds.waiting > 0).then(|| {
+        badge(el("waiting"))
+            .variant("info")
+            .text(format!("waiting for {} payment(s)", funds.waiting))
+    });
+    if doing.is_some() || waiting.is_some() {
+        nodes.push(row(el("doing")).children(doing).children(waiting));
+    }
+    if let Some(outcome) = &funds.outcome {
+        let (variant, message) = match outcome {
+            Ok(message) => ("success", message),
+            Err(error) => ("failure", error),
+        };
+        nodes.push(
+            notice(el("outcome"))
+                .variant(variant)
+                .text(message.as_str()),
+        );
+    }
+    if let Some(output) = &funds.output {
+        nodes.push(
+            column(el("output")).gap("small").children([
+                text(el("output/label"))
+                    .variant("caption")
+                    .text(format!("{}: copy it now, it is not kept", output.label)),
+                text(el("output/value"))
+                    .variant("code")
+                    .text(output.address.as_str()),
+                act(
+                    el("dismiss"),
+                    "Hide it",
+                    "wallet.dismiss",
+                    json!({"id": id}),
+                ),
+            ]),
+        );
+    }
+
+    let mut receive = Vec::new();
+    match &funds.addresses {
+        Some(Ok(addresses)) => {
+            for (i, address) in addresses.iter().enumerate() {
+                receive.push(fact(
+                    &el(&format!("address/{i}")),
+                    address.label,
+                    address.address.as_str(),
+                ));
+            }
+            if can.new_addresses && !addresses.is_empty() {
+                receive.push(act(
+                    el("address"),
+                    "New address",
+                    "wallet.address",
+                    json!({"id": id}),
+                ));
+            }
+        }
+        Some(Err(error)) => receive.extend([
+            notice(el("addresses/error"))
+                .variant("failure")
+                .title("Could not get a deposit address")
+                .text(error.as_str()),
+            act(el("address"), "Retry", "wallet.address", json!({"id": id})),
+        ]),
+        None => {}
+    }
+    if let Some(deposit) = can.deposit {
+        receive.push(run(
+            "deposit",
+            &format!("New {}", deposit.to_lowercase()),
+            false,
+            "false",
+        ));
+    }
+    if can.lightning {
+        receive.push(row(el("invoice/form")).align("end").wrap(true).children([
+            amount("invoice"),
+            run("invoice", "Create invoice", true, "false"),
+        ]));
+    }
+    if let Some(redeem) = can.redeem {
+        receive.extend([
+            field(el("redeem/token"), redeem, &d("redeem", "token")).variant("multiline"),
+            run("redeem", "Redeem", true, &empty("redeem", "token")),
+        ]);
+    }
+    if can.onboard {
+        receive.push(run("onboard", "Onboard", false, "false"));
+    }
+
+    let mut send = Vec::new();
+    if let Some(to) = can.send {
+        send.extend([
+            field(el("send/to"), to, &d("send", "to")),
+            row(el("send/form")).align("end").wrap(true).children([
+                amount("send"),
+                run("send", "Send", true, &empty("send", "to")),
+            ]),
+        ]);
+    }
+    if can.lightning {
+        send.extend([
+            field(el("pay/invoice"), "Lightning invoice", &d("pay", "invoice"))
+                .placeholder("lnbc…"),
+            run("pay", "Pay", true, &empty("pay", "invoice")),
+        ]);
+    }
+    if let Some(issue) = can.issue {
+        send.push(row(el("issue/form")).align("end").wrap(true).children([
+            amount("issue"),
+            run(
+                "issue",
+                &format!("Take out as {}", issue.to_lowercase()),
+                true,
+                "false",
+            ),
+        ]));
+    }
+
+    let note = can
+        .note
+        .map(|note| text(el("note")).variant("caption").text(note));
+    nodes.push(
+        tabs(el("tabs"))
+            .bind(format!("_wallet_{}", short_hash(id)))
+            .children([
+                tab(el("tab/receive"))
+                    .label("Receive")
+                    .children(receive)
+                    .children(note),
+                tab(el("tab/send")).label("Send").children(send),
+            ]),
+    );
+    nodes
 }
 
 fn routes(ctx: &Context) -> Node {

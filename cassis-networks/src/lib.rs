@@ -1,10 +1,13 @@
 //! Opening the [`Network`] adapters this build was compiled with, one
 //! cargo feature per network, the same way in every Cassis binary.
 
+mod wallet;
+
 use cassis_core::{Network, NetworkId};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::Span;
+pub use wallet::{Address, Balance, Can, Done, Op, Then, Wallet};
 
 #[cfg(feature = "arkade")]
 pub use cassis_arkade as arkade;
@@ -62,35 +65,58 @@ pub fn network_dir(root: &Path, network: &NetworkId) -> PathBuf {
 }
 
 /// Open the adapter of `network`, if this build has it.
-#[allow(unused_variables)]
 pub async fn open(
     network: &NetworkId,
     settings: &NetworkSettings,
     span: &Span,
 ) -> Result<Arc<dyn Network>, String> {
+    open_wallet(network, settings, span)
+        .await
+        .map(|(opened, _)| opened)
+}
+
+/// The adapter and its wallet, sharing one handle.
+#[allow(dead_code)]
+fn with_wallet<A: Network + 'static>(
+    adapter: A,
+    wallet: fn(Arc<A>) -> Wallet,
+) -> (Arc<dyn Network>, Wallet) {
+    let adapter = Arc::new(adapter);
+    (adapter.clone(), wallet(adapter))
+}
+
+/// Open the adapter of `network`, if this build has it, and its wallet.
+#[allow(unused_variables, unreachable_code)]
+pub async fn open_wallet(
+    network: &NetworkId,
+    settings: &NetworkSettings,
+    span: &Span,
+) -> Result<(Arc<dyn Network>, Wallet), String> {
     let secret = settings.secret;
     let dir = &settings.dir;
-    let opened: Arc<dyn Network> = match network.kind() {
+    let (opened, wallet) = match network.kind() {
         #[cfg(feature = "cashu")]
-        "cashu" => Arc::new(cassis_cashu::CashuAdapter::open(
-            network.clone(),
-            secret,
-            dir,
-            span,
-        )?),
+        "cashu" => with_wallet(
+            cassis_cashu::CashuAdapter::open(network.clone(), secret, dir, span)?,
+            Wallet::Cashu,
+        ),
         #[cfg(feature = "liquid")]
-        "liquid" => {
-            Arc::new(cassis_liquid::LiquidAdapter::open(network.clone(), secret, dir, span).await?)
-        }
+        "liquid" => with_wallet(
+            cassis_liquid::LiquidAdapter::open(network.clone(), secret, dir, span).await?,
+            Wallet::Liquid,
+        ),
         #[cfg(feature = "bitcoin")]
-        "bitcoin" => Arc::new(cassis_bitcoin::BitcoinAdapter::open_with_esplora(
-            network.clone(),
-            secret,
-            settings.esplora_url.as_deref(),
-            span,
-        )?),
+        "bitcoin" => with_wallet(
+            cassis_bitcoin::BitcoinAdapter::open_with_esplora(
+                network.clone(),
+                secret,
+                settings.esplora_url.as_deref(),
+                span,
+            )?,
+            Wallet::Bitcoin,
+        ),
         #[cfg(feature = "arkade")]
-        "arkade" => Arc::new(
+        "arkade" => with_wallet(
             cassis_arkade::ArkadeAdapter::open_with_esplora(
                 network.clone(),
                 secret,
@@ -98,25 +124,27 @@ pub async fn open(
                 span,
             )
             .await?,
+            Wallet::Arkade,
         ),
         #[cfg(feature = "rootstock")]
-        "rootstock" => Arc::new(cassis_rootstock::RootstockAdapter::open(
-            network.clone(),
-            secret,
-            span,
-        )?),
+        "rootstock" => with_wallet(
+            cassis_rootstock::RootstockAdapter::open(network.clone(), secret, span)?,
+            Wallet::Rootstock,
+        ),
         #[cfg(feature = "fedimint")]
-        "fedimint" => Arc::new(
+        "fedimint" => with_wallet(
             cassis_fedimint::FedimintAdapter::open(network.clone(), secret, dir, span).await?,
+            Wallet::Fedimint,
         ),
         #[cfg(any(feature = "lightning", feature = "bark-lightning"))]
         "lightning" => open_lightning(network, settings, span).await?,
         kind => return Err(format!("this build has no '{kind}' support")),
     };
-    Ok(match settings.max_incoming_lifetime_secs {
+    let opened = match settings.max_incoming_lifetime_secs {
         Some(secs) => cassis_core::with_max_incoming_lifetime(opened, secs),
         None => opened,
-    })
+    };
+    Ok((opened, wallet))
 }
 
 /// A `lightning` network goes through bark when it has an Ark server,
@@ -127,10 +155,10 @@ async fn open_lightning(
     network: &NetworkId,
     settings: &NetworkSettings,
     span: &Span,
-) -> Result<Arc<dyn Network>, String> {
+) -> Result<(Arc<dyn Network>, Wallet), String> {
     #[cfg(feature = "bark-lightning")]
     if let Some(bark) = &settings.bark {
-        return Ok(Arc::new(
+        return Ok(with_wallet(
             cassis_bark_lightning::BarkLightningAdapter::open(
                 network.clone(),
                 settings.secret,
@@ -139,6 +167,7 @@ async fn open_lightning(
                 span,
             )
             .await?,
+            Wallet::Bark,
         ));
     }
     #[cfg(feature = "lightning")]
@@ -147,8 +176,9 @@ async fn open_lightning(
             .lnd
             .clone()
             .ok_or("lightning needs an LND node or an Ark server (bark)")?;
-        return Ok(Arc::new(
+        return Ok(with_wallet(
             cassis_lnd::LndAdapter::open(network.clone(), lnd, span).await?,
+            Wallet::Lnd,
         ));
     }
     Err(format!(

@@ -82,6 +82,8 @@ fn wallet_error(error: impl std::fmt::Display) -> NetworkError {
 pub struct BarkLightningAdapter {
     id: NetworkId,
     wallet: Wallet,
+    /// The server's chain.
+    network: BitcoinNetwork,
     /// Average seconds between blocks of the server's chain.
     block_secs: u64,
     /// The server's blocks between a lightning HTLC and the Ark HTLC
@@ -146,6 +148,7 @@ impl BarkLightningAdapter {
             span: cassis_core::network_span(span, &id),
             id,
             wallet,
+            network,
             block_secs,
             htlc_expiry_delta: ark_info.htlc_expiry_delta.to_u16().into(),
             min_cltv_delta: min_cltv_delta.to_u16().into(),
@@ -171,6 +174,56 @@ impl BarkLightningAdapter {
         self.wallet.sync().await;
         let balance = self.wallet.balance().await.map_err(wallet_error)?;
         Ok(balance.spendable.to_sat())
+    }
+
+    /// Sats that can be sent right now, and the others the wallet owns:
+    /// waiting for a refresh, or held by payments and rounds in flight.
+    pub async fn balance_sats(&self) -> Result<(u64, u64), NetworkError> {
+        self.wallet.sync().await;
+        let balance = self.wallet.balance().await.map_err(wallet_error)?.summary();
+        Ok((
+            balance.spendable.to_sat(),
+            balance.total.to_sat() - balance.spendable.to_sat(),
+        ))
+    }
+
+    /// A new Ark address of the wallet, to receive VTXOs at.
+    pub async fn new_address(&self) -> Result<String, NetworkError> {
+        let address = self.wallet.new_address().await.map_err(wallet_error)?;
+        Ok(address.to_string())
+    }
+
+    /// Send `sats` to an Ark address, else on-chain to a bitcoin address
+    /// of the server's chain. Returns the txid of an on-chain send.
+    pub async fn send(&self, to: &str, sats: u64) -> Result<Option<String>, NetworkError> {
+        let amount = Amount::from_sat(sats);
+        if let Ok(address) = bark::ark::Address::from_str(to.trim()) {
+            self.wallet
+                .send_arkoor_payment(&address, amount)
+                .await
+                .map_err(wallet_error)?;
+            return Ok(None);
+        }
+        let address = bark::ark::bitcoin::Address::from_str(to.trim())
+            .map_err(|e| NetworkError::invalid(format!("not an Ark or bitcoin address: {e}")))?
+            .require_network(self.network)
+            .map_err(NetworkError::invalid)?;
+        let offboard = self
+            .wallet
+            .send_onchain(address, amount)
+            .await
+            .map_err(wallet_error)?;
+        Ok(Some(offboard.txid.to_string()))
+    }
+
+    /// Pay `invoice`, waiting until it settles or fails.
+    pub async fn pay_invoice(&self, invoice: &str) -> Result<(), NetworkError> {
+        let invoice = Bolt11Invoice::from_str(invoice.trim()).map_err(NetworkError::invalid)?;
+        self.wallet
+            .pay_lightning_invoice(invoice, None, true)
+            .await
+            .map_err(wallet_error)?;
+        Ok(())
     }
 
     /// A plain invoice of `sats` (with its own preimage) to fund the

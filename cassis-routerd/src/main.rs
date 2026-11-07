@@ -83,10 +83,14 @@ async fn run(cli: Cli) -> Result<(), String> {
     // its hops on them. A network that does not open is left out, for
     // the admin interface to fix and open later.
     let mut networks = Vec::new();
+    let mut wallets = BTreeMap::new();
     let mut failed = BTreeMap::new();
     for network in config.network_ids()? {
         match networks::open(&config, &network, &keys, &dir, &span).await {
-            Ok(opened) => networks.push(opened),
+            Ok((opened, wallet)) => {
+                networks.push(opened);
+                wallets.insert(network.to_string(), wallet);
+            }
             Err(error) => {
                 warn!("not opening {network}: {error}");
                 failed.insert(network.to_string(), error);
@@ -111,7 +115,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         networks,
     )
     .await?;
-    let networks = Networks::new(node.clone(), keys, dir.clone(), span, &config, failed);
+    let networks = Networks::new(
+        node.clone(),
+        keys,
+        dir.clone(),
+        span,
+        &config,
+        wallets,
+        failed,
+    );
 
     let policy = routing_policy(&config, &store)?;
     if policy.routes.is_empty() {

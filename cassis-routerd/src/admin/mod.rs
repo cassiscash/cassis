@@ -20,6 +20,16 @@
 //! | `network.set`         | `id`, `esplora_url`, `backend` (`lnd`, `bark`, `none`), `lnd_rest_url`, `lnd_tls_cert_path`, `lnd_macaroon_path`, `bark_server_url`, `bark_esplora_url` |
 //! | `network.remove`      | `id`                                                      |
 //! | `network.open`        | `id`                                                      |
+//! | `wallet.refresh`      | `id`                                                      |
+//! | `wallet.address`      | `id`                                                      |
+//! | `wallet.send`         | `id`, `to`, `amount_sat`                                  |
+//! | `wallet.issue`        | `id`, `amount_sat`                                        |
+//! | `wallet.redeem`       | `id`, `token`                                             |
+//! | `wallet.onboard`      | `id`                                                      |
+//! | `wallet.invoice`      | `id`, `amount_sat`                                        |
+//! | `wallet.pay`          | `id`, `invoice`                                           |
+//! | `wallet.deposit`      | `id`                                                      |
+//! | `wallet.dismiss`      | `id`                                                      |
 //! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `max_incoming_lifetime_secs`, `test_money` |
 //! | `route.remove`        | `from`, `to`                                              |
 //! | `routes.announce`     |                                                           |
@@ -38,6 +48,13 @@
 //! `result` notice of the page of the session that sent it; announcing
 //! and checking the relays run in the background, and show in the
 //! announcements card of the Routes tab.
+//!
+//! `wallet.*` actions move the funds of an open network, as far as its
+//! wallet can (see [`cassis_networks::Can`]), in the background: what
+//! they did, and what they hand out (a token, an invoice), shows in the
+//! network's card, as do its balances, read every minute while a page is
+//! open (`wallet.refresh` reads them now), and its deposit addresses
+//! (`wallet.address` asks for new ones).
 
 mod edit;
 mod http;
@@ -51,6 +68,7 @@ use cassis_core::node::Node;
 use cassis_core::routing::{autohue, autoname, fetch_published, Published};
 use cassis_core::store::Store;
 use cassis_core::{unix_now, NetworkId};
+use cassis_networks::{Op, Wallet};
 use edit::Args;
 use hypereffect::vtree;
 use hypereffect::{json, Action, Map, Metadata, RendererMessage, ServerMessage, Value};
@@ -65,6 +83,8 @@ use tracing::{info, warn};
 /// How often open pages are brought up to date with the hops and the
 /// config file.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the balances of the wallets are read while a page is open.
+const FUNDS_INTERVAL: u64 = 60;
 /// How long after start the relays are first checked, leaving time for
 /// the first announcement.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(20);
@@ -212,6 +232,11 @@ impl Admin {
                 admin.reload_if_modified();
                 // Also picks up changes left waiting for hops to settle.
                 admin.sync_networks(None);
+                if !lock(&admin.sessions).is_empty() {
+                    for id in admin.networks.stale_funds(FUNDS_INTERVAL) {
+                        admin.read_funds(id, false);
+                    }
+                }
                 admin.refresh();
             }
         });
@@ -389,10 +414,16 @@ impl Admin {
             Err(error) => warn!("admin {} ({:?}): {error}", action.name, session.access),
         }
         let mut reset = json!({"_busy": false});
-        // A form that added something is emptied for the next one.
+        // A form that added or moved something is emptied for the next one.
         if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("new_")) {
             if result.is_ok() {
                 let fresh = view::new_drafts(&lock(&self.state).config);
+                reset["d"] = json!({draft: fresh.get(draft)});
+            }
+        }
+        if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("w_")) {
+            if result.is_ok() {
+                let fresh = view::drafts(&lock(&self.state).config);
                 reset["d"] = json!({draft: fresh.get(draft)});
             }
         }
@@ -404,6 +435,12 @@ impl Admin {
     /// Do what the action `name` says, returning what happened.
     async fn act(self: &Arc<Self>, name: &str, args: &Args) -> Result<String, String> {
         let network = || NetworkId::parse(&args.required("id")?);
+        let amount = || {
+            args.number("amount_sat")?
+                .flatten()
+                .filter(|amount| *amount > 0)
+                .ok_or_else(|| "amount_sat is required".to_string())
+        };
         let ends = || {
             Ok::<_, String>((
                 NetworkId::parse(&args.required("from")?)?,
@@ -444,6 +481,62 @@ impl Admin {
                 }
                 self.sync_networks(Some(id.0.clone()));
                 Ok(format!("Opening {id}"))
+            }
+            "wallet.refresh" | "wallet.address" => {
+                let id = network()?;
+                if !self.networks.has_wallet(&id.0) {
+                    return Err(format!("{id} is not open"));
+                }
+                self.read_funds(id.0.clone(), name == "wallet.address");
+                Ok(match name {
+                    "wallet.address" => format!("Asking {id} for new addresses"),
+                    _ => format!("Reading the wallet of {id}"),
+                })
+            }
+            "wallet.send" => self.wallet_op(
+                network()?,
+                "Sending",
+                Op::Send {
+                    to: args.required("to")?,
+                    amount_sat: amount()?,
+                },
+            ),
+            "wallet.issue" => self.wallet_op(
+                network()?,
+                "Taking funds out",
+                Op::Issue {
+                    amount_sat: amount()?,
+                },
+            ),
+            "wallet.redeem" => self.wallet_op(
+                network()?,
+                "Redeeming",
+                Op::Redeem {
+                    token: args.required("token")?,
+                },
+            ),
+            "wallet.onboard" => self.wallet_op(network()?, "Onboarding", Op::Onboard),
+            "wallet.invoice" => self.wallet_op(
+                network()?,
+                "Creating an invoice",
+                Op::Invoice {
+                    amount_sat: amount()?,
+                },
+            ),
+            "wallet.pay" => self.wallet_op(
+                network()?,
+                "Paying",
+                Op::Pay {
+                    invoice: args.required("invoice")?,
+                },
+            ),
+            "wallet.deposit" => {
+                self.wallet_op(network()?, "Creating a deposit address", Op::Deposit)
+            }
+            "wallet.dismiss" => {
+                let id = network()?;
+                self.networks.dismiss(&id.0);
+                Ok(format!("{id}: dismissed"))
             }
             "network.remove" => {
                 let id = network()?;
@@ -490,6 +583,38 @@ impl Admin {
             }
             other => Err(format!("unknown action {other}")),
         }
+    }
+
+    /// Start `op` on the wallet of `id`, saying it is `doing` it, and run
+    /// it in the background.
+    fn wallet_op(
+        self: &Arc<Self>,
+        id: NetworkId,
+        doing: &'static str,
+        op: Op,
+    ) -> Result<String, String> {
+        let wallet = self.networks.start(&id.0, doing)?;
+        let admin = self.clone();
+        let network = id.0.clone();
+        tokio::spawn(async move {
+            admin
+                .networks
+                .run(&network, wallet, op, &|| admin.refresh())
+                .await;
+        });
+        Ok(format!("{id}: {doing}…"))
+    }
+
+    /// Read the funds of `id` in the background, and its addresses again
+    /// if `addresses`.
+    fn read_funds(self: &Arc<Self>, id: String, addresses: bool) {
+        let admin = self.clone();
+        tokio::spawn(async move {
+            admin
+                .networks
+                .read_funds(&id, addresses, &|| admin.refresh())
+                .await;
+        });
     }
 
     /// Let `key` in if `secret` is the pairing link's, replacing it.
@@ -618,7 +743,15 @@ impl Admin {
                 .networks
                 .slots()
                 .iter()
-                .map(|(id, slot)| (id.clone(), (slot.config.clone(), slot.status.clone())))
+                .map(|(id, slot)| {
+                    let network = view::Network {
+                        config: slot.config.clone(),
+                        status: slot.status.clone(),
+                        can: slot.wallet.as_ref().map(Wallet::can),
+                        funds: slot.funds.clone(),
+                    };
+                    (id.clone(), network)
+                })
                 .collect(),
             name: name.clone(),
             autoname: autoname(&self.node.node_pubkey()),
