@@ -72,14 +72,14 @@ impl Args {
         })
     }
 
-    /// A boolean, or `inherit` (like empty) for unset.
+    /// A boolean, or empty for unset.
     pub fn flag(&self, key: &str) -> Result<Option<Option<bool>>, String> {
         Ok(match self.0.get(key) {
             None => None,
             Some(Value::Null) => Some(None),
             Some(Value::Bool(b)) => Some(Some(*b)),
             Some(Value::String(text)) => Some(match text.trim() {
-                "" | "inherit" => None,
+                "" => None,
                 "true" | "yes" | "on" => Some(true),
                 "false" | "no" | "off" => Some(false),
                 _ => return Err(format!("{key}: expected true or false")),
@@ -110,16 +110,13 @@ impl Args {
     }
 }
 
-/// `nostr_relays`, `test_money`, `max_reservations`.
+/// `name`, `nostr_relays`, `max_reservations`.
 pub fn settings(doc: &mut DocumentMut, args: &Args) -> Result<(), String> {
     let root = doc.as_table_mut();
-    put_list(root, "nostr_relays", args.list("nostr_relays")?);
-    if let Some(test_money) = args.flag("test_money")? {
-        put(
-            root,
-            "test_money",
-            test_money.filter(|b| *b).map(Value::from),
-        );
+    put_text(root, "name", args.text("name")?);
+    match args.list("nostr_relays")? {
+        Some(None) => return Err("nostr_relays: name at least one relay".into()),
+        relays => put_list(root, "nostr_relays", relays),
     }
     put_number(root, "max_reservations", args.number("max_reservations")?)?;
     Ok(())
@@ -137,26 +134,106 @@ pub fn admin(doc: &mut DocumentMut, args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// Adds `id` if missing. Fields: `max_incoming_lifetime_secs`,
-/// `esplora_url`, `maintenance`, `backend` (`lnd`, `bark` or `none`),
-/// and the `lnd_*` and `bark_*` fields of whichever backend the network
-/// has.
+/// The kinds of network [`new_network_id`] takes, with their labels and
+/// whether this build has them.
+pub const KINDS: [(&str, &str, bool); 8] = [
+    ("arkade", "Arkade", cfg!(feature = "arkade")),
+    ("cashu", "Cashu", cfg!(feature = "cashu")),
+    ("liquid", "Liquid", cfg!(feature = "liquid")),
+    ("lnd", "Lightning (LND)", cfg!(feature = "lightning")),
+    ("bark", "Lightning (bark)", cfg!(feature = "bark-lightning")),
+    ("fedimint", "Fedimint", cfg!(feature = "fedimint")),
+    ("bitcoin", "Bitcoin", cfg!(feature = "bitcoin")),
+    ("rootstock", "Rootstock", cfg!(feature = "rootstock")),
+];
+
+/// The chains a kind of [`KINDS`] runs on, the first its default.
+pub fn chains(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "arkade" => &["mainnet", "mutinynet"],
+        "bitcoin" => &["mainnet", "mutinynet", "regtest"],
+        "liquid" | "rootstock" => &["mainnet", "testnet"],
+        "lnd" | "bark" => &["mainnet", "signet", "mutinynet", "regtest"],
+        _ => &[],
+    }
+}
+
+/// The id of the network a `network.add` describes: `kind`, one of
+/// [`KINDS`], then `chain` (one of its [`chains`]), `mint` (a cashu
+/// mint's URL) or `invite` (a fedimint invite code).
+pub fn new_network_id(args: &Args) -> Result<NetworkId, String> {
+    let kind = args.required("kind")?;
+    let (_, label, built) = KINDS
+        .iter()
+        .find(|(name, ..)| *name == kind)
+        .ok_or_else(|| format!("kind {kind}: expected one of {}", kind_names()))?;
+    if !built {
+        return Err(format!("this build has no {label} support"));
+    }
+    let spec = match kind.as_str() {
+        "cashu" => {
+            let mint = args.required("mint")?;
+            let host = mint
+                .strip_prefix("https://")
+                .or_else(|| mint.strip_prefix("http://"))
+                .unwrap_or(&mint)
+                .trim_end_matches('/');
+            format!("cashu::{host}")
+        }
+        "fedimint" => format!("fedimint::{}", args.required("invite")?),
+        kind => {
+            let chains = chains(kind);
+            let chain = args.text("chain")?.filter(|chain| !chain.is_empty());
+            let chain = chain.as_deref().unwrap_or(chains[0]);
+            if !chains.contains(&chain) {
+                return Err(format!(
+                    "{label} runs on {}, not {chain}",
+                    chains.join(", ")
+                ));
+            }
+            let kind = if matches!(kind, "lnd" | "bark") {
+                "lightning"
+            } else {
+                kind
+            };
+            match chain {
+                "mainnet" => kind.to_string(),
+                chain => format!("{kind}::{chain}"),
+            }
+        }
+    };
+    NetworkId::parse(&spec)
+}
+
+fn kind_names() -> String {
+    KINDS.map(|(name, ..)| name).join(", ")
+}
+
+/// Adds the network [`new_network_id`] describes, with the fields of
+/// [`network`] and the backend its kind says.
+pub fn add_network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
+    if doc
+        .get("networks")
+        .and_then(Item::as_table_like)
+        .is_some_and(|networks| networks.contains_key(&id.0))
+    {
+        return Err(format!("{id} is added already"));
+    }
+    let mut args = Args(args.0.clone());
+    let kind = args.required("kind")?;
+    if matches!(kind.as_str(), "lnd" | "bark") {
+        args.0.insert("backend".into(), kind.into());
+    }
+    network(doc, id, &args)
+}
+
+/// Adds `id` if missing. Fields: `esplora_url`, `backend` (`lnd`,
+/// `bark` or `none`), and the `lnd_*` and `bark_*` fields of whichever
+/// backend the network has.
 pub fn network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
     let networks = child(doc.as_table_mut(), "networks", implicit_table)?;
     let network = child(networks, &id.0, toml_edit::table)?;
-    put_number(
-        network,
-        "max_incoming_lifetime_secs",
-        args.number("max_incoming_lifetime_secs")?,
-    )?;
     put_text(network, "esplora_url", args.text("esplora_url")?);
-    if let Some(maintenance) = args.flag("maintenance")? {
-        put(
-            network,
-            "maintenance",
-            maintenance.filter(|b| !b).map(Value::from),
-        );
-    }
     match args.text("backend")?.as_deref() {
         None => {}
         Some("" | "none") => {
@@ -205,7 +282,7 @@ pub fn remove_network(doc: &mut DocumentMut, id: &NetworkId) -> Result<(), Strin
 
 /// Adds `from -> to` if missing, at the default fees unless given.
 /// Fields: `fee_base_msat`, `fee_ppm`, `transit_slack_secs`,
-/// `nostr_relays`, `test_money` (`inherit` for the default).
+/// `max_incoming_lifetime_secs`, `test_money`.
 pub fn route(
     doc: &mut DocumentMut,
     from: &NetworkId,
@@ -241,9 +318,17 @@ pub fn route(
         "transit_slack_secs",
         args.number("transit_slack_secs")?,
     )?;
-    put_list(route, "nostr_relays", args.list("nostr_relays")?);
+    put_number(
+        route,
+        "max_incoming_lifetime_secs",
+        args.number("max_incoming_lifetime_secs")?,
+    )?;
     if let Some(test_money) = args.flag("test_money")? {
-        put(route, "test_money", test_money.map(Value::from));
+        put(
+            route,
+            "test_money",
+            test_money.filter(|b| *b).map(Value::from),
+        );
     }
     Ok(())
 }
@@ -341,17 +426,23 @@ fn child<'a>(
         .ok_or_else(|| format!("{key} is not a table"))
 }
 
-/// Sets or removes `key`, keeping the comments around its old value.
+/// Sets or removes `key`, keeping the comments around its old value
+/// and above its key.
 fn put(table: &mut dyn TableLike, key: &str, value: Option<Value>) {
     let Some(value) = value else {
         table.remove(key);
         return;
     };
     let mut value = toml_value(value);
-    if let Some(old) = table.get(key).and_then(Item::as_value) {
-        *value.decor_mut() = old.decor().clone();
+    match table.get_mut(key).and_then(Item::as_value_mut) {
+        Some(old) => {
+            *value.decor_mut() = old.decor().clone();
+            *old = value;
+        }
+        None => {
+            table.insert(key, Item::Value(value));
+        }
     }
-    table.insert(key, Item::Value(value));
 }
 
 fn put_text(table: &mut dyn TableLike, key: &str, change: Option<String>) {
@@ -425,20 +516,45 @@ mod tests {
             &mut doc,
             &from,
             &to,
-            &args(json!({"fee_base_msat": "7", "nostr_relays": "wss://a, wss://b"})),
+            &args(json!({"fee_base_msat": "7", "max_incoming_lifetime_secs": 600, "test_money": true})),
         )
         .unwrap();
         let text = doc.to_string();
         assert!(text.contains("# top\n"));
         assert!(text.contains("fee_base_msat = 7 # base\n"));
         assert!(text.contains("fee_ppm = 2\n"));
-        assert!(text.contains("nostr_relays = [\"wss://a\", \"wss://b\"]"));
+        assert!(text.contains("max_incoming_lifetime_secs = 600\n"));
+        assert!(text.contains("test_money = true\n"));
         // Empty unsets what is optional, and is refused for what is not.
-        route(&mut doc, &from, &to, &args(json!({"nostr_relays": ""}))).unwrap();
-        assert!(!doc.to_string().contains("nostr_relays"));
+        route(
+            &mut doc,
+            &from,
+            &to,
+            &args(json!({"max_incoming_lifetime_secs": "", "test_money": false})),
+        )
+        .unwrap();
+        assert!(!doc.to_string().contains("max_incoming_lifetime_secs"));
+        assert!(!doc.to_string().contains("test_money"));
         assert!(route(&mut doc, &from, &to, &args(json!({"fee_ppm": null}))).is_err());
         remove_route(&mut doc, &from, &to).unwrap();
         assert!(!doc.to_string().contains("[[routes]]"));
+    }
+
+    #[test]
+    fn rewritten_keys_keep_the_comments_above_them() {
+        let mut doc: DocumentMut =
+            "# about the file\n\n# relays\nnostr_relays = [\"wss://a\"]\nmnemonic = \"x\"\n"
+                .parse()
+                .unwrap();
+        settings(
+            &mut doc,
+            &args(json!({"nostr_relays": "wss://b", "name": "r"})),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.to_string(),
+            "# about the file\n\n# relays\nnostr_relays = [\"wss://b\"]\nmnemonic = \"x\"\nname = \"r\"\n"
+        );
     }
 
     #[test]
@@ -447,19 +563,38 @@ mod tests {
         let lightning = id("lightning");
         let lnd = json!({"backend": "lnd", "lnd_rest_url": "https://127.0.0.1:8080", "bark_server_url": "ignored"});
         network(&mut doc, &lightning, &args(lnd)).unwrap();
-        network(
-            &mut doc,
-            &id("cashu::mint.example"),
-            &args(json!({"maintenance": false})),
-        )
-        .unwrap();
+        let cashu = args(json!({"kind": "cashu", "mint": "https://mint.example/"}));
+        let cashu_id = new_network_id(&cashu).unwrap();
+        assert_eq!(cashu_id, id("cashu::mint.example"));
+        add_network(&mut doc, &cashu_id, &cashu).unwrap();
+        assert!(add_network(&mut doc, &cashu_id, &cashu).is_err());
         assert_eq!(
             doc.to_string(),
-            "[networks.lightning]\nlnd = { rest_url = \"https://127.0.0.1:8080\" }\n\n[networks.\"cashu::mint.example\"]\nmaintenance = false\n"
+            "[networks.lightning]\nlnd = { rest_url = \"https://127.0.0.1:8080\" }\n\n[networks.\"cashu::mint.example\"]\n"
         );
         network(&mut doc, &lightning, &args(json!({"backend": "bark"}))).unwrap();
         assert!(doc.to_string().contains("bark = {}"));
         assert!(!doc.to_string().contains("lnd"));
+    }
+
+    #[test]
+    fn new_network_ids() {
+        let new = |payload| new_network_id(&args(payload));
+        if cfg!(feature = "arkade") {
+            assert_eq!(new(json!({"kind": "arkade"})), Ok(id("arkade")));
+            assert_eq!(
+                new(json!({"kind": "arkade", "chain": "mutinynet"})),
+                Ok(id("arkade::mutinynet"))
+            );
+            assert!(new(json!({"kind": "arkade", "chain": "regtest"})).is_err());
+        }
+        if cfg!(feature = "bark-lightning") {
+            assert_eq!(
+                new(json!({"kind": "bark", "chain": "signet"})),
+                Ok(id("lightning::signet"))
+            );
+        }
+        assert!(new(json!({"kind": "dogecoin"})).is_err());
     }
 
     #[test]

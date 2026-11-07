@@ -16,6 +16,7 @@ rootstock = ["cassis-networks/rootstock"]
 
 [dependencies]
 axum = { workspace = true }
+base64 = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
 clap = { workspace = true, features = ["env"] }

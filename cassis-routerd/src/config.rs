@@ -6,13 +6,11 @@
 //! mnemonic = "twelve words ..."    # every key derives from it, unless set below
 //! # iroh_secret = "<hex>"          # identity of the cassis-hop endpoint
 //! # nostr_secret = "nsec1..."      # node key: signs route announcements
-//! nostr_relays = ["wss://nostr.wine"]  # for routes that name none
-//! test_money = false               # default of every route
+//! # name = "My router"             # published as its profile; else its autoname
+//! nostr_relays = ["wss://nostr.wine"]  # where routes are announced
 //!
 //! [networks."cashu::mint.example"]
 //! # secret = "<hex>"               # wallet key on this network
-//! # max_incoming_lifetime_secs = 3600
-//! # maintenance = false            # skip the wallet's upkeep
 //!
 //! [networks.lightning]
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
@@ -24,7 +22,7 @@
 //! fee_base_msat = 1000
 //! fee_ppm = 500
 //! # transit_slack_secs = 60
-//! # nostr_relays = ["wss://relay.example"]
+//! # max_incoming_lifetime_secs = 3600  # below what the `from` network allows
 //! # test_money = true
 //!
 //! [admin]
@@ -35,7 +33,7 @@
 
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{RouteOffer, RoutingPolicy};
-use cassis_core::routing::{DEFAULT_NOSTR_RELAYS, DEFAULT_TRANSIT_SLACK_SECS, TEST_NOSTR_RELAYS};
+use cassis_core::routing::{DEFAULT_NOSTR_RELAYS, DEFAULT_TRANSIT_SLACK_SECS};
 use cassis_core::NetworkId;
 use cassis_networks::NetworkSettings;
 use serde::Deserialize;
@@ -55,11 +53,12 @@ pub struct Config {
     pub iroh_secret: Option<String>,
     /// Node key (`nsec1...` or hex), instead of the mnemonic's.
     pub nostr_secret: Option<String>,
-    /// Relays of routes that name none; the test relays when
-    /// `test_money` and unset, else the default ones.
-    pub nostr_relays: Option<Vec<String>>,
-    #[serde(default)]
-    pub test_money: bool,
+    /// Published as the router's profile name; without it, payers and
+    /// explorers show its autoname.
+    pub name: Option<String>,
+    /// Relays every route is announced on.
+    #[serde(default = "default_relays")]
+    pub nostr_relays: Vec<String>,
     #[serde(default = "default_max_reservations")]
     pub max_reservations: usize,
     #[serde(default)]
@@ -118,12 +117,8 @@ impl AdminConfig {
 pub struct NetworkConfig {
     /// Hex wallet key on this network, instead of the mnemonic's.
     pub secret: Option<String>,
-    pub max_incoming_lifetime_secs: Option<u64>,
     /// Chain API of `arkade` and `bitcoin`, instead of the public one.
     pub esplora_url: Option<String>,
-    /// Run the wallet's upkeep (e.g. refreshing arkade VTXOs).
-    #[serde(default = "yes")]
-    pub maintenance: bool,
     /// The LND node of a `lightning` network.
     pub lnd: Option<LndConfig>,
     /// The Ark server of a `lightning` network going through bark.
@@ -157,8 +152,12 @@ pub struct RouteConfig {
     pub fee_ppm: u64,
     #[serde(default = "default_transit_slack")]
     pub transit_slack_secs: u64,
-    pub nostr_relays: Option<Vec<String>>,
-    pub test_money: Option<bool>,
+    /// Longest an incoming HTLC may run, when shorter than what the
+    /// `from` network allows.
+    pub max_incoming_lifetime_secs: Option<u64>,
+    /// Mark the route's announcement as test money.
+    #[serde(default)]
+    pub test_money: bool,
 }
 
 fn default_max_reservations() -> usize {
@@ -167,6 +166,13 @@ fn default_max_reservations() -> usize {
 
 fn default_transit_slack() -> u64 {
     DEFAULT_TRANSIT_SLACK_SECS
+}
+
+fn default_relays() -> Vec<String> {
+    DEFAULT_NOSTR_RELAYS
+        .iter()
+        .map(|relay| relay.to_string())
+        .collect()
 }
 
 fn default_admin_listen() -> String {
@@ -210,6 +216,17 @@ impl Config {
     fn check(&self) -> Result<(), String> {
         self.keys()?;
         self.admin.listen_addr()?;
+        if self.nostr_relays.is_empty() {
+            return Err("nostr_relays: routes need a relay to be announced on".into());
+        }
+        for (at, relay) in self.nostr_relays.iter().enumerate() {
+            if !(relay.starts_with("wss://") || relay.starts_with("ws://")) {
+                return Err(format!("nostr_relays {relay}: expected a wss:// URL"));
+            }
+            if self.nostr_relays[..at].contains(relay) {
+                return Err(format!("nostr_relays {relay}: listed twice"));
+            }
+        }
         for peer in &self.admin.peers {
             parse_secret(peer).map_err(|e| format!("admin.peers {peer}: {e}"))?;
         }
@@ -254,18 +271,6 @@ impl Config {
         Ok(keys)
     }
 
-    /// Relays of routes that name none.
-    pub fn default_relays(&self) -> Vec<String> {
-        self.nostr_relays.clone().unwrap_or_else(|| {
-            let relays = if self.test_money {
-                TEST_NOSTR_RELAYS
-            } else {
-                DEFAULT_NOSTR_RELAYS
-            };
-            relays.iter().map(|relay| relay.to_string()).collect()
-        })
-    }
-
     pub fn routing_policy(&self) -> Result<RoutingPolicy, String> {
         let routes = self
             .routes
@@ -277,17 +282,15 @@ impl Config {
                     fee_base_msat: route.fee_base_msat,
                     fee_ppm: route.fee_ppm,
                     transit_slack_secs: route.transit_slack_secs,
-                    nostr_relays: route
-                        .nostr_relays
-                        .clone()
-                        .unwrap_or_else(|| self.default_relays()),
-                    test_money: route.test_money.unwrap_or(self.test_money),
+                    nostr_relays: self.nostr_relays.clone(),
+                    max_incoming_lifetime_secs: route.max_incoming_lifetime_secs,
+                    test_money: route.test_money,
                 })
             })
             .collect::<Result<_, String>>()?;
         Ok(RoutingPolicy {
             routes,
-            cleanup_relays: self.default_relays(),
+            cleanup_relays: self.nostr_relays.clone(),
             max_reservations: self.max_reservations,
             ..RoutingPolicy::default()
         })
@@ -336,7 +339,7 @@ impl Config {
         Ok(NetworkSettings {
             secret,
             dir: cassis_networks::network_dir(dir, network),
-            max_incoming_lifetime_secs: config.max_incoming_lifetime_secs,
+            max_incoming_lifetime_secs: None,
             esplora_url: config.esplora_url.clone(),
             #[cfg(feature = "lightning")]
             lnd: config.lnd.as_ref().map(|lnd| {
@@ -419,11 +422,9 @@ fn write_new(path: &Path) -> Result<(), String> {
 # iroh_secret = "<64 hex>"
 # nostr_secret = "nsec1..."
 #
-# Relays of routes that name none (default: wss://nostr.wine, or the
-# test relays with test_money). The router also deletes its stale
-# announcements from them.
-# nostr_relays = ["wss://nostr.wine"]
-# test_money = false
+# The name published as the router's profile (else it goes by the
+# autoname derived from its key):
+# name = "My router"
 #
 # One table per network to open, e.g.:
 # [networks."cashu::mint.example"]
@@ -437,6 +438,7 @@ fn write_new(path: &Path) -> Result<(), String> {
 # to = "arkade"
 # fee_base_msat = 1000
 # fee_ppm = 500
+# test_money = true
 #
 # The admin interface: open over HTTP on loopback, and over iroh to the
 # renderers listed in peers (or paired with the link printed on start).
@@ -445,8 +447,15 @@ fn write_new(path: &Path) -> Result<(), String> {
 # iroh = true
 # peers = []
 
+# Relays every route is announced on.
+nostr_relays = [{relays}]
 mnemonic = "{mnemonic}"
 "#,
+        relays = DEFAULT_NOSTR_RELAYS
+            .iter()
+            .map(|relay| format!("{relay:?}"))
+            .collect::<Vec<_>>()
+            .join(", "),
         mnemonic = generate_mnemonic()
     );
     file.write_all(template.as_bytes())

@@ -3,34 +3,43 @@
 //! and send actions whose payloads name it too; what a form edits is in
 //! its draft, the signal `d.<draft>` (see [`drafts`]).
 
-use super::{Access, Running};
-use crate::config::{Config, NetworkConfig};
+use super::edit::{chains, KINDS};
+use super::{Access, Nostr, Running};
+use crate::config::{Config, NetworkConfig, RouteConfig};
 use cassis_core::node::{HopRecord, HopState};
-use cassis_core::routing::{DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
+use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
 use hypereffect::vtree::{
     badge, button, card, checkbox, column, input, list, notice, row, select, tab, tabs, text, Node,
 };
 use hypereffect::{cel, json, Handler, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 /// What the page shows, besides the config.
 pub struct Context<'a> {
     pub config: &'a Config,
     pub running: &'a Running,
-    /// Networks the node has open.
-    pub open: Vec<NetworkId>,
+    /// The name the router goes by: its own, else its autoname.
+    pub name: String,
+    pub autoname: String,
+    /// Networks the node has open, with the longest an incoming HTLC
+    /// may run on each.
+    pub open: BTreeMap<String, Option<u64>>,
     pub hops: Vec<HopRecord>,
     pub node_pubkey: String,
     pub iroh_peer_id: String,
     pub http_url: Option<String>,
     pub iroh_url: Option<String>,
     pub pairing_link: Option<String>,
+    pub nostr: &'a Nostr,
+    /// Unix seconds.
+    pub now: u64,
 }
 
 impl Context<'_> {
     fn is_open(&self, id: &str) -> bool {
-        self.open.iter().any(|open| open.0 == id)
+        self.open.contains_key(id)
     }
 
     /// What a restart would change.
@@ -55,6 +64,15 @@ impl Context<'_> {
         }
         pending
     }
+
+    /// What a route's incoming lifetime is when it sets none.
+    fn lifetime_default(&self, from: &str) -> String {
+        match self.open.get(from) {
+            Some(Some(secs)) => format!("{secs}, the most {from} allows"),
+            Some(None) => format!("no limit: {from} sets none now"),
+            None => format!("what {from} allows once open"),
+        }
+    }
 }
 
 /// The signal path segment of the draft of a network's form.
@@ -77,8 +95,8 @@ pub fn drafts(config: &Config) -> Map<String, Value> {
     drafts.insert(
         "settings".into(),
         json!({
-            "nostr_relays": config.nostr_relays.as_deref().map(join).unwrap_or_default(),
-            "test_money": config.test_money,
+            "name": config.name.clone().unwrap_or_default(),
+            "nostr_relays": config.nostr_relays.join(" "),
             "max_reservations": config.max_reservations,
         }),
     );
@@ -90,20 +108,7 @@ pub fn drafts(config: &Config) -> Map<String, Value> {
         drafts.insert(network_draft(id), network_values(network));
     }
     for route in &config.routes {
-        drafts.insert(
-            route_draft(&route.from, &route.to),
-            json!({
-                "fee_base_msat": route.fee_base_msat,
-                "fee_ppm": route.fee_ppm,
-                "transit_slack_secs": route.transit_slack_secs,
-                "nostr_relays": route.nostr_relays.as_deref().map(join).unwrap_or_default(),
-                "test_money": match route.test_money {
-                    None => "inherit",
-                    Some(true) => "true",
-                    Some(false) => "false",
-                },
-            }),
-        );
+        drafts.insert(route_draft(&route.from, &route.to), route_values(route));
     }
     drafts
 }
@@ -119,9 +124,7 @@ fn network_values(network: &NetworkConfig) -> Value {
     let lnd = network.lnd.as_ref();
     let bark = network.bark.as_ref();
     json!({
-        "max_incoming_lifetime_secs": network.max_incoming_lifetime_secs,
         "esplora_url": text(&network.esplora_url),
-        "maintenance": network.maintenance,
         "backend": if lnd.is_some() { "lnd" } else if bark.is_some() { "bark" } else { "none" },
         "lnd_rest_url": lnd.map(|lnd| lnd.rest_url.clone()).unwrap_or_default(),
         "lnd_tls_cert_path": path(&lnd.and_then(|lnd| lnd.tls_cert_path.clone())),
@@ -131,23 +134,50 @@ fn network_values(network: &NetworkConfig) -> Value {
     })
 }
 
+fn route_values(route: &RouteConfig) -> Value {
+    json!({
+        "fee_base_msat": route.fee_base_msat,
+        "fee_ppm": route.fee_ppm,
+        "transit_slack_secs": route.transit_slack_secs,
+        "max_incoming_lifetime_secs": route.max_incoming_lifetime_secs,
+        "test_money": route.test_money,
+    })
+}
+
 /// The drafts of the forms that add to the config, empty.
 pub fn new_drafts(config: &Config) -> Map<String, Value> {
     let mut ids = config.networks.keys();
     let from = ids.next().cloned().unwrap_or_default();
     let to = ids.next().cloned().unwrap_or_default();
     let mut drafts = Map::new();
-    drafts.insert("new_network".into(), json!({"id": ""}));
+    drafts.insert(
+        "new_network".into(),
+        json!({
+            "kind": "",
+            "chain": "",
+            "mint": "",
+            "invite": "",
+            "esplora_url": "",
+            "lnd_rest_url": "",
+            "lnd_tls_cert_path": "",
+            "lnd_macaroon_path": "",
+            "bark_server_url": "",
+            "bark_esplora_url": "",
+        }),
+    );
     drafts.insert(
         "new_route".into(),
-        json!({"from": from, "to": to, "fee_base_msat": 1000, "fee_ppm": 500}),
+        json!({
+            "from": from,
+            "to": to,
+            "fee_base_msat": 1000,
+            "fee_ppm": 500,
+            "max_incoming_lifetime_secs": null,
+            "test_money": false,
+        }),
     );
     drafts.insert("new_peer".into(), json!({"key": ""}));
     drafts
-}
-
-fn join(items: &[String]) -> String {
-    items.join(" ")
 }
 
 /// A button sending `name` with `payload`, disabled while an action of
@@ -184,6 +214,11 @@ fn options<'a>(items: impl IntoIterator<Item = (&'a str, &'a str)>) -> Value {
     )
 }
 
+/// A CEL string literal.
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 /// A label over a value to copy.
 fn fact(id: &str, label: &str, value: impl Into<String>) -> Node {
     column(id).gap("none").children([
@@ -192,6 +227,24 @@ fn fact(id: &str, label: &str, value: impl Into<String>) -> Node {
             .variant("code")
             .text(value.into()),
     ])
+}
+
+/// How long ago `then` was, coarsely.
+fn ago(now: u64, then: u64) -> String {
+    match now.saturating_sub(then) {
+        0..=59 => "just now".into(),
+        secs @ 60..=3_599 => format!("{} min ago", secs / 60),
+        secs @ 3_600..=86_399 => format!("{} h ago", secs / 3_600),
+        secs => format!("{} days ago", secs / 86_400),
+    }
+}
+
+/// `from → to` of a `d` tag.
+fn hop_name(d_tag: &str) -> String {
+    match d_tag.split_once("->") {
+        Some((from, to)) => format!("{from} → {to}"),
+        None => d_tag.to_string(),
+    }
 }
 
 /// The page `access` gets.
@@ -206,11 +259,11 @@ pub fn page(
         Err(error) => notice("result").variant("failure").text(error.as_str()),
     });
     if !allowed {
-        return vec![locked(access, flash)];
+        return vec![locked(ctx, access, flash)];
     }
     let pending = ctx.pending();
     let header = row("header").justify("between").children([
-        text("title").variant("h1").text("Cassis router"),
+        title(ctx),
         act("daemon/restart", "Restart", "daemon.restart", json!({})).variant(
             if pending.is_empty() {
                 "secondary"
@@ -238,28 +291,33 @@ pub fn page(
         ]))]
 }
 
-fn locked(access: &Access, flash: Option<Node>) -> Node {
+fn title(ctx: &Context) -> Node {
+    column("title").gap("none").children([
+        text("title/name").variant("h1").text(ctx.name.as_str()),
+        text("title/what").variant("caption").text("Cassis router"),
+    ])
+}
+
+fn locked(ctx: &Context, access: &Access, flash: Option<Node>) -> Node {
     let key = match access {
         Access::Local => "",
         Access::Peer(key) => key.as_str(),
     };
-    column("page")
-        .child(text("title").variant("h1").text("Cassis router"))
-        .children(flash)
-        .children([
-            notice("locked")
-                .variant("warning")
-                .title("Not let in")
-                .text(
-                    "This router does not know your key. Open the pairing link it prints on its \
+    column("page").child(title(ctx)).children(flash).children([
+        notice("locked")
+            .variant("warning")
+            .title("Not let in")
+            .text(
+                "This router does not know your key. Open the pairing link it prints on its \
              console, or add your key from its admin page on its own machine.",
-                ),
-            fact("locked/key", "Your key", key),
-        ])
+            ),
+        fact("locked/key", "Your key", key),
+    ])
 }
 
 fn overview(ctx: &Context) -> Node {
     let identity = card("identity").title("Identity").children([
+        fact("identity/name", "Name", &ctx.name),
         fact(
             "identity/node",
             "Node key (signs route announcements)",
@@ -327,15 +385,9 @@ fn overview(ctx: &Context) -> Node {
                 .empty("No hop in flight.")
                 .children(active),
         );
-    let actions = row("overview/actions").child(act(
-        "routes/announce",
-        "Announce routes now",
-        "routes.announce",
-        json!({}),
-    ));
     tab("tab/overview")
         .label("Overview")
-        .children([identity, hops, actions])
+        .children([identity, hops])
 }
 
 fn networks(ctx: &Context) -> Node {
@@ -344,23 +396,121 @@ fn networks(ctx: &Context) -> Node {
         .networks
         .iter()
         .map(|(id, network)| network_card(ctx, id, network));
-    let add = card("network/new").title("Add a network").children([
-        field("network/new/id", "Network", "d.new_network.id")
-            .placeholder("cashu::mint.example, arkade, lightning, …"),
-        submit(
-            "network/new/add",
-            "Add",
-            "network.set",
-            json!({"draft": "new_network"}),
-            "s.d.new_network.id.trim() == ''",
-        ),
-    ]);
     tab("tab/networks").label("Networks").children([
         list("networks")
             .empty("No networks yet: add one below.")
             .children(cards),
-        add,
+        new_network(),
     ])
+}
+
+/// The picker of a network's kind, then what that kind needs.
+fn new_network() -> Node {
+    let kind_is = |kind: &str| format!("s.d.new_network.kind == {}", quote(kind));
+    let picker = KINDS.iter().map(|(kind, label, built)| {
+        let chain = chains(kind).first().copied().unwrap_or_default();
+        button(format!("network/new/kind/{kind}"))
+            .label(*label)
+            .variant(cel(format!("{} ? 'primary' : 'secondary'", kind_is(kind))))
+            .disabled(!built)
+            .on_press(Handler::patch(
+                json!({"d": {"new_network": {"kind": kind, "chain": chain}}}),
+            ))
+    });
+    let missing = KINDS.iter().any(|(.., built)| !built).then(|| {
+        text("network/new/missing")
+            .variant("caption")
+            .text("Greyed out: not compiled into this build.")
+    });
+    let details = KINDS.iter().map(|(kind, _, _)| {
+        let el = |part: &str| format!("network/new/{kind}/{part}");
+        let d = |field: &str| format!("d.new_network.{field}");
+        let chains = chains(kind);
+        let chain = (!chains.is_empty()).then(|| {
+            select(el("chain"))
+                .label("Chain")
+                .variant("segmented")
+                .bind(d("chain"))
+                .options(options(
+                    chains.iter().map(|chain| (*chain, chain_label(chain))),
+                ))
+        });
+        let fields: Vec<Node> = match *kind {
+            "cashu" => {
+                vec![field(el("mint"), "Mint URL", &d("mint")).placeholder("https://mint.example")]
+            }
+            "fedimint" => {
+                vec![field(el("invite"), "Invite code", &d("invite")).placeholder("fed1…")]
+            }
+            "arkade" | "bitcoin" => {
+                vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
+                    .placeholder("the public one")]
+            }
+            "lnd" => lnd_fields(&el, &d),
+            "bark" => bark_fields(&el, &d),
+            _ => Vec::new(),
+        };
+        column(format!("network/new/{kind}"))
+            .visible(cel(kind_is(kind)))
+            .children(chain)
+            .children(fields)
+    });
+    card("network/new")
+        .title("Add a network")
+        .child(row("network/new/kinds").wrap(true).children(picker))
+        .children(missing)
+        .children(details)
+        .child(submit(
+            "network/new/add",
+            "Add",
+            "network.add",
+            json!({"draft": "new_network"}),
+            "s.d.new_network.kind == '' \
+             || (s.d.new_network.kind == 'cashu' && s.d.new_network.mint.trim() == '') \
+             || (s.d.new_network.kind == 'fedimint' && s.d.new_network.invite.trim() == '')",
+        ))
+}
+
+fn chain_label(chain: &str) -> &str {
+    match chain {
+        "mainnet" => "Mainnet",
+        "mutinynet" => "Mutinynet",
+        "signet" => "Signet",
+        "testnet" => "Testnet",
+        "regtest" => "Regtest",
+        other => other,
+    }
+}
+
+/// The inputs of an LND node, under element ids from `el` and signal
+/// paths from `d`.
+fn lnd_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
+    vec![
+        field(el("lnd_rest_url"), "LND REST URL", &d("lnd_rest_url"))
+            .placeholder("https://127.0.0.1:8080"),
+        field(
+            el("lnd_tls_cert_path"),
+            "TLS certificate",
+            &d("lnd_tls_cert_path"),
+        )
+        .placeholder("/path/to/tls.cert"),
+        field(el("lnd_macaroon_path"), "Macaroon", &d("lnd_macaroon_path"))
+            .placeholder("/path/to/admin.macaroon"),
+    ]
+}
+
+/// The inputs of an Ark server for bark, like [`lnd_fields`].
+fn bark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
+    vec![
+        field(el("bark_server_url"), "Ark server", &d("bark_server_url"))
+            .placeholder("Second's server"),
+        field(
+            el("bark_esplora_url"),
+            "Esplora URL",
+            &d("bark_esplora_url"),
+        )
+        .placeholder("the default one"),
+    ]
 }
 
 fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
@@ -379,85 +529,43 @@ fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
     } else {
         ("warning", "not open".to_string())
     };
-    let esplora = matches!(kind, "arkade" | "bitcoin").then(|| {
-        field(el("esplora_url"), "Esplora URL", &d("esplora_url")).placeholder("the public one")
-    });
-    let lightning = (kind == "lightning").then(|| {
-        let backend = |name: &str| cel(format!("s.d.{draft}.backend == '{name}'"));
-        column(el("backend-settings")).children([
-            select(el("backend"))
-                .label("Backend")
-                .variant("segmented")
-                .bind(d("backend"))
-                .options(options([
-                    ("lnd", "LND"),
-                    ("bark", "Bark"),
-                    ("none", "None"),
-                ])),
-            column(el("lnd")).visible(backend("lnd")).children([
-                field(el("lnd_rest_url"), "LND REST URL", &d("lnd_rest_url"))
-                    .placeholder("https://127.0.0.1:8080"),
-                field(
-                    el("lnd_tls_cert_path"),
-                    "TLS certificate",
-                    &d("lnd_tls_cert_path"),
-                ),
-                field(el("lnd_macaroon_path"), "Macaroon", &d("lnd_macaroon_path")),
-            ]),
-            column(el("bark")).visible(backend("bark")).children([
-                field(el("bark_server_url"), "Ark server", &d("bark_server_url"))
-                    .placeholder("Second's server"),
-                field(
-                    el("bark_esplora_url"),
-                    "Esplora URL",
-                    &d("bark_esplora_url"),
-                )
-                .placeholder("the default one"),
-            ]),
-        ])
-    });
-    let maintain = ctx.is_open(id).then(|| {
-        act(
-            el("maintain"),
-            "Run upkeep now",
-            "network.maintain",
-            json!({"id": id}),
+    let fields: Vec<Node> = match kind {
+        "arkade" | "bitcoin" => vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
+            .placeholder("the public one")],
+        "lightning" => {
+            let backend = |name: &str| cel(format!("s.d.{draft}.backend == '{name}'"));
+            vec![
+                select(el("backend"))
+                    .label("Through")
+                    .variant("segmented")
+                    .bind(d("backend"))
+                    .options(options([("lnd", "LND"), ("bark", "Bark")])),
+                column(el("lnd"))
+                    .visible(backend("lnd"))
+                    .children(lnd_fields(&el, &d)),
+                column(el("bark"))
+                    .visible(backend("bark"))
+                    .children(bark_fields(&el, &d)),
+            ]
+        }
+        _ => Vec::new(),
+    };
+    let save = (!fields.is_empty()).then(|| {
+        submit(
+            el("save"),
+            "Save",
+            "network.set",
+            json!({"draft": draft, "id": id}),
+            "false",
         )
     });
     card(format!("network/{id}"))
         .title(id)
         .child(badge(el("status")).variant(variant).text(status))
-        .child(
-            number(
-                el("max_incoming_lifetime_secs"),
-                "Longest incoming HTLC (seconds)",
-                &d("max_incoming_lifetime_secs"),
-            )
-            .placeholder("no limit"),
-        )
-        .children(esplora)
-        .child(
-            checkbox(el("maintenance"))
-                .variant("switch")
-                .label("Wallet upkeep")
-                .bind(d("maintenance")),
-        )
-        .children(lightning)
-        .child(
-            row(el("actions"))
-                .child(submit(
-                    el("save"),
-                    "Save",
-                    "network.set",
-                    json!({"draft": draft, "id": id}),
-                    "false",
-                ))
-                .children(maintain)
-                .child(
-                    act(el("remove"), "Remove", "network.remove", json!({"id": id}))
-                        .variant("failure"),
-                ),
-        )
+        .children(fields)
+        .child(row(el("actions")).children(save).child(
+            act(el("remove"), "Remove", "network.remove", json!({"id": id})).variant("failure"),
+        ))
 }
 
 fn routes(ctx: &Context) -> Node {
@@ -473,11 +581,11 @@ fn routes(ctx: &Context) -> Node {
             .map(String::as_str)
             .collect();
         let status = if closed.is_empty() {
-            badge(el("status")).variant("success").text("announced")
+            badge(el("status")).variant("success").text("routed")
         } else {
             badge(el("status"))
                 .variant("warning")
-                .text(format!("not announced: {} not open", closed.join(" and ")))
+                .text(format!("not routed: {} not open", closed.join(" and ")))
         };
         card(format!("route/{from}/{to}"))
             .title(format!("{from} → {to}"))
@@ -489,23 +597,8 @@ fn routes(ctx: &Context) -> Node {
                     "Transit slack (seconds)",
                     &d("transit_slack_secs"),
                 ),
-                field(el("nostr_relays"), "Relays", &d("nostr_relays"))
-                    .placeholder(join(&config.default_relays())),
-                select(el("test_money"))
-                    .label("Test money")
-                    .bind(d("test_money"))
-                    .options(options([
-                        (
-                            "inherit",
-                            if config.test_money {
-                                "As in settings (yes)"
-                            } else {
-                                "As in settings (no)"
-                            },
-                        ),
-                        ("true", "Yes"),
-                        ("false", "No"),
-                    ])),
+                lifetime(&el(""), &d("")).placeholder(ctx.lifetime_default(from)),
+                test_money(&el(""), &d("")),
                 row(el("actions")).children([
                     submit(
                         el("save"),
@@ -530,6 +623,13 @@ fn routes(ctx: &Context) -> Node {
             .title("Add a route")
             .child(text("route/new/help").text("A route needs two networks: add them first."))
     } else {
+        // The default of the network picked, without a round trip.
+        let defaults = config
+            .networks
+            .keys()
+            .map(|id| format!("{}: {}", quote(id), quote(&ctx.lifetime_default(id))))
+            .collect::<Vec<_>>()
+            .join(", ");
         card("route/new").title("Add a route").children([
             row("route/new/ends").wrap(true).children([
                 select("route/new/from")
@@ -542,6 +642,9 @@ fn routes(ctx: &Context) -> Node {
                     .options(networks),
             ]),
             fees("route/new/", "d.new_route."),
+            lifetime("route/new/", "d.new_route.")
+                .placeholder(cel(format!("{{{defaults}}}[s.d.new_route.from]"))),
+            test_money("route/new/", "d.new_route."),
             submit(
                 "route/new/add",
                 "Add",
@@ -552,6 +655,7 @@ fn routes(ctx: &Context) -> Node {
         ])
     };
     tab("tab/routes").label("Routes").children([
+        announcements(ctx),
         list("routes")
             .empty("No routes: this router forwards nothing.")
             .children(cards),
@@ -573,6 +677,136 @@ fn fees(el: &str, d: &str) -> Node {
             "Proportional fee (ppm)",
             &format!("{d}fee_ppm"),
         ),
+    ])
+}
+
+/// A route's incoming lifetime input, like [`fees`].
+fn lifetime(el: &str, d: &str) -> Node {
+    number(
+        format!("{el}max_incoming_lifetime_secs"),
+        "Longest incoming HTLC (seconds)",
+        &format!("{d}max_incoming_lifetime_secs"),
+    )
+}
+
+/// A route's test money switch, like [`fees`].
+fn test_money(el: &str, d: &str) -> Node {
+    checkbox(format!("{el}test_money"))
+        .label("Test money: announce it as such")
+        .bind(format!("{d}test_money"))
+}
+
+/// What the relays keep of this router's announcements, and the button
+/// to announce again.
+fn announcements(ctx: &Context) -> Node {
+    let nostr = ctx.nostr;
+    let status = match (nostr.busy, nostr.checked_at) {
+        (Some(doing), _) => badge("announcements/status")
+            .variant("info")
+            .text(format!("{doing}…")),
+        (None, Some(at)) => badge("announcements/status")
+            .variant("info")
+            .text(format!("Relays checked {}", ago(ctx.now, at))),
+        (None, None) => badge("announcements/status")
+            .variant("info")
+            .text("Relays not checked yet"),
+    };
+    let relays = ctx.config.nostr_relays.iter().map(|relay| {
+        let el = |part: &str| format!("announcements/{relay}/{part}");
+        let found = nostr.found.get(relay);
+        let error = match found {
+            Some(Err(error)) => Some(badge(el("error")).variant("failure").text(error.as_str())),
+            _ => None,
+        };
+        let published = match found {
+            Some(Ok(published)) => published.as_slice(),
+            _ => &[],
+        };
+        let mut hops: Vec<Node> = Vec::new();
+        for route in &ctx.config.routes {
+            let d_tag = match (NetworkId::parse(&route.from), NetworkId::parse(&route.to)) {
+                (Ok(from), Ok(to)) => route_d_tag(&from, &to),
+                _ => continue,
+            };
+            let state = match published.iter().find(|p| p.d_tag == d_tag) {
+                Some(p) if ctx.now.saturating_sub(p.created_at) > ANNOUNCEMENT_MAX_AGE_SECS => (
+                    "warning",
+                    format!("expired: published {}", ago(ctx.now, p.created_at)),
+                ),
+                Some(p) => (
+                    "success",
+                    format!("published {}", ago(ctx.now, p.created_at)),
+                ),
+                None if !ctx.is_open(&route.from) || !ctx.is_open(&route.to) => {
+                    ("warning", "not announced: a network is not open".into())
+                }
+                None if found.is_some_and(|found| found.is_ok()) => ("warning", "not found".into()),
+                None => ("info", "not checked".into()),
+            };
+            hops.push(announced(&el(&d_tag), &d_tag, state));
+        }
+        for p in published {
+            let routed = ctx
+                .config
+                .routes
+                .iter()
+                .any(|route| format!("{}->{}", route.from, route.to) == p.d_tag);
+            if !routed {
+                let state = (
+                    "warning",
+                    format!(
+                        "not routed, deleted on the next announcement: published {}",
+                        ago(ctx.now, p.created_at)
+                    ),
+                );
+                hops.push(announced(&el(&p.d_tag), &p.d_tag, state));
+            }
+        }
+        column(format!("announcements/{relay}"))
+            .gap("small")
+            .child(
+                row(el("header"))
+                    .child(text(el("name")).variant("code").text(relay.as_str()))
+                    .children(error),
+            )
+            .child(
+                list(el("hops"))
+                    .empty("Nothing found on this relay.")
+                    .children(hops),
+            )
+    });
+    card("announcements")
+        .title("Announcements")
+        .child(text("announcements/help").variant("caption").text(
+            "Routes are announced on these relays when they change and every few hours; \
+             payers ignore announcements older than a day. Relays are set in Settings.",
+        ))
+        .child(status)
+        .children(relays)
+        .child(
+            row("announcements/actions").children([
+                act(
+                    "routes/announce",
+                    "Announce routes now",
+                    "routes.announce",
+                    json!({}),
+                )
+                .variant("primary"),
+                act(
+                    "announcements/check",
+                    "Check relays",
+                    "announcements.check",
+                    json!({}),
+                ),
+            ]),
+        )
+}
+
+/// One hop as a relay keeps it.
+fn announced(id: &str, d_tag: &str, (variant, state): (&str, String)) -> Node {
+    row(id).justify("between").wrap(true).children([
+        text(format!("{id}/hop")).text(hop_name(d_tag)),
+        badge(format!("{id}/state")).variant(variant).text(state),
     ])
 }
 
@@ -636,44 +870,6 @@ fn access_tab(ctx: &Context, access: &Access) -> Node {
             ),
         ]),
     ]);
-    tab("tab/access")
-        .label("Access")
-        .child(addresses)
-        .children(pairing)
-        .child(peers)
-}
-
-fn settings(ctx: &Context) -> Node {
-    let routing = card("settings").title("Routing").children([
-        field(
-            "settings/nostr_relays",
-            "Relays of routes that name none",
-            "d.settings.nostr_relays",
-        )
-        .placeholder(
-            if ctx.config.test_money {
-                TEST_NOSTR_RELAYS
-            } else {
-                DEFAULT_NOSTR_RELAYS
-            }
-            .join(" "),
-        ),
-        checkbox("settings/test_money")
-            .label("Test money, unless a route says otherwise")
-            .bind("d.settings.test_money"),
-        number(
-            "settings/max_reservations",
-            "Most hops reserved at once",
-            "d.settings.max_reservations",
-        ),
-        submit(
-            "settings/save",
-            "Save",
-            "settings.set",
-            json!({"draft": "settings"}),
-            "false",
-        ),
-    ]);
     let admin = card("admin").title("Admin interface").children([
         text("admin/help")
             .variant("caption")
@@ -695,7 +891,36 @@ fn settings(ctx: &Context) -> Node {
             "false",
         ),
     ]);
-    tab("tab/settings")
-        .label("Settings")
-        .children([routing, admin])
+    tab("tab/access")
+        .label("Access")
+        .child(addresses)
+        .children(pairing)
+        .child(peers)
+        .child(admin)
+}
+
+fn settings(ctx: &Context) -> Node {
+    let router = card("settings").title("Router").children([
+        field("settings/name", "Name", "d.settings.name")
+            .placeholder(format!("{}, from its key", ctx.autoname)),
+        field(
+            "settings/nostr_relays",
+            "Relays routes are announced on",
+            "d.settings.nostr_relays",
+        )
+        .placeholder("wss://relay.example …"),
+        number(
+            "settings/max_reservations",
+            "Most hops reserved at once",
+            "d.settings.max_reservations",
+        ),
+        submit(
+            "settings/save",
+            "Save",
+            "settings.set",
+            json!({"draft": "settings"}),
+            "false",
+        ),
+    ]);
+    tab("tab/settings").label("Settings").child(router)
 }

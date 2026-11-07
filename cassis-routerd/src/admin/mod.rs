@@ -12,37 +12,42 @@
 //! sent from anywhere, like API calls (`hypb action <address> <name>
 //! --payload <json>`):
 //!
-//! | action             | payload                                                   |
-//! | ------------------ | --------------------------------------------------------- |
-//! | `settings.set`     | `nostr_relays`, `test_money`, `max_reservations`          |
-//! | `admin.set`        | `listen`, `iroh`                                          |
-//! | `network.set`      | `id`, `max_incoming_lifetime_secs`, `esplora_url`, `maintenance`, `backend` (`lnd`, `bark`, `none`), `lnd_rest_url`, `lnd_tls_cert_path`, `lnd_macaroon_path`, `bark_server_url`, `bark_esplora_url` |
-//! | `network.remove`   | `id`                                                      |
-//! | `network.maintain` | `id`                                                      |
-//! | `route.set`        | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `nostr_relays`, `test_money` |
-//! | `route.remove`     | `from`, `to`                                              |
-//! | `routes.announce`  |                                                           |
-//! | `peer.add`         | `key`                                                     |
-//! | `peer.remove`      | `key`                                                     |
-//! | `pairing.rotate`   |                                                           |
-//! | `daemon.restart`   |                                                           |
+//! | action                | payload                                                   |
+//! | --------------------- | --------------------------------------------------------- |
+//! | `settings.set`        | `name`, `nostr_relays`, `max_reservations`                |
+//! | `admin.set`           | `listen`, `iroh`                                          |
+//! | `network.add`         | `kind` (`arkade`, `cashu`, `liquid`, `lnd`, `bark`, `fedimint`, `bitcoin`, `rootstock`), `chain`, `mint`, `invite`, and the fields of `network.set` but `id` and `backend` |
+//! | `network.set`         | `id`, `esplora_url`, `backend` (`lnd`, `bark`, `none`), `lnd_rest_url`, `lnd_tls_cert_path`, `lnd_macaroon_path`, `bark_server_url`, `bark_esplora_url` |
+//! | `network.remove`      | `id`                                                      |
+//! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `max_incoming_lifetime_secs`, `test_money` |
+//! | `route.remove`        | `from`, `to`                                              |
+//! | `routes.announce`     |                                                           |
+//! | `announcements.check` |                                                           |
+//! | `peer.add`            | `key`                                                     |
+//! | `peer.remove`         | `key`                                                     |
+//! | `pairing.rotate`      |                                                           |
+//! | `daemon.restart`      |                                                           |
 //!
 //! `*.set` actions add what they name if it is missing, and change only
 //! the fields given (see [`edit::Args`]); a form's payload names its
 //! `draft` instead of the fields it edits. Config changes are written
-//! right away: routing changes apply at once, networks and the admin
-//! section on restart. The outcome of an action is the `result` notice
-//! of the page of the session that sent it.
+//! right away: routing changes apply and are announced at once, networks
+//! and the admin section on restart. The outcome of an action is the
+//! `result` notice of the page of the session that sent it; announcing
+//! and checking the relays run in the background, and show in the
+//! announcements card of the Routes tab.
 
 mod edit;
 mod http;
+mod icon;
 mod iroh;
 mod view;
 
 use crate::config::{self, AdminConfig, Config, NetworkConfig};
 use cassis_core::node::Node;
+use cassis_core::routing::{autohue, autoname, fetch_published, Published};
 use cassis_core::store::Store;
-use cassis_core::NetworkId;
+use cassis_core::{unix_now, NetworkId};
 use edit::Args;
 use hypereffect::vtree;
 use hypereffect::{json, Action, Map, Metadata, RendererMessage, ServerMessage, Value};
@@ -57,6 +62,11 @@ use tracing::{info, warn};
 /// How often open pages are brought up to date with the hops and the
 /// config file.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// How long after start the relays are first checked, leaving time for
+/// the first announcement.
+const FIRST_CHECK_DELAY: Duration = Duration::from_secs(20);
+/// How often the relays are checked for this router's announcements.
+const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// What the daemon opened on start, which config changes apply to on
 /// restart only.
@@ -82,6 +92,7 @@ pub struct Admin {
     store: Arc<Store>,
     running: Running,
     state: Mutex<State>,
+    nostr: Mutex<Nostr>,
     sessions: Mutex<Vec<Arc<Session>>>,
     restart: Notify,
     http_url: OnceLock<String>,
@@ -98,6 +109,22 @@ struct State {
     pairing: String,
 }
 
+/// What the relays keep of this router's announcements.
+#[derive(Default)]
+pub struct Nostr {
+    /// What the background job is doing, if anything.
+    pub busy: Option<&'static str>,
+    /// Whether to run the job again when done, and to announce first.
+    queued: Option<bool>,
+    /// The name last published as the router's profile, if any was
+    /// since start.
+    published_name: Option<Option<String>>,
+    /// When the relays were last checked, in unix seconds.
+    pub checked_at: Option<u64>,
+    /// The router's announcements by relay, as last checked.
+    pub found: BTreeMap<String, Result<Vec<Published>, String>>,
+}
+
 pub struct Session {
     access: Access,
     out: mpsc::UnboundedSender<String>,
@@ -106,6 +133,8 @@ pub struct Session {
 
 #[derive(Default)]
 struct Shown {
+    /// The name in the metadata last sent.
+    name: String,
     tree: Vec<vtree::Node>,
     /// The outcome of the session's last action.
     flash: Option<Result<String, String>>,
@@ -147,6 +176,7 @@ impl Admin {
                 modified,
                 pairing: new_secret(),
             }),
+            nostr: Default::default(),
             sessions: Default::default(),
             restart: Notify::new(),
             http_url: OnceLock::new(),
@@ -186,6 +216,94 @@ impl Admin {
                 admin.refresh();
             }
         });
+        let admin = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(FIRST_CHECK_DELAY).await;
+            loop {
+                admin.nostr_job(false);
+                tokio::time::sleep(CHECK_INTERVAL).await;
+            }
+        });
+    }
+
+    /// The name the router goes by: its own, else its autoname.
+    fn name(&self, config: &Config) -> String {
+        config
+            .name
+            .clone()
+            .unwrap_or_else(|| autoname(&self.node.node_pubkey()))
+    }
+
+    /// The metadata of the page, under the router's name.
+    fn metadata(&self, name: &str) -> Metadata {
+        Metadata::new()
+            .name(format!("{name} (cassis router)"))
+            .description("Configure and run this Cassis router")
+            .icon(icon::square(autohue(&self.node.node_pubkey())))
+    }
+
+    /// Run the background job of the relays: publish the router's name
+    /// if it changed, announce its routes if `announce`, then check what
+    /// the relays keep. Asked while it runs, it runs again after.
+    fn nostr_job(self: &Arc<Self>, announce: bool) {
+        {
+            let mut nostr = lock(&self.nostr);
+            nostr.queued = Some(announce || nostr.queued == Some(true));
+            if nostr.busy.is_some() {
+                return;
+            }
+            nostr.busy = Some("Starting");
+        }
+        let admin = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let announce = {
+                    let mut nostr = lock(&admin.nostr);
+                    let Some(announce) = nostr.queued.take() else {
+                        nostr.busy = None;
+                        break;
+                    };
+                    nostr.busy = Some(if announce {
+                        "Announcing routes"
+                    } else {
+                        "Checking the relays"
+                    });
+                    announce
+                };
+                admin.refresh();
+                let config = lock(&admin.state).config.clone();
+                let relays = &config.nostr_relays;
+                let published = lock(&admin.nostr).published_name.clone();
+                // A router never named keeps its autoname, unpublished.
+                if published.as_ref() != Some(&config.name)
+                    && (published.is_some() || config.name.is_some())
+                {
+                    let accepted = admin
+                        .node
+                        .publish_name(relays, config.name.as_deref())
+                        .await;
+                    info!(
+                        "published the router's name to {accepted}/{} relay(s)",
+                        relays.len()
+                    );
+                    if accepted > 0 {
+                        lock(&admin.nostr).published_name = Some(config.name.clone());
+                    }
+                }
+                if announce {
+                    admin.node.announce().await;
+                }
+                let router = admin.node.node_pubkey();
+                let found = futures::future::join_all(
+                    relays.iter().map(|relay| fetch_published(relay, router)),
+                )
+                .await;
+                let mut nostr = lock(&admin.nostr);
+                nostr.found = relays.iter().cloned().zip(found).collect();
+                nostr.checked_at = Some(unix_now());
+            }
+            admin.refresh();
+        });
     }
 
     /// Resolves when `daemon.restart` is asked for.
@@ -222,9 +340,9 @@ impl Admin {
             out,
             shown: Default::default(),
         });
-        let mut metadata = Metadata::new()
-            .name("Cassis router")
-            .description("Configure and run this Cassis router");
+        let name = self.name(&lock(&self.state).config);
+        let mut metadata = self.metadata(&name);
+        lock(&session.shown).name = name;
         if let (Access::Peer(key), Some(secret)) = (&session.access, params.get("pair")) {
             match self.pair(key, secret) {
                 Ok(true) => lock(&session.shown).flash = Some(Ok("Paired: you are a peer".into())),
@@ -298,6 +416,11 @@ impl Admin {
                 self.edit(|doc| edit::settings(doc, args))?;
                 Ok("Settings saved".into())
             }
+            "network.add" => {
+                let id = edit::new_network_id(args)?;
+                self.edit(|doc| edit::add_network(doc, &id, args))?;
+                Ok(format!("{id} added: it opens on restart"))
+            }
             "admin.set" => {
                 self.edit(|doc| edit::admin(doc, args))?;
                 Ok("Admin interface settings saved".into())
@@ -312,15 +435,6 @@ impl Admin {
                 self.edit(|doc| edit::remove_network(doc, &id))?;
                 Ok(format!("{id} removed"))
             }
-            "network.maintain" => {
-                let id = network()?;
-                self.node
-                    .network(&id)?
-                    .maintain()
-                    .await
-                    .map_err(|e| format!("{id}: {e}"))?;
-                Ok(format!("{id} kept up"))
-            }
             "route.set" => {
                 let (from, to) = ends()?;
                 self.edit(|doc| edit::route(doc, &from, &to, args))?;
@@ -332,10 +446,12 @@ impl Admin {
                 Ok(format!("Route {from} → {to} removed"))
             }
             "routes.announce" => {
-                let config = lock(&self.state).config.clone();
-                self.node
-                    .set_routing(crate::routing_policy(&config, &self.store)?);
+                self.nostr_job(true);
                 Ok("Announcing routes".into())
+            }
+            "announcements.check" => {
+                self.nostr_job(false);
+                Ok("Checking the relays".into())
             }
             "peer.add" => {
                 let key = edit::peer_key(&args.required("key")?)?;
@@ -363,7 +479,7 @@ impl Admin {
 
     /// Let `key` in if `secret` is the pairing link's, replacing it.
     /// Whether `key` was let in.
-    fn pair(&self, key: &str, secret: &str) -> Result<bool, String> {
+    fn pair(self: &Arc<Self>, key: &str, secret: &str) -> Result<bool, String> {
         let mut state = lock(&self.state);
         if self.allowed(&state, &Access::Peer(key.to_string())) {
             return Ok(false);
@@ -379,7 +495,7 @@ impl Admin {
     }
 
     fn edit(
-        &self,
+        self: &Arc<Self>,
         change: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
     ) -> Result<(), String> {
         self.edit_locked(&mut lock(&self.state), change)
@@ -387,7 +503,7 @@ impl Admin {
 
     /// Change the config file, and apply what applies right away.
     fn edit_locked(
-        &self,
+        self: &Arc<Self>,
         state: &mut State,
         change: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
     ) -> Result<(), String> {
@@ -397,8 +513,9 @@ impl Admin {
         Ok(())
     }
 
-    /// Make `config` the current one, routing under it if that changed.
-    fn adopt(&self, state: &mut State, config: Config) {
+    /// Make `config` the current one, routing under it and announcing
+    /// it if that changed.
+    fn adopt(self: &Arc<Self>, state: &mut State, config: Config) {
         let routing = |config: &Config| {
             config.routing_policy().ok().map(|policy| {
                 (
@@ -409,6 +526,7 @@ impl Admin {
             })
         };
         let changed = routing(&state.config) != routing(&config);
+        let renamed = state.config.name != config.name;
         state.config = config;
         if changed {
             match crate::routing_policy(&state.config, &self.store) {
@@ -416,10 +534,13 @@ impl Admin {
                 Err(error) => warn!("admin: not routing under the new config: {error}"),
             }
         }
+        if changed || renamed {
+            self.nostr_job(changed);
+        }
     }
 
     /// Pick up edits made to the config file by hand.
-    fn reload_if_modified(&self) {
+    fn reload_if_modified(self: &Arc<Self>) {
         let mut state = lock(&self.state);
         let modified = modified(&self.dir);
         if modified == state.modified {
@@ -451,16 +572,30 @@ impl Admin {
             }
         }
         state.drafts = drafts;
+        let nostr = lock(&self.nostr);
+        let name = self.name(&state.config);
         let ctx = view::Context {
             config: &state.config,
             running: &self.running,
-            open: self.node.network_ids(),
+            name: name.clone(),
+            autoname: autoname(&self.node.node_pubkey()),
+            open: self
+                .node
+                .network_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let lifetime = self.node.network(&id).ok()?.max_incoming_lifetime_secs();
+                    Some((id.0, lifetime))
+                })
+                .collect(),
             hops: self.node.hops().unwrap_or_default(),
             node_pubkey: self.node.node_pubkey().to_hex(),
             iroh_peer_id: self.node.iroh_peer_id(),
             http_url: self.http_url.get().cloned(),
             iroh_url: self.iroh_id.get().map(|id| format!("hyperb://{id}")),
             pairing_link: self.pairing_link(&state.pairing),
+            nostr: &nostr,
+            now: unix_now(),
         };
         let patch = (!patch.is_empty()).then(|| ServerMessage::signal(json!({"d": patch})));
         for session in lock(&self.sessions).iter() {
@@ -469,6 +604,10 @@ impl Admin {
                 .map(ServerMessage::to_line)
                 .unwrap_or_default();
             let mut shown = lock(&session.shown);
+            if shown.name != name {
+                lines.push_str(&ServerMessage::from(self.metadata(&name)).to_line());
+                shown.name = name.clone();
+            }
             let allowed = self.allowed(&state, &session.access);
             let tree = view::page(&ctx, &session.access, allowed, shown.flash.as_ref());
             for message in vtree::diff_into(None, &shown.tree, &tree) {

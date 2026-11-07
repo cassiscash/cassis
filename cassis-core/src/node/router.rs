@@ -2,7 +2,7 @@
 //! announcements.
 
 use super::{HopRecord, HopState, Node, HOPS, INLINE_WAIT, VERIFY_RETRY_INTERVAL};
-use crate::network::{Htlc, HtlcTarget, NetworkError, NetworkId};
+use crate::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId};
 use crate::primitives::{unix_now, OperationId};
 use crate::protocol::{Discard, Execute, Prepare, Response, Settle};
 use crate::routing::{self, RouteAnnouncement, DEFAULT_TRANSIT_SLACK_SECS};
@@ -30,6 +30,10 @@ pub struct RouteOffer {
     pub fee_ppm: u64,
     pub transit_slack_secs: u64,
     pub nostr_relays: Vec<String>,
+    /// Longest an incoming HTLC of this hop may run, when shorter than
+    /// what its incoming network allows (see
+    /// [`RouteOffer::incoming_lifetime_secs`]).
+    pub max_incoming_lifetime_secs: Option<u64>,
     /// Mark the announcement as test money ([`routing::TEST_MONEY_TAG`]).
     pub test_money: bool,
 }
@@ -47,7 +51,20 @@ impl RouteOffer {
                 .iter()
                 .map(|relay| relay.to_string())
                 .collect(),
+            max_incoming_lifetime_secs: None,
             test_money: false,
+        }
+    }
+
+    /// Longest an incoming HTLC of this hop may run on `incoming`, its
+    /// `from` network: the shorter of its own limit and the network's.
+    pub fn incoming_lifetime_secs(&self, incoming: &dyn Network) -> Option<u64> {
+        match (
+            self.max_incoming_lifetime_secs,
+            incoming.max_incoming_lifetime_secs(),
+        ) {
+            (Some(own), Some(network)) => Some(own.min(network)),
+            (own, network) => own.or(network),
         }
     }
 }
@@ -109,11 +126,15 @@ impl Node {
     }
 
     /// Replace the policy routed under since [`Node::start_routing`],
-    /// and announce it now rather than at the next interval.
+    /// announced at the next interval or [`Node::announce`].
     pub fn set_routing(&self, policy: RoutingPolicy) {
         *self.0.routing.write().unwrap_or_else(|e| e.into_inner()) = Some(policy);
-        let node = self.clone();
-        self.spawn(async move { node.announce().await });
+    }
+
+    /// Publish `name` as this node's profile on `relays`: see
+    /// [`routing::publish_name`].
+    pub async fn publish_name(&self, relays: &[String], name: Option<&str>) -> usize {
+        routing::publish_name(relays, &self.0.keys.node, name).await
     }
 
     fn routing(&self) -> Option<RoutingPolicy> {
@@ -124,7 +145,10 @@ impl Node {
             .clone()
     }
 
-    async fn announce(&self) {
+    /// Publish the announcements of the hops routed now, and delete
+    /// this node's others, as [`Node::start_routing`] does every
+    /// interval.
+    pub async fn announce(&self) {
         let Some(policy) = self.routing() else {
             return;
         };
@@ -160,7 +184,7 @@ impl Node {
                 fee_ppm: route.fee_ppm,
                 incoming_delta_secs: incoming.incoming_delta_secs(),
                 transit_slack_secs: route.transit_slack_secs,
-                max_incoming_lifetime_secs: incoming.max_incoming_lifetime_secs(),
+                max_incoming_lifetime_secs: route.incoming_lifetime_secs(incoming.as_ref()),
                 test_money: route.test_money,
             };
             for (d_tag, accepted) in routing::publish_announcements(
@@ -269,7 +293,7 @@ impl Node {
                 "incoming expiry must be at least {delta}s after the outgoing expiry"
             ));
         }
-        if let Some(max) = incoming.max_incoming_lifetime_secs() {
+        if let Some(max) = route.incoming_lifetime_secs(incoming.as_ref()) {
             if prepare.incoming_expiry > now.saturating_add(max) {
                 return Err(format!(
                     "incoming expiry is more than the accepted {max}s away"

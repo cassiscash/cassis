@@ -1,7 +1,8 @@
 //! `cassis-routerd`: a Cassis router daemon. It does what
 //! `<data dir>/config.toml` says (see [`config`]): opens the networks
 //! listed there, routes and announces the hops listed there, deletes its
-//! announcements of anything else, and keeps its wallets in shape. Each
+//! announcements of anything else, and keeps its wallets in shape
+//! (refreshing coins before they expire, and the like). Each
 //! network is compiled in by the cargo feature of the same name.
 //!
 //! It also serves an [`admin`] interface for hyperb renderers, which
@@ -116,11 +117,9 @@ async fn run(cli: Cli) -> Result<(), String> {
     .await?;
 
     for network in &networks {
-        if config.networks[&network.id().to_string()].maintenance {
-            if let Some(interval) = network.maintenance_interval() {
-                info!("maintaining {} every {}s", network.id(), interval.as_secs());
-                tokio::spawn(maintain(network.clone()).instrument(span.clone()));
-            }
+        if let Some(interval) = network.maintenance_interval() {
+            info!("maintaining {} every {}s", network.id(), interval.as_secs());
+            tokio::spawn(maintain(network.clone()).instrument(span.clone()));
         }
     }
 

@@ -51,11 +51,11 @@ pub const TEST_MONEY_TAG: &str = "testmoney";
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bytes of a node key [`RouteAnnouncement::autoname`] encodes, away
+/// Bytes of a node key [`autoname`] encodes, away
 /// from both ends so it does not echo the truncated hex shown in UIs.
 const AUTONAME_BYTES: std::ops::Range<usize> = 8..12;
 
-/// Bytes of a node key [`RouteAnnouncement::autohue`] derives from,
+/// Bytes of a node key [`autohue`] derives from,
 /// apart from [`AUTONAME_BYTES`] so names and colors vary independently.
 const AUTOHUE_BYTES: std::ops::Range<usize> = 20..22;
 
@@ -111,25 +111,14 @@ impl RouteAnnouncement {
             .filter(|name| !name.is_empty())
     }
 
-    /// A memorable name derived from the node key, like
-    /// `misty-heron-quiet-willow`: two adjective/noun pairs, one byte
-    /// of [`AUTONAME_BYTES`] per word.
+    /// The router's [`autoname`].
     pub fn autoname(&self) -> String {
-        let [a, b, c, d] = self.node_pubkey.0[AUTONAME_BYTES]
-            .try_into()
-            .expect("AUTONAME_BYTES spans 4 bytes");
-        format!(
-            "{}-{}-{}-{}",
-            ADJECTIVES[a as usize], NOUNS[b as usize], ADJECTIVES[c as usize], NOUNS[d as usize]
-        )
+        autoname(&self.node_pubkey)
     }
 
-    /// A hue in degrees (`0..360`) derived from the node key, to tell
-    /// nodes apart at a glance in UIs.
+    /// The router's [`autohue`].
     pub fn autohue(&self) -> u16 {
-        let bytes = &self.node_pubkey.0[AUTOHUE_BYTES];
-        let value = u16::from_be_bytes([bytes[0], bytes[1]]);
-        (value as u32 * 360 / 65_536) as u16
+        autohue(&self.node_pubkey)
     }
 
     /// The `d` tag of this announcement: see [`route_d_tag`].
@@ -204,6 +193,27 @@ impl RouteAnnouncement {
             to,
         })
     }
+}
+
+/// A memorable name derived from a node key, like
+/// `misty-heron-quiet-willow`: two adjective/noun pairs, one byte of
+/// [`AUTONAME_BYTES`] per word.
+pub fn autoname(node_pubkey: &XOnlyPubKey) -> String {
+    let [a, b, c, d] = node_pubkey.0[AUTONAME_BYTES]
+        .try_into()
+        .expect("AUTONAME_BYTES spans 4 bytes");
+    format!(
+        "{}-{}-{}-{}",
+        ADJECTIVES[a as usize], NOUNS[b as usize], ADJECTIVES[c as usize], NOUNS[d as usize]
+    )
+}
+
+/// A hue in degrees (`0..360`) derived from a node key, to tell nodes
+/// apart at a glance in UIs.
+pub fn autohue(node_pubkey: &XOnlyPubKey) -> u16 {
+    let bytes = &node_pubkey.0[AUTOHUE_BYTES];
+    let value = u16::from_be_bytes([bytes[0], bytes[1]]);
+    (value as u32 * 360 / 65_536) as u16
 }
 
 /// The `d` tag a router announces the hop from `from` to `to` under,
@@ -291,9 +301,18 @@ pub async fn publish_announcements(
     results
 }
 
-/// `d` tags of every route announcement `relay` keeps from `router`,
-/// however old.
-pub async fn fetch_own_routes(relay: &str, router: XOnlyPubKey) -> Result<Vec<String>, String> {
+/// One route announcement a relay keeps from a router.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Published {
+    /// Which hop it announces: see [`route_d_tag`].
+    pub d_tag: String,
+    /// When it was signed, in unix seconds.
+    pub created_at: u64,
+}
+
+/// Every route announcement `relay` keeps from `router`, however old,
+/// the newest per `d` tag, sorted by it.
+pub async fn fetch_published(relay: &str, router: XOnlyPubKey) -> Result<Vec<Published>, String> {
     let filter = Filter {
         kinds: Some(vec![Kind(ROUTE_ANNOUNCEMENT_KIND)]),
         authors: Some(vec![router]),
@@ -307,14 +326,65 @@ pub async fn fetch_own_routes(relay: &str, router: XOnlyPubKey) -> Result<Vec<St
     )
     .await
     .map_err(|_| format!("{relay}: query timed out"))?;
-    let mut routes: Vec<String> = events
-        .iter()
-        .filter(|event| event.pubkey == router && event.verify_signature())
-        .map(|event| event.tags.get_d())
-        .collect();
-    routes.sort();
-    routes.dedup();
-    Ok(routes)
+    let mut published: Vec<Published> = Vec::new();
+    for event in &events {
+        if event.pubkey != router || !event.verify_signature() {
+            continue;
+        }
+        let found = Published {
+            d_tag: event.tags.get_d(),
+            created_at: event.created_at.0 as u64,
+        };
+        match published.iter_mut().find(|p| p.d_tag == found.d_tag) {
+            Some(known) => known.created_at = known.created_at.max(found.created_at),
+            None => published.push(found),
+        }
+    }
+    published.sort_by(|a, b| a.d_tag.cmp(&b.d_tag));
+    Ok(published)
+}
+
+/// `d` tags of every route announcement `relay` keeps from `router`,
+/// however old.
+pub async fn fetch_own_routes(relay: &str, router: XOnlyPubKey) -> Result<Vec<String>, String> {
+    Ok(fetch_published(relay, router)
+        .await?
+        .into_iter()
+        .map(|published| published.d_tag)
+        .collect())
+}
+
+/// Publish `name` as the router's profile (kind-0 metadata), which
+/// payers and explorers show instead of its [`autoname`]; `None`
+/// publishes an empty profile. Returns how many relays accepted it.
+pub async fn publish_name(
+    relays: &[String],
+    node_key: &ritualistic::SecretKey,
+    name: Option<&str>,
+) -> usize {
+    let content = match name {
+        Some(name) => serde_json::json!({ "name": name }).to_string(),
+        None => "{}".to_string(),
+    };
+    let event = EventTemplate {
+        created_at: Timestamp::now(),
+        kind: Kind(0),
+        tags: Tags(Vec::new()),
+        content,
+    }
+    .finalize(node_key);
+    let mut pool = ritualistic::Network::new();
+    let mut replies = pool
+        .publish_many(relays, event, PublishOptions::default())
+        .await;
+    let mut accepted = 0;
+    while let Some(reply) = replies.recv().await {
+        match reply.error {
+            None => accepted += 1,
+            Some(error) => tracing::debug!("relay {} rejected a profile: {error}", reply.relay_url),
+        }
+    }
+    accepted
 }
 
 /// Ask `relays` to delete the router's announcements under `d_tags`
