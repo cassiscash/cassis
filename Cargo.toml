@@ -54,6 +54,7 @@ sha2 = "0.10.9"
 thiserror = "1.0.69"
 tokio = "1.53.1"
 toml = "0.8.23"
+toml_edit = "0.22.27"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }

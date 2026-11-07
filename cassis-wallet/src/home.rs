@@ -20,7 +20,7 @@ use cassis_networks::lnd;
 use cassis_networks::NetworkSettings;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::Span;
+use tracing::{warn, Span};
 
 const SETTINGS: &str = "settings";
 const NETWORKS: &str = "networks";
@@ -133,14 +133,16 @@ impl Home {
         let config = self.bark_config(network)?.ok_or_else(|| {
             format!("{network} goes through LND here: enable it with --bark to use bark")
         })?;
-        bark_lightning::BarkLightningAdapter::open(
+        let adapter = bark_lightning::BarkLightningAdapter::open(
             network.clone(),
             self.secret(network),
             &self.network_dir(network),
             &config,
             span,
         )
-        .await
+        .await?;
+        routine_checks(&adapter).await;
+        Ok(adapter)
     }
 
     /// Private directory of `network`: `<home>/<kind>/<variant>`.
@@ -163,13 +165,15 @@ impl Home {
         span: &Span,
     ) -> Result<arkade::ArkadeAdapter, String> {
         let esplora = std::env::var("CASSIS_ESPLORA_URL").ok();
-        arkade::ArkadeAdapter::open_with_esplora(
+        let adapter = arkade::ArkadeAdapter::open_with_esplora(
             network.clone(),
             self.secret(network),
             esplora.as_deref(),
             span,
         )
-        .await
+        .await?;
+        routine_checks(&adapter).await;
+        Ok(adapter)
     }
 
     /// What opening `network` takes, as configured with `enable`.
@@ -189,7 +193,8 @@ impl Home {
         })
     }
 
-    /// Open the adapter of `network`, if this binary was built with it.
+    /// Open the adapter of `network`, if this binary was built with it,
+    /// and run its [`routine_checks`].
     pub async fn open_network(
         &self,
         network: &NetworkId,
@@ -200,7 +205,9 @@ impl Home {
             // Import the proofs an older home kept in its database.
             drop(self.open_cashu(network, span)?);
         }
-        cassis_networks::open(network, &self.settings(network)?, span).await
+        let opened = cassis_networks::open(network, &self.settings(network)?, span).await?;
+        routine_checks(opened.as_ref()).await;
+        Ok(opened)
     }
 
     pub async fn open_networks(
@@ -250,6 +257,17 @@ impl Home {
             }
         }
         Ok(adapter)
+    }
+}
+
+/// The upkeep a long-running node would do now and then (see
+/// [`Network::maintain`]: settling arkade boarding deposits, refreshing
+/// VTXOs before the operator may sweep them, syncing bark), done once
+/// whenever the wallet opens `network`, before any command uses it. A
+/// failure only warns: the command may still work.
+pub async fn routine_checks(network: &dyn Network) {
+    if let Err(error) = network.maintain().await {
+        warn!("routine checks of {}: {error}", network.id());
     }
 }
 

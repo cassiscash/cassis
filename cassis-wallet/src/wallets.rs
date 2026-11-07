@@ -1,7 +1,10 @@
 //! Per-network funds management, outside of Cassis payments: balances,
 //! deposits and plain sends. One subcommand per compiled-in network.
+//! Opening a wallet runs its routine checks first (see
+//! [`routine_checks`]).
 
-use crate::home::Home;
+#[allow(unused_imports)]
+use crate::home::{routine_checks, Home};
 #[allow(unused_imports)]
 use cassis_core::NetworkId;
 use clap::Subcommand;
@@ -166,6 +169,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
         #[cfg(feature = "cashu")]
         Command::Cashu { network, command } => {
             let wallet = home.open_cashu(&kind(&network, "cashu")?, span)?;
+            routine_checks(&wallet).await;
             match command {
                 CashuCommand::Balance => println!("{} msat", wallet.balance_msat()?),
                 CashuCommand::Send { amount_sat } => {
@@ -186,6 +190,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                 span,
             )
             .await?;
+            routine_checks(&wallet).await;
             let error = |e: cassis_core::NetworkError| e.to_string();
             match command {
                 ChainCommand::Balance => {
@@ -211,6 +216,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                 home.secret(&network),
                 span,
             )?;
+            routine_checks(&wallet).await;
             let error = |e: cassis_core::NetworkError| e.to_string();
             match command {
                 ChainCommand::Balance => {
@@ -289,6 +295,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                 home.secret(&network),
                 span,
             )?;
+            routine_checks(&wallet).await;
             match command {
                 ChainCommand::Balance => println!("{} msat", wallet.balance_msat().await?),
                 ChainCommand::Address => println!("{}", wallet.address()),
@@ -307,6 +314,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                 span,
             )
             .await?;
+            routine_checks(&wallet).await;
             match command {
                 FedimintCommand::Balance => println!("{} msat", wallet.balance_msat().await?),
                 FedimintCommand::Send { amount_msat } => {

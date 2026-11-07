@@ -1,5 +1,6 @@
 //! `<data dir>/config.toml`: everything the router does. Written with a
-//! fresh mnemonic and no routes on first start, then only read.
+//! fresh mnemonic and no routes on first start, then read, and edited by
+//! the admin interface through [`edit`], which keeps its comments.
 //!
 //! ```toml
 //! mnemonic = "twelve words ..."    # every key derives from it, unless set below
@@ -25,6 +26,11 @@
 //! # transit_slack_secs = 60
 //! # nostr_relays = ["wss://relay.example"]
 //! # test_money = true
+//!
+//! [admin]
+//! # listen = "127.0.0.1:7979"      # open admin page over HTTP; "" turns it off
+//! # iroh = true                    # admin page over iroh, for `peers`
+//! # peers = ["<64 hex>"]           # iroh keys of renderers let in
 //! ```
 
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
@@ -34,11 +40,14 @@ use cassis_core::NetworkId;
 use cassis_networks::NetworkSettings;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use toml_edit::DocumentMut;
 
 pub const FILE: &str = "config.toml";
+pub const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:7979";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub mnemonic: String,
@@ -57,9 +66,54 @@ pub struct Config {
     pub networks: BTreeMap<String, NetworkConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Loopback address of the admin page over HTTP, open to anyone on
+    /// this machine; empty turns it off.
+    #[serde(default = "default_admin_listen")]
+    pub listen: String,
+    /// Serve the admin page over iroh, to `peers` only.
+    #[serde(default = "yes")]
+    pub iroh: bool,
+    /// Hex iroh keys of the renderers let in over iroh.
+    #[serde(default)]
+    pub peers: Vec<String>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_admin_listen(),
+            iroh: true,
+            peers: Vec::new(),
+        }
+    }
+}
+
+impl AdminConfig {
+    pub fn listen_addr(&self) -> Result<Option<SocketAddr>, String> {
+        if self.listen.is_empty() {
+            return Ok(None);
+        }
+        let addr: SocketAddr = self
+            .listen
+            .parse()
+            .map_err(|e| format!("admin.listen {}: {e}", self.listen))?;
+        if !addr.ip().is_loopback() {
+            return Err(format!(
+                "admin.listen {addr}: the HTTP admin page is open, so it only listens on loopback"
+            ));
+        }
+        Ok(Some(addr))
+    }
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Hex wallet key on this network, instead of the mnemonic's.
@@ -76,7 +130,7 @@ pub struct NetworkConfig {
     pub bark: Option<BarkConfig>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(not(feature = "lightning"), allow(dead_code))]
 pub struct LndConfig {
@@ -85,7 +139,7 @@ pub struct LndConfig {
     pub macaroon_path: Option<PathBuf>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(not(feature = "bark-lightning"), allow(dead_code))]
 pub struct BarkConfig {
@@ -94,7 +148,7 @@ pub struct BarkConfig {
     pub esplora_url: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub from: String,
@@ -115,6 +169,10 @@ fn default_transit_slack() -> u64 {
     DEFAULT_TRANSIT_SLACK_SECS
 }
 
+fn default_admin_listen() -> String {
+    DEFAULT_ADMIN_LISTEN.to_string()
+}
+
 fn yes() -> bool {
     true
 }
@@ -132,19 +190,40 @@ impl Config {
             );
         }
         warn_if_readable_by_others(&path);
+        Self::load(dir)
+    }
+
+    /// Read `<dir>/config.toml`.
+    pub fn load(dir: &Path) -> Result<Self, String> {
+        let path = dir.join(FILE);
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let config: Self = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         config.check()?;
         Ok(config)
     }
 
     fn check(&self) -> Result<(), String> {
+        self.keys()?;
+        self.admin.listen_addr()?;
+        for peer in &self.admin.peers {
+            parse_secret(peer).map_err(|e| format!("admin.peers {peer}: {e}"))?;
+        }
         let networks = self.network_ids()?;
         for route in &self.routes {
             let (from, to) = (NetworkId::parse(&route.from)?, NetworkId::parse(&route.to)?);
             if from == to {
                 return Err(format!("route {from} -> {to} goes nowhere"));
+            }
+            let same = self.routes.iter().filter(|other| {
+                (other.from.as_str(), other.to.as_str()) == (route.from.as_str(), route.to.as_str())
+            });
+            if same.count() > 1 {
+                return Err(format!("route {from} -> {to} is listed twice"));
             }
             for end in [&from, &to] {
                 if !networks.contains(end) {
@@ -273,6 +352,45 @@ impl Config {
     }
 }
 
+/// Apply `change` to `<dir>/config.toml` as it is on disk now, keeping
+/// its comments and layout, and write it back if the result is a valid
+/// config, which is returned.
+pub fn edit(
+    dir: &Path,
+    change: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
+) -> Result<Config, String> {
+    let path = dir.join(FILE);
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    change(&mut doc)?;
+    let text = doc.to_string();
+    let config = Config::parse(&text)?;
+    write_private(&path, &text)?;
+    Ok(config)
+}
+
+/// Replace `path` with `text` at once, readable by its owner only.
+fn write_private(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("toml.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&tmp)
+        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))
+}
+
 fn parse_secret(hex: &str) -> Result<[u8; 32], String> {
     let mut bytes = [0u8; 32];
     lowercase_hex::decode_to_slice(hex.trim(), &mut bytes)
@@ -294,30 +412,40 @@ fn write_new(path: &Path) -> Result<(), String> {
         .open(path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
     let template = format!(
-        r#"# cassis-routerd config. Every key derives from the mnemonic unless
-# overridden here: back it up, it controls the router's funds.
-mnemonic = "{mnemonic}"
+        r#"# cassis-routerd config, also edited by the admin interface, which
+# keeps comments. Every key derives from the mnemonic below unless
+# overridden: back it up, it controls the router's funds.
+#
 # iroh_secret = "<64 hex>"
 # nostr_secret = "nsec1..."
-
+#
 # Relays of routes that name none (default: wss://nostr.wine, or the
 # test relays with test_money). The router also deletes its stale
 # announcements from them.
 # nostr_relays = ["wss://nostr.wine"]
 # test_money = false
-
+#
 # One table per network to open, e.g.:
 # [networks."cashu::mint.example"]
 # [networks.arkade]
 # [networks.lightning]
 # lnd = {{ rest_url = "https://127.0.0.1:8080", tls_cert_path = "/path/tls.cert", macaroon_path = "/path/admin.macaroon" }}
-
+#
 # One entry per hop to offer and announce, e.g.:
 # [[routes]]
 # from = "cashu::mint.example"
 # to = "arkade"
 # fee_base_msat = 1000
 # fee_ppm = 500
+#
+# The admin interface: open over HTTP on loopback, and over iroh to the
+# renderers listed in peers (or paired with the link printed on start).
+# [admin]
+# listen = "127.0.0.1:7979"
+# iroh = true
+# peers = []
+
+mnemonic = "{mnemonic}"
 "#,
         mnemonic = generate_mnemonic()
     );

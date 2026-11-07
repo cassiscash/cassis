@@ -45,7 +45,7 @@ node's home):
 | `mint.sh` | local mints; `fund` (free ecash), `fund-external` (real mints) |
 | `fedimint.sh` | our federation: `start` (runs DKG through the guardian UI), `invite`, `fund` |
 | `arkd.sh` | our operator: `start`, `fund` (on-chain float), `note`, `give` |
-| `node.sh` | `route`/`serve`/`stop` nodes in the background, `pay`, `route-of` |
+| `node.sh` | `route`/`stop` nodes in the background, `sync`, `pay`, `route-of` |
 | `pay.sh` | one payment with the payee serving its invoice, plus an optional failure hook |
 | `up.sh` / `down.sh` | bring everything up / down again |
 | `hooks/` | `pay.sh` failure hooks: `kill-router.sh`, `kill-payee.sh` |
@@ -129,7 +129,8 @@ start`, it forgets their announcements) and the remaining routers.
 
 Inspect state with `cassis <node> payments|invoices|hops` and the
 routers' logs (`tmp/live/nodes/<router>.log`). Expired HTLCs are only
-refunded by a serving node: `node.sh serve alice` for a payer.
+refunded by a running router or, for a payer, by `node.sh sync alice`
+once they expired.
 
 ## Failure and refund tests
 
@@ -151,8 +152,8 @@ LAST=r3 PAYEE=dave scripts/live/pay.sh henry $AL dave 1000000 $H/kill-payee.sh
 
 Then, for each test:
 
-1. `scripts/live/node.sh serve henry`: the payer refunds its own HTLC
-   only while serving (routers already are).
+1. Routers refund on their own; the payer refunds its own HTLC with
+   `scripts/live/node.sh sync henry` once it expired (step 3).
 2. Note each lock's expiry: `locked … until <unix time>` in the routers'
    logs, and the payer's in `tmp/live/nodes/henry.pay.log`. The first
    leg expires last, over an hour later on long routes; rootstock and
@@ -265,8 +266,8 @@ c. Announcements of dead routers stay on the relay, so the same dead
 d. Payee-side ledger costs come out of the invoice amount: fedimint
    claim fees (995 328 of 1 000 000 msat with base fees on), Rootstock
    claim gas (~18 sat), cashu.mutinynet.com input fees (1 sat each side).
-e. `invoice --network X` accepts networks the node has not enabled; its
-   `run` would never claim such an invoice.
+e. `invoice --network X` accepts networks the node has not enabled; it
+   would never claim such an invoice.
 f. A second process on a home whose fedimint client is open (e.g. a
    leftover `invoice --wait`) hangs silently on the database lock.
 g. Payers keep retrying a hop after the payee's claim window closed.

@@ -3,7 +3,7 @@
 #
 #   scripts/live/pay.sh <payer> <from network> <payee> <amount msat> [hook]
 #
-# The payee serves its invoice (`invoice --wait`) while the payer pays
+# The payee serves its invoice (`invoice` waits until paid) while the payer pays
 # it over the private relay's routes. `hook`, if given, runs in the
 # background with the payment hash's last 7 hex digits as $1 (how logs
 # abbreviate it), to inject failures mid-payment. Prints both sides'
@@ -14,7 +14,7 @@ source "$(dirname "$0")/env.sh"
 payer="$1" from="$2" payee="$3" amount="$4" hook="${5:-}"
 L="$LIVE/nodes"
 rm -f "$L/$payee.inv"
-cassis "$payee" invoice --amount-msat "$amount" --wait > "$L/$payee.inv" 2> "$L/$payee.inv.log" &
+cassis "$payee" invoice --amount-msat "$amount" > "$L/$payee.inv" 2> "$L/$payee.inv.log" &
 payee_pid=$!
 until [ -s "$L/$payee.inv" ]; do
   kill -0 "$payee_pid" 2> /dev/null || { grep -v DEBUG "$L/$payee.inv.log" | tail -3; exit 1; }

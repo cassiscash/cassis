@@ -3,6 +3,11 @@
 //! manages each network's funds under a subcommand of its own. Each
 //! network is compiled in by the cargo feature of the same name.
 //! Routing is `cassis-routerd`'s job.
+//!
+//! The wallet is stateless between commands: nothing runs in the
+//! background. Every command that opens a network first runs its routine
+//! checks (see [`home::routine_checks`]); `sync` does only that, and
+//! settles the HTLCs this wallet funded.
 
 #[cfg(not(any(
     feature = "arkade",
@@ -21,9 +26,8 @@ mod order_demo;
 mod wallets;
 
 use cassis_core::node::{
-    create_invoice, create_preimage_server_invoice, redeem_preimage_server_payments, InvoiceRecord,
-    InvoiceStatus, Node, NodeConfig, PaymentRecord, PreimageServerInvoiceRecord,
-    PREIMAGE_SERVER_INVOICES,
+    create_preimage_server_invoice, redeem_preimage_server_payments, InvoiceRecord, InvoiceStatus,
+    Node, NodeConfig, PaymentRecord, PreimageServerInvoiceRecord, PREIMAGE_SERVER_INVOICES,
 };
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
 use cassis_core::transport::PeerAddr;
@@ -32,7 +36,7 @@ use clap::{Parser, Subcommand};
 use home::Home;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{info, info_span, Span};
+use tracing::{info_span, Span};
 
 #[derive(Parser)]
 #[command(name = "cassis-wallet", about = "Cassis wallet: pay and receive")]
@@ -104,11 +108,13 @@ enum Command {
         #[arg(required = true)]
         networks: Vec<String>,
     },
-    /// Serve the wallet until interrupted: claim payments to its
-    /// invoices and settle and refund its HTLCs.
-    Run,
-    /// Create an invoice to receive a payment. A running wallet (`run`)
-    /// claims it when paid.
+    /// Run the routine checks of every enabled network and settle the
+    /// HTLCs of this wallet's payments (refunding expired ones), and
+    /// nothing else.
+    Sync,
+    /// Create an invoice to receive a payment, and serve the node until
+    /// it is paid or expires; with `--preimage-server`, return at once
+    /// and claim with `redeem` later.
     #[command(visible_alias = "invoice")]
     Receive {
         #[arg(long)]
@@ -120,9 +126,6 @@ enum Command {
         description: Option<String>,
         #[arg(long, default_value_t = 3600)]
         expires_in: u64,
-        /// Serve the node here until the invoice is paid or expires.
-        #[arg(long, conflicts_with = "preimage_server")]
-        wait: bool,
         /// Iroh id of a preimage server to answer payers instead of this
         /// node, which can then stay offline. It picks the payment hash
         /// and the metadata; claim with `redeem` afterwards.
@@ -257,10 +260,19 @@ async fn run(cli: Cli) -> Result<(), String> {
             enabled.retain(|network| !remove.contains(network));
             home.set_networks(&enabled)?;
         }
-        Command::Run => {
-            let node = serve(&home, &span).await?;
-            info!("running as {}; Ctrl-C to stop", node.iroh_peer_id());
-            tokio::signal::ctrl_c().await.ok();
+        Command::Sync => {
+            let networks = home.open_networks(&home.networks()?, &span).await?;
+            let node = Node::start(
+                NodeConfig {
+                    keys: home.keys.clone(),
+                    store: home.store.clone(),
+                    span,
+                    serve: false,
+                },
+                networks,
+            )
+            .await?;
+            node.settle_once().await;
             node.shutdown().await;
         }
         Command::Receive {
@@ -268,7 +280,6 @@ async fn run(cli: Cli) -> Result<(), String> {
             networks,
             description,
             expires_in,
-            wait,
             preimage_server,
             preimage_server_relay,
             claim_window,
@@ -282,10 +293,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                     .collect::<Result<_, _>>()?
             };
             let expires_at = unix_now() + expires_in;
-            let mut serving = None;
-            let invoice = if let Some(id) = preimage_server {
+            if let Some(id) = preimage_server {
                 let opened = home.open_networks(&networks, &span).await?;
-                create_preimage_server_invoice(
+                let invoice = create_preimage_server_invoice(
                     &home.store,
                     &home.keys,
                     PeerAddr {
@@ -298,54 +308,30 @@ async fn run(cli: Cli) -> Result<(), String> {
                     description,
                     claim_window,
                 )
-                .await?
-            } else if wait {
-                let node = serve(&home, &span).await?;
-                let invoice = node
-                    .create_invoice(&networks, amount_msat, expires_at, description, None)
-                    .await?;
-                serving = Some(node);
-                invoice
-            } else {
-                let opened = home.open_networks(&networks, &span).await?;
-                create_invoice(
-                    &home.store,
-                    &home.keys,
-                    None,
-                    &opened,
-                    amount_msat,
-                    expires_at,
-                    description,
-                    None,
-                )
-                .await?
+                .await?;
+                print_invoice(&invoice)?;
+                return Ok(());
+            }
+            let node = serve(&home, &span).await?;
+            let invoice = node
+                .create_invoice(&networks, amount_msat, expires_at, description, None)
+                .await?;
+            print_invoice(&invoice)?;
+            // Some network clients install their own SIGINT handler,
+            // so Ctrl-C would not end the process by itself.
+            let claimed = tokio::select! {
+                claimed = wait_for_claim(&home, &invoice) => claimed,
+                _ = tokio::signal::ctrl_c() => Err("interrupted".into()),
             };
-            println!(
-                "{}",
-                serde_json::to_string(&invoice).map_err(|e| e.to_string())?
-            );
-            if wait {
-                // Some network clients install their own SIGINT handler,
-                // so Ctrl-C would not end the process by itself.
-                let claimed = tokio::select! {
-                    claimed = wait_for_claim(&home, &invoice) => claimed,
-                    _ = tokio::signal::ctrl_c() => Err("interrupted".into()),
-                };
-                if let Err(error) = claimed {
-                    if let Some(node) = serving {
-                        node.shutdown().await;
-                    }
-                    return Err(error);
-                }
+            if claimed.is_ok() {
                 // A payer that got `Pending` from COMMIT polls again every
                 // 5s. Keep the node serving for one more round trip: exiting
                 // immediately leaves the payment Pending forever when the
                 // payer never receives the preimage.
                 tokio::time::sleep(CLAIM_GRACE).await;
-                if let Some(node) = serving {
-                    node.shutdown().await;
-                }
             }
+            node.shutdown().await;
+            claimed?;
         }
         Command::Redeem {
             preimage_server,
@@ -466,7 +452,15 @@ async fn serve(home: &Home, span: &Span) -> Result<Node, String> {
     .await
 }
 
-/// How long `invoice --wait` keeps serving after a claim so the payer
+fn print_invoice(invoice: &Invoice) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string(invoice).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
+/// How long `receive` keeps serving after a claim so the payer
 /// can collect the preimage from a COMMIT it was told was still pending.
 const CLAIM_GRACE: Duration = Duration::from_secs(30);
 

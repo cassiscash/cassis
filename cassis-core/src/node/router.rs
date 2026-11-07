@@ -108,6 +108,14 @@ impl Node {
         });
     }
 
+    /// Replace the policy routed under since [`Node::start_routing`],
+    /// and announce it now rather than at the next interval.
+    pub fn set_routing(&self, policy: RoutingPolicy) {
+        *self.0.routing.write().unwrap_or_else(|e| e.into_inner()) = Some(policy);
+        let node = self.clone();
+        self.spawn(async move { node.announce().await });
+    }
+
     fn routing(&self) -> Option<RoutingPolicy> {
         self.0
             .routing

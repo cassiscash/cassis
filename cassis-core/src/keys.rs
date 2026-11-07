@@ -59,6 +59,13 @@ impl NodeKeys {
         hmac(&self.seed, b"cassis/order", None)
     }
 
+    /// Secret of the endpoint serving a router's admin interface: stable,
+    /// so its `hyperb://` address keeps working, and distinct from
+    /// [`NodeKeys::iroh`], so the interface outlives node restarts.
+    pub fn admin_endpoint_secret(&self) -> [u8; 32] {
+        hmac(&self.seed, b"cassis/admin", None)
+    }
+
     /// Secret of the endpoint this node talks to its preimage server
     /// from: stable, since the server keeps the node's invoices and
     /// payments under it, and distinct from [`NodeKeys::iroh`] so it
