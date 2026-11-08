@@ -31,15 +31,14 @@ mod config;
 mod networks;
 
 use admin::Admin;
+use cassis_admin::{reexec, shutdown_signal, Refresh, Server, RESTART_GRACE};
 use cassis_core::node::{Node, NodeConfig, RoutingPolicy};
 use cassis_core::store::Store;
 use clap::Parser;
 use config::Config;
-use networks::Networks;
-use std::collections::BTreeMap;
+use networks::{Networks, RouterDaemon, RouterOpener};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, info_span, warn};
 
 const SETTINGS: &str = "settings";
@@ -80,23 +79,17 @@ async fn run(cli: Cli) -> Result<(), String> {
     let span = info_span!("node", node = "routerd");
 
     // Networks are opened before the node starts, so that it can resume
-    // its hops on them. A network that does not open is left out, for
-    // the admin interface to fix and open later.
-    let mut networks = Vec::new();
-    let mut wallets = BTreeMap::new();
-    let mut failed = BTreeMap::new();
-    for network in config.network_ids()? {
-        match networks::open(&config, &network, &keys, &dir, &span).await {
-            Ok((opened, wallet)) => {
-                networks.push(opened);
-                wallets.insert(network.to_string(), wallet);
-            }
-            Err(error) => {
-                warn!("not opening {network}: {error}");
-                failed.insert(network.to_string(), error);
-            }
-        }
-    }
+    // its hops on them.
+    let networks = Networks::new(
+        RouterOpener {
+            keys: keys.clone(),
+            dir: dir.clone(),
+            span: span.clone(),
+        },
+        span.clone(),
+        true,
+    );
+    let opened = networks.open_all(&config.networks).await;
     if config.networks.is_empty() {
         warn!(
             "no networks in {}: add some under [networks], or from the admin interface",
@@ -112,18 +105,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             span: span.clone(),
             serve: true,
         },
-        networks,
+        opened,
     )
     .await?;
-    let networks = Networks::new(
-        node.clone(),
-        keys,
-        dir.clone(),
-        span,
-        &config,
-        wallets,
-        failed,
-    );
+    networks.attach(Arc::new(RouterDaemon(node.clone())));
 
     let policy = routing_policy(&config, &store)?;
     if policy.routes.is_empty() {
@@ -136,17 +121,18 @@ async fn run(cli: Cli) -> Result<(), String> {
         node.iroh_peer_id(),
         node.node_pubkey().to_hex()
     );
-    let admin_config = config.admin.clone();
-    let admin = Admin::new(dir, node.clone(), networks, store, config);
-    admin.serve(&admin_config, admin_secret).await;
+    let refresh = Refresh::default();
+    let admin = Admin::new(dir, node.clone(), networks, store, config, refresh.clone());
+    let server = Server::new(admin.clone(), refresh);
+    server.serve(admin_secret).await;
+    admin.keep_checking_relays();
 
     let restart = tokio::select! {
         _ = shutdown_signal() => false,
-        _ = admin.restart_requested() => true,
+        _ = server.restart_requested() => true,
     };
     if restart {
-        // Let the pages hear about it first.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(RESTART_GRACE).await;
     }
     info!("shutting down");
     node.shutdown().await;
@@ -176,46 +162,4 @@ pub fn routing_policy(config: &Config, store: &Store) -> Result<RoutingPolicy, S
         }
     }
     Ok(policy)
-}
-
-/// Replace this process with a fresh run of the same command, from the
-/// binary now at its path, which returns only if that fails.
-fn reexec() -> String {
-    info!("restarting");
-    let exe = match std::env::current_exe() {
-        // Linux names a binary replaced since it started `<path> (deleted)`.
-        Ok(exe) => match exe.to_str().and_then(|exe| exe.strip_suffix(" (deleted)")) {
-            Some(path) => PathBuf::from(path),
-            None => exe,
-        },
-        Err(error) => return format!("restart: {error}"),
-    };
-    let mut command = std::process::Command::new(exe);
-    command.args(std::env::args_os().skip(1));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        format!("restart: {}", command.exec())
-    }
-    #[cfg(not(unix))]
-    match command.spawn() {
-        Ok(_) => std::process::exit(0),
-        Err(error) => format!("restart: {error}"),
-    }
-}
-
-/// Ctrl-C, or SIGTERM from a service manager.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut term) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-            return;
-        }
-    }
-    tokio::signal::ctrl_c().await.ok();
 }

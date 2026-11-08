@@ -10,6 +10,7 @@ members = [
   "networks/cassis-lnd",
   "networks/cassis-bark-lightning",
   "cassis-networks",
+  "cassis-admin",
   "cassis-routerd",
   "cassis-wallet",
   "cassis-preimage-server",
@@ -99,6 +100,7 @@ fedimint-walletv2-client = { git = "https://github.com/fedimint/fedimint", rev =
 fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd9cdc61412bc079c8d00208e7fcc07a3948" }
 
 cassis-core = { path = "cassis-core", default-features = false }
+cassis-admin = { path = "cassis-admin" }
 cassis-networks = { path = "cassis-networks" }
 cassis-cashu = { path = "networks/cassis-cashu" }
 cassis-fedimint = { path = "networks/cassis-fedimint" }

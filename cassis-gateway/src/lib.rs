@@ -25,6 +25,9 @@
 //! resumes interrupted ones and refunds HTLCs to payees who never
 //! claimed them before they expired.
 
+pub mod admin;
+pub mod config;
+
 use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId, OutgoingState};
 use cassis_core::offline::{
     endpoint_public_key, AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization,
@@ -50,6 +53,10 @@ pub const INVOICES: &str = "gateway_invoices";
 /// Payments it forwards, by payment hash.
 pub const FORWARDS: &str = "gateway_forwards";
 
+/// Why a forward left mid-funding by a restart failed: whether its HTLC
+/// to the payee exists is unknown.
+pub const INTERRUPTED_FUNDING: &str = "interrupted while funding";
+
 /// How long COMMIT works before answering [`Response::Pending`].
 const INLINE_WAIT: Duration = Duration::from_secs(5);
 /// How often an HTLC not final yet is verified again, and a preimage
@@ -58,7 +65,8 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const SETTLE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Terms the gateway accepts from payees.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GatewayPolicy {
     /// Longest final timeout a payee may ask for: the gateway's funds
     /// stay locked that long when the payee does not claim.
@@ -172,8 +180,8 @@ pub struct Gateway(Arc<Inner>);
 struct Inner {
     endpoint_secret: [u8; 32],
     store: Arc<Store>,
-    networks: HashMap<NetworkId, Arc<dyn Network>>,
-    policy: GatewayPolicy,
+    networks: Mutex<HashMap<NetworkId, Arc<dyn Network>>>,
+    policy: Mutex<GatewayPolicy>,
     transport: Transport,
     span: Span,
     /// Payment hashes some task is forwarding; others leave them be.
@@ -192,12 +200,14 @@ impl Gateway {
         let gateway = Self(Arc::new(Inner {
             endpoint_secret: config.endpoint_secret,
             store: config.store,
-            networks: config
-                .networks
-                .into_iter()
-                .map(|network| (network.id(), network))
-                .collect(),
-            policy: config.policy,
+            networks: Mutex::new(
+                config
+                    .networks
+                    .into_iter()
+                    .map(|network| (network.id(), network))
+                    .collect(),
+            ),
+            policy: Mutex::new(config.policy),
             transport: transport.clone(),
             span: config.span,
             busy: Default::default(),
@@ -257,6 +267,73 @@ impl Gateway {
         self.store().list(FORWARDS)
     }
 
+    pub fn invoices(&self) -> Result<Vec<InvoiceRecord>, String> {
+        self.store().list(INVOICES)
+    }
+
+    pub fn authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
+        self.store().list(AUTHORIZATIONS)
+    }
+
+    /// Stop issuing invoices under the standing authorization `id`.
+    /// Invoices issued before stay payable: they carry their own copy.
+    pub fn forget_authorization(&self, id: &Bytes32) -> Result<(), String> {
+        self.store().delete(AUTHORIZATIONS, &id.to_string())
+    }
+
+    /// The terms it accepts now.
+    pub fn policy(&self) -> GatewayPolicy {
+        lock(&self.0.policy).clone()
+    }
+
+    /// Accept these terms from now on. Authorizations and invoices it
+    /// took under others stay as they are.
+    pub fn set_policy(&self, policy: GatewayPolicy) {
+        *lock(&self.0.policy) = policy;
+    }
+
+    /// Be paid and pay payees on `network` too, or anew.
+    pub fn add_network(&self, network: Arc<dyn Network>) {
+        lock(&self.0.networks).insert(network.id(), network);
+    }
+
+    /// Stop using `id`. Tasks that hold it already keep it until they
+    /// end, and forwards through it wait for it to come back.
+    pub fn remove_network(&self, id: &NetworkId) {
+        lock(&self.0.networks).remove(id);
+    }
+
+    /// The networks the gateway is on, in order.
+    pub fn network_ids(&self) -> Vec<NetworkId> {
+        let mut ids: Vec<NetworkId> = lock(&self.0.networks).keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// The forwards that still need `id`: to claim or fund while in
+    /// progress, and to see the payee claim its HTLC or refund it.
+    pub fn in_flight(&self, id: &NetworkId) -> usize {
+        let Ok(forwards) = self.forwards() else {
+            // Unable to tell: do not let go of the network.
+            return 1;
+        };
+        forwards
+            .iter()
+            .filter(|forward| {
+                let on_outgoing = forward.outgoing_network.as_ref() == Some(id);
+                let on_either = on_outgoing || forward.incoming_network == *id;
+                let open_outgoing =
+                    forward.outgoing.is_some() && forward.outgoing_outcome.is_none();
+                match forward.state {
+                    ForwardState::Settled => open_outgoing && on_outgoing,
+                    // Claimable with the preimage the payee reveals.
+                    ForwardState::Failed(_) => open_outgoing && on_either,
+                    _ => on_either,
+                }
+            })
+            .count()
+    }
+
     async fn handle(&self, request: Request, peer: String) -> Response {
         match request {
             Request::GatewayInvoice(request) => {
@@ -281,11 +358,30 @@ impl Gateway {
     }
 
     fn network(&self, id: &NetworkId) -> Result<Arc<dyn Network>, String> {
-        self.0
-            .networks
+        lock(&self.0.networks)
             .get(id)
             .cloned()
             .ok_or_else(|| format!("this gateway is not on {id}"))
+    }
+
+    /// The network `id` for a forward under way, waiting for it until
+    /// `until` if it is not open: it may be reopening, or fail to open
+    /// for a while, and money waits on it.
+    async fn network_by(&self, id: &NetworkId, until: u64) -> Result<Arc<dyn Network>, String> {
+        let mut waiting = false;
+        loop {
+            match self.network(id) {
+                Ok(network) => return Ok(network),
+                Err(error) if unix_now() >= until => return Err(error),
+                Err(_) => {
+                    if !waiting {
+                        warn!("a forward waits for {id} to open");
+                        waiting = true;
+                    }
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                }
+            }
+        }
     }
 
     /// Whether the gateway takes `authorization`, of `kind`: it names
@@ -303,7 +399,7 @@ impl Gateway {
         if authorization.gateway != self.key() {
             return Err("the authorization names another gateway".into());
         }
-        let policy = &self.0.policy;
+        let policy = self.policy();
         if authorization.min_final_timeout_secs > policy.max_final_timeout_secs {
             return Err(format!(
                 "a final timeout of {}s is more than this gateway locks funds for ({}s)",
@@ -322,7 +418,7 @@ impl Gateway {
         if !authorization
             .destinations
             .iter()
-            .any(|destination| self.0.networks.contains_key(&destination.network))
+            .any(|destination| self.network(&destination.network).is_ok())
         {
             return Err("this gateway pays on none of the payee's networks".into());
         }
@@ -416,7 +512,7 @@ impl Gateway {
         let authorization = record.authorization;
         let expires_at = request
             .expires_at
-            .unwrap_or(now + self.0.policy.default_invoice_expiry_secs)
+            .unwrap_or(now + self.policy().default_invoice_expiry_secs)
             .min(authorization.valid_until);
         if expires_at <= now {
             return Err("invoice expiry must be in the future".into());
@@ -478,7 +574,9 @@ impl Gateway {
         {
             return Err("this gateway already issued an invoice for the hash".into());
         }
-        let mut networks: Vec<&Arc<dyn Network>> = self.0.networks.values().collect();
+        let forward_slack_secs = self.policy().forward_slack_secs;
+        let mut networks: Vec<Arc<dyn Network>> =
+            lock(&self.0.networks).values().cloned().collect();
         networks.sort_by_key(|network| network.id());
         let mut targets = Vec::with_capacity(networks.len());
         for network in networks {
@@ -492,7 +590,7 @@ impl Gateway {
                     incoming_delta_secs: Some(
                         network
                             .incoming_delta_secs()
-                            .saturating_add(self.0.policy.forward_slack_secs),
+                            .saturating_add(forward_slack_secs),
                     ),
                     max_incoming_lifetime_secs: network.max_incoming_lifetime_secs(),
                 }),
@@ -565,7 +663,7 @@ impl Gateway {
             .ok_or_else(|| format!("invoice is not payable on {network}"))?;
         let opened = self.network(network)?;
         let claim_by = expiry.saturating_sub(opened.incoming_delta_secs());
-        if claim_by.saturating_sub(self.0.policy.forward_slack_secs) <= unix_now() {
+        if claim_by.saturating_sub(self.policy().forward_slack_secs) <= unix_now() {
             return Err("HTLC expires too soon to pay the payee on".into());
         }
         Ok((target, opened, claim_by))
@@ -745,7 +843,9 @@ impl Gateway {
     /// payee.
     async fn verify_and_fund(&self, forward: &mut ForwardRecord) -> Result<ForwardState, String> {
         let hash = forward.payment_hash;
-        let incoming = self.network(&forward.incoming_network)?;
+        let incoming = self
+            .network_by(&forward.incoming_network, forward.claim_by)
+            .await?;
         let mut waiting = false;
         loop {
             match incoming.verify_incoming_htlc(&forward.incoming).await {
@@ -766,14 +866,14 @@ impl Gateway {
         let (destination, outgoing) = self.destination(authorization, amount_msat).await?;
         if forward
             .claim_by
-            .saturating_sub(self.0.policy.forward_slack_secs / 2)
+            .saturating_sub(self.policy().forward_slack_secs / 2)
             <= unix_now()
         {
             return Err("too late to pay the payee before the incoming HTLC expires".into());
         }
         let expiry = unix_now()
             .saturating_add(authorization.min_final_timeout_secs)
-            .saturating_add(self.0.policy.final_slack_secs);
+            .saturating_add(self.policy().final_slack_secs);
         forward.state = ForwardState::Funding;
         forward.outgoing_network = Some(destination.network.clone());
         self.save(forward)?;
@@ -867,7 +967,9 @@ impl Gateway {
     async fn claim(&self, forward: &mut ForwardRecord) -> Result<ForwardState, String> {
         let hash = forward.payment_hash;
         let preimage = forward.preimage.ok_or("no preimage to claim with")?;
-        let incoming = self.network(&forward.incoming_network)?;
+        let incoming = self
+            .network_by(&forward.incoming_network, forward.incoming.expiry)
+            .await?;
         loop {
             match incoming
                 .claim_incoming_htlc(&forward.incoming, preimage)
@@ -903,8 +1005,10 @@ impl Gateway {
     /// Release what the gateway's networks, except `claimed_on`, set up
     /// to receive `payment_hash`.
     async fn release_targets(&self, payment_hash: &Bytes32, claimed_on: Option<&NetworkId>) {
-        for (id, network) in &self.0.networks {
-            if Some(id) == claimed_on {
+        let networks: Vec<Arc<dyn Network>> = lock(&self.0.networks).values().cloned().collect();
+        for network in networks {
+            let id = network.id();
+            if Some(&id) == claimed_on {
                 continue;
             }
             if let Err(error) = network.cancel_receive(*payment_hash).await {
@@ -931,7 +1035,7 @@ impl Gateway {
                          wallet for a lock to it",
                         forward.payment_hash, forward.outgoing_network
                     );
-                    forward.state = ForwardState::Failed("interrupted while funding".into());
+                    forward.state = ForwardState::Failed(INTERRUPTED_FUNDING.into());
                     self.save(&forward)?;
                 }
                 _ => {}
@@ -1072,6 +1176,10 @@ impl Gateway {
             self.spawn(self.clone().drive(saved, busy));
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 struct BusyGuard {

@@ -4,21 +4,27 @@
 //!
 //! ```text
 //! <dir>/seed                12-word mnemonic every key derives from
+//! <dir>/config.toml         networks, terms, admin (see `cassis_gateway::config`)
 //! <dir>/store.db            authorizations, invoices and forwards
 //! <dir>/<kind>/<variant>/   private data of one network's wallet
 //! ```
 //!
 //! Each network is compiled in by the cargo feature of the same name.
+//!
+//! It also serves an admin interface for hyperb renderers (see
+//! [`cassis_gateway::admin`]).
 
+use cassis_admin::networks::Networks;
+use cassis_admin::{reexec, shutdown_signal, ConfigFile, Refresh, Server, RESTART_GRACE};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::store::Store;
-use cassis_core::NetworkId;
-use cassis_gateway::{Gateway, GatewayConfig, GatewayPolicy};
-use cassis_networks::NetworkSettings;
+use cassis_gateway::admin::{GatewayAdmin, GatewayOpener};
+use cassis_gateway::config::{Config, TEMPLATE};
+use cassis_gateway::{Gateway, GatewayConfig};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, info_span};
+use tracing::{info, info_span, warn};
 
 #[derive(Parser)]
 #[command(
@@ -30,28 +36,6 @@ struct Cli {
     /// `~/.cassis-gateway`.
     #[arg(long, value_name = "DIR")]
     home: Option<PathBuf>,
-    /// Networks to be paid on and to pay payees on, e.g.
-    /// `cashu::mint.host`, `liquid`, `arkade::mutinynet`.
-    #[arg(long = "network", required = true)]
-    networks: Vec<String>,
-    /// Longest final timeout a payee may ask for: funds stay locked that
-    /// long when a payee never claims.
-    #[arg(long, value_name = "SECS", default_value_t = GatewayPolicy::default().max_final_timeout_secs)]
-    max_final_timeout: u64,
-    /// Longest a standing authorization may run.
-    #[arg(long, value_name = "SECS", default_value_t = GatewayPolicy::default().max_authorization_secs)]
-    max_authorization: u64,
-    /// Expiry of invoices issued under a standing authorization, when
-    /// the asker names none.
-    #[arg(long, value_name = "SECS", default_value_t = GatewayPolicy::default().default_invoice_expiry_secs)]
-    invoice_expiry: u64,
-    /// Margin asked of payers on top of each network's: time to pay the
-    /// payee and have the preimage released.
-    #[arg(long, value_name = "SECS", default_value_t = GatewayPolicy::default().forward_slack_secs)]
-    forward_slack: u64,
-    /// Margin added to the payee's final timeout.
-    #[arg(long, value_name = "SECS", default_value_t = GatewayPolicy::default().final_slack_secs)]
-    final_slack: u64,
 }
 
 #[tokio::main]
@@ -75,42 +59,39 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let keys = NodeKeys::from_mnemonic(&read_or_create_seed(&dir)?).map_err(|e| e.to_string())?;
+    let file: ConfigFile<Config> = ConfigFile::load_or_create(&dir, TEMPLATE)?;
+    let config = file.get();
     let store = Arc::new(Store::open(&dir.join("store.db"))?);
     let span = info_span!("node", node = "gateway");
-    let mut networks = Vec::new();
-    for spec in &cli.networks {
-        let id = NetworkId::parse(spec)?;
-        let settings = NetworkSettings {
-            secret: keys.network_secret(&id),
-            dir: cassis_networks::network_dir(&dir, &id),
-            // `$CASSIS_ESPLORA_URL` overrides the chain API, as in
-            // cassis-wallet.
-            esplora_url: match id.kind() {
-                "arkade" => std::env::var("CASSIS_ESPLORA_URL").ok(),
-                _ => None,
-            },
-            ..Default::default()
-        };
-        networks.push(
-            cassis_networks::open(&id, &settings, &span)
-                .await
-                .map_err(|e| format!("{id}: {e}"))?,
+    // Networks are opened before the gateway starts, so that it can
+    // resume its forwards on them. Forwards through one that does not
+    // open wait for it.
+    let networks = Networks::new(
+        GatewayOpener {
+            keys: keys.clone(),
+            dir: dir.clone(),
+            span: span.clone(),
+        },
+        span.clone(),
+        // It holds funds like a router: keep its wallets in shape.
+        true,
+    );
+    let opened = networks.open_all(&config.networks).await;
+    if config.networks.is_empty() {
+        warn!(
+            "no networks in {}: add some under [networks], or from the admin interface",
+            dir.join(cassis_admin::config::FILE).display()
         );
     }
     let gateway = Gateway::start(GatewayConfig {
         endpoint_secret: keys.iroh,
         store,
-        networks,
-        policy: GatewayPolicy {
-            max_final_timeout_secs: cli.max_final_timeout,
-            max_authorization_secs: cli.max_authorization,
-            default_invoice_expiry_secs: cli.invoice_expiry,
-            forward_slack_secs: cli.forward_slack,
-            final_slack_secs: cli.final_slack,
-        },
+        networks: opened,
+        policy: config.terms,
         span,
     })
     .await?;
+    networks.attach(Arc::new(gateway.clone()));
     let relay = gateway.home_relay().await;
     info!(
         "serving as {} (relay {}); Ctrl-C to stop",
@@ -118,8 +99,23 @@ async fn run(cli: Cli) -> Result<(), String> {
         relay.as_deref().unwrap_or("unknown")
     );
     println!("{}", gateway.peer_id());
-    tokio::signal::ctrl_c().await.ok();
+
+    let refresh = Refresh::default();
+    let app = GatewayAdmin::new(gateway.clone(), file, networks, relay, refresh.clone());
+    let server = Server::new(app, refresh);
+    server.serve(keys.admin_endpoint_secret()).await;
+
+    let restart = tokio::select! {
+        _ = shutdown_signal() => false,
+        _ = server.restart_requested() => true,
+    };
+    if restart {
+        tokio::time::sleep(RESTART_GRACE).await;
+    }
     gateway.shutdown().await;
+    if restart {
+        return Err(reexec());
+    }
     Ok(())
 }
 

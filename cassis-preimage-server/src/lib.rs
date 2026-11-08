@@ -22,6 +22,9 @@
 //!
 //! Only HTLCs whose preimage was released are stored.
 
+pub mod admin;
+pub mod config;
+
 use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
 use cassis_core::offline::{
     endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
@@ -34,7 +37,8 @@ use iroh_base::PublicKey;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{info, warn, Instrument, Span};
 
 pub use db::Db;
@@ -92,6 +96,24 @@ pub struct ServerConfig {
     pub span: Span,
 }
 
+/// What a server answered since it started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Hashes issued.
+    pub issued: u64,
+    /// HTLCs logged and their preimages released.
+    pub released: u64,
+    /// Issues and releases refused.
+    pub refused: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    issued: AtomicU64,
+    released: AtomicU64,
+    refused: AtomicU64,
+}
+
 /// Handle to a running preimage server. Cheap to clone.
 #[derive(Clone)]
 pub struct PreimageServer(Arc<Inner>);
@@ -100,9 +122,10 @@ struct Inner {
     endpoint_secret: [u8; 32],
     preimage_secret: [u8; 32],
     db: Arc<Db>,
-    networks: HashMap<NetworkId, Arc<dyn Network>>,
+    networks: Mutex<HashMap<NetworkId, Arc<dyn Network>>>,
     transport: Transport,
     span: Span,
+    counters: Counters,
 }
 
 impl PreimageServer {
@@ -114,13 +137,16 @@ impl PreimageServer {
             endpoint_secret: config.endpoint_secret,
             preimage_secret: config.preimage_secret,
             db: config.db,
-            networks: config
-                .networks
-                .into_iter()
-                .map(|network| (network.id(), network))
-                .collect(),
+            networks: Mutex::new(
+                config
+                    .networks
+                    .into_iter()
+                    .map(|network| (network.id(), network))
+                    .collect(),
+            ),
             transport: transport.clone(),
             span: config.span,
+            counters: Counters::default(),
         }));
         let handling = server.clone();
         let handler: Handler = Arc::new(move |request, peer| {
@@ -145,8 +171,56 @@ impl PreimageServer {
         self.0.transport.close().await;
     }
 
-    fn key(&self) -> PublicKey {
+    pub fn key(&self) -> PublicKey {
         endpoint_public_key(&self.0.endpoint_secret)
+    }
+
+    fn networks(&self) -> MutexGuard<'_, HashMap<NetworkId, Arc<dyn Network>>> {
+        self.0.networks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Verify HTLCs on `network` too, or anew.
+    pub fn add_network(&self, network: Arc<dyn Network>) {
+        self.networks().insert(network.id(), network);
+    }
+
+    /// Stop verifying HTLCs on `id`, refusing payees receiving on it.
+    pub fn remove_network(&self, id: &NetworkId) {
+        self.networks().remove(id);
+    }
+
+    /// The networks it verifies HTLCs on, in order.
+    pub fn network_ids(&self) -> Vec<NetworkId> {
+        let mut ids: Vec<NetworkId> = self.networks().keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn stats(&self) -> Stats {
+        let counters = &self.0.counters;
+        Stats {
+            issued: counters.issued.load(Ordering::Relaxed),
+            released: counters.released.load(Ordering::Relaxed),
+            refused: counters.refused.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Every HTLC whose preimage was released.
+    pub fn all_payments(&self) -> Result<Vec<Payment>, String> {
+        self.0
+            .db
+            .payments()
+            .all()
+            .map_err(|e| format!("read payments: {e}"))
+    }
+
+    /// Everyone paid through this server.
+    pub fn all_payees(&self) -> Result<Vec<Payee>, String> {
+        self.0
+            .db
+            .payees()
+            .all()
+            .map_err(|e| format!("read payees: {e}"))
     }
 
     async fn handle(&self, request: Request, peer: String) -> Response {
@@ -215,12 +289,18 @@ impl PreimageServer {
     ) -> Result<PreimageIssuance, String> {
         let result = self.try_issue(peer, authorization, amount_msat, metadata);
         match &result {
-            Ok(issuance) => info!(
-                "issued {} for {amount_msat} msat to {peer} for payee {}",
-                issuance.payment_hash.short(),
-                authorization.payee
-            ),
-            Err(reason) => warn!("refused to issue a hash to {peer}: {reason}"),
+            Ok(issuance) => {
+                self.0.counters.issued.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    "issued {} for {amount_msat} msat to {peer} for payee {}",
+                    issuance.payment_hash.short(),
+                    authorization.payee
+                )
+            }
+            Err(reason) => {
+                self.0.counters.refused.fetch_add(1, Ordering::Relaxed);
+                warn!("refused to issue a hash to {peer}: {reason}")
+            }
         }
         result
     }
@@ -267,8 +347,7 @@ impl PreimageServer {
     }
 
     fn network(&self, id: &NetworkId) -> Result<Arc<dyn Network>, String> {
-        self.0
-            .networks
+        self.networks()
             .get(id)
             .cloned()
             .ok_or_else(|| format!("this preimage server does not verify HTLCs on {id}"))
@@ -283,6 +362,7 @@ impl PreimageServer {
             Ok(Some(preimage)) => Response::PreimageReleased(Ok(preimage)),
             Ok(None) => Response::Pending,
             Err(reason) => {
+                self.0.counters.refused.fetch_add(1, Ordering::Relaxed);
                 warn!("RELEASE {} refused: {reason}", hash.short());
                 Response::PreimageReleased(Err(reason))
             }
@@ -377,7 +457,9 @@ impl PreimageServer {
             tx.payments().insert(&payment)
         });
         match written {
-            Ok(_) => {}
+            Ok(_) => {
+                self.0.counters.released.fetch_add(1, Ordering::Relaxed);
+            }
             // A concurrent release of the same payment got there first.
             Err(orangedb::Error::AlreadyExists { .. }) => {}
             Err(error) => return Err(format!("store payment: {error}")),

@@ -31,6 +31,8 @@
 //! # peers = ["<64 hex>"]           # iroh keys of renderers let in
 //! ```
 
+use cassis_admin::config::write_private;
+pub use cassis_admin::AdminConfig;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{RouteOffer, RoutingPolicy};
 use cassis_core::routing::{DEFAULT_NOSTR_RELAYS, DEFAULT_TRANSIT_SLACK_SECS};
@@ -38,12 +40,10 @@ use cassis_core::NetworkId;
 use cassis_networks::NetworkSettings;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
 
 pub const FILE: &str = "config.toml";
-pub const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:7979";
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,49 +67,6 @@ pub struct Config {
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub admin: AdminConfig,
-}
-
-#[derive(Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdminConfig {
-    /// Loopback address of the admin page over HTTP, open to anyone on
-    /// this machine; empty turns it off.
-    #[serde(default = "default_admin_listen")]
-    pub listen: String,
-    /// Serve the admin page over iroh, to `peers` only.
-    #[serde(default = "yes")]
-    pub iroh: bool,
-    /// Hex iroh keys of the renderers let in over iroh.
-    #[serde(default)]
-    pub peers: Vec<String>,
-}
-
-impl Default for AdminConfig {
-    fn default() -> Self {
-        Self {
-            listen: default_admin_listen(),
-            iroh: true,
-            peers: Vec::new(),
-        }
-    }
-}
-
-impl AdminConfig {
-    pub fn listen_addr(&self) -> Result<Option<SocketAddr>, String> {
-        if self.listen.is_empty() {
-            return Ok(None);
-        }
-        let addr: SocketAddr = self
-            .listen
-            .parse()
-            .map_err(|e| format!("admin.listen {}: {e}", self.listen))?;
-        if !addr.ip().is_loopback() {
-            return Err(format!(
-                "admin.listen {addr}: the HTTP admin page is open, so it only listens on loopback"
-            ));
-        }
-        Ok(Some(addr))
-    }
 }
 
 #[derive(Clone, PartialEq, Deserialize)]
@@ -173,14 +130,6 @@ fn default_relays() -> Vec<String> {
         .iter()
         .map(|relay| relay.to_string())
         .collect()
-}
-
-fn default_admin_listen() -> String {
-    DEFAULT_ADMIN_LISTEN.to_string()
-}
-
-fn yes() -> bool {
-    true
 }
 
 impl Config {
@@ -295,30 +244,31 @@ impl Config {
             ..RoutingPolicy::default()
         })
     }
+}
 
+impl NetworkConfig {
     /// What opening `network` takes, its wallet kept under `dir`.
     #[allow(unused_variables)]
-    pub fn network_settings(
+    pub fn settings(
         &self,
         network: &NetworkId,
         keys: &NodeKeys,
         dir: &Path,
     ) -> Result<NetworkSettings, String> {
-        let config = &self.networks[&network.to_string()];
-        let secret = match &config.secret {
+        let secret = match &self.secret {
             Some(hex) => parse_secret(hex).map_err(|e| format!("{network} secret: {e}"))?,
             None => keys.network_secret(network),
         };
         #[cfg(not(feature = "lightning"))]
-        if config.lnd.is_some() {
+        if self.lnd.is_some() {
             return Err(format!("{network}: this build has no LND support"));
         }
         #[cfg(not(feature = "bark-lightning"))]
-        if config.bark.is_some() {
+        if self.bark.is_some() {
             return Err(format!("{network}: this build has no bark support"));
         }
         #[cfg(feature = "bark-lightning")]
-        let bark = match &config.bark {
+        let bark = match &self.bark {
             None => None,
             Some(bark) => {
                 let default = cassis_networks::bark_lightning::BarkConfig::default_for(network);
@@ -340,9 +290,9 @@ impl Config {
             secret,
             dir: cassis_networks::network_dir(dir, network),
             max_incoming_lifetime_secs: None,
-            esplora_url: config.esplora_url.clone(),
+            esplora_url: self.esplora_url.clone(),
             #[cfg(feature = "lightning")]
-            lnd: config.lnd.as_ref().map(|lnd| {
+            lnd: self.lnd.as_ref().map(|lnd| {
                 cassis_networks::lnd::LndConfig::new(
                     lnd.rest_url.clone(),
                     lnd.tls_cert_path.clone(),
@@ -373,25 +323,6 @@ pub fn edit(
     let config = Config::parse(&text)?;
     write_private(&path, &text)?;
     Ok(config)
-}
-
-/// Replace `path` with `text` at once, readable by its owner only.
-fn write_private(path: &Path, text: &str) -> Result<(), String> {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("toml.tmp");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&tmp)
-        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    file.write_all(text.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))
 }
 
 fn parse_secret(hex: &str) -> Result<[u8; 32], String> {

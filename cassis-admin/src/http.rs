@@ -5,7 +5,7 @@
 //! this machine in, but answers only requests addressed to a loopback
 //! name, so that web pages cannot reach it by rebinding theirs.
 
-use super::{Access, Admin, Session};
+use crate::{Access, Server, Session};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -30,7 +30,7 @@ const STREAM_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct Http {
-    admin: Arc<Admin>,
+    server: Arc<Server>,
     sessions: Arc<Mutex<HashMap<String, Pending>>>,
 }
 
@@ -43,13 +43,13 @@ struct Pending {
 }
 
 /// Listen on `addr`, returning the address bound.
-pub async fn serve(admin: Arc<Admin>, addr: SocketAddr) -> Result<SocketAddr, String> {
+pub async fn serve(server: Arc<Server>, addr: SocketAddr) -> Result<SocketAddr, String> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("listen on {addr}: {e}"))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let http = Http {
-        admin,
+        server,
         sessions: Default::default(),
     };
     let app = Router::new()
@@ -122,8 +122,8 @@ impl Http {
             return refuse(StatusCode::BAD_REQUEST, "expected a hello");
         };
         let (out, lines) = mpsc::unbounded_channel();
-        let session = self.admin.open(Access::Local, &params, out);
-        let id = super::new_secret();
+        let session = self.server.open(Access::Local, &params, out);
+        let id = crate::new_secret();
         self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -142,7 +142,7 @@ impl Http {
             let mut sessions = http.sessions.lock().unwrap_or_else(|e| e.into_inner());
             if sessions.get(&waiting).is_some_and(|p| p.lines.is_some()) {
                 if let Some(pending) = sessions.remove(&waiting) {
-                    http.admin.close(&pending.session);
+                    http.server.close(&pending.session);
                 }
             }
         });
@@ -162,7 +162,7 @@ async fn post_line(State(http): State<Http>, headers: HeaderMap, body: String) -
         Err(response) => return response,
     };
     for line in body.lines().filter(|line| !line.trim().is_empty()) {
-        http.admin.receive(&session, line).await;
+        http.server.receive(&session, line);
     }
     StatusCode::OK.into_response()
 }
@@ -182,7 +182,7 @@ impl Drop for Closer {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
         if let Some(pending) = removed {
-            self.http.admin.close(&pending.session);
+            self.http.server.close(&pending.session);
         }
     }
 }

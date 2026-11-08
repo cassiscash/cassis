@@ -64,6 +64,22 @@ pub fn network_dir(root: &Path, network: &NetworkId) -> PathBuf {
     root.join(network.kind()).join(variant)
 }
 
+/// Whether this build has the kind of network named `kind`: a network
+/// kind, or `lnd` or `bark` for the two ways of being on `lightning`.
+pub fn built(kind: &str) -> bool {
+    match kind {
+        "arkade" => cfg!(feature = "arkade"),
+        "bark" => cfg!(feature = "bark-lightning"),
+        "bitcoin" => cfg!(feature = "bitcoin"),
+        "cashu" => cfg!(feature = "cashu"),
+        "fedimint" => cfg!(feature = "fedimint"),
+        "liquid" => cfg!(feature = "liquid"),
+        "lnd" => cfg!(feature = "lightning"),
+        "rootstock" => cfg!(feature = "rootstock"),
+        _ => false,
+    }
+}
+
 /// Open the adapter of `network`, if this build has it.
 pub async fn open(
     network: &NetworkId,

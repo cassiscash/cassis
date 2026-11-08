@@ -4,7 +4,7 @@
 //! says it is, and is let in if it is one of `admin.peers` or brings
 //! the pairing secret in its `hello`.
 
-use super::{Access, Admin};
+use crate::{Access, Server};
 use hypereffect::RendererMessage;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 const ALPN: &[u8] = b"hyperb/0";
 
 /// Bind the admin endpoint and serve it, returning its id.
-pub async fn serve(admin: Arc<Admin>, secret: [u8; 32]) -> Result<String, String> {
+pub async fn serve(server: Arc<Server>, secret: [u8; 32]) -> Result<String, String> {
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::from(secret))
         .alpns(vec![ALPN.to_vec()])
@@ -28,9 +28,9 @@ pub async fn serve(admin: Arc<Admin>, secret: [u8; 32]) -> Result<String, String
     let id = endpoint.id().to_string();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let admin = admin.clone();
+            let server = server.clone();
             tokio::spawn(async move {
-                if let Err(error) = session(admin, incoming).await {
+                if let Err(error) = session(server, incoming).await {
                     debug!("admin session over iroh ended: {error}");
                 }
             });
@@ -39,7 +39,7 @@ pub async fn serve(admin: Arc<Admin>, secret: [u8; 32]) -> Result<String, String
     Ok(id)
 }
 
-async fn session(admin: Arc<Admin>, incoming: iroh::endpoint::Incoming) -> Result<(), String> {
+async fn session(server: Arc<Server>, incoming: iroh::endpoint::Incoming) -> Result<(), String> {
     let connection = incoming.await.map_err(|e| e.to_string())?;
     let key = connection.remote_id().to_string();
     let (mut send, recv) = connection.accept_bi().await.map_err(|e| e.to_string())?;
@@ -60,16 +60,16 @@ async fn session(admin: Arc<Admin>, incoming: iroh::endpoint::Incoming) -> Resul
             }
         }
     });
-    let session = admin.open(Access::Peer(key), &params, out);
+    let session = server.open(Access::Peer(key), &params, out);
     let ended = loop {
         match lines.next_line().await {
             Ok(Some(line)) if line.trim().is_empty() => {}
-            Ok(Some(line)) => admin.receive(&session, &line).await,
+            Ok(Some(line)) => server.receive(&session, &line),
             Ok(None) => break Ok(()),
             Err(error) => break Err(error.to_string()),
         }
     };
-    admin.close(&session);
+    server.close(&session);
     drop(session);
     writer.abort();
     connection.close(0u32.into(), b"bye");

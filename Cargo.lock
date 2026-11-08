@@ -2625,6 +2625,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cassis-admin"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "cassis-core",
+ "cassis-networks",
+ "futures",
+ "hypereffect",
+ "iroh 1.0.3",
+ "lowercase-hex",
+ "rand 0.8.7",
+ "serde",
+ "sha2 0.10.9",
+ "tokio",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
+ "tracing",
+]
+
+[[package]]
 name = "cassis-arkade"
 version = "0.1.0"
 dependencies = [
@@ -2740,15 +2761,19 @@ name = "cassis-gateway"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cassis-admin",
  "cassis-core",
  "cassis-networks",
  "cassis-preimage-server",
  "clap",
+ "futures",
+ "hypereffect",
  "iroh-base 1.0.3",
  "ritualistic",
  "rustls",
  "serde",
  "tokio",
+ "toml_edit 0.22.27",
  "tracing",
 ]
 
@@ -2810,20 +2835,19 @@ dependencies = [
 name = "cassis-preimage-server"
 version = "0.1.0"
 dependencies = [
- "cassis-arkade",
- "cassis-bitcoin",
- "cassis-cashu",
+ "cassis-admin",
  "cassis-core",
- "cassis-fedimint",
- "cassis-liquid",
- "cassis-rootstock",
+ "cassis-networks",
  "clap",
+ "futures",
  "hmac",
+ "hypereffect",
  "iroh 1.0.3",
  "iroh-base 1.0.3",
  "orangedb",
  "rand 0.8.7",
  "rustls",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -2845,21 +2869,17 @@ dependencies = [
 name = "cassis-routerd"
 version = "0.1.0"
 dependencies = [
- "axum",
- "base64 0.22.1",
+ "cassis-admin",
  "cassis-core",
  "cassis-networks",
  "clap",
  "futures",
  "hypereffect",
- "iroh 1.0.3",
  "lowercase-hex",
- "rand 0.8.7",
  "ritualistic",
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tokio",
  "toml 0.8.23",
  "toml_edit 0.22.27",
