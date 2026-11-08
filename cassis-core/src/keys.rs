@@ -30,7 +30,10 @@ pub struct NodeKeys {
     /// Node identity: signs route announcements and names the payee of
     /// every invoice.
     pub node: SecretKey,
-    /// Secret of the node's iroh endpoint.
+    /// Secret of the node's iroh endpoint, whose public key is the
+    /// node's identity as a payee: it signs its invoices and receive
+    /// authorizations (see [`crate::offline`]), and gateways and
+    /// preimage servers know the node by it.
     pub iroh: [u8; 32],
 }
 
@@ -64,16 +67,6 @@ impl NodeKeys {
     /// [`NodeKeys::iroh`], so the interface outlives node restarts.
     pub fn admin_endpoint_secret(&self) -> [u8; 32] {
         hmac(&self.seed, b"cassis/admin", None)
-    }
-
-    /// Key this node receives offline under (see [`crate::offline`]):
-    /// it signs the node's receive authorizations and gateway invoices,
-    /// and is the endpoint the node talks to gateways and preimage
-    /// servers from. Stable, since preimage servers log the node's
-    /// payments under it, and distinct from [`NodeKeys::iroh`] so it can
-    /// be used while the node runs.
-    pub fn offline_payee_secret(&self) -> [u8; 32] {
-        hmac(&self.seed, b"cassis/preimage-server-client", None)
     }
 
     /// Key a preimage server derives its preimages with (see

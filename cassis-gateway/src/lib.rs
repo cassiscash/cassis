@@ -27,15 +27,16 @@
 
 use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId, OutgoingState};
 use cassis_core::offline::{
-    AuthorizationKind, Destination, EndpointKey, PreimageIssuance, ReceiveAuthorization,
+    endpoint_public_key, AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization,
 };
 use cassis_core::protocol::{
-    Commit, GatewayInvoiceFor, GatewayInvoiceRequest, Invoice, InvoiceKind, InvoiceNetwork,
+    Commit, GatewayInvoiceFor, GatewayInvoiceRequest, Invoice, InvoiceBody, InvoiceNetwork,
     Metadata, PreimageRelease, PreparePayee, Request, Response,
 };
 use cassis_core::store::Store;
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
+use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -225,8 +226,8 @@ impl Gateway {
         self.0.transport.peer_id()
     }
 
-    pub fn key(&self) -> EndpointKey {
-        EndpointKey::from_secret(&self.0.endpoint_secret)
+    pub fn key(&self) -> PublicKey {
+        endpoint_public_key(&self.0.endpoint_secret)
     }
 
     pub async fn home_relay(&self) -> Option<String> {
@@ -341,12 +342,20 @@ impl Gateway {
             preimage_server_relay,
         } = request;
         self.check_authorization(&authorization, AuthorizationKind::Single)?;
-        if peer.parse::<EndpointKey>()? != authorization.payee {
+        if peer
+            .trim()
+            .parse::<PublicKey>()
+            .map_err(|e| format!("endpoint key {peer}: {e}"))?
+            != authorization.payee
+        {
             return Err("only the payee asks for its own invoices".into());
         }
         issuance.verify(&authorization.preimage_server, &authorization)?;
         if issuance.amount_msat != authorization.min_amount_msat {
             return Err("the hash was issued for another amount".into());
+        }
+        if !issuance.matches_metadata(metadata.as_ref()) {
+            return Err("the hash was issued for other metadata".into());
         }
         if expires_at > authorization.valid_until {
             return Err("the invoice would outlive its authorization".into());
@@ -355,10 +364,10 @@ impl Gateway {
             id: authorization.preimage_server.to_string(),
             relay: preimage_server_relay,
         };
-        let mut invoice = self
+        let body = self
             .build(&issuance, expires_at, description, metadata)
             .await?;
-        invoice.sign_as_gateway(&self.0.endpoint_secret)?;
+        let invoice = Invoice::gateway_invoice(body, authorization.payee, &self.0.endpoint_secret);
         self.record(invoice, authorization, issuance, preimage_server)
     }
 
@@ -419,6 +428,7 @@ impl Gateway {
         let issue = Request::PreimageIssue {
             authorization: authorization.clone(),
             amount_msat: request.amount_msat,
+            metadata: request.metadata.clone(),
         };
         let issuance = match self.0.transport.request(&preimage_server, &issue).await? {
             Response::PreimageIssued(Ok(issuance)) => issuance,
@@ -428,32 +438,35 @@ impl Gateway {
             other => return Err(format!("unexpected answer from preimage server: {other:?}")),
         };
         issuance.verify(&authorization.preimage_server, &authorization)?;
-        if issuance.amount_msat != request.amount_msat {
-            return Err("preimage server issued the hash for another amount".into());
+        if issuance.amount_msat != request.amount_msat
+            || !issuance.matches_metadata(request.metadata.as_ref())
+        {
+            return Err("preimage server issued the hash for another payment".into());
         }
-        let mut invoice = self
+        let body = self
             .build(&issuance, expires_at, request.description, request.metadata)
             .await?;
-        invoice.payee = Some(authorization.payee);
-        invoice.preimage_server = Some(authorization.preimage_server);
-        invoice.preimage_server_issuance = Some(issuance.clone());
-        invoice.payee_authorization = Some(authorization.clone());
-        invoice.sign_as_gateway(&self.0.endpoint_secret)?;
-        if invoice.verify()? != InvoiceKind::Delegated {
-            return Err("built an invoice of the wrong kind".into());
-        }
+        let invoice = Invoice::delegated(
+            body,
+            authorization.payee,
+            &self.0.endpoint_secret,
+            authorization.preimage_server,
+            issuance.clone(),
+            authorization.clone(),
+        );
+        invoice.verify()?;
         self.record(invoice, authorization, issuance, preimage_server)
     }
 
-    /// An unsigned invoice for `issuance`, payable to this gateway on
-    /// every network it is on.
+    /// The terms of an invoice for `issuance`, payable to this gateway
+    /// on every network it is on.
     async fn build(
         &self,
         issuance: &PreimageIssuance,
         expires_at: u64,
         description: Option<String>,
         metadata: Option<Metadata>,
-    ) -> Result<Invoice, String> {
+    ) -> Result<InvoiceBody, String> {
         if expires_at <= unix_now() {
             return Err("invoice expiry must be in the future".into());
         }
@@ -489,22 +502,14 @@ impl Gateway {
         if targets.is_empty() {
             return Err("this gateway can receive on none of its networks".into());
         }
-        Ok(Invoice {
+        Ok(InvoiceBody {
             payment_hash,
             amount_msat: issuance.amount_msat,
             expires_at,
             networks: targets,
             description,
             metadata,
-            iroh_peer_id: Some(self.peer_id()),
             iroh_relay: self.home_relay().await,
-            payee: None,
-            payee_signature: None,
-            gateway: None,
-            gateway_signature: None,
-            preimage_server: None,
-            preimage_server_issuance: None,
-            payee_authorization: None,
         })
     }
 
@@ -517,13 +522,13 @@ impl Gateway {
     ) -> Result<Invoice, String> {
         info!(
             "issued invoice {} of {} msat for payee {}",
-            invoice.payment_hash.short(),
-            invoice.amount_msat,
+            invoice.body.payment_hash.short(),
+            invoice.body.amount_msat,
             authorization.payee
         );
         self.store().put(
             INVOICES,
-            &invoice.payment_hash.to_string(),
+            &invoice.body.payment_hash.to_string(),
             &InvoiceRecord {
                 invoice: invoice.clone(),
                 authorization,
@@ -550,7 +555,7 @@ impl Gateway {
         network: &NetworkId,
         expiry: u64,
     ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
-        if record.status == InvoiceStatus::Expired || record.invoice.expires_at <= unix_now() {
+        if record.status == InvoiceStatus::Expired || record.invoice.body.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
         let target = record
@@ -601,7 +606,7 @@ impl Gateway {
             return Err("invoice already paid".into());
         }
         self.payable_on(&record, &prepare.network, prepare.expiry)?;
-        self.destination(&record.authorization, record.invoice.amount_msat)
+        self.destination(&record.authorization, record.invoice.body.amount_msat)
             .await?;
         info!(
             "PREPARE {} accepted on {}",
@@ -672,7 +677,7 @@ impl Gateway {
             incoming_network: commit.network,
             incoming: Htlc {
                 payment_hash: hash,
-                amount_msat: record.invoice.amount_msat,
+                amount_msat: record.invoice.body.amount_msat,
                 expiry: commit.expiry,
                 target,
                 descriptor: commit.descriptor,
@@ -803,6 +808,7 @@ impl Gateway {
         let request = Request::PreimageRelease(PreimageRelease {
             authorization: record.authorization.clone(),
             issuance: record.issuance.clone(),
+            metadata: record.invoice.body.metadata.clone(),
             network: network.clone(),
             htlc: htlc.clone(),
         });
@@ -959,9 +965,9 @@ impl Gateway {
             Ok(invoices) => {
                 for mut record in invoices {
                     if record.status == InvoiceStatus::Pending
-                        && record.invoice.expires_at <= unix_now()
+                        && record.invoice.body.expires_at <= unix_now()
                     {
-                        let hash = record.invoice.payment_hash;
+                        let hash = record.invoice.body.payment_hash;
                         if self
                             .store()
                             .get::<ForwardRecord>(FORWARDS, &hash.to_string())

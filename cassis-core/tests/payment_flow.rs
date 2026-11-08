@@ -9,7 +9,8 @@ use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{
     HopRecord, HopState, Node, NodeConfig, PaymentRecord, PaymentStatus, RouteOffer, RoutingPolicy,
 };
-use cassis_core::protocol::Metadata;
+use cassis_core::offline::endpoint_public_key;
+use cassis_core::protocol::{InvoiceReceiver, Metadata};
 use cassis_core::store::Store;
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
@@ -271,7 +272,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .pay(&invoice, &NetworkId(a.into()), &[RELAY.into()])
         .await
         .unwrap();
-    assert!(invoice.payment_hash.matches_preimage(&preimage));
+    assert!(invoice.body.payment_hash.matches_preimage(&preimage));
     let hops: Vec<HopRecord> = router.store().list("hops").unwrap();
     assert_eq!(hops.len(), 1);
     // Fee: 1000 base + 500 ppm of 100_000.
@@ -292,7 +293,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
         .await
         .unwrap();
-    tampered.amount_msat = 40_000;
+    tampered.body.amount_msat = 40_000;
     let error = payer
         .pay(&tampered, &NetworkId(a.into()), &[RELAY.into()])
         .await
@@ -300,7 +301,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     assert!(error.contains("invalid invoice signature"), "{error}");
     assert!(payer
         .store()
-        .get::<PaymentRecord>("payments", &tampered.payment_hash.to_string())
+        .get::<PaymentRecord>("payments", &tampered.body.payment_hash.to_string())
         .unwrap()
         .is_none());
 
@@ -310,7 +311,9 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
         .await
         .unwrap();
-    misdirected.iroh_peer_id = Some(router.iroh_peer_id());
+    if let InvoiceReceiver::Direct(receiver) = &mut misdirected.receiver {
+        receiver.payee = endpoint_public_key(&router_keys.iroh);
+    }
     misdirected.sign_as_payee(&router_keys.iroh).unwrap();
     let error = payer
         .pay(&misdirected, &NetworkId(a.into()), &[RELAY.into()])
@@ -319,7 +322,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     assert!(error.contains("payee refused: unknown invoice"), "{error}");
     assert!(payer
         .store()
-        .get::<PaymentRecord>("payments", &misdirected.payment_hash.to_string())
+        .get::<PaymentRecord>("payments", &misdirected.body.payment_hash.to_string())
         .unwrap()
         .is_none());
 
@@ -330,7 +333,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
         .await
         .unwrap();
-    unreachable.networks[0].target = HtlcTarget::XOnlyPubKey(
+    unreachable.body.networks[0].target = HtlcTarget::XOnlyPubKey(
         ritualistic::SecretKey::from_bytes([9; 32])
             .unwrap()
             .pubkey(),
@@ -343,15 +346,15 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     assert!(error.contains("payee did not claim"), "{error}");
     let payment: PaymentRecord = payer
         .store()
-        .get("payments", &unreachable.payment_hash.to_string())
+        .get("payments", &unreachable.body.payment_hash.to_string())
         .unwrap()
         .unwrap();
     assert_eq!(payment.status, PaymentStatus::Pending);
     let forwarded: Vec<HopRecord> = router.store().list("hops").unwrap();
-    assert!(forwarded
-        .iter()
-        .any(|hop| hop.prepare.payment_hash == unreachable.payment_hash
-            && hop.state == HopState::Forwarded));
+    assert!(forwarded.iter().any(
+        |hop| hop.prepare.payment_hash == unreachable.body.payment_hash
+            && hop.state == HopState::Forwarded
+    ));
     // Nothing is refunded before the expiry.
     router.settle_once().await;
     payer.settle_once().await;

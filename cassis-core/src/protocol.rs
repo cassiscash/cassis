@@ -25,11 +25,12 @@
 
 use crate::network::{Htlc, HtlcDescriptor, HtlcTarget, NetworkId};
 use crate::offline::{
-    AuthorizationKind, EndpointKey, PreimageIssuance, ReceiveAuthorization, Signature,
+    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
 };
 use crate::primitives::{Bytes32, OperationId};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// Protocol identifier negotiated on every connection.
@@ -57,6 +58,12 @@ impl Metadata {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// SHA-256 of the bytes: what a [`PreimageIssuance`] commits to.
+    pub fn hash(&self) -> Bytes32 {
+        use sha2::{Digest, Sha256};
+        Bytes32(Sha256::digest(&self.0).into())
     }
 }
 
@@ -89,10 +96,17 @@ const PAYEE_SIGNATURE_DOMAIN: &[u8] = b"cassis-invoice/v2/payee\0";
 /// Same for a gateway (see [`Invoice::sign_as_gateway`]).
 const GATEWAY_SIGNATURE_DOMAIN: &[u8] = b"cassis-invoice/v2/gateway\0";
 
-/// A payment request. Who issued it, and so which signatures it
-/// carries, is its [`InvoiceKind`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A payment request: the payment terms every invoice carries, plus the
+/// [`InvoiceReceiver`] that issued it and carries its signatures.
+#[derive(Clone, Debug)]
 pub struct Invoice {
+    pub body: InvoiceBody,
+    pub receiver: InvoiceReceiver,
+}
+
+/// The payment terms every invoice carries, whatever its receiver.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvoiceBody {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
     pub expires_at: u64,
@@ -103,51 +117,102 @@ pub struct Invoice {
     /// Handed back to the endpoint with PREPARE and COMMIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// Iroh endpoint PREPARE and COMMIT are sent to: the payee's, or
-    /// the gateway's when there is one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub iroh_peer_id: Option<String>,
+    /// Relay the payer reaches the invoice's endpoint through, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay: Option<String>,
-    /// Key of the final payee.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payee: Option<EndpointKey>,
-    /// By `payee`, over everything else.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payee_signature: Option<Signature>,
-    /// Key of the gateway that is paid in the payee's place.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway: Option<EndpointKey>,
-    /// By `gateway`, over everything but `payee` and the signatures.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_signature: Option<Signature>,
-    /// Key of the preimage server that issued `payment_hash`, on
-    /// invoices the gateway issued alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preimage_server: Option<EndpointKey>,
-    /// `preimage_server`'s word that it issued `payment_hash` under
-    /// `payee_authorization`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preimage_server_issuance: Option<PreimageIssuance>,
-    /// The payee's leave for the gateway to issue this invoice, in
-    /// place of a payee signature.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payee_authorization: Option<ReceiveAuthorization>,
 }
 
-/// The three kinds of invoices, by who issued them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InvoiceKind {
+/// The three kinds of invoices, by who issued them and how the payer
+/// reaches the payee.
+#[derive(Clone, Debug)]
+pub enum InvoiceReceiver {
     /// Issued and signed by the payee, which is paid directly at its
     /// own endpoint.
-    Direct,
+    Direct(DirectReceiver),
     /// Issued by a gateway that is paid in the payee's place, for a
     /// hash the payee got from a preimage server, and signed by both.
-    Gateway,
+    Gateway(GatewayReceiver),
     /// Issued by a gateway alone while the payee is offline, under the
     /// payee's standing [`ReceiveAuthorization`] and for a hash its
     /// preimage server vouches for.
-    Delegated,
+    Delegated(DelegatedReceiver),
+}
+
+/// A direct invoice's receiver: the payee itself.
+#[derive(Clone, Debug)]
+pub struct DirectReceiver {
+    /// Key of the final payee, which is also the endpoint the payer
+    /// talks to.
+    pub payee: PublicKey,
+    /// By `payee`, over everything else.
+    pub payee_signature: Option<Signature>,
+}
+
+/// A gateway invoice's receiver: the gateway the payer talks to, and
+/// the payee behind it. The payee signs after the gateway, so its
+/// signature is absent until it does.
+#[derive(Clone, Debug)]
+pub struct GatewayReceiver {
+    /// Key of the final payee.
+    pub payee: PublicKey,
+    /// Key of the gateway that is paid in the payee's place, and the
+    /// endpoint the payer talks to.
+    pub gateway: PublicKey,
+    /// By `gateway`, over everything but the signatures.
+    pub gateway_signature: Option<Signature>,
+    /// By `payee`, over everything but its own signature.
+    pub payee_signature: Option<Signature>,
+}
+
+/// A delegated invoice's receiver: a gateway issuing alone under the
+/// payee's standing authorization.
+#[derive(Clone, Debug)]
+pub struct DelegatedReceiver {
+    /// Key of the final payee.
+    pub payee: PublicKey,
+    /// Key of the gateway that is paid in the payee's place, and the
+    /// endpoint the payer talks to.
+    pub gateway: PublicKey,
+    /// By `gateway`, over everything but the signatures.
+    pub gateway_signature: Option<Signature>,
+    /// Key of the preimage server that issued `payment_hash`.
+    pub preimage_server: PublicKey,
+    /// `preimage_server`'s word that it issued `payment_hash` under
+    /// `payee_authorization`.
+    pub preimage_server_issuance: PreimageIssuance,
+    /// The payee's leave for the gateway to issue this invoice, in
+    /// place of a payee signature.
+    pub payee_authorization: ReceiveAuthorization,
+}
+
+impl InvoiceReceiver {
+    /// The iroh endpoint PREPARE and COMMIT are sent to: the payee's, or
+    /// the gateway's when there is one.
+    pub fn iroh_peer_id(&self) -> &PublicKey {
+        match self {
+            Self::Direct(receiver) => &receiver.payee,
+            Self::Gateway(receiver) => &receiver.gateway,
+            Self::Delegated(receiver) => &receiver.gateway,
+        }
+    }
+
+    /// Key of the final payee, whoever the payer talks to.
+    pub fn payee(&self) -> &PublicKey {
+        match self {
+            Self::Direct(receiver) => &receiver.payee,
+            Self::Gateway(receiver) => &receiver.payee,
+            Self::Delegated(receiver) => &receiver.payee,
+        }
+    }
+
+    /// Key of the gateway paid in the payee's place, if any.
+    pub fn gateway(&self) -> Option<&PublicKey> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Gateway(receiver) => Some(&receiver.gateway),
+            Self::Delegated(receiver) => Some(&receiver.gateway),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,165 +232,390 @@ pub struct InvoiceNetwork {
 }
 
 impl Invoice {
-    /// Sign as the payee whose secret is `secret`, naming it as `payee`.
-    /// A direct invoice must name that same key as its endpoint; on a
-    /// gateway's invoice the signature covers the gateway's.
+    /// A direct invoice: `body`, signed by `secret` as its payee and
+    /// endpoint.
+    pub fn direct(body: InvoiceBody, secret: &[u8; 32]) -> Self {
+        let payee = endpoint_public_key(secret);
+        let mut invoice = Self {
+            body,
+            receiver: InvoiceReceiver::Direct(DirectReceiver {
+                payee,
+                payee_signature: None,
+            }),
+        };
+        invoice
+            .sign_as_payee(secret)
+            .expect("a direct invoice signs for its own payee");
+        invoice
+    }
+
+    /// A gateway invoice for `payee`, signed by `secret` as the
+    /// gateway. The payee signs it later.
+    pub fn gateway_invoice(body: InvoiceBody, payee: PublicKey, secret: &[u8; 32]) -> Self {
+        let gateway = endpoint_public_key(secret);
+        let mut invoice = Self {
+            body,
+            receiver: InvoiceReceiver::Gateway(GatewayReceiver {
+                payee,
+                gateway,
+                gateway_signature: None,
+                payee_signature: None,
+            }),
+        };
+        invoice
+            .sign_as_gateway(secret)
+            .expect("a gateway invoice signs for its own gateway");
+        invoice
+    }
+
+    /// A delegated invoice for `payee`, issued and signed by `secret` as
+    /// the gateway under `payee_authorization`.
+    pub fn delegated(
+        body: InvoiceBody,
+        payee: PublicKey,
+        secret: &[u8; 32],
+        preimage_server: PublicKey,
+        preimage_server_issuance: PreimageIssuance,
+        payee_authorization: ReceiveAuthorization,
+    ) -> Self {
+        let gateway = endpoint_public_key(secret);
+        let mut invoice = Self {
+            body,
+            receiver: InvoiceReceiver::Delegated(DelegatedReceiver {
+                payee,
+                gateway,
+                gateway_signature: None,
+                preimage_server,
+                preimage_server_issuance,
+                payee_authorization,
+            }),
+        };
+        invoice
+            .sign_as_gateway(secret)
+            .expect("a delegated invoice signs for its own gateway");
+        invoice
+    }
+
+    /// The iroh endpoint PREPARE and COMMIT are sent to: the payee's, or
+    /// the gateway's when there is one.
+    pub fn iroh_peer_id(&self) -> &PublicKey {
+        self.receiver.iroh_peer_id()
+    }
+
+    /// Key of the final payee, whoever the payer talks to.
+    pub fn payee(&self) -> &PublicKey {
+        self.receiver.payee()
+    }
+
+    /// Key of the gateway paid in the payee's place, if any.
+    pub fn gateway(&self) -> Option<&PublicKey> {
+        self.receiver.gateway()
+    }
+
+    /// Sign as the payee whose secret is `secret`. A direct invoice must
+    /// name that same key as its payee; a gateway's invoice must already
+    /// name it as its payee, and the signature covers the gateway's.
+    /// Delegated invoices carry no payee signature.
     pub fn sign_as_payee(&mut self, secret: &[u8; 32]) -> Result<(), String> {
-        let payee = EndpointKey::from_secret(secret);
-        if self.gateway.is_none() && self.endpoint_key()? != payee {
-            return Err("invoice names another endpoint than the signing key's".into());
+        let payee = endpoint_public_key(secret);
+        match &self.receiver {
+            InvoiceReceiver::Direct(receiver) if receiver.payee != payee => {
+                return Err("invoice names another payee than the signing key's".into());
+            }
+            InvoiceReceiver::Gateway(receiver) if receiver.payee != payee => {
+                return Err("the gateway issued the invoice for another payee".into());
+            }
+            InvoiceReceiver::Delegated(_) => {
+                return Err("a delegated invoice carries no payee signature".into());
+            }
+            _ => {}
         }
-        self.payee = Some(payee);
-        self.payee_signature = Some(Signature::sign(secret, &self.payee_message()));
+        let signature = Signature::sign(secret, &self.payee_message());
+        match &mut self.receiver {
+            InvoiceReceiver::Direct(receiver) => receiver.payee_signature = Some(signature),
+            InvoiceReceiver::Gateway(receiver) => receiver.payee_signature = Some(signature),
+            InvoiceReceiver::Delegated(_) => unreachable!(),
+        }
         Ok(())
     }
 
-    /// Sign as the gateway whose secret is `secret`, naming it as
-    /// `gateway` and as the endpoint.
+    /// Sign as the gateway whose secret is `secret`. The invoice must
+    /// already name that key as its gateway; the signature covers the
+    /// payee too.
     pub fn sign_as_gateway(&mut self, secret: &[u8; 32]) -> Result<(), String> {
-        let gateway = EndpointKey::from_secret(secret);
-        if self.endpoint_key()? != gateway {
-            return Err("invoice names another endpoint than the gateway's".into());
+        let gateway = endpoint_public_key(secret);
+        match &self.receiver {
+            InvoiceReceiver::Direct(_) => {
+                return Err("a direct invoice has no gateway".into());
+            }
+            InvoiceReceiver::Gateway(receiver) if receiver.gateway != gateway => {
+                return Err("invoice names another gateway than the signing key's".into());
+            }
+            InvoiceReceiver::Delegated(receiver) if receiver.gateway != gateway => {
+                return Err("invoice names another gateway than the signing key's".into());
+            }
+            _ => {}
         }
-        self.gateway = Some(gateway);
-        self.gateway_signature = Some(Signature::sign(secret, &self.gateway_message()));
+        let signature = Signature::sign(secret, &self.gateway_message());
+        match &mut self.receiver {
+            InvoiceReceiver::Direct(_) => unreachable!(),
+            InvoiceReceiver::Gateway(receiver) => receiver.gateway_signature = Some(signature),
+            InvoiceReceiver::Delegated(receiver) => receiver.gateway_signature = Some(signature),
+        }
         Ok(())
     }
 
-    /// Check the invoice is signed as its kind requires, and return that
-    /// kind:
+    /// Check the invoice is signed as its receiver requires:
     ///
-    /// * [`InvoiceKind::Direct`]: no gateway; `payee` is the endpoint
-    ///   and signed.
-    /// * [`InvoiceKind::Gateway`]: `gateway` is the endpoint and
-    ///   signed; `payee` signed too, over the gateway's signature.
-    /// * [`InvoiceKind::Delegated`]: `gateway` is the endpoint and
-    ///   signed; `payee` signed no invoice but a standing authorization
-    ///   naming this gateway and `preimage_server`, whose terms the
-    ///   invoice meets, and `preimage_server` vouches for its hash.
+    /// * [`InvoiceReceiver::Direct`]: signed by the payee.
+    /// * [`InvoiceReceiver::Gateway`]: signed by the gateway (over the
+    ///   payee too) and by the payee (over the gateway's signature).
+    /// * [`InvoiceReceiver::Delegated`]: signed by the gateway; the
+    ///   payee signed no invoice but a standing authorization naming
+    ///   this gateway and preimage server, whose terms the invoice
+    ///   meets, and the preimage server vouches for its hash, amount
+    ///   and metadata.
     ///
     /// Decoding drops unknown fields, so an invoice carrying fields this
     /// version does not know fails to verify.
-    pub fn verify(&self) -> Result<InvoiceKind, String> {
-        let endpoint = self.endpoint_key()?;
-        let payee = self.payee.ok_or("invoice names no payee")?;
-        let Some(gateway) = self.gateway else {
-            if self.gateway_signature.is_some()
-                || self.preimage_server.is_some()
-                || self.preimage_server_issuance.is_some()
-                || self.payee_authorization.is_some()
-            {
-                return Err("an invoice without a gateway carries gateway fields".into());
+    pub fn verify(&self) -> Result<(), String> {
+        match &self.receiver {
+            InvoiceReceiver::Direct(receiver) => {
+                let signature = receiver
+                    .payee_signature
+                    .ok_or("invoice is not signed by its payee")?;
+                signature
+                    .verify(&receiver.payee, &self.payee_message())
+                    .map_err(|_| "invalid invoice signature by the payee".to_string())
             }
-            if endpoint != payee {
-                return Err("invoice names another endpoint than its payee".into());
+            InvoiceReceiver::Gateway(receiver) => {
+                if receiver.payee == receiver.gateway {
+                    return Err("the payee cannot be its own gateway".into());
+                }
+                let signature = receiver
+                    .gateway_signature
+                    .ok_or("invoice is not signed by its gateway")?;
+                signature
+                    .verify(&receiver.gateway, &self.gateway_message())
+                    .map_err(|_| "invalid invoice signature by the gateway".to_string())?;
+                let signature = receiver
+                    .payee_signature
+                    .ok_or("invoice is not signed by its payee")?;
+                signature
+                    .verify(&receiver.payee, &self.payee_message())
+                    .map_err(|_| "invalid invoice signature by the payee".to_string())
             }
-            self.verify_payee_signature(&payee)?;
-            return Ok(InvoiceKind::Direct);
-        };
-        if endpoint != gateway {
-            return Err("invoice names another endpoint than its gateway".into());
-        }
-        if gateway == payee {
-            return Err("the payee cannot be its own gateway".into());
-        }
-        let signature = self
-            .gateway_signature
-            .ok_or("invoice is not signed by its gateway")?;
-        gateway
-            .verify(&self.gateway_message(), &signature)
-            .map_err(|_| "invalid invoice signature by the gateway".to_string())?;
-        let Some(authorization) = &self.payee_authorization else {
-            if self.preimage_server.is_some() || self.preimage_server_issuance.is_some() {
-                return Err("a payee-signed gateway invoice carries preimage server fields".into());
+            InvoiceReceiver::Delegated(receiver) => {
+                if receiver.payee == receiver.gateway {
+                    return Err("the payee cannot be its own gateway".into());
+                }
+                let signature = receiver
+                    .gateway_signature
+                    .ok_or("invoice is not signed by its gateway")?;
+                signature
+                    .verify(&receiver.gateway, &self.gateway_message())
+                    .map_err(|_| "invalid invoice signature by the gateway".to_string())?;
+                let authorization = &receiver.payee_authorization;
+                authorization.verify()?;
+                if authorization.kind != AuthorizationKind::Standing {
+                    return Err(
+                        "the payee's authorization does not let the gateway issue invoices".into(),
+                    );
+                }
+                if authorization.payee != receiver.payee {
+                    return Err("the payee's authorization is another payee's".into());
+                }
+                if authorization.gateway != receiver.gateway {
+                    return Err("the payee's authorization names another gateway".into());
+                }
+                if authorization.preimage_server != receiver.preimage_server {
+                    return Err("the payee's authorization names another preimage server".into());
+                }
+                if !authorization.allows_amount(self.body.amount_msat) {
+                    return Err("the payee did not authorize this amount".into());
+                }
+                if self.body.expires_at > authorization.valid_until
+                    || self.body.expires_at <= authorization.valid_from
+                {
+                    return Err("invoice expires outside the payee's authorization".into());
+                }
+                let issuance = &receiver.preimage_server_issuance;
+                issuance.verify(&receiver.preimage_server, authorization)?;
+                if issuance.payment_hash != self.body.payment_hash
+                    || issuance.amount_msat != self.body.amount_msat
+                    || !issuance.matches_metadata(self.body.metadata.as_ref())
+                {
+                    return Err("the preimage server issued the hash for another payment".into());
+                }
+                Ok(())
             }
-            self.verify_payee_signature(&payee)?;
-            return Ok(InvoiceKind::Gateway);
-        };
-        if self.payee_signature.is_some() {
-            return Err("an invoice under a payee authorization carries a payee signature".into());
         }
-        authorization.verify()?;
-        if authorization.kind != AuthorizationKind::Standing {
-            return Err("the payee's authorization does not let the gateway issue invoices".into());
-        }
-        if authorization.payee != payee {
-            return Err("the payee's authorization is another payee's".into());
-        }
-        if authorization.gateway != gateway {
-            return Err("the payee's authorization names another gateway".into());
-        }
-        let preimage_server = self
-            .preimage_server
-            .ok_or("invoice names no preimage server")?;
-        if authorization.preimage_server != preimage_server {
-            return Err("the payee's authorization names another preimage server".into());
-        }
-        if !authorization.allows_amount(self.amount_msat) {
-            return Err("the payee did not authorize this amount".into());
-        }
-        if self.expires_at > authorization.valid_until
-            || self.expires_at <= authorization.valid_from
-        {
-            return Err("invoice expires outside the payee's authorization".into());
-        }
-        let issuance = self
-            .preimage_server_issuance
-            .as_ref()
-            .ok_or("invoice carries no issuance of its payment hash")?;
-        issuance.verify(&preimage_server, authorization)?;
-        if issuance.payment_hash != self.payment_hash || issuance.amount_msat != self.amount_msat {
-            return Err("the preimage server issued the hash for another payment".into());
-        }
-        Ok(InvoiceKind::Delegated)
-    }
-
-    fn verify_payee_signature(&self, payee: &EndpointKey) -> Result<(), String> {
-        let signature = self
-            .payee_signature
-            .ok_or("invoice is not signed by its payee")?;
-        payee
-            .verify(&self.payee_message(), &signature)
-            .map_err(|_| "invalid invoice signature by the payee".to_string())
-    }
-
-    fn endpoint_key(&self) -> Result<EndpointKey, String> {
-        self.iroh_peer_id
-            .as_deref()
-            .ok_or("invoice does not name an endpoint")?
-            .parse()
     }
 
     /// What the payee signs: the invoice without its payee signature, as
     /// JSON.
     fn payee_message(&self) -> Vec<u8> {
-        let unsigned = Invoice {
-            payee_signature: None,
-            ..self.clone()
-        };
+        let mut wire = self.to_wire();
+        wire.payee_signature = None;
         let mut message = PAYEE_SIGNATURE_DOMAIN.to_vec();
-        message.extend(serde_json::to_vec(&unsigned).expect("invoices serialize"));
+        message.extend(serde_json::to_vec(&wire).expect("invoices serialize"));
         message
     }
 
-    /// What the gateway signs: the invoice without `payee` and the
-    /// signatures, as JSON. The payee is added after the gateway signed,
-    /// or is bound by the payee's authorization.
+    /// What the gateway signs: the invoice without the signatures, as
+    /// JSON. The payee signs after the gateway, if at all.
     fn gateway_message(&self) -> Vec<u8> {
-        let unsigned = Invoice {
-            payee: None,
-            payee_signature: None,
-            gateway_signature: None,
-            ..self.clone()
-        };
+        let mut wire = self.to_wire();
+        wire.payee_signature = None;
+        wire.gateway_signature = None;
         let mut message = GATEWAY_SIGNATURE_DOMAIN.to_vec();
-        message.extend(serde_json::to_vec(&unsigned).expect("invoices serialize"));
+        message.extend(serde_json::to_vec(&wire).expect("invoices serialize"));
         message
+    }
+
+    /// The flat wire form: what is serialized and signed.
+    fn to_wire(&self) -> InvoiceWire {
+        let (
+            payee,
+            payee_signature,
+            gateway,
+            gateway_signature,
+            preimage_server,
+            preimage_server_issuance,
+            payee_authorization,
+        ) = match &self.receiver {
+            InvoiceReceiver::Direct(receiver) => (
+                receiver.payee,
+                receiver.payee_signature,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            InvoiceReceiver::Gateway(receiver) => (
+                receiver.payee,
+                receiver.payee_signature,
+                Some(receiver.gateway),
+                receiver.gateway_signature,
+                None,
+                None,
+                None,
+            ),
+            InvoiceReceiver::Delegated(receiver) => (
+                receiver.payee,
+                None,
+                Some(receiver.gateway),
+                receiver.gateway_signature,
+                Some(receiver.preimage_server),
+                Some(receiver.preimage_server_issuance.clone()),
+                Some(receiver.payee_authorization.clone()),
+            ),
+        };
+        InvoiceWire {
+            payment_hash: self.body.payment_hash,
+            amount_msat: self.body.amount_msat,
+            expires_at: self.body.expires_at,
+            networks: self.body.networks.clone(),
+            description: self.body.description.clone(),
+            metadata: self.body.metadata.clone(),
+            iroh_peer_id: Some(self.iroh_peer_id().to_string()),
+            iroh_relay: self.body.iroh_relay.clone(),
+            payee: Some(payee),
+            payee_signature,
+            gateway,
+            gateway_signature,
+            preimage_server,
+            preimage_server_issuance,
+            payee_authorization,
+        }
+    }
+
+    /// Classify a flat wire invoice into its receiver.
+    fn from_wire(wire: InvoiceWire) -> Result<Self, String> {
+        let payee = wire.payee.ok_or("invoice names no payee")?;
+        let body = InvoiceBody {
+            payment_hash: wire.payment_hash,
+            amount_msat: wire.amount_msat,
+            expires_at: wire.expires_at,
+            networks: wire.networks,
+            description: wire.description,
+            metadata: wire.metadata,
+            iroh_relay: wire.iroh_relay,
+        };
+        let receiver = if let Some(gateway) = wire.gateway {
+            if gateway == payee {
+                return Err("the payee cannot be its own gateway".into());
+            }
+            if let Some(named) = wire.iroh_peer_id.as_deref() {
+                let named: PublicKey = named
+                    .parse()
+                    .map_err(|e| format!("invoice endpoint: {e}"))?;
+                if named != gateway {
+                    return Err("invoice names another endpoint than its gateway".into());
+                }
+            }
+            if let Some(authorization) = wire.payee_authorization {
+                if wire.payee_signature.is_some() {
+                    return Err(
+                        "an invoice under a payee authorization carries a payee signature".into(),
+                    );
+                }
+                let preimage_server = wire
+                    .preimage_server
+                    .ok_or("invoice names no preimage server")?;
+                let issuance = wire
+                    .preimage_server_issuance
+                    .ok_or("invoice carries no issuance of its payment hash")?;
+                InvoiceReceiver::Delegated(DelegatedReceiver {
+                    payee,
+                    gateway,
+                    gateway_signature: wire.gateway_signature,
+                    preimage_server,
+                    preimage_server_issuance: issuance,
+                    payee_authorization: authorization,
+                })
+            } else {
+                if wire.preimage_server.is_some() || wire.preimage_server_issuance.is_some() {
+                    return Err(
+                        "a payee-signed gateway invoice carries preimage server fields".into(),
+                    );
+                }
+                InvoiceReceiver::Gateway(GatewayReceiver {
+                    payee,
+                    gateway,
+                    gateway_signature: wire.gateway_signature,
+                    payee_signature: wire.payee_signature,
+                })
+            }
+        } else {
+            if wire.gateway_signature.is_some()
+                || wire.preimage_server.is_some()
+                || wire.preimage_server_issuance.is_some()
+                || wire.payee_authorization.is_some()
+            {
+                return Err("an invoice without a gateway carries gateway fields".into());
+            }
+            if let Some(named) = wire.iroh_peer_id.as_deref() {
+                let named: PublicKey = named
+                    .parse()
+                    .map_err(|e| format!("invoice endpoint: {e}"))?;
+                if named != payee {
+                    return Err("invoice names another endpoint than its payee".into());
+                }
+            }
+            InvoiceReceiver::Direct(DirectReceiver {
+                payee,
+                payee_signature: wire.payee_signature,
+            })
+        };
+        Ok(Self { body, receiver })
     }
 
     /// Target the payer must lock to when paying on `network`.
     pub fn target_for(&self, network: &NetworkId) -> Option<&HtlcTarget> {
-        self.networks
+        self.body
+            .networks
             .iter()
             .find(|entry| entry.network == *network)
             .map(|entry| &entry.target)
@@ -333,7 +623,8 @@ impl Invoice {
 
     /// The receiver's safety margin when paid on `network`.
     pub fn incoming_delta_for(&self, network: &NetworkId) -> u64 {
-        self.networks
+        self.body
+            .networks
             .iter()
             .find(|entry| entry.network == *network)
             .and_then(|entry| entry.incoming_delta_secs)
@@ -342,10 +633,56 @@ impl Invoice {
 
     /// Longest the receiver lets its HTLC on `network` run.
     pub fn max_incoming_lifetime_for(&self, network: &NetworkId) -> Option<u64> {
-        self.networks
+        self.body
+            .networks
             .iter()
             .find(|entry| entry.network == *network)
             .and_then(|entry| entry.max_incoming_lifetime_secs)
+    }
+}
+
+/// The flat JSON form of an [`Invoice`], kept so its bytes (and so its
+/// signatures) do not depend on how the Rust model is nested.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InvoiceWire {
+    payment_hash: Bytes32,
+    amount_msat: u64,
+    expires_at: u64,
+    networks: Vec<InvoiceNetwork>,
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<Metadata>,
+    /// Derived from the receiver; serialized for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    iroh_peer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    iroh_relay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payee: Option<PublicKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payee_signature: Option<Signature>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway: Option<PublicKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_signature: Option<Signature>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preimage_server: Option<PublicKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preimage_server_issuance: Option<PreimageIssuance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payee_authorization: Option<ReceiveAuthorization>,
+}
+
+impl Serialize for Invoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_wire().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Invoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = InvoiceWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
     }
 }
 
@@ -392,7 +729,7 @@ pub struct PreparePayee {
     pub payment_hash: Bytes32,
     pub network: NetworkId,
     pub expiry: u64,
-    /// The invoice's [`Invoice::metadata`].
+    /// The invoice's [`InvoiceBody::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
     /// The whole invoice.
@@ -408,7 +745,7 @@ pub struct Commit {
     pub network: NetworkId,
     pub expiry: u64,
     pub descriptor: HtlcDescriptor,
-    /// The invoice's [`Invoice::metadata`].
+    /// The invoice's [`InvoiceBody::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
     /// The whole invoice.
@@ -431,6 +768,10 @@ pub struct Settle {
 pub struct PreimageRelease {
     pub authorization: ReceiveAuthorization,
     pub issuance: PreimageIssuance,
+    /// The invoice's metadata, which the issuance commits to; logged
+    /// for the payee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
     pub network: NetworkId,
     pub htlc: Htlc,
 }
@@ -455,7 +796,7 @@ pub struct GatewayInvoiceRequest {
 /// its standing authorizations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatewayInvoiceFor {
-    pub payee: EndpointKey,
+    pub payee: PublicKey,
     pub amount_msat: u64,
     /// The gateway's default, capped by the authorization, when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -480,6 +821,9 @@ pub enum ReceivedPayment {
         target: HtlcTarget,
         descriptor: HtlcDescriptor,
         preimage: Bytes32,
+        /// The paid invoice's metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Metadata>,
         at: u64,
     },
     /// A payment the server refused or could not verify. Servers may
@@ -500,10 +844,13 @@ pub enum Request {
     Commit(Commit),
     Settle(Settle),
     /// Payee (single authorization) or gateway (standing) to preimage
-    /// server: a payment hash for an invoice of `amount_msat`.
+    /// server: a payment hash for an invoice of `amount_msat` carrying
+    /// `metadata`.
     PreimageIssue {
         authorization: ReceiveAuthorization,
         amount_msat: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Metadata>,
     },
     PreimageRelease(PreimageRelease),
     /// Payee to preimage server: what it logged since unix time `since`.
@@ -581,31 +928,31 @@ mod tests {
 
     #[test]
     fn invoice_decodes_without_optional_fields() {
-        let decoded: Invoice = serde_json::from_str(
-            r#"{
+        let payee = endpoint_public_key(&[1; 32]);
+        let decoded: Invoice = serde_json::from_str(&format!(
+            r#"{{
                 "payment_hash": "0000000000000000000000000000000000000000000000000000000000000001",
                 "amount_msat": 1000,
                 "expires_at": 3000,
-                "networks": [{
+                "networks": [{{
                     "network": "cashu::localhost",
-                    "target": {"XOnlyPubKey": "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"}
-                }],
-                "description": null
-            }"#,
-        )
+                    "target": {{"XOnlyPubKey": "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"}}
+                }}],
+                "description": null,
+                "payee": "{payee}"
+            }}"#
+        ))
         .unwrap();
         assert!(decoded
             .target_for(&NetworkId("cashu::localhost".into()))
             .is_some());
-        assert!(decoded.metadata.is_none());
+        assert!(decoded.body.metadata.is_none());
+        assert!(decoded.body.iroh_relay.is_none());
+        assert!(matches!(decoded.receiver, InvoiceReceiver::Direct(_)));
     }
 
-    fn endpoint(secret: &[u8; 32]) -> String {
-        EndpointKey::from_secret(secret).to_string()
-    }
-
-    fn unsigned_invoice(endpoint_secret: &[u8; 32]) -> Invoice {
-        Invoice {
+    fn body() -> InvoiceBody {
+        InvoiceBody {
             payment_hash: Bytes32([1; 32]),
             amount_msat: 1000,
             expires_at: 3000,
@@ -621,22 +968,12 @@ mod tests {
             }],
             description: Some("coffee".into()),
             metadata: Some(Metadata::new(b"order 42".to_vec()).unwrap()),
-            iroh_peer_id: Some(endpoint(endpoint_secret)),
             iroh_relay: None,
-            payee: None,
-            payee_signature: None,
-            gateway: None,
-            gateway_signature: None,
-            preimage_server: None,
-            preimage_server_issuance: None,
-            payee_authorization: None,
         }
     }
 
     fn signed_invoice(secret: &[u8; 32]) -> Invoice {
-        let mut invoice = unsigned_invoice(secret);
-        invoice.sign_as_payee(secret).unwrap();
-        invoice
+        Invoice::direct(body(), secret)
     }
 
     const PAYEE: [u8; 32] = [7; 32];
@@ -647,8 +984,8 @@ mod tests {
         ReceiveAuthorization::sign(
             &PAYEE,
             kind,
-            EndpointKey::from_secret(&GATEWAY),
-            EndpointKey::from_secret(&PREIMAGE_SERVER),
+            endpoint_public_key(&GATEWAY),
+            endpoint_public_key(&PREIMAGE_SERVER),
             1000,
             5000,
             1000,
@@ -670,6 +1007,7 @@ mod tests {
         let mut issuance = PreimageIssuance {
             payment_hash: Bytes32([1; 32]),
             amount_msat: 1000,
+            metadata_hash: Some(Metadata::new(b"order 42".to_vec()).unwrap().hash()),
             authorization: authorization.id().unwrap(),
             nonce: Bytes32([0; 32]),
             signature: Signature([0; 64]),
@@ -680,9 +1018,8 @@ mod tests {
 
     /// Issued by the gateway, then signed by the payee.
     fn gateway_invoice() -> Invoice {
-        let mut invoice = unsigned_invoice(&GATEWAY);
-        invoice.sign_as_gateway(&GATEWAY).unwrap();
-        assert!(invoice.payee.is_none());
+        let mut invoice = Invoice::gateway_invoice(body(), endpoint_public_key(&PAYEE), &GATEWAY);
+        assert!(invoice.clone().sign_as_payee(&[11; 32]).is_err());
         invoice.sign_as_payee(&PAYEE).unwrap();
         invoice
     }
@@ -690,105 +1027,155 @@ mod tests {
     /// Issued by the gateway alone.
     fn delegated_invoice() -> Invoice {
         let authorization = authorization(AuthorizationKind::Standing);
-        let mut invoice = unsigned_invoice(&GATEWAY);
-        invoice.payee = Some(authorization.payee);
-        invoice.preimage_server = Some(authorization.preimage_server);
-        invoice.preimage_server_issuance = Some(issuance(&authorization));
-        invoice.payee_authorization = Some(authorization);
-        invoice.sign_as_gateway(&GATEWAY).unwrap();
-        invoice
+        Invoice::delegated(
+            body(),
+            authorization.payee,
+            &GATEWAY,
+            authorization.preimage_server,
+            issuance(&authorization),
+            authorization,
+        )
+    }
+
+    #[test]
+    fn invoice_serializes_flat_and_derives_iroh_peer_id() {
+        let payee = endpoint_public_key(&PAYEE).to_string();
+        let gateway = endpoint_public_key(&GATEWAY).to_string();
+
+        let json = serde_json::to_value(signed_invoice(&PAYEE)).unwrap();
+        assert!(json.get("body").is_none() && json.get("receiver").is_none());
+        assert_eq!(json["payee"].as_str(), Some(payee.as_str()));
+        assert_eq!(json["iroh_peer_id"].as_str(), Some(payee.as_str()));
+        assert!(json.get("gateway").is_none());
+
+        let json = serde_json::to_value(gateway_invoice()).unwrap();
+        assert_eq!(json["payee"].as_str(), Some(payee.as_str()));
+        assert_eq!(json["gateway"].as_str(), Some(gateway.as_str()));
+        assert_eq!(json["iroh_peer_id"].as_str(), Some(gateway.as_str()));
     }
 
     #[test]
     fn invoice_signature_covers_every_field() {
         let invoice = signed_invoice(&PAYEE);
-        assert_eq!(invoice.verify().unwrap(), InvoiceKind::Direct);
+        assert!(matches!(invoice.receiver, InvoiceReceiver::Direct(_)));
+        invoice.verify().unwrap();
         let decoded: Invoice =
             serde_json::from_str(&serde_json::to_string(&invoice).unwrap()).unwrap();
         decoded.verify().unwrap();
 
         let mut tampered = invoice.clone();
-        tampered.amount_msat += 1;
+        tampered.body.amount_msat += 1;
         assert!(tampered.verify().is_err());
         let mut tampered = invoice.clone();
-        tampered.metadata = None;
+        tampered.body.metadata = None;
         assert!(tampered.verify().is_err());
-        // Pointing the invoice at another endpoint breaks it, and that
-        // endpoint's key cannot sign for the first one.
+        // Changing the payee breaks the signature, and that key cannot
+        // sign for the first one.
         let mut redirected = invoice.clone();
-        redirected.iroh_peer_id = Some(endpoint(&[8; 32]));
+        if let InvoiceReceiver::Direct(receiver) = &mut redirected.receiver {
+            receiver.payee = endpoint_public_key(&[8; 32]);
+        }
         assert!(redirected.verify().is_err());
         assert!(invoice.clone().sign_as_payee(&[8; 32]).is_err());
         let mut unsigned = invoice;
-        unsigned.payee_signature = None;
+        if let InvoiceReceiver::Direct(receiver) = &mut unsigned.receiver {
+            receiver.payee_signature = None;
+        }
         assert!(unsigned.verify().is_err());
+        // A direct invoice has no gateway to sign as.
+        let mut direct = signed_invoice(&PAYEE);
+        assert!(direct.sign_as_gateway(&GATEWAY).is_err());
     }
 
     #[test]
     fn gateway_invoices_need_both_signatures() {
         let invoice = gateway_invoice();
-        assert_eq!(invoice.verify().unwrap(), InvoiceKind::Gateway);
+        assert!(matches!(invoice.receiver, InvoiceReceiver::Gateway(_)));
+        invoice.verify().unwrap();
         let decoded: Invoice =
             serde_json::from_str(&serde_json::to_string(&invoice).unwrap()).unwrap();
-        assert_eq!(decoded.verify().unwrap(), InvoiceKind::Gateway);
+        assert!(matches!(decoded.receiver, InvoiceReceiver::Gateway(_)));
+        decoded.verify().unwrap();
 
         let mut unsigned = invoice.clone();
-        unsigned.payee_signature = None;
+        if let InvoiceReceiver::Gateway(receiver) = &mut unsigned.receiver {
+            receiver.payee_signature = None;
+        }
         assert!(unsigned.verify().is_err());
         // The payee signed over the gateway: another one cannot step in.
         let mut swapped = invoice.clone();
-        swapped.gateway = Some(EndpointKey::from_secret(&[10; 32]));
-        swapped.iroh_peer_id = Some(endpoint(&[10; 32]));
+        if let InvoiceReceiver::Gateway(receiver) = &mut swapped.receiver {
+            receiver.gateway = endpoint_public_key(&[10; 32]);
+        }
         swapped.sign_as_gateway(&[10; 32]).unwrap();
         assert!(swapped.verify().is_err());
-        // The gateway's signature leaves the payee out, but the payee's
-        // covers it.
+        // Both signatures cover the payee: a new payee cannot sign the
+        // gateway's invoice over.
         let mut other_payee = invoice.clone();
-        other_payee.payee = Some(EndpointKey::from_secret(&[11; 32]));
+        if let InvoiceReceiver::Gateway(receiver) = &mut other_payee.receiver {
+            receiver.payee = endpoint_public_key(&[11; 32]);
+        }
         assert!(other_payee.verify().is_err());
+        other_payee.sign_as_payee(&[11; 32]).unwrap();
+        assert!(other_payee
+            .verify()
+            .unwrap_err()
+            .contains("signature by the gateway"));
         let mut tampered = invoice;
-        tampered.amount_msat += 1;
+        tampered.body.amount_msat += 1;
         assert!(tampered.verify().is_err());
     }
 
     #[test]
     fn delegated_invoices_follow_the_authorization() {
         let invoice = delegated_invoice();
-        assert_eq!(invoice.verify().unwrap(), InvoiceKind::Delegated);
+        assert!(matches!(invoice.receiver, InvoiceReceiver::Delegated(_)));
+        invoice.verify().unwrap();
         let decoded: Invoice =
             serde_json::from_str(&serde_json::to_string(&invoice).unwrap()).unwrap();
-        assert_eq!(decoded.verify().unwrap(), InvoiceKind::Delegated);
+        assert!(matches!(decoded.receiver, InvoiceReceiver::Delegated(_)));
+        decoded.verify().unwrap();
 
         // Outside the authorized amounts, even signed by the gateway.
         let mut more = invoice.clone();
-        more.amount_msat = 2000;
+        more.body.amount_msat = 2000;
         more.sign_as_gateway(&GATEWAY).unwrap();
         assert!(more.verify().is_err());
         // Expiring after the authorization does.
         let mut later = invoice.clone();
-        later.expires_at = 6000;
+        later.body.expires_at = 6000;
         later.sign_as_gateway(&GATEWAY).unwrap();
         assert!(later.verify().unwrap_err().contains("outside"));
         // Another payee's name.
         let mut renamed = invoice.clone();
-        renamed.payee = Some(EndpointKey::from_secret(&[11; 32]));
+        if let InvoiceReceiver::Delegated(receiver) = &mut renamed.receiver {
+            receiver.payee = endpoint_public_key(&[11; 32]);
+        }
         assert!(renamed.verify().is_err());
+        // Other metadata than the preimage server issued the hash for.
+        let mut relabeled = invoice.clone();
+        relabeled.body.metadata = Some(Metadata::new(b"order 43".to_vec()).unwrap());
+        relabeled.sign_as_gateway(&GATEWAY).unwrap();
+        assert!(relabeled.verify().unwrap_err().contains("another payment"));
         // A hash the gateway made up.
         let mut made_up = invoice.clone();
-        made_up.payment_hash = Bytes32([2; 32]);
+        made_up.body.payment_hash = Bytes32([2; 32]);
         made_up.sign_as_gateway(&GATEWAY).unwrap();
         assert!(made_up.verify().is_err());
         // A single authorization does not let the gateway issue alone.
         let single = authorization(AuthorizationKind::Single);
         let mut unauthorized = invoice.clone();
-        unauthorized.preimage_server_issuance = Some(issuance(&single));
-        unauthorized.payee_authorization = Some(single);
+        if let InvoiceReceiver::Delegated(receiver) = &mut unauthorized.receiver {
+            receiver.preimage_server_issuance = issuance(&single);
+            receiver.payee_authorization = single;
+        }
         unauthorized.sign_as_gateway(&GATEWAY).unwrap();
         assert!(unauthorized.verify().unwrap_err().contains("does not let"));
         // Another gateway cannot reuse the authorization.
         let mut stolen = invoice;
-        stolen.gateway = None;
-        stolen.iroh_peer_id = Some(endpoint(&[10; 32]));
+        if let InvoiceReceiver::Delegated(receiver) = &mut stolen.receiver {
+            receiver.gateway = endpoint_public_key(&[10; 32]);
+        }
         stolen.sign_as_gateway(&[10; 32]).unwrap();
         assert!(stolen.verify().unwrap_err().contains("another gateway"));
     }

@@ -2744,6 +2744,7 @@ dependencies = [
  "cassis-networks",
  "cassis-preimage-server",
  "clap",
+ "iroh-base 1.0.3",
  "ritualistic",
  "rustls",
  "serde",
@@ -2819,6 +2820,7 @@ dependencies = [
  "clap",
  "hmac",
  "iroh 1.0.3",
+ "iroh-base 1.0.3",
  "orangedb",
  "rand 0.8.7",
  "rustls",
@@ -8840,23 +8842,22 @@ dependencies = [
 
 [[package]]
 name = "orangedb"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0acf9d31b41ceb3fdda71f7111330964dc9a4db2922de0c0a9867ba7fadd4f50"
+checksum = "5915cb20d3d671e68f0de0951c61dfaec6b4992963dd0924f43c8ec1b0989324"
 dependencies = [
  "orangedb-macros",
  "postcard",
  "redb",
  "serde",
  "thiserror 2.0.19",
- "uuid",
 ]
 
 [[package]]
 name = "orangedb-macros"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef38c5603cc36508f6ddb8eb7ec346174d8d936ba2044708f354422766357b32"
+checksum = "e167e666ef636a68ce09b38bbcd1afdee0231dd4353e579a3df8c55609a85245"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10056,7 +10057,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
 dependencies = [
  "libc",
- "uuid",
 ]
 
 [[package]]

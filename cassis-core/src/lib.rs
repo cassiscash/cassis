@@ -35,4 +35,4 @@ pub use network::{
 pub use primitives::{
     sats_for_msat, unix_now, Bytes32, OperationId, PubKey, XOnlyPubKey, MSAT_PER_SAT,
 };
-pub use protocol::Invoice;
+pub use protocol::{Invoice, InvoiceBody, InvoiceReceiver};

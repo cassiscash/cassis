@@ -22,15 +22,16 @@
 //! * [`PreimageIssuance`]: the preimage server vouches that it issued a
 //!   payment hash under an authorization.
 //!
-//! Invoices come in three [`InvoiceKind`](crate::protocol::InvoiceKind)s
+//! Invoices come in three [`InvoiceReceiver`](crate::protocol::InvoiceReceiver)s
 //! with their own signature rules (see
 //! [`Invoice::verify`](crate::protocol::Invoice::verify)).
 
 use crate::network::{HtlcTarget, NetworkId};
 use crate::primitives::Bytes32;
+use crate::protocol::Metadata;
+use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::str::FromStr;
 
 /// Default of [`ReceiveAuthorization::min_final_timeout_secs`]: how
 /// long the payee may stay offline after a payment before it claims.
@@ -41,66 +42,12 @@ const AUTHORIZATION_HEADER: &str = "Cassis receive authorization v1";
 /// First line of [`PreimageIssuance::message`].
 const ISSUANCE_HEADER: &str = "Cassis preimage issuance v1";
 
-/// Ed25519 public key of an iroh endpoint: the identity a payee,
-/// gateway or preimage server signs and talks with. Its iroh id (hex)
-/// on the wire.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EndpointKey(pub iroh_base::PublicKey);
-
-impl EndpointKey {
-    pub fn from_secret(secret: &[u8; 32]) -> Self {
-        Self(iroh_base::SecretKey::from_bytes(secret).public())
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        self.0.as_bytes()
-    }
-
-    /// Check `signature` over `message`.
-    pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), String> {
-        self.0
-            .verify(message, &iroh_base::Signature::from_bytes(&signature.0))
-            .map_err(|_| format!("invalid signature by {self}"))
-    }
+/// The public key of the iroh endpoint whose secret is `secret`.
+pub fn endpoint_public_key(secret: &[u8; 32]) -> PublicKey {
+    iroh_base::SecretKey::from_bytes(secret).public()
 }
 
-impl fmt::Display for EndpointKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl fmt::Debug for EndpointKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromStr for EndpointKey {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        iroh_base::PublicKey::from_str(value.trim())
-            .map(Self)
-            .map_err(|e| format!("endpoint key {value}: {e}"))
-    }
-}
-
-impl Serialize for EndpointKey {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for EndpointKey {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Ed25519 signature by an [`EndpointKey`]. Hex on the wire.
+/// Ed25519 signature by a [`PublicKey`]. Hex on the wire.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Signature(pub [u8; 64]);
 
@@ -111,6 +58,12 @@ impl Signature {
                 .sign(message)
                 .to_bytes(),
         )
+    }
+
+    /// Check this signature over `message` by `key`.
+    pub fn verify(&self, key: &PublicKey, message: &[u8]) -> Result<(), String> {
+        key.verify(message, &iroh_base::Signature::from_bytes(&self.0))
+            .map_err(|_| format!("invalid signature by {key}"))
     }
 }
 
@@ -175,9 +128,9 @@ pub struct Destination {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiveAuthorization {
     pub kind: AuthorizationKind,
-    pub payee: EndpointKey,
-    pub gateway: EndpointKey,
-    pub preimage_server: EndpointKey,
+    pub payee: PublicKey,
+    pub gateway: PublicKey,
+    pub preimage_server: PublicKey,
     /// Unix seconds.
     pub valid_from: u64,
     /// Unix seconds; invoices made under it expire by then.
@@ -196,8 +149,8 @@ impl ReceiveAuthorization {
     pub fn sign(
         payee_secret: &[u8; 32],
         kind: AuthorizationKind,
-        gateway: EndpointKey,
-        preimage_server: EndpointKey,
+        gateway: PublicKey,
+        preimage_server: PublicKey,
         valid_from: u64,
         valid_until: u64,
         min_amount_msat: u64,
@@ -207,7 +160,7 @@ impl ReceiveAuthorization {
     ) -> Result<Self, String> {
         let mut authorization = Self {
             kind,
-            payee: EndpointKey::from_secret(payee_secret),
+            payee: endpoint_public_key(payee_secret),
             gateway,
             preimage_server,
             valid_from,
@@ -319,8 +272,8 @@ impl ReceiveAuthorization {
     /// Check the terms and that `payee` signed them.
     pub fn verify(&self) -> Result<(), String> {
         let message = self.message()?;
-        self.payee
-            .verify(message.as_bytes(), &self.signature)
+        self.signature
+            .verify(&self.payee, message.as_bytes())
             .map_err(|_| "invalid payee signature on the receive authorization".to_string())
     }
 
@@ -349,14 +302,19 @@ impl ReceiveAuthorization {
 }
 
 /// A preimage server's statement: "I issued `payment_hash`, for
-/// `amount_msat`, under the receive authorization `authorization`", and
-/// the `nonce` it derived the preimage from. It releases the preimage
-/// only to the authorization's gateway, against an HTLC paying the
-/// payee at least `amount_msat`.
+/// `amount_msat` and the invoice metadata hashing to `metadata_hash`,
+/// under the receive authorization `authorization`", and the `nonce` it
+/// derived the preimage from. It releases the preimage only to the
+/// authorization's gateway, against an HTLC paying the payee at least
+/// `amount_msat`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreimageIssuance {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
+    /// [`Metadata::hash`] of the metadata of the invoice the hash is
+    /// for; `None` for an invoice without.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_hash: Option<Bytes32>,
     /// [`ReceiveAuthorization::id`].
     pub authorization: Bytes32,
     /// Not signed: the server derives the preimage from it, so a wrong
@@ -375,28 +333,39 @@ impl PreimageIssuance {
     /// authorization: <hex id>
     /// payment hash: <hex>
     /// amount msat: <n>
+    /// metadata: <hex hash, or "none">
     /// ```
-    pub fn message(&self, preimage_server: &EndpointKey) -> String {
+    pub fn message(&self, preimage_server: &PublicKey) -> String {
         format!(
             "{ISSUANCE_HEADER}\n\
              preimage server: {preimage_server}\n\
              authorization: {}\n\
              payment hash: {}\n\
-             amount msat: {}\n",
-            self.authorization, self.payment_hash, self.amount_msat
+             amount msat: {}\n\
+             metadata: {}\n",
+            self.authorization,
+            self.payment_hash,
+            self.amount_msat,
+            self.metadata_hash
+                .map_or_else(|| "none".to_string(), |hash| hash.to_string())
         )
+    }
+
+    /// Whether the hash was issued for an invoice carrying `metadata`.
+    pub fn matches_metadata(&self, metadata: Option<&Metadata>) -> bool {
+        self.metadata_hash == metadata.map(Metadata::hash)
     }
 
     /// Sign as the preimage server whose secret is `secret`.
     pub fn sign(&mut self, secret: &[u8; 32]) {
-        let message = self.message(&EndpointKey::from_secret(secret));
+        let message = self.message(&endpoint_public_key(secret));
         self.signature = Signature::sign(secret, message.as_bytes());
     }
 
     /// Check that `preimage_server` issued this under `authorization`.
     pub fn verify(
         &self,
-        preimage_server: &EndpointKey,
+        preimage_server: &PublicKey,
         authorization: &ReceiveAuthorization,
     ) -> Result<(), String> {
         if authorization.preimage_server != *preimage_server {
@@ -405,8 +374,8 @@ impl PreimageIssuance {
         if self.authorization != authorization.id()? {
             return Err("the hash was issued under another authorization".into());
         }
-        preimage_server
-            .verify(self.message(preimage_server).as_bytes(), &self.signature)
+        self.signature
+            .verify(preimage_server, self.message(preimage_server).as_bytes())
             .map_err(|_| "invalid preimage server signature on the payment hash".to_string())
     }
 }
@@ -415,8 +384,8 @@ impl PreimageIssuance {
 mod tests {
     use super::*;
 
-    fn key(byte: u8) -> EndpointKey {
-        EndpointKey::from_secret(&[byte; 32])
+    fn key(byte: u8) -> PublicKey {
+        endpoint_public_key(&[byte; 32])
     }
 
     fn authorization(kind: AuthorizationKind) -> ReceiveAuthorization {
@@ -489,18 +458,25 @@ mod tests {
     #[test]
     fn issuance_is_bound_to_server_and_authorization() {
         let authorization = authorization(AuthorizationKind::Standing);
+        let metadata = Metadata::new(b"order 42".to_vec()).unwrap();
         let mut issuance = PreimageIssuance {
             payment_hash: Bytes32([5; 32]),
             amount_msat: 1000,
+            metadata_hash: Some(metadata.hash()),
             authorization: authorization.id().unwrap(),
             nonce: Bytes32([6; 32]),
             signature: Signature([0; 64]),
         };
         issuance.sign(&[3; 32]);
         issuance.verify(&key(3), &authorization).unwrap();
+        assert!(issuance.matches_metadata(Some(&metadata)));
+        assert!(!issuance.matches_metadata(None));
         assert!(issuance.verify(&key(2), &authorization).is_err());
         let mut other = issuance.clone();
         other.amount_msat = 2000;
+        assert!(other.verify(&key(3), &authorization).is_err());
+        let mut other = issuance.clone();
+        other.metadata_hash = None;
         assert!(other.verify(&key(3), &authorization).is_err());
         let mut elsewhere = authorization;
         elsewhere.max_amount_msat += 1;

@@ -14,9 +14,10 @@ use cassis_core::node::{
     authorize_gateway, create_gateway_invoice, redeem_offline_payments, GatewayInvoiceRecord,
     InvoiceStatus, Node, NodeConfig, OfflineEndpoints, GATEWAY_INVOICES,
 };
-use cassis_core::offline::{EndpointKey, DEFAULT_MIN_FINAL_TIMEOUT_SECS};
+use cassis_core::offline::{endpoint_public_key, DEFAULT_MIN_FINAL_TIMEOUT_SECS};
 use cassis_core::protocol::{
-    GatewayInvoiceFor, Invoice, InvoiceKind, PreimageRelease, ReceivedPayment, Request, Response,
+    GatewayInvoiceFor, Invoice, InvoiceReceiver, Metadata, PreimageRelease, ReceivedPayment,
+    Request, Response,
 };
 use cassis_core::store::Store;
 use cassis_core::transport::{PeerAddr, Transport};
@@ -26,6 +27,7 @@ use cassis_core::{
 };
 use cassis_gateway::{Gateway, GatewayConfig, GatewayPolicy};
 use cassis_preimage_server::{Db, PreimageServer, ServerConfig};
+use iroh_base::PublicKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -196,19 +198,24 @@ struct Payee {
     keys: NodeKeys,
     store: Store,
     network: Arc<dyn Network>,
+    /// Client endpoint with the payee's identity, its iroh key.
+    transport: Transport,
 }
 
 impl Payee {
-    fn new(key: u8, ledger: &Ledger) -> Self {
+    async fn new(key: u8, ledger: &Ledger) -> Self {
+        let keys = NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap();
+        let transport = Transport::bind_client(keys.iroh).await.unwrap();
         Self {
-            keys: NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap(),
+            keys,
             store: Store::open(&temp_dir("payee").join("store.db")).unwrap(),
             network: MockNetwork::new(key, ledger),
+            transport,
         }
     }
 
-    fn key(&self) -> EndpointKey {
-        EndpointKey::from_secret(&self.keys.offline_payee_secret())
+    fn key(&self) -> PublicKey {
+        endpoint_public_key(&self.keys.iroh)
     }
 
     async fn invoice(
@@ -220,12 +227,13 @@ impl Payee {
         create_gateway_invoice(
             &self.store,
             &self.keys,
+            &self.transport,
             endpoints.clone(),
             std::slice::from_ref(&self.network),
             amount_msat,
             unix_now() + 600,
             Some("coffee".into()),
-            None,
+            Some(metadata("order 42")),
             min_final_timeout_secs,
         )
         .await
@@ -235,6 +243,7 @@ impl Payee {
         redeem_offline_payments(
             &self.store,
             &self.keys,
+            &self.transport,
             server,
             std::slice::from_ref(&self.network),
             0,
@@ -242,6 +251,10 @@ impl Payee {
         .await
         .unwrap()
     }
+}
+
+fn metadata(text: &str) -> Metadata {
+    Metadata::new(text.as_bytes().to_vec()).unwrap()
 }
 
 async fn request(transport: &Transport, peer: &PeerAddr, request: Request) -> Response {
@@ -343,25 +356,24 @@ async fn payee_offline_behind_a_gateway() {
     let network = NetworkId(NETWORK.into());
 
     // The payee has the gateway issue an invoice and goes offline.
-    let payee = Payee::new(2, &setup.ledger);
+    let payee = Payee::new(2, &setup.ledger).await;
     let invoice = payee
         .invoice(&setup.endpoints, 50_000, DEFAULT_MIN_FINAL_TIMEOUT_SECS)
         .await
         .unwrap();
-    assert_eq!(invoice.verify().unwrap(), InvoiceKind::Gateway);
-    assert_eq!(invoice.payee, Some(payee.key()));
-    assert_eq!(invoice.gateway, Some(setup.gateway.key()));
-    assert_eq!(
-        invoice.iroh_peer_id.as_deref(),
-        Some(setup.gateway.peer_id().as_str())
-    );
+    invoice.verify().unwrap();
+    assert!(matches!(invoice.receiver, InvoiceReceiver::Gateway(_)));
+    assert_eq!(*invoice.payee(), payee.key());
+    assert_eq!(invoice.body.metadata, Some(metadata("order 42")));
+    assert_eq!(invoice.gateway().copied(), Some(setup.gateway.key()));
+    assert_eq!(invoice.iroh_peer_id().to_string(), setup.gateway.peer_id());
 
     let preimage = setup.payer.pay(&invoice, &network, &[]).await.unwrap();
-    assert!(invoice.payment_hash.matches_preimage(&preimage));
+    assert!(invoice.body.payment_hash.matches_preimage(&preimage));
 
     // The payer's HTLC runs as for any payee and the gateway claimed it;
     // the gateway's own to the payee runs a week, still unclaimed.
-    let (to_gateway, to_payee) = setup.locks(invoice.payment_hash, 2);
+    let (to_gateway, to_payee) = setup.locks(invoice.body.payment_hash, 2);
     assert_eq!(to_gateway.state, LockState::Claimed(preimage));
     assert!(to_gateway.expiry < unix_now() + 3600);
     assert_eq!(to_payee.state, LockState::Locked);
@@ -373,22 +385,30 @@ async fn payee_offline_behind_a_gateway() {
         setup.payer.pay(&invoice, &network, &[]).await.unwrap(),
         preimage
     );
-    setup.locks(invoice.payment_hash, 2);
+    setup.locks(invoice.body.payment_hash, 2);
 
     // The payee comes back and redeems, once.
     let report = payee.redeem(&setup.endpoints.preimage_server).await;
     assert_eq!(
         report.claimed,
-        vec![(invoice.payment_hash, network.clone(), to_payee.amount_msat)]
+        vec![(
+            invoice.body.payment_hash,
+            network.clone(),
+            to_payee.amount_msat
+        )]
+    );
+    assert_eq!(
+        report.metadata,
+        vec![(invoice.body.payment_hash, metadata("order 42"))]
     );
     assert!(report.pending.is_empty() && report.failed.is_empty());
     assert_eq!(
-        setup.locks(invoice.payment_hash, 2).1.state,
+        setup.locks(invoice.body.payment_hash, 2).1.state,
         LockState::Claimed(preimage)
     );
     let record: GatewayInvoiceRecord = payee
         .store
-        .get(GATEWAY_INVOICES, &invoice.payment_hash.to_string())
+        .get(GATEWAY_INVOICES, &invoice.body.payment_hash.to_string())
         .unwrap()
         .unwrap();
     assert_eq!(record.status, InvoiceStatus::Claimed);
@@ -408,15 +428,19 @@ async fn payee_offline_behind_a_gateway() {
     let record: cassis_gateway::InvoiceRecord = setup
         .gateway
         .store()
-        .get(cassis_gateway::INVOICES, &invoice.payment_hash.to_string())
+        .get(
+            cassis_gateway::INVOICES,
+            &invoice.body.payment_hash.to_string(),
+        )
         .unwrap()
         .unwrap();
     let release = Request::PreimageRelease(PreimageRelease {
         authorization: record.authorization,
         issuance: record.issuance,
+        metadata: record.invoice.body.metadata,
         network: network.clone(),
         htlc: Htlc {
-            payment_hash: invoice.payment_hash,
+            payment_hash: invoice.body.payment_hash,
             amount_msat: to_payee.amount_msat,
             expiry: to_payee.expiry,
             target: to_payee.target.clone(),
@@ -439,11 +463,8 @@ async fn payee_offline_behind_a_gateway() {
         panic!("expected a payment log");
     };
     assert!(payments.is_empty());
-    let payee_client = Transport::bind_client(payee.keys.offline_payee_secret())
-        .await
-        .unwrap();
     let Response::PreimagePayments(Ok(payments)) = request(
-        &payee_client,
+        &payee.transport,
         &setup.endpoints.preimage_server,
         Request::PreimagePayments { since: 0 },
     )
@@ -453,11 +474,11 @@ async fn payee_offline_behind_a_gateway() {
     };
     assert!(matches!(
         payments.as_slice(),
-        [ReceivedPayment::Received { payment_hash, .. }] if *payment_hash == invoice.payment_hash
+        [ReceivedPayment::Received { payment_hash, .. }] if *payment_hash == invoice.body.payment_hash
     ));
 
     intruder.close().await;
-    payee_client.close().await;
+    payee.transport.close().await;
     setup.shutdown().await;
 }
 
@@ -466,11 +487,12 @@ async fn payee_offline_behind_a_gateway() {
 async fn gateway_issues_invoices_for_an_offline_payee() {
     let setup = setup().await;
     let network = NetworkId(NETWORK.into());
-    let payee = Payee::new(3, &setup.ledger);
+    let payee = Payee::new(3, &setup.ledger).await;
     let now = unix_now();
     authorize_gateway(
         &payee.store,
         &payee.keys,
+        &payee.transport,
         setup.endpoints.clone(),
         std::slice::from_ref(&payee.network),
         now,
@@ -491,7 +513,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
             amount_msat,
             expires_at: None,
             description: Some("tip".into()),
-            metadata: None,
+            metadata: Some(metadata("tip jar")),
         })
     };
     let Response::GatewayInvoice(Ok(invoice)) =
@@ -499,9 +521,9 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     else {
         panic!("expected an invoice");
     };
-    assert_eq!(invoice.verify().unwrap(), InvoiceKind::Delegated);
-    assert_eq!(invoice.payee, Some(payee.key()));
-    assert!(invoice.payee_signature.is_none());
+    invoice.verify().unwrap();
+    assert!(matches!(invoice.receiver, InvoiceReceiver::Delegated(_)));
+    assert_eq!(*invoice.payee(), payee.key());
 
     // Outside the authorized amounts, or for a payee that authorized
     // nothing, there is none.
@@ -511,7 +533,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     ));
     let mut stranger = ask(20_000);
     if let Request::GatewayInvoiceFor(ref mut ask) = stranger {
-        ask.payee = EndpointKey::from_secret(&[5; 32]);
+        ask.payee = endpoint_public_key(&[5; 32]);
     }
     assert!(matches!(
         request(&asker, &setup.endpoints.gateway, stranger).await,
@@ -519,8 +541,8 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     ));
 
     let preimage = setup.payer.pay(&invoice, &network, &[]).await.unwrap();
-    assert!(invoice.payment_hash.matches_preimage(&preimage));
-    let (to_gateway, to_payee) = setup.locks(invoice.payment_hash, 3);
+    assert!(invoice.body.payment_hash.matches_preimage(&preimage));
+    let (to_gateway, to_payee) = setup.locks(invoice.body.payment_hash, 3);
     assert_eq!(to_gateway.state, LockState::Claimed(preimage));
     assert_eq!(to_payee.state, LockState::Locked);
     assert!(to_payee.expiry >= unix_now() + DEFAULT_MIN_FINAL_TIMEOUT_SECS);
@@ -528,13 +550,18 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     let report = payee.redeem(&setup.endpoints.preimage_server).await;
     assert_eq!(
         report.claimed,
-        vec![(invoice.payment_hash, network, to_payee.amount_msat)]
+        vec![(invoice.body.payment_hash, network, to_payee.amount_msat)]
     );
     assert_eq!(
-        setup.locks(invoice.payment_hash, 3).1.state,
+        report.metadata,
+        vec![(invoice.body.payment_hash, metadata("tip jar"))]
+    );
+    assert_eq!(
+        setup.locks(invoice.body.payment_hash, 3).1.state,
         LockState::Claimed(preimage)
     );
 
     asker.close().await;
+    payee.transport.close().await;
     setup.shutdown().await;
 }

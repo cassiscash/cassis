@@ -71,7 +71,8 @@ export interface Invoice {
   description: string | null;
   /** Base64, at most 128 KiB; handed back with PREPARE and COMMIT. */
   metadata?: string;
-  /** Where PREPARE and COMMIT go: the payee, or its gateway. */
+  /** The payee's endpoint, or its gateway's when `gateway` is set:
+   * PREPARE and COMMIT go to the gateway then. */
   iroh_peer_id?: string;
   iroh_relay?: string;
   /** Ed25519 key (iroh id) of the final payee. */
@@ -80,6 +81,7 @@ export interface Invoice {
   payee_signature?: string;
   /** Ed25519 key (iroh id) of the gateway paid in the payee's place. */
   gateway?: string;
+  /** Ed25519 by `gateway`, hex, over everything but the signatures. */
   gateway_signature?: string;
   /** On invoices a gateway issued alone, under `payee_authorization`. */
   preimage_server?: string;
@@ -92,7 +94,7 @@ export interface Commit {
   expiry: number;
   descriptor: HtlcDescriptor;
   metadata?: string;
-  /** The whole invoice; preimage servers refuse COMMITs without it. */
+  /** The whole invoice. */
   invoice?: Invoice;
 }
 /** Announces the payee's HTLC before anything is funded. */
@@ -101,7 +103,7 @@ export interface PreparePayee {
   network: NetworkId;
   expiry: number;
   metadata?: string;
-  /** The whole invoice; preimage servers refuse PREPAREs without it. */
+  /** The whole invoice. */
   invoice?: Invoice;
 }
 /** Only PreparePayee and COMMIT are used without routers; the other
@@ -144,16 +146,16 @@ pub fn parse_invoice(json: &str) -> Result<String, JsValue> {
     let invoice: Invoice =
         serde_json::from_str(json).map_err(|e| js_error(format!("invalid invoice: {e}")))?;
     invoice.verify().map_err(js_error)?;
-    for entry in &invoice.networks {
+    for entry in &invoice.body.networks {
         NetworkId::parse(&entry.network.0).map_err(js_error)?;
     }
-    if invoice.amount_msat == 0 {
+    if invoice.body.amount_msat == 0 {
         return Err(js_error("invoice amount is zero"));
     }
-    if invoice.expires_at <= unix_now() {
+    if invoice.body.expires_at <= unix_now() {
         return Err(js_error("invoice expired"));
     }
-    if invoice.networks.is_empty() {
+    if invoice.body.networks.is_empty() {
         return Err(js_error("invoice names no network"));
     }
     serde_json::to_string(&invoice).map_err(js_error)
@@ -224,7 +226,8 @@ impl CassisEndpoint {
 
     /// Sign an invoice (JSON) as its payee, this endpoint: its
     /// `iroh_peer_id` must be this endpoint, or the invoice must come
-    /// from a gateway. Sets `payee`; returns it signed.
+    /// from a gateway that issued it for this endpoint as `payee`. Sets
+    /// `payee`; returns it signed.
     #[wasm_bindgen(js_name = signInvoice, unchecked_return_type = "string")]
     pub fn sign_invoice(&self, json: &str) -> Result<String, JsValue> {
         let mut invoice: Invoice =

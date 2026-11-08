@@ -317,7 +317,7 @@ impl Flow {
                     return self.redraw(&order).await;
                 }
                 let invoice = match &order.invoice {
-                    Some(invoice) if invoice.expires_at > unix_now() + 60 => invoice.clone(),
+                    Some(invoice) if invoice.body.expires_at > unix_now() + 60 => invoice.clone(),
                     _ => {
                         let networks = self.node.network_ids();
                         let mut description = summary(&order);
@@ -379,15 +379,15 @@ impl Flow {
         ))
         .await?;
         let flow = self.clone();
-        let payment_hash = invoice.payment_hash;
+        let payment_hash = invoice.body.payment_hash;
         let key = payment_hash.to_string();
-        let expires_at = invoice.expires_at;
+        let expires_at = invoice.body.expires_at;
         tokio::spawn(async move {
             while unix_now() < expires_at {
                 let order = flow.order();
                 // Superseded by a newer invoice, or paid through another flow.
                 if order.paid
-                    || order.invoice.as_ref().map(|i| i.payment_hash) != Some(payment_hash)
+                    || order.invoice.as_ref().map(|i| i.body.payment_hash) != Some(payment_hash)
                 {
                     return;
                 }
@@ -412,14 +412,15 @@ impl Flow {
         }
         let invoice: Invoice = serde_json::from_value(invoice)
             .map_err(|e| format!("refund invoice is not a cassis invoice: {e}"))?;
-        if invoice.amount_msat != REFUND_SATS * 1000 {
+        if invoice.body.amount_msat != REFUND_SATS * 1000 {
             return Err(format!(
                 "refund invoice asks for {} msat",
-                invoice.amount_msat
+                invoice.body.amount_msat
             ));
         }
         let ours = self.node.network_ids();
         let from = invoice
+            .body
             .networks
             .iter()
             .map(|entry| entry.network.clone())

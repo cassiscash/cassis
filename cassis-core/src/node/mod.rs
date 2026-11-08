@@ -237,6 +237,12 @@ impl Node {
         self.0.transport.peer_id()
     }
 
+    /// The node's endpoint: with its identity when it serves, so the
+    /// offline flows (see [`create_gateway_invoice`]) can talk from it.
+    pub fn transport(&self) -> &Transport {
+        &self.0.transport
+    }
+
     pub fn add_network(&self, network: Arc<dyn Network>) {
         self.0
             .networks

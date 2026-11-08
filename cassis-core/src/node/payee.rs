@@ -4,7 +4,9 @@ use super::{InvoiceRecord, InvoiceStatus, Node, INLINE_WAIT, INVOICES, VERIFY_RE
 use crate::keys::NodeKeys;
 use crate::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId};
 use crate::primitives::{unix_now, Bytes32};
-use crate::protocol::{Commit, Invoice, InvoiceNetwork, Metadata, PreparePayee, Response};
+use crate::protocol::{
+    Commit, Invoice, InvoiceBody, InvoiceNetwork, Metadata, PreparePayee, Response,
+};
 use crate::store::Store;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,24 +59,18 @@ pub async fn create_invoice(
             max_incoming_lifetime_secs: network.max_incoming_lifetime_secs(),
         });
     }
-    let mut invoice = Invoice {
-        payment_hash,
-        amount_msat,
-        expires_at,
-        networks: targets,
-        description,
-        metadata,
-        iroh_peer_id: Some(iroh::SecretKey::from(keys.iroh).public().to_string()),
-        iroh_relay,
-        payee: None,
-        payee_signature: None,
-        gateway: None,
-        gateway_signature: None,
-        preimage_server: None,
-        preimage_server_issuance: None,
-        payee_authorization: None,
-    };
-    invoice.sign_as_payee(&keys.iroh)?;
+    let invoice = Invoice::direct(
+        InvoiceBody {
+            payment_hash,
+            amount_msat,
+            expires_at,
+            networks: targets,
+            description,
+            metadata,
+            iroh_relay,
+        },
+        &keys.iroh,
+    );
     store.put(
         INVOICES,
         &payment_hash.to_string(),
@@ -156,7 +152,7 @@ impl Node {
         network: &NetworkId,
         expiry: u64,
     ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
-        if record.status == InvoiceStatus::Expired || record.invoice.expires_at <= unix_now() {
+        if record.status == InvoiceStatus::Expired || record.invoice.body.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
         let target = record
@@ -247,7 +243,7 @@ impl Node {
             self.payable_on(&record, &commit.network, commit.expiry)?;
         let htlc = Htlc {
             payment_hash: commit.payment_hash,
-            amount_msat: record.invoice.amount_msat,
+            amount_msat: record.invoice.body.amount_msat,
             expiry: commit.expiry,
             target,
             descriptor: commit.descriptor,
@@ -291,14 +287,17 @@ impl Node {
         record: &InvoiceRecord,
         claimed_on: Option<&crate::network::NetworkId>,
     ) {
-        for entry in &record.invoice.networks {
+        for entry in &record.invoice.body.networks {
             if Some(&entry.network) == claimed_on {
                 continue;
             }
             let Ok(network) = self.network(&entry.network) else {
                 continue;
             };
-            if let Err(error) = network.cancel_receive(record.invoice.payment_hash).await {
+            if let Err(error) = network
+                .cancel_receive(record.invoice.body.payment_hash)
+                .await
+            {
                 warn!("releasing invoice target on {}: {error}", entry.network);
             }
         }

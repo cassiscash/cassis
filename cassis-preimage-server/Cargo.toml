@@ -17,6 +17,7 @@ cassis-core = { workspace = true, features = ["node"] }
 clap = { workspace = true }
 hmac = { workspace = true }
 iroh = { workspace = true }
+iroh-base = { workspace = true }
 orangedb = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }

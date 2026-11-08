@@ -56,11 +56,11 @@ impl Node {
             Ok(invoices) => {
                 for mut record in invoices {
                     if record.status == InvoiceStatus::Pending
-                        && record.invoice.expires_at <= unix_now()
+                        && record.invoice.body.expires_at <= unix_now()
                     {
                         record.status = InvoiceStatus::Expired;
                         self.cancel_targets(&record, None).await;
-                        let key = record.invoice.payment_hash.to_string();
+                        let key = record.invoice.body.payment_hash.to_string();
                         if let Err(error) = self.store().put(INVOICES, &key, &record) {
                             warn!("expiring invoice {key}: {error}");
                         }
@@ -149,7 +149,7 @@ impl Node {
     }
 
     async fn advance_payment(&self, mut payment: PaymentRecord) {
-        let key = payment.invoice.payment_hash.to_string();
+        let key = payment.invoice.body.payment_hash.to_string();
         let Some(_busy) = self.busy(format!("pay:{key}")) else {
             return;
         };

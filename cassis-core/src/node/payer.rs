@@ -34,15 +34,15 @@ impl Node {
         from: &NetworkId,
         relays: &[String],
     ) -> Result<Bytes32, String> {
-        let hash = invoice.payment_hash;
+        let hash = invoice.body.payment_hash;
         let _busy = self
             .busy(format!("pay:{hash}"))
             .ok_or("this invoice is already being paid")?;
         invoice.verify()?;
-        if invoice.amount_msat == 0 {
+        if invoice.body.amount_msat == 0 {
             return Err("invoice amount is zero".into());
         }
-        if invoice.expires_at <= unix_now() {
+        if invoice.body.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
         if let Some(previous) = self
@@ -70,17 +70,16 @@ impl Node {
             .target_for(&payee_network)
             .cloned()
             .ok_or("invoice has no target for the chosen network")?;
-        // The payee's endpoint, or its gateway's.
+        // PREPARE and COMMIT go to the gateway when there is one: it is
+        // paid in the payee's place.
+        let endpoint = invoice.iroh_peer_id();
         let payee = PeerAddr {
-            id: invoice
-                .iroh_peer_id
-                .clone()
-                .ok_or("invoice does not name an endpoint")?,
-            relay: invoice.iroh_relay.clone(),
+            id: endpoint.to_string(),
+            relay: invoice.body.iroh_relay.clone(),
         };
         let plan = routing::plan_route(
             &route,
-            invoice.amount_msat,
+            invoice.body.amount_msat,
             invoice.incoming_delta_for(&payee_network),
             invoice.max_incoming_lifetime_for(&payee_network),
             unix_now(),
@@ -107,7 +106,7 @@ impl Node {
             .collect();
         info!(
             "paying {} msat ({} msat with fees) from {from} to {payee_network} over {} hop(s)",
-            invoice.amount_msat,
+            invoice.body.amount_msat,
             plan.amounts[0],
             hops.len()
         );
@@ -119,7 +118,7 @@ impl Node {
             payment_hash: hash,
             network: payee_network.clone(),
             expiry: plan.expiries[hops.len()],
-            metadata: invoice.metadata.clone(),
+            metadata: invoice.body.metadata.clone(),
             invoice: Some(invoice.clone()),
         });
         let (replies, payee_reply) = futures::join!(
@@ -222,7 +221,7 @@ impl Node {
             network: payee_network,
             expiry: plan.expiries[hops.len()],
             descriptor,
-            metadata: invoice.metadata.clone(),
+            metadata: invoice.body.metadata.clone(),
             invoice: Some(invoice.clone()),
         };
         let deadline = commit.expiry;
@@ -279,6 +278,7 @@ impl Node {
         // Why the last route found could not be planned, if any was.
         let mut unplannable = None;
         invoice
+            .body
             .networks
             .iter()
             .filter_map(|entry| {
@@ -286,14 +286,14 @@ impl Node {
                     &announcements,
                     from,
                     &entry.network,
-                    invoice.amount_msat,
+                    invoice.body.amount_msat,
                     &HashSet::new(),
                 )
                 .ok()?;
                 // Fails when a leg runs longer than its receiver accepts.
                 let plan = routing::plan_route(
                     &route,
-                    invoice.amount_msat,
+                    invoice.body.amount_msat,
                     invoice.incoming_delta_for(&entry.network),
                     invoice.max_incoming_lifetime_for(&entry.network),
                     unix_now(),

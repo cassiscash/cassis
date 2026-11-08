@@ -30,7 +30,7 @@ use cassis_core::node::{
     InvoiceRecord, InvoiceStatus, Node, NodeConfig, OfflineEndpoints, PaymentRecord,
     StandingAuthorizationRecord, GATEWAY_INVOICES, STANDING_AUTHORIZATIONS,
 };
-use cassis_core::offline::{EndpointKey, DEFAULT_MIN_FINAL_TIMEOUT_SECS};
+use cassis_core::offline::{endpoint_public_key, DEFAULT_MIN_FINAL_TIMEOUT_SECS};
 use cassis_core::protocol::{GatewayInvoiceFor, Request, Response};
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
 use cassis_core::transport::{PeerAddr, Transport};
@@ -167,7 +167,7 @@ enum Command {
         gateway: String,
         #[arg(long, value_name = "URL")]
         gateway_relay: Option<String>,
-        /// The payee's offline key (see `info`).
+        /// The payee's key, its iroh id (see `info`).
         #[arg(long, value_name = "KEY")]
         payee: String,
         #[arg(long)]
@@ -289,8 +289,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Info => {
             println!("node pubkey: {}", home.keys.node.pubkey().to_hex());
             println!(
-                "offline payee key: {}",
-                EndpointKey::from_secret(&home.keys.offline_payee_secret())
+                "payee key (iroh id): {}",
+                endpoint_public_key(&home.keys.iroh)
             );
             println!("networks:");
             for network in home.networks()? {
@@ -367,9 +367,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             let expires_at = unix_now() + expires_in;
             if let Some(endpoints) = offline.endpoints() {
                 let opened = home.open_networks(&networks, &span).await?;
+                let transport = Transport::bind_client(home.keys.iroh).await?;
                 let invoice = create_gateway_invoice(
                     &home.store,
                     &home.keys,
+                    &transport,
                     endpoints,
                     &opened,
                     amount_msat,
@@ -378,8 +380,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                     None,
                     min_final_timeout,
                 )
-                .await?;
-                print_invoice(&invoice)?;
+                .await;
+                transport.close().await;
+                print_invoice(&invoice?)?;
                 return Ok(());
             }
             let node = serve(&home, &span).await?;
@@ -417,9 +420,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             let networks = parse_networks(&home, &networks)?;
             let opened = home.open_networks(&networks, &span).await?;
             let now = unix_now();
+            let transport = Transport::bind_client(home.keys.iroh).await?;
             let authorization = authorize_gateway(
                 &home.store,
                 &home.keys,
+                &transport,
                 endpoints,
                 &opened,
                 now,
@@ -428,7 +433,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                 max_amount_msat,
                 min_final_timeout,
             )
-            .await?;
+            .await;
+            transport.close().await;
+            let authorization = authorization?;
             println!(
                 "{}",
                 serde_json::to_string(&authorization).map_err(|e| e.to_string())?
@@ -444,7 +451,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => {
             let transport = Transport::bind(None).await?;
             let request = Request::GatewayInvoiceFor(GatewayInvoiceFor {
-                payee: payee.parse()?,
+                payee: payee
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("payee key {payee}: {e}"))?,
                 amount_msat,
                 expires_at: expires_in.map(|secs| unix_now() + secs),
                 description,
@@ -535,19 +545,19 @@ async fn run(cli: Cli) -> Result<(), String> {
             for record in home.store.list::<InvoiceRecord>("invoices")? {
                 println!(
                     "{} {:>12} msat {:?} expires {}",
-                    record.invoice.payment_hash,
-                    record.invoice.amount_msat,
+                    record.invoice.body.payment_hash,
+                    record.invoice.body.amount_msat,
                     record.status,
-                    record.invoice.expires_at
+                    record.invoice.body.expires_at
                 );
             }
             for record in home.store.list::<GatewayInvoiceRecord>(GATEWAY_INVOICES)? {
                 println!(
                     "{} {:>12} msat {:?} expires {} via gateway {}",
-                    record.invoice.payment_hash,
-                    record.invoice.amount_msat,
+                    record.invoice.body.payment_hash,
+                    record.invoice.body.amount_msat,
                     record.status,
-                    record.invoice.expires_at,
+                    record.invoice.body.expires_at,
                     record.endpoints.gateway.id
                 );
             }
@@ -569,7 +579,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             for record in home.store.list::<PaymentRecord>("payments")? {
                 println!(
                     "{} {:>12} msat on {} {:?}",
-                    record.invoice.payment_hash,
+                    record.invoice.body.payment_hash,
                     record.htlc.amount_msat,
                     record.network,
                     record.status
@@ -612,7 +622,7 @@ fn print_invoice(invoice: &Invoice) -> Result<(), String> {
 const CLAIM_GRACE: Duration = Duration::from_secs(30);
 
 async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
-    let key = invoice.payment_hash.to_string();
+    let key = invoice.body.payment_hash.to_string();
     loop {
         let record: InvoiceRecord = home
             .store
@@ -689,13 +699,39 @@ async fn redeem(
         println!("this node receives through no preimage server");
         return Ok(());
     }
+    let transport = Transport::bind_client(home.keys.iroh).await?;
+    let result = redeem_from(home, &transport, servers, since, span).await;
+    transport.close().await;
+    result
+}
+
+/// Claim what each of `servers` logged for this node since `since`.
+async fn redeem_from(
+    home: &Home,
+    transport: &Transport,
+    servers: Vec<(PeerAddr, Vec<NetworkId>)>,
+    since: u64,
+    span: &Span,
+) -> Result<(), String> {
     for (preimage_server, networks) in servers {
         let opened = home.open_networks(&networks, span).await?;
-        let report =
-            redeem_offline_payments(&home.store, &home.keys, &preimage_server, &opened, since)
-                .await?;
+        let report = redeem_offline_payments(
+            &home.store,
+            &home.keys,
+            transport,
+            &preimage_server,
+            &opened,
+            since,
+        )
+        .await?;
         for (hash, network, amount_msat) in &report.claimed {
             println!("claimed {hash} {amount_msat:>12} msat on {network}");
+        }
+        for (hash, metadata) in &report.metadata {
+            println!(
+                "        {hash} metadata {}",
+                serde_json::to_string(metadata).map_err(|e| e.to_string())?
+            );
         }
         for (hash, reason) in &report.pending {
             println!("pending {hash}: {reason}");

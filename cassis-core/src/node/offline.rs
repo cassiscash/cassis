@@ -2,22 +2,26 @@
 //! invoices through a gateway and a preimage server, or let the gateway
 //! issue them alone, and later claim what the preimage server logged.
 //!
-//! None of this needs a running node: the payee talks to both servers
-//! from the endpoint of [`NodeKeys::offline_payee_secret`], the key its
-//! authorizations are signed with and its payments are logged under.
+//! None of this needs a running node, only an endpoint with the node's
+//! identity, [`NodeKeys::iroh`]: the key its invoices and authorizations
+//! are signed with and its payments are logged under, which the servers
+//! check the payee talks from. A serving node passes its own
+//! ([`super::Node::transport`]); otherwise bind a client one with
+//! [`Transport::bind_client`].
 
 use super::InvoiceStatus;
 use crate::keys::NodeKeys;
 use crate::network::{Htlc, Network, NetworkError, NetworkId};
 use crate::offline::{
-    AuthorizationKind, Destination, EndpointKey, PreimageIssuance, ReceiveAuthorization,
+    endpoint_public_key, AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization,
 };
 use crate::primitives::{unix_now, Bytes32};
 use crate::protocol::{
-    GatewayInvoiceRequest, Invoice, InvoiceKind, Metadata, ReceivedPayment, Request, Response,
+    GatewayInvoiceRequest, Invoice, InvoiceReceiver, Metadata, ReceivedPayment, Request, Response,
 };
 use crate::store::Store;
 use crate::transport::{PeerAddr, Transport};
+use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -107,8 +111,20 @@ async fn destinations(
     Ok(destinations)
 }
 
-fn endpoint_key(peer: &PeerAddr) -> Result<EndpointKey, String> {
-    peer.id.parse()
+fn endpoint_key(peer: &PeerAddr) -> Result<PublicKey, String> {
+    peer.id
+        .trim()
+        .parse()
+        .map_err(|e| format!("endpoint key {}: {e}", peer.id))
+}
+
+/// Check `transport` speaks as this node, whose payee key is the
+/// identity the servers expect, and return that key's secret.
+fn payee_secret(keys: &NodeKeys, transport: &Transport) -> Result<[u8; 32], String> {
+    if transport.peer_id() != endpoint_public_key(&keys.iroh).to_string() {
+        return Err("the endpoint does not have this node's identity".into());
+    }
+    Ok(keys.iroh)
 }
 
 /// Create and record an invoice that payers pay to `endpoints.gateway`,
@@ -125,6 +141,7 @@ fn endpoint_key(peer: &PeerAddr) -> Result<EndpointKey, String> {
 pub async fn create_gateway_invoice(
     store: &Store,
     keys: &NodeKeys,
+    transport: &Transport,
     endpoints: OfflineEndpoints,
     networks: &[Arc<dyn Network>],
     amount_msat: u64,
@@ -140,7 +157,7 @@ pub async fn create_gateway_invoice(
     if expires_at <= now {
         return Err("invoice expiry must be in the future".into());
     }
-    let secret = keys.offline_payee_secret();
+    let secret = payee_secret(keys, transport)?;
     let authorization = ReceiveAuthorization::sign(
         &secret,
         AuthorizationKind::Single,
@@ -153,25 +170,23 @@ pub async fn create_gateway_invoice(
         min_final_timeout_secs,
         destinations(networks, min_final_timeout_secs).await?,
     )?;
-    let transport = Transport::bind_client(secret).await?;
-    let result = issue(
-        &transport,
+    let mut invoice = issue(
+        transport,
         &endpoints,
         &authorization,
         expires_at,
         description,
         metadata,
     )
-    .await;
-    transport.close().await;
-    let mut invoice = result?;
+    .await?;
     invoice.sign_as_payee(&secret)?;
-    if invoice.verify()? != InvoiceKind::Gateway {
+    invoice.verify()?;
+    if !matches!(invoice.receiver, InvoiceReceiver::Gateway(_)) {
         return Err("the gateway's invoice is not a gateway invoice".into());
     }
     store.put(
         GATEWAY_INVOICES,
-        &invoice.payment_hash.to_string(),
+        &invoice.body.payment_hash.to_string(),
         &GatewayInvoiceRecord {
             invoice: invoice.clone(),
             authorization,
@@ -198,6 +213,7 @@ async fn issue(
     let request = Request::PreimageIssue {
         authorization: authorization.clone(),
         amount_msat,
+        metadata: metadata.clone(),
     };
     let issuance: PreimageIssuance = match transport
         .request(&endpoints.preimage_server, &request)
@@ -210,8 +226,8 @@ async fn issue(
         other => return Err(format!("unexpected answer from preimage server: {other:?}")),
     };
     issuance.verify(&authorization.preimage_server, authorization)?;
-    if issuance.amount_msat != amount_msat {
-        return Err("preimage server issued the hash for another amount".into());
+    if issuance.amount_msat != amount_msat || !issuance.matches_metadata(metadata.as_ref()) {
+        return Err("preimage server issued the hash for another payment".into());
     }
     let request = Request::GatewayInvoice(GatewayInvoiceRequest {
         authorization: authorization.clone(),
@@ -228,18 +244,24 @@ async fn issue(
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     };
-    let asked = invoice.payment_hash == issuance.payment_hash
-        && invoice.amount_msat == amount_msat
-        && invoice.expires_at == expires_at
-        && invoice.description == description
-        && invoice.metadata == metadata
-        && invoice.gateway == Some(authorization.gateway)
-        && invoice.payee.is_none()
-        && invoice.payee_signature.is_none()
-        && invoice.preimage_server.is_none()
-        && invoice.preimage_server_issuance.is_none()
-        && invoice.payee_authorization.is_none()
-        && !invoice.networks.is_empty();
+    let asked = match &invoice {
+        Invoice {
+            body,
+            receiver: InvoiceReceiver::Gateway(receiver),
+        } => {
+            body.payment_hash == issuance.payment_hash
+                && body.amount_msat == amount_msat
+                && body.expires_at == expires_at
+                && body.description == description
+                && body.metadata == metadata
+                && receiver.gateway == authorization.gateway
+                && receiver.payee == authorization.payee
+                && receiver.gateway_signature.is_some()
+                && receiver.payee_signature.is_none()
+                && !body.networks.is_empty()
+        }
+        _ => false,
+    };
     if !asked {
         return Err("the gateway's invoice is not the one asked for".into());
     }
@@ -256,6 +278,7 @@ async fn issue(
 pub async fn authorize_gateway(
     store: &Store,
     keys: &NodeKeys,
+    transport: &Transport,
     endpoints: OfflineEndpoints,
     networks: &[Arc<dyn Network>],
     valid_from: u64,
@@ -267,7 +290,7 @@ pub async fn authorize_gateway(
     if valid_until <= unix_now() {
         return Err("the authorization must end in the future".into());
     }
-    let secret = keys.offline_payee_secret();
+    let secret = payee_secret(keys, transport)?;
     let authorization = ReceiveAuthorization::sign(
         &secret,
         AuthorizationKind::Standing,
@@ -280,7 +303,6 @@ pub async fn authorize_gateway(
         min_final_timeout_secs,
         destinations(networks, min_final_timeout_secs).await?,
     )?;
-    let transport = Transport::bind_client(secret).await?;
     let answer = transport
         .request(
             &endpoints.gateway,
@@ -289,9 +311,8 @@ pub async fn authorize_gateway(
                 preimage_server_relay: endpoints.preimage_server.relay.clone(),
             },
         )
-        .await;
-    transport.close().await;
-    match answer? {
+        .await?;
+    match answer {
         Response::GatewayAuthorized(Ok(())) => {}
         Response::GatewayAuthorized(Err(reason)) | Response::Error(reason) => {
             return Err(format!("gateway refused: {reason}"))
@@ -315,6 +336,9 @@ pub async fn authorize_gateway(
 pub struct RedeemReport {
     /// Claimed now: payment hash, network, amount.
     pub claimed: Vec<(Bytes32, NetworkId, u64)>,
+    /// Metadata of the invoices claimed now, by payment hash: how an
+    /// offline payee learns what a gateway's invoice was for.
+    pub metadata: Vec<(Bytes32, Metadata)>,
     /// Logged but not claimed yet (an HTLC not final, a backend down);
     /// a later call tries again.
     pub pending: Vec<(Bytes32, String)>,
@@ -329,16 +353,16 @@ pub struct RedeemReport {
 pub async fn redeem_offline_payments(
     store: &Store,
     keys: &NodeKeys,
+    transport: &Transport,
     preimage_server: &PeerAddr,
     networks: &[Arc<dyn Network>],
     since: u64,
 ) -> Result<RedeemReport, String> {
-    let transport = Transport::bind_client(keys.offline_payee_secret()).await?;
+    payee_secret(keys, transport)?;
     let answer = transport
         .request(preimage_server, &Request::PreimagePayments { since })
-        .await;
-    transport.close().await;
-    let payments = match answer? {
+        .await?;
+    let payments = match answer {
         Response::PreimagePayments(Ok(payments)) => payments,
         Response::PreimagePayments(Err(reason)) | Response::Error(reason) => {
             return Err(format!("preimage server: {reason}"))
@@ -347,7 +371,7 @@ pub async fn redeem_offline_payments(
     };
     let mut report = RedeemReport::default();
     for payment in payments {
-        let (payment_hash, network, htlc, preimage) = match payment {
+        let (payment_hash, network, htlc, preimage, metadata) = match payment {
             ReceivedPayment::Failed {
                 payment_hash,
                 reason,
@@ -364,6 +388,7 @@ pub async fn redeem_offline_payments(
                 target,
                 descriptor,
                 preimage,
+                metadata,
                 ..
             } => (
                 payment_hash,
@@ -376,6 +401,7 @@ pub async fn redeem_offline_payments(
                     descriptor,
                 },
                 preimage,
+                metadata,
             ),
         };
         let key = payment_hash.to_string();
@@ -404,6 +430,9 @@ pub async fn redeem_offline_payments(
                 report
                     .claimed
                     .push((payment_hash, network, htlc.amount_msat));
+                if let Some(metadata) = metadata {
+                    report.metadata.push((payment_hash, metadata));
+                }
             }
             Err(NetworkError::NotYet(reason) | NetworkError::Network(reason)) => {
                 report.pending.push((payment_hash, reason))

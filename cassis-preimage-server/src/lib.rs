@@ -4,29 +4,33 @@
 //!
 //! * The payee, or the gateway it authorized, asks for a payment hash
 //!   ([`Request::PreimageIssue`]) under the payee's signed
-//!   [`ReceiveAuthorization`]. The server keeps no record of it: the
-//!   preimage is an HMAC by the server's key over the authorization, the
-//!   amount and a random nonce, all in the [`PreimageIssuance`] it signs
-//!   and returns.
+//!   [`ReceiveAuthorization`], for an invoice of some amount and
+//!   metadata. The server keeps no record of it: the preimage is an
+//!   HMAC, keyed by a secret only the server knows, over the
+//!   authorization, the amount, the metadata's hash and a random nonce,
+//!   all in the [`PreimageIssuance`] it signs and returns. Without that
+//!   secret nobody, the gateway included, can work the preimage out.
 //! * The gateway, paid for the invoice, funds an HTLC to one of the
 //!   payee's destinations and presents it ([`Request::PreimageRelease`]).
 //!   The server checks it against the authorization (destination,
 //!   amount, timeout) and on the network, logs it for the payee and
 //!   releases the preimage, so the gateway can settle its incoming
 //!   payment.
-//! * The payee fetches its log ([`Request::PreimagePayments`]) and
-//!   claims each HTLC before it expires.
+//! * The payee fetches its log ([`Request::PreimagePayments`]), with
+//!   the metadata of each invoice, and claims each HTLC before it
+//!   expires.
 //!
 //! Only HTLCs whose preimage was released are stored.
 
 use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
 use cassis_core::offline::{
-    AuthorizationKind, EndpointKey, PreimageIssuance, ReceiveAuthorization, Signature,
+    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
 };
-use cassis_core::protocol::{PreimageRelease, ReceivedPayment, Request, Response};
+use cassis_core::protocol::{Metadata, PreimageRelease, ReceivedPayment, Request, Response};
 use cassis_core::transport::{Handler, Transport};
 use cassis_core::{unix_now, Bytes32};
 use hmac::{Hmac, Mac};
+use iroh_base::PublicKey;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -65,6 +69,8 @@ pub mod db {
         pub descriptor: String,
         /// Hex.
         pub preimage: String,
+        /// JSON of the invoice's `Metadata`, if any.
+        pub metadata: Option<String>,
         pub released_at: u64,
     }
 }
@@ -74,7 +80,9 @@ use db::{Payee, PayeeKey, Payment, PaymentHash};
 pub struct ServerConfig {
     /// Secret of the server's iroh endpoint, which signs its issuances.
     pub endpoint_secret: [u8; 32],
-    /// Key preimages are derived with. Changing it orphans every
+    /// Key preimages are derived with, known to this server only (see
+    /// [`cassis_core::keys::NodeKeys::preimage_server_secret`]): anyone
+    /// holding it can compute every preimage. Changing it orphans every
     /// invoice issued before.
     pub preimage_secret: [u8; 32],
     pub db: Arc<Db>,
@@ -137,8 +145,8 @@ impl PreimageServer {
         self.0.transport.close().await;
     }
 
-    fn key(&self) -> EndpointKey {
-        EndpointKey::from_secret(&self.0.endpoint_secret)
+    fn key(&self) -> PublicKey {
+        endpoint_public_key(&self.0.endpoint_secret)
     }
 
     async fn handle(&self, request: Request, peer: String) -> Response {
@@ -146,7 +154,13 @@ impl PreimageServer {
             Request::PreimageIssue {
                 authorization,
                 amount_msat,
-            } => Response::PreimageIssued(self.issue(&peer, &authorization, amount_msat)),
+                metadata,
+            } => Response::PreimageIssued(self.issue(
+                &peer,
+                &authorization,
+                amount_msat,
+                metadata.as_ref(),
+            )),
             Request::PreimageRelease(release) => self.release(&peer, release).await,
             Request::PreimagePayments { since } => {
                 Response::PreimagePayments(self.payments(&peer, since))
@@ -157,15 +171,22 @@ impl PreimageServer {
         }
     }
 
-    /// The preimage of the hash issued for `amount_msat` under the
-    /// authorization `authorization` with `nonce`.
-    fn preimage(&self, authorization: &Bytes32, amount_msat: u64, nonce: &Bytes32) -> Bytes32 {
+    /// The preimage of `issuance`'s hash: the HMAC by the server's
+    /// secret over everything it issued the hash for.
+    fn preimage(&self, issuance: &PreimageIssuance) -> Bytes32 {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.0.preimage_secret)
             .expect("hmac accepts any key length");
-        mac.update(b"cassis/preimage-server/v2\0");
-        mac.update(&authorization.0);
-        mac.update(&amount_msat.to_be_bytes());
-        mac.update(&nonce.0);
+        mac.update(b"cassis/preimage-server/v3\0");
+        mac.update(&issuance.authorization.0);
+        mac.update(&issuance.amount_msat.to_be_bytes());
+        match &issuance.metadata_hash {
+            Some(hash) => {
+                mac.update(&[1]);
+                mac.update(&hash.0);
+            }
+            None => mac.update(&[0]),
+        }
+        mac.update(&issuance.nonce.0);
         Bytes32(mac.finalize().into_bytes().into())
     }
 
@@ -190,8 +211,9 @@ impl PreimageServer {
         peer: &str,
         authorization: &ReceiveAuthorization,
         amount_msat: u64,
+        metadata: Option<&Metadata>,
     ) -> Result<PreimageIssuance, String> {
-        let result = self.try_issue(peer, authorization, amount_msat);
+        let result = self.try_issue(peer, authorization, amount_msat, metadata);
         match &result {
             Ok(issuance) => info!(
                 "issued {} for {amount_msat} msat to {peer} for payee {}",
@@ -208,6 +230,7 @@ impl PreimageServer {
         peer: &str,
         authorization: &ReceiveAuthorization,
         amount_msat: u64,
+        metadata: Option<&Metadata>,
     ) -> Result<PreimageIssuance, String> {
         let id = self.check_authorization(authorization)?;
         let peer = peer_key(peer)?;
@@ -230,14 +253,15 @@ impl PreimageServer {
         if !authorization.allows_amount(amount_msat) {
             return Err("the payee did not authorize this amount".into());
         }
-        let nonce = Bytes32::random();
         let mut issuance = PreimageIssuance {
-            payment_hash: self.preimage(&id, amount_msat, &nonce).sha256(),
+            payment_hash: Bytes32([0; 32]),
             amount_msat,
+            metadata_hash: metadata.map(Metadata::hash),
             authorization: id,
-            nonce,
+            nonce: Bytes32::random(),
             signature: Signature([0; 64]),
         };
+        issuance.payment_hash = self.preimage(&issuance).sha256();
         issuance.sign(&self.0.endpoint_secret);
         Ok(issuance)
     }
@@ -273,6 +297,7 @@ impl PreimageServer {
         let PreimageRelease {
             authorization,
             issuance,
+            metadata,
             network,
             htlc,
         } = release;
@@ -283,10 +308,13 @@ impl PreimageServer {
         if issuance.authorization != id {
             return Err("the hash was issued under another authorization".into());
         }
-        let preimage = self.preimage(&id, issuance.amount_msat, &issuance.nonce);
+        let preimage = self.preimage(&issuance);
         let hash = preimage.sha256();
         if hash != issuance.payment_hash || htlc.payment_hash != hash {
             return Err("this server did not issue the HTLC's payment hash".into());
+        }
+        if !issuance.matches_metadata(metadata.as_ref()) {
+            return Err("the hash was issued for other metadata".into());
         }
         if self.stored(hash)?.is_some() {
             // A repeated release: the preimage is out anyway.
@@ -332,6 +360,11 @@ impl PreimageServer {
             target: serde_json::to_string(&htlc.target).map_err(|e| e.to_string())?,
             descriptor: serde_json::to_string(&htlc.descriptor).map_err(|e| e.to_string())?,
             preimage: preimage.to_string(),
+            metadata: metadata
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| e.to_string())?,
             released_at: unix_now(),
         };
         let written = self.0.db.write(|tx| {
@@ -390,6 +423,11 @@ impl PreimageServer {
                     descriptor: serde_json::from_str(&payment.descriptor)
                         .map_err(|e| format!("stored descriptor: {e}"))?,
                     preimage: Bytes32::from_str(&payment.preimage)?,
+                    metadata: payment
+                        .metadata
+                        .map(|metadata| serde_json::from_str(&metadata))
+                        .transpose()
+                        .map_err(|e| format!("stored metadata: {e}"))?,
                     at: payment.released_at,
                 })
             })
@@ -397,6 +435,8 @@ impl PreimageServer {
     }
 }
 
-fn peer_key(peer: &str) -> Result<EndpointKey, String> {
-    peer.parse()
+fn peer_key(peer: &str) -> Result<PublicKey, String> {
+    peer.trim()
+        .parse()
+        .map_err(|e| format!("endpoint key {peer}: {e}"))
 }
