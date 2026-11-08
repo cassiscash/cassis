@@ -311,7 +311,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .await
         .unwrap();
     misdirected.iroh_peer_id = Some(router.iroh_peer_id());
-    misdirected.sign(&router_keys.iroh).unwrap();
+    misdirected.sign_as_payee(&router_keys.iroh).unwrap();
     let error = payer
         .pay(&misdirected, &NetworkId(a.into()), &[RELAY.into()])
         .await
@@ -335,7 +335,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
             .unwrap()
             .pubkey(),
     );
-    unreachable.sign(&payee_keys.iroh).unwrap();
+    unreachable.sign_as_payee(&payee_keys.iroh).unwrap();
     let error = payer
         .pay(&unreachable, &NetworkId(a.into()), &[RELAY.into()])
         .await

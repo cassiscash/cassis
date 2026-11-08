@@ -26,11 +26,14 @@ mod order_demo;
 mod wallets;
 
 use cassis_core::node::{
-    create_preimage_server_invoice, redeem_preimage_server_payments, InvoiceRecord, InvoiceStatus,
-    Node, NodeConfig, PaymentRecord, PreimageServerInvoiceRecord, PREIMAGE_SERVER_INVOICES,
+    authorize_gateway, create_gateway_invoice, redeem_offline_payments, GatewayInvoiceRecord,
+    InvoiceRecord, InvoiceStatus, Node, NodeConfig, OfflineEndpoints, PaymentRecord,
+    StandingAuthorizationRecord, GATEWAY_INVOICES, STANDING_AUTHORIZATIONS,
 };
+use cassis_core::offline::{EndpointKey, DEFAULT_MIN_FINAL_TIMEOUT_SECS};
+use cassis_core::protocol::{GatewayInvoiceFor, Request, Response};
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
-use cassis_core::transport::PeerAddr;
+use cassis_core::transport::{PeerAddr, Transport};
 use cassis_core::{unix_now, Invoice, NetworkId};
 use clap::{Parser, Subcommand};
 use home::Home;
@@ -113,43 +116,73 @@ enum Command {
     /// nothing else.
     Sync,
     /// Create an invoice to receive a payment, and serve the node until
-    /// it is paid or expires; with `--preimage-server`, return at once
-    /// and claim with `redeem` later.
+    /// it is paid or expires; with `--gateway`, return at once and claim
+    /// with `redeem` later.
     #[command(visible_alias = "invoice")]
     Receive {
         #[arg(long)]
         amount_msat: u64,
-        /// Networks it can be paid on; all of the node's by default.
+        /// Networks it can be paid on (with `--gateway`: the gateway pays
+        /// this node on); all of the node's by default.
         #[arg(long = "network")]
         networks: Vec<String>,
         #[arg(long)]
         description: Option<String>,
         #[arg(long, default_value_t = 3600)]
         expires_in: u64,
-        /// Iroh id of a preimage server to answer payers instead of this
-        /// node, which can then stay offline. It picks the payment hash
-        /// and the metadata; claim with `redeem` afterwards.
-        #[arg(long = "preimage-server", visible_alias = "ps", value_name = "ID")]
-        preimage_server: Option<String>,
-        /// Home relay of the preimage server.
-        #[arg(
-            long = "preimage-server-relay",
-            visible_alias = "ps-relay",
-            value_name = "URL",
-            requires = "preimage_server"
-        )]
-        preimage_server_relay: Option<String>,
-        /// With `--preimage-server`: how long this node may stay offline
-        /// after a payment before `redeem` must claim it. Payers and
-        /// routers lock their HTLCs that much longer.
-        #[arg(long, value_name = "SECS", default_value_t = 24 * 3600, requires = "preimage_server")]
-        claim_window: u64,
+        #[command(flatten)]
+        offline: OfflineArgs,
+        /// With `--gateway`: how long the gateway's HTLC to this node
+        /// must stay unrefundable after the preimage is released, i.e.
+        /// how long this node may stay offline before `redeem`.
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_MIN_FINAL_TIMEOUT_SECS)]
+        min_final_timeout: u64,
     },
-    /// Fetch the payments preimage servers logged for this node's
-    /// invoices and claim them, before their HTLCs expire.
+    /// Let a gateway issue invoices in this node's name while it is
+    /// offline, for hashes a preimage server issues; claim with `redeem`.
+    Authorize {
+        #[command(flatten)]
+        offline: OfflineArgs,
+        /// Networks the gateway pays this node on; all of the node's by
+        /// default.
+        #[arg(long = "network")]
+        networks: Vec<String>,
+        /// How long the gateway may issue invoices, from now.
+        #[arg(long, value_name = "SECS", default_value_t = 30 * 24 * 3600)]
+        valid_for: u64,
+        #[arg(long, default_value_t = 1000)]
+        min_amount_msat: u64,
+        #[arg(long)]
+        max_amount_msat: u64,
+        /// How long the gateway's HTLC to this node must stay
+        /// unrefundable after the preimage is released.
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_MIN_FINAL_TIMEOUT_SECS)]
+        min_final_timeout: u64,
+    },
+    /// Ask a gateway for an invoice paying an offline payee that
+    /// authorized it (see `authorize`).
+    RequestInvoice {
+        /// Iroh id of the gateway.
+        #[arg(long, value_name = "ID")]
+        gateway: String,
+        #[arg(long, value_name = "URL")]
+        gateway_relay: Option<String>,
+        /// The payee's offline key (see `info`).
+        #[arg(long, value_name = "KEY")]
+        payee: String,
+        #[arg(long)]
+        amount_msat: u64,
+        #[arg(long)]
+        description: Option<String>,
+        /// The gateway's default when absent.
+        #[arg(long)]
+        expires_in: Option<u64>,
+    },
+    /// Fetch the HTLCs gateways funded to this node from the preimage
+    /// servers that logged them, and claim them before they expire.
     Redeem {
-        /// Only this preimage server; by default every one with an
-        /// unclaimed invoice.
+        /// Only this preimage server; by default every one this node
+        /// receives through.
         #[arg(long = "preimage-server", visible_alias = "ps", value_name = "ID")]
         preimage_server: Option<String>,
         #[arg(
@@ -193,6 +226,49 @@ enum Command {
     Wallet(wallets::Command),
 }
 
+/// The gateway and preimage server to receive offline through.
+#[derive(clap::Args)]
+struct OfflineArgs {
+    /// Iroh id of a gateway to be paid in this node's place, so this
+    /// node can stay offline. It pays this node on with an HTLC once
+    /// paid.
+    #[arg(long, value_name = "ID", requires = "preimage_server")]
+    gateway: Option<String>,
+    #[arg(long, value_name = "URL", requires = "gateway")]
+    gateway_relay: Option<String>,
+    /// Iroh id of the preimage server that picks the payment hash and
+    /// releases the preimage to the gateway once it paid this node.
+    #[arg(
+        long = "preimage-server",
+        visible_alias = "ps",
+        value_name = "ID",
+        requires = "gateway"
+    )]
+    preimage_server: Option<String>,
+    #[arg(
+        long = "preimage-server-relay",
+        visible_alias = "ps-relay",
+        value_name = "URL",
+        requires = "preimage_server"
+    )]
+    preimage_server_relay: Option<String>,
+}
+
+impl OfflineArgs {
+    fn endpoints(self) -> Option<OfflineEndpoints> {
+        Some(OfflineEndpoints {
+            gateway: PeerAddr {
+                id: self.gateway?,
+                relay: self.gateway_relay,
+            },
+            preimage_server: PeerAddr {
+                id: self.preimage_server?,
+                relay: self.preimage_server_relay,
+            },
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() {
     cassis_core::logging::init_logging();
@@ -212,6 +288,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Seed => println!("{}", home.mnemonic()?),
         Command::Info => {
             println!("node pubkey: {}", home.keys.node.pubkey().to_hex());
+            println!(
+                "offline payee key: {}",
+                EndpointKey::from_secret(&home.keys.offline_payee_secret())
+            );
             println!("networks:");
             for network in home.networks()? {
                 println!("  {network}");
@@ -280,33 +360,23 @@ async fn run(cli: Cli) -> Result<(), String> {
             networks,
             description,
             expires_in,
-            preimage_server,
-            preimage_server_relay,
-            claim_window,
+            offline,
+            min_final_timeout,
         } => {
-            let networks = if networks.is_empty() {
-                home.networks()?
-            } else {
-                networks
-                    .iter()
-                    .map(|spec| NetworkId::parse(spec))
-                    .collect::<Result<_, _>>()?
-            };
+            let networks = parse_networks(&home, &networks)?;
             let expires_at = unix_now() + expires_in;
-            if let Some(id) = preimage_server {
+            if let Some(endpoints) = offline.endpoints() {
                 let opened = home.open_networks(&networks, &span).await?;
-                let invoice = create_preimage_server_invoice(
+                let invoice = create_gateway_invoice(
                     &home.store,
                     &home.keys,
-                    PeerAddr {
-                        id,
-                        relay: preimage_server_relay,
-                    },
+                    endpoints,
                     &opened,
                     amount_msat,
                     expires_at,
                     description,
-                    claim_window,
+                    None,
+                    min_final_timeout,
                 )
                 .await?;
                 print_invoice(&invoice)?;
@@ -332,6 +402,73 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             node.shutdown().await;
             claimed?;
+        }
+        Command::Authorize {
+            offline,
+            networks,
+            valid_for,
+            min_amount_msat,
+            max_amount_msat,
+            min_final_timeout,
+        } => {
+            let endpoints = offline
+                .endpoints()
+                .ok_or("authorize needs --gateway and --preimage-server")?;
+            let networks = parse_networks(&home, &networks)?;
+            let opened = home.open_networks(&networks, &span).await?;
+            let now = unix_now();
+            let authorization = authorize_gateway(
+                &home.store,
+                &home.keys,
+                endpoints,
+                &opened,
+                now,
+                now + valid_for,
+                min_amount_msat,
+                max_amount_msat,
+                min_final_timeout,
+            )
+            .await?;
+            println!(
+                "{}",
+                serde_json::to_string(&authorization).map_err(|e| e.to_string())?
+            );
+        }
+        Command::RequestInvoice {
+            gateway,
+            gateway_relay,
+            payee,
+            amount_msat,
+            description,
+            expires_in,
+        } => {
+            let transport = Transport::bind(None).await?;
+            let request = Request::GatewayInvoiceFor(GatewayInvoiceFor {
+                payee: payee.parse()?,
+                amount_msat,
+                expires_at: expires_in.map(|secs| unix_now() + secs),
+                description,
+                metadata: None,
+            });
+            let answer = transport
+                .request(
+                    &PeerAddr {
+                        id: gateway,
+                        relay: gateway_relay,
+                    },
+                    &request,
+                )
+                .await;
+            transport.close().await;
+            let invoice = match answer? {
+                Response::GatewayInvoice(Ok(invoice)) => invoice,
+                Response::GatewayInvoice(Err(reason)) | Response::Error(reason) => {
+                    return Err(format!("gateway refused: {reason}"))
+                }
+                other => return Err(format!("unexpected answer from gateway: {other:?}")),
+            };
+            invoice.verify()?;
+            print_invoice(&invoice)?;
         }
         Command::Redeem {
             preimage_server,
@@ -404,17 +541,27 @@ async fn run(cli: Cli) -> Result<(), String> {
                     record.invoice.expires_at
                 );
             }
-            for record in home
-                .store
-                .list::<PreimageServerInvoiceRecord>(PREIMAGE_SERVER_INVOICES)?
-            {
+            for record in home.store.list::<GatewayInvoiceRecord>(GATEWAY_INVOICES)? {
                 println!(
-                    "{} {:>12} msat {:?} expires {} via preimage server {}",
+                    "{} {:>12} msat {:?} expires {} via gateway {}",
                     record.invoice.payment_hash,
                     record.invoice.amount_msat,
                     record.status,
                     record.invoice.expires_at,
-                    record.server.id
+                    record.endpoints.gateway.id
+                );
+            }
+            for record in home
+                .store
+                .list::<StandingAuthorizationRecord>(STANDING_AUTHORIZATIONS)?
+            {
+                let authorization = &record.authorization;
+                println!(
+                    "standing: {}..{} msat until {} via gateway {}",
+                    authorization.min_amount_msat,
+                    authorization.max_amount_msat,
+                    authorization.valid_until,
+                    record.endpoints.gateway.id
                 );
             }
         }
@@ -484,8 +631,8 @@ async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
     }
 }
 
-/// `redeem`: claim what preimage servers logged, on the networks of the
-/// invoices still unclaimed through each.
+/// `redeem`: claim what preimage servers logged, on the networks this
+/// node named to gateways under each.
 async fn redeem(
     home: &Home,
     span: &Span,
@@ -493,51 +640,60 @@ async fn redeem(
     preimage_server_relay: Option<String>,
     since: u64,
 ) -> Result<(), String> {
-    let unclaimed: Vec<PreimageServerInvoiceRecord> = home
+    // Every preimage server this node receives through, with the
+    // networks it was paid on there.
+    let mut servers: Vec<(PeerAddr, Vec<NetworkId>)> = Vec::new();
+    let mut add = |server: &PeerAddr,
+                   authorization: &cassis_core::offline::ReceiveAuthorization| {
+        let index = match servers.iter().position(|(known, _)| known.id == server.id) {
+            Some(index) => index,
+            None => {
+                servers.push((server.clone(), Vec::new()));
+                servers.len() - 1
+            }
+        };
+        for destination in &authorization.destinations {
+            if !servers[index].1.contains(&destination.network) {
+                servers[index].1.push(destination.network.clone());
+            }
+        }
+    };
+    for record in home
         .store
-        .list::<PreimageServerInvoiceRecord>(PREIMAGE_SERVER_INVOICES)?
+        .list::<GatewayInvoiceRecord>(GATEWAY_INVOICES)?
         .into_iter()
         .filter(|record| record.status == InvoiceStatus::Pending)
-        .collect();
-    let mut servers: Vec<PeerAddr> = Vec::new();
-    match preimage_server {
-        Some(id) => servers.push(PeerAddr {
-            id,
-            relay: preimage_server_relay,
-        }),
-        None => {
-            for record in &unclaimed {
-                if !servers.iter().any(|r| r.id == record.server.id) {
-                    servers.push(record.server.clone());
-                }
-            }
+    {
+        add(&record.endpoints.preimage_server, &record.authorization);
+    }
+    for record in home
+        .store
+        .list::<StandingAuthorizationRecord>(STANDING_AUTHORIZATIONS)?
+    {
+        add(&record.endpoints.preimage_server, &record.authorization);
+    }
+    if let Some(id) = preimage_server {
+        servers.retain(|(server, _)| server.id == id);
+        match servers.first_mut() {
+            Some((server, _)) => server.relay = preimage_server_relay.or(server.relay.take()),
+            None => servers.push((
+                PeerAddr {
+                    id,
+                    relay: preimage_server_relay,
+                },
+                home.networks()?,
+            )),
         }
     }
     if servers.is_empty() {
-        println!("no unclaimed invoices through a preimage server");
+        println!("this node receives through no preimage server");
         return Ok(());
     }
-    for preimage_server in servers {
-        let mut networks: Vec<NetworkId> = Vec::new();
-        for record in unclaimed
-            .iter()
-            .filter(|r| r.server.id == preimage_server.id)
-        {
-            for entry in &record.invoice.networks {
-                if !networks.contains(&entry.network) {
-                    networks.push(entry.network.clone());
-                }
-            }
-        }
+    for (preimage_server, networks) in servers {
         let opened = home.open_networks(&networks, span).await?;
-        let report = redeem_preimage_server_payments(
-            &home.store,
-            &home.keys,
-            &preimage_server,
-            &opened,
-            since,
-        )
-        .await?;
+        let report =
+            redeem_offline_payments(&home.store, &home.keys, &preimage_server, &opened, since)
+                .await?;
         for (hash, network, amount_msat) in &report.claimed {
             println!("claimed {hash} {amount_msat:>12} msat on {network}");
         }
@@ -549,6 +705,14 @@ async fn redeem(
         }
     }
     Ok(())
+}
+
+/// `specs` parsed, or every network of the node when empty.
+fn parse_networks(home: &Home, specs: &[String]) -> Result<Vec<NetworkId>, String> {
+    if specs.is_empty() {
+        return home.networks();
+    }
+    specs.iter().map(|spec| NetworkId::parse(spec)).collect()
 }
 
 /// `--nostr-relay`s if given, else the test or default relays.

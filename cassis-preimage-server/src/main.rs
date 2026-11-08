@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! <dir>/seed                12-word mnemonic every key derives from
-//! <dir>/payments.redb       payments let through, for their payees
+//! <dir>/releases.redb       HTLCs whose preimage was released, for their payees
 //! <dir>/<kind>/<variant>/   private data of one network's adapter
 //! ```
 //!
@@ -20,15 +20,16 @@ use tracing::{info, info_span, Span};
 #[derive(Parser)]
 #[command(
     name = "cassis-preimage-server",
-    about = "Answer PREPARE and COMMIT for offline payees and keep their payments"
+    about = "Issue payment hashes for offline payees and release preimages to their gateways"
 )]
 struct Cli {
     /// Server directory. Defaults to `$CASSIS_PREIMAGE_SERVER_HOME`,
     /// else `~/.cassis-preimage-server`.
     #[arg(long, value_name = "DIR")]
     home: Option<PathBuf>,
-    /// Networks to verify HTLCs on, e.g. `cashu::mint.host`, `liquid`,
-    /// `arkade::mutinynet`. Invoices on others are refused.
+    /// Networks to verify HTLCs to payees on, e.g. `cashu::mint.host`,
+    /// `liquid`, `arkade::mutinynet`. Payees receiving on others are
+    /// refused.
     #[arg(long = "network", required = true)]
     networks: Vec<String>,
 }
@@ -54,7 +55,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let keys = NodeKeys::from_mnemonic(&read_or_create_seed(&dir)?).map_err(|e| e.to_string())?;
-    let db = Db::open(dir.join("payments.redb")).map_err(|e| format!("open database: {e}"))?;
+    let db = Db::open(dir.join("releases.redb")).map_err(|e| format!("open database: {e}"))?;
     let span = info_span!("preimage-server");
     let mut networks = Vec::new();
     for spec in &cli.networks {

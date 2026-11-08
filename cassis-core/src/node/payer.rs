@@ -38,7 +38,7 @@ impl Node {
         let _busy = self
             .busy(format!("pay:{hash}"))
             .ok_or("this invoice is already being paid")?;
-        invoice.verify_signature()?;
+        invoice.verify()?;
         if invoice.amount_msat == 0 {
             return Err("invoice amount is zero".into());
         }
@@ -70,11 +70,12 @@ impl Node {
             .target_for(&payee_network)
             .cloned()
             .ok_or("invoice has no target for the chosen network")?;
+        // The payee's endpoint, or its gateway's.
         let payee = PeerAddr {
             id: invoice
                 .iroh_peer_id
                 .clone()
-                .ok_or("invoice does not name the payee's endpoint")?,
+                .ok_or("invoice does not name an endpoint")?,
             relay: invoice.iroh_relay.clone(),
         };
         let plan = routing::plan_route(

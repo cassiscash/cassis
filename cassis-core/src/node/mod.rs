@@ -14,9 +14,9 @@
 //! preimage shows up downstream, refund the outgoing side once it
 //! expires.
 
+mod offline;
 mod payee;
 mod payer;
-mod preimage_server;
 mod router;
 mod settle;
 
@@ -32,11 +32,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{Instrument, Span};
 
-pub use payee::create_invoice;
-pub use preimage_server::{
-    create_preimage_server_invoice, redeem_preimage_server_payments, PreimageServerInvoiceRecord,
-    RedeemReport, PREIMAGE_SERVER_INVOICES,
+pub use offline::{
+    authorize_gateway, create_gateway_invoice, redeem_offline_payments, GatewayInvoiceRecord,
+    OfflineClaim, OfflineEndpoints, RedeemReport, StandingAuthorizationRecord, GATEWAY_INVOICES,
+    OFFLINE_CLAIMS, STANDING_AUTHORIZATIONS,
 };
+pub use payee::create_invoice;
 pub use router::{PrepareVeto, RouteOffer, RoutingPolicy};
 
 const INVOICES: &str = "invoices";
@@ -291,11 +292,14 @@ impl Node {
                 self.settle_hop(settle, peer).await;
                 Response::Settled
             }
-            Request::PreimageInvoice
-            | Request::PreimageSign(_)
+            Request::PreimageIssue { .. }
+            | Request::PreimageRelease(_)
             | Request::PreimagePayments { .. } => {
                 Response::Error("this node is not a preimage server".into())
             }
+            Request::GatewayInvoice(_)
+            | Request::GatewayAuthorize { .. }
+            | Request::GatewayInvoiceFor(_) => Response::Error("this node is not a gateway".into()),
         }
     }
 

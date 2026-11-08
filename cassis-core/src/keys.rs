@@ -66,16 +66,18 @@ impl NodeKeys {
         hmac(&self.seed, b"cassis/admin", None)
     }
 
-    /// Secret of the endpoint this node talks to its preimage server
-    /// from: stable, since the server keeps the node's invoices and
-    /// payments under it, and distinct from [`NodeKeys::iroh`] so it
-    /// can be used while the node runs.
-    pub fn preimage_server_client_secret(&self) -> [u8; 32] {
+    /// Key this node receives offline under (see [`crate::offline`]):
+    /// it signs the node's receive authorizations and gateway invoices,
+    /// and is the endpoint the node talks to gateways and preimage
+    /// servers from. Stable, since preimage servers log the node's
+    /// payments under it, and distinct from [`NodeKeys::iroh`] so it can
+    /// be used while the node runs.
+    pub fn offline_payee_secret(&self) -> [u8; 32] {
         hmac(&self.seed, b"cassis/preimage-server-client", None)
     }
 
     /// Key a preimage server derives its preimages with (see
-    /// [`crate::protocol::PreimageServerMetadata`]).
+    /// [`crate::offline::PreimageIssuance`]).
     pub fn preimage_server_secret(&self) -> [u8; 32] {
         hmac(&self.seed, b"cassis/preimage-server", None)
     }

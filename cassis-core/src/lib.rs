@@ -6,6 +6,8 @@
 //! * [`routing`] — route announcements, pathfinding, fee and timelock
 //!   planning.
 //! * [`keys`] — key derivation from the node's mnemonic.
+//! * [`offline`] — receiving while offline: the payee's authorization
+//!   of a gateway and a preimage server, and their signed statements.
 //! * [`node`] (feature `node`, on by default) — the runtime that
 //!   coordinates networks to pay, route and receive, with its iroh
 //!   [`transport`] and its [`store`]. Without it the crate stays light
@@ -14,6 +16,7 @@
 pub mod keys;
 pub mod logging;
 pub mod network;
+pub mod offline;
 mod primitives;
 pub mod protocol;
 pub mod routing;

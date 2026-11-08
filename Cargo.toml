@@ -13,6 +13,7 @@ members = [
   "cassis-routerd",
   "cassis-wallet",
   "cassis-preimage-server",
+  "cassis-gateway",
   "cassis-wasm",
 ]
 resolver = "2"

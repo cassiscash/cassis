@@ -2736,6 +2736,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cassis-gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cassis-core",
+ "cassis-networks",
+ "cassis-preimage-server",
+ "clap",
+ "ritualistic",
+ "rustls",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cassis-liquid"
 version = "0.1.0"
 dependencies = [
@@ -2793,7 +2809,6 @@ dependencies = [
 name = "cassis-preimage-server"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "cassis-arkade",
  "cassis-bitcoin",
  "cassis-cashu",
@@ -2806,7 +2821,6 @@ dependencies = [
  "iroh 1.0.3",
  "orangedb",
  "rand 0.8.7",
- "ritualistic",
  "rustls",
  "serde_json",
  "sha2 0.10.9",

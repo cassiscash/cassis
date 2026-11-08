@@ -66,16 +66,25 @@ export interface InvoiceNetwork {
 export interface Invoice {
   payment_hash: string;
   amount_msat: number;
-  payee: string;
   expires_at: number;
   networks: InvoiceNetwork[];
   description: string | null;
   /** Base64, at most 128 KiB; handed back with PREPARE and COMMIT. */
   metadata?: string;
+  /** Where PREPARE and COMMIT go: the payee, or its gateway. */
   iroh_peer_id?: string;
   iroh_relay?: string;
-  /** Ed25519 by the key of `iroh_peer_id`, hex; see `signInvoice`. */
-  signature?: string;
+  /** Ed25519 key (iroh id) of the final payee. */
+  payee?: string;
+  /** Ed25519 by `payee`, hex; see `signInvoice`. */
+  payee_signature?: string;
+  /** Ed25519 key (iroh id) of the gateway paid in the payee's place. */
+  gateway?: string;
+  gateway_signature?: string;
+  /** On invoices a gateway issued alone, under `payee_authorization`. */
+  preimage_server?: string;
+  preimage_server_issuance?: unknown;
+  payee_authorization?: unknown;
 }
 export interface Commit {
   payment_hash: string;
@@ -126,14 +135,15 @@ fn endpoint_addr(peer: &str, relay: Option<&str>) -> Result<EndpointAddr, String
 }
 
 /// Parse and check an invoice: well-formed JSON in the `cassis-core`
-/// shape, signed by the endpoint it names, valid network ids, a
+/// shape, signed as its kind requires (see `Invoice::verify`), valid
+/// network ids, a
 /// positive amount, not expired. Returns it re-serialized, so callers
 /// read exactly what the Rust side would.
 #[wasm_bindgen(js_name = parseInvoice, unchecked_return_type = "string")]
 pub fn parse_invoice(json: &str) -> Result<String, JsValue> {
     let invoice: Invoice =
         serde_json::from_str(json).map_err(|e| js_error(format!("invalid invoice: {e}")))?;
-    invoice.verify_signature().map_err(js_error)?;
+    invoice.verify().map_err(js_error)?;
     for entry in &invoice.networks {
         NetworkId::parse(&entry.network.0).map_err(js_error)?;
     }
@@ -212,14 +222,15 @@ impl CassisEndpoint {
         self.endpoint.id().to_string()
     }
 
-    /// Sign an invoice (JSON) whose `iroh_peer_id` is this endpoint, as
-    /// payers require. Returns it signed.
+    /// Sign an invoice (JSON) as its payee, this endpoint: its
+    /// `iroh_peer_id` must be this endpoint, or the invoice must come
+    /// from a gateway. Sets `payee`; returns it signed.
     #[wasm_bindgen(js_name = signInvoice, unchecked_return_type = "string")]
     pub fn sign_invoice(&self, json: &str) -> Result<String, JsValue> {
         let mut invoice: Invoice =
             serde_json::from_str(json).map_err(|e| js_error(format!("invalid invoice: {e}")))?;
         invoice
-            .sign(&self.endpoint.secret_key().to_bytes())
+            .sign_as_payee(&self.endpoint.secret_key().to_bytes())
             .map_err(js_error)?;
         serde_json::to_string(&invoice).map_err(js_error)
     }

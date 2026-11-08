@@ -60,16 +60,21 @@ pub async fn create_invoice(
     let mut invoice = Invoice {
         payment_hash,
         amount_msat,
-        payee: keys.node.pubkey(),
         expires_at,
         networks: targets,
         description,
         metadata,
         iroh_peer_id: Some(iroh::SecretKey::from(keys.iroh).public().to_string()),
         iroh_relay,
-        signature: None,
+        payee: None,
+        payee_signature: None,
+        gateway: None,
+        gateway_signature: None,
+        preimage_server: None,
+        preimage_server_issuance: None,
+        payee_authorization: None,
     };
-    invoice.sign(&keys.iroh)?;
+    invoice.sign_as_payee(&keys.iroh)?;
     store.put(
         INVOICES,
         &payment_hash.to_string(),

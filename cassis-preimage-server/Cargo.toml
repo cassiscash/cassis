@@ -31,7 +31,3 @@ cassis-cashu = { workspace = true, optional = true }
 cassis-fedimint = { workspace = true, optional = true }
 cassis-liquid = { workspace = true, optional = true }
 cassis-rootstock = { workspace = true, optional = true }
-
-[dev-dependencies]
-async-trait = { workspace = true }
-ritualistic = { workspace = true }
