@@ -1,29 +1,27 @@
-//! The admin page, as a function of the config and of what the daemon
-//! runs. Elements that do something have ids naming what they act on,
-//! and send actions whose payloads name it too; what a form edits is in
-//! its draft, the signal `d.<draft>` (see [`drafts`]).
+//! The router's tabs on its admin page, as a function of the config and
+//! of what the daemon runs. Elements that do something have ids naming
+//! what they act on, and send actions whose payloads name it too; what a
+//! form edits is in its draft, the signal `d.<draft>` (see [`drafts`]).
 
-use super::edit::{chains, KINDS};
-use super::{Access, Nostr};
-use crate::config::{AdminConfig, Config, NetworkConfig, RouteConfig};
-use crate::networks::{Funds, Status};
+use super::Nostr;
+use crate::config::{Config, NetworkConfig, RouteConfig};
+use cassis_admin::networks::{
+    bark_fields, closing_notice, lnd_fields, network_card as card_of, network_draft, new_network,
+    new_network_draft, NetworkCard, Status, ALL_KINDS,
+};
+use cassis_admin::view::{act, ago, fact, field, number, options, quote, short_hash, submit};
+use cassis_admin::wallets::{self, Funds};
 use cassis_core::node::{HopRecord, HopState};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
 use cassis_networks::Can;
-use hypereffect::vtree::{
-    badge, button, card, checkbox, column, divider, input, list, notice, row, select, tab, tabs,
-    text, Node,
-};
-use hypereffect::{cel, json, Handler, Map, Value};
-use sha2::{Digest, Sha256};
+use hypereffect::vtree::{badge, card, checkbox, column, list, row, select, tab, text, Node};
+use hypereffect::{cel, json, Map, Value};
 use std::collections::BTreeMap;
 
 /// What the page shows, besides the config.
 pub struct Context<'a> {
     pub config: &'a Config,
-    /// The admin section served, which changes apply to on restart.
-    pub serving: &'a AdminConfig,
     /// The networks the daemon has.
     pub networks: BTreeMap<String, Network>,
     /// The name the router goes by: its own, else its autoname.
@@ -35,9 +33,6 @@ pub struct Context<'a> {
     pub hops: Vec<HopRecord>,
     pub node_pubkey: String,
     pub iroh_peer_id: String,
-    pub http_url: Option<String>,
-    pub iroh_url: Option<String>,
-    pub pairing_link: Option<String>,
     pub nostr: &'a Nostr,
     /// Unix seconds.
     pub now: u64,
@@ -58,17 +53,6 @@ impl Context<'_> {
         self.open.contains_key(id)
     }
 
-    /// What a restart would change.
-    fn pending(&self) -> Vec<String> {
-        let mut pending = Vec::new();
-        if self.serving.listen != self.config.admin.listen
-            || self.serving.iroh != self.config.admin.iroh
-        {
-            pending.push("move the admin interface".into());
-        }
-        pending
-    }
-
     /// What a route's incoming lifetime is when it sets none.
     fn lifetime_default(&self, from: &str) -> String {
         match self.open.get(from) {
@@ -79,24 +63,9 @@ impl Context<'_> {
     }
 }
 
-/// The signal path segment of the draft of a network's form.
-pub fn network_draft(id: &str) -> String {
-    format!("n_{}", short_hash(id))
-}
-
 /// The signal path segment of the draft of a route's form.
 pub fn route_draft(from: &str, to: &str) -> String {
     format!("r_{}", short_hash(&format!("{from}\n{to}")))
-}
-
-/// The signal path segment of the draft of a form of a network's
-/// wallet, `form` being the action it sends without `wallet.`.
-pub fn wallet_draft(id: &str, form: &str) -> String {
-    format!("w_{}_{form}", short_hash(id))
-}
-
-fn short_hash(text: &str) -> String {
-    lowercase_hex::encode(&Sha256::digest(text.as_bytes())[..6])
 }
 
 /// The drafts of the forms that edit the config, as it is.
@@ -110,22 +79,9 @@ pub fn drafts(config: &Config) -> Map<String, Value> {
             "max_reservations": config.max_reservations,
         }),
     );
-    drafts.insert(
-        "admin".into(),
-        json!({"listen": config.admin.listen, "iroh": config.admin.iroh}),
-    );
     for (id, network) in &config.networks {
         drafts.insert(network_draft(id), network_values(network));
-        let forms = [
-            ("send", json!({"to": "", "amount_sat": null})),
-            ("issue", json!({"amount_sat": null})),
-            ("redeem", json!({"token": ""})),
-            ("invoice", json!({"amount_sat": null})),
-            ("pay", json!({"invoice": ""})),
-        ];
-        for (form, values) in forms {
-            drafts.insert(wallet_draft(id, form), values);
-        }
+        drafts.extend(wallets::drafts(id));
     }
     for route in &config.routes {
         drafts.insert(route_draft(&route.from, &route.to), route_values(route));
@@ -170,21 +126,8 @@ pub fn new_drafts(config: &Config) -> Map<String, Value> {
     let from = ids.next().cloned().unwrap_or_default();
     let to = ids.next().cloned().unwrap_or_default();
     let mut drafts = Map::new();
-    drafts.insert(
-        "new_network".into(),
-        json!({
-            "kind": "",
-            "chain": "",
-            "mint": "",
-            "invite": "",
-            "esplora_url": "",
-            "lnd_rest_url": "",
-            "lnd_tls_cert_path": "",
-            "lnd_macaroon_path": "",
-            "bark_server_url": "",
-            "bark_esplora_url": "",
-        }),
-    );
+    let (name, draft) = new_network_draft();
+    drafts.insert(name, draft);
     drafts.insert(
         "new_route".into(),
         json!({
@@ -196,83 +139,7 @@ pub fn new_drafts(config: &Config) -> Map<String, Value> {
             "test_money": false,
         }),
     );
-    drafts.insert("new_peer".into(), json!({"key": ""}));
     drafts
-}
-
-/// A button sending `name` with `payload`, disabled while an action of
-/// this session is on its way.
-fn act(id: impl Into<String>, label: &str, name: &str, payload: Value) -> Node {
-    button(id)
-        .label(label)
-        .disabled(cel("s._busy"))
-        .on_press(Handler::action(name).payload(payload).indicator("_busy"))
-}
-
-/// A form's submit button, also disabled while `blocked` (an expression
-/// over the signals) holds.
-fn submit(id: impl Into<String>, label: &str, name: &str, payload: Value, blocked: &str) -> Node {
-    act(id, label, name, payload)
-        .variant("primary")
-        .disabled(cel(format!("s._busy || ({blocked})")))
-}
-
-fn field(id: impl Into<String>, label: &str, path: &str) -> Node {
-    input(id).label(label).bind(path)
-}
-
-fn number(id: impl Into<String>, label: &str, path: &str) -> Node {
-    field(id, label, path).variant("number")
-}
-
-fn options<'a>(items: impl IntoIterator<Item = (&'a str, &'a str)>) -> Value {
-    Value::Array(
-        items
-            .into_iter()
-            .map(|(value, label)| json!({"value": value, "label": label}))
-            .collect(),
-    )
-}
-
-/// A CEL string literal.
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
-}
-
-/// A label over a value to copy.
-fn fact(id: &str, label: &str, value: impl Into<String>) -> Node {
-    column(id).gap("none").children([
-        text(format!("{id}/label")).variant("caption").text(label),
-        text(format!("{id}/value"))
-            .variant("code")
-            .text(value.into()),
-    ])
-}
-
-/// How long ago `then` was, coarsely.
-fn ago(now: u64, then: u64) -> String {
-    match now.saturating_sub(then) {
-        0..=59 => "just now".into(),
-        secs @ 60..=3_599 => format!("{} min ago", secs / 60),
-        secs @ 3_600..=86_399 => format!("{} h ago", secs / 3_600),
-        secs => format!("{} days ago", secs / 86_400),
-    }
-}
-
-/// `msat` in sats, thousands apart.
-fn sat(msat: u64) -> String {
-    let digits = (msat / 1000).to_string();
-    let mut grouped = String::new();
-    for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    match msat % 1000 {
-        0 => format!("{grouped} sat"),
-        rest => format!("{grouped}.{rest:03} sat"),
-    }
 }
 
 /// `from → to` of a `d` tag.
@@ -283,72 +150,15 @@ fn hop_name(d_tag: &str) -> String {
     }
 }
 
-/// The page `access` gets.
-pub fn page(
-    ctx: &Context,
-    access: &Access,
-    allowed: bool,
-    flash: Option<&Result<String, String>>,
-) -> Vec<Node> {
-    let flash = flash.map(|result| match result {
-        Ok(message) => notice("result").variant("success").text(message.as_str()),
-        Err(error) => notice("result").variant("failure").text(error.as_str()),
-    });
-    if !allowed {
-        return vec![locked(ctx, access, flash)];
-    }
-    let pending = ctx.pending();
-    let header = row("header").justify("between").children([
-        title(ctx),
-        act("daemon/restart", "Restart", "daemon.restart", json!({})).variant(
-            if pending.is_empty() {
-                "secondary"
-            } else {
-                "primary"
-            },
-        ),
-    ]);
-    let pending = (!pending.is_empty()).then(|| {
-        notice("restart-needed")
-            .variant("warning")
-            .title("Saved, applies on restart")
-            .text(format!("Restarting will {}.", pending.join(", ")))
-    });
-    vec![column("page")
-        .child(header)
-        .children(flash)
-        .children(pending)
-        .child(tabs("tabs").bind("_tab").children([
-            overview(ctx),
-            networks(ctx),
-            routes(ctx),
-            access_tab(ctx, access),
-            settings(ctx),
-        ]))]
-}
-
-fn title(ctx: &Context) -> Node {
-    column("title").gap("none").children([
-        text("title/name").variant("h1").text(ctx.name.as_str()),
-        text("title/what").variant("caption").text("Cassis router"),
-    ])
-}
-
-fn locked(ctx: &Context, access: &Access, flash: Option<Node>) -> Node {
-    let key = match access {
-        Access::Local => "",
-        Access::Peer(key) => key.as_str(),
-    };
-    column("page").child(title(ctx)).children(flash).children([
-        notice("locked")
-            .variant("warning")
-            .title("Not let in")
-            .text(
-                "This router does not know your key. Open the pairing link it prints on its \
-             console, or add your key from its admin page on its own machine.",
-            ),
-        fact("locked/key", "Your key", key),
-    ])
+/// The tabs of the page, with the `access` one.
+pub fn tabs(ctx: &Context, access: Node) -> Vec<Node> {
+    vec![
+        overview(ctx),
+        networks(ctx),
+        routes(ctx),
+        access,
+        settings(ctx),
+    ]
 }
 
 fn overview(ctx: &Context) -> Node {
@@ -437,13 +247,7 @@ fn networks(ctx: &Context) -> Node {
         let Status::Waiting(hops) = &network.status else {
             return None;
         };
-        (!ctx.config.networks.contains_key(id)).then(|| {
-            notice(format!("network/{id}/closing"))
-                .variant("warning")
-                .text(format!(
-                    "{id} closes once its {hops} hop(s) in flight settle."
-                ))
-        })
+        (!ctx.config.networks.contains_key(id)).then(|| closing_notice(id, *hops, "hop"))
     });
     tab("tab/networks")
         .label("Networks")
@@ -452,117 +256,8 @@ fn networks(ctx: &Context) -> Node {
             list("networks")
                 .empty("No networks yet: add one below.")
                 .children(cards),
-            new_network(),
+            new_network(&ALL_KINDS),
         ])
-}
-
-/// The picker of a network's kind, then what that kind needs.
-fn new_network() -> Node {
-    let kind_is = |kind: &str| format!("s.d.new_network.kind == {}", quote(kind));
-    let picker = KINDS.iter().map(|(kind, label, built)| {
-        let chain = chains(kind).first().copied().unwrap_or_default();
-        button(format!("network/new/kind/{kind}"))
-            .label(*label)
-            .variant(cel(format!("{} ? 'primary' : 'secondary'", kind_is(kind))))
-            .disabled(!built)
-            .on_press(Handler::patch(
-                json!({"d": {"new_network": {"kind": kind, "chain": chain}}}),
-            ))
-    });
-    let missing = KINDS.iter().any(|(.., built)| !built).then(|| {
-        text("network/new/missing")
-            .variant("caption")
-            .text("Greyed out: not compiled into this build.")
-    });
-    let details = KINDS.iter().map(|(kind, _, _)| {
-        let el = |part: &str| format!("network/new/{kind}/{part}");
-        let d = |field: &str| format!("d.new_network.{field}");
-        let chains = chains(kind);
-        let chain = (!chains.is_empty()).then(|| {
-            select(el("chain"))
-                .label("Chain")
-                .variant("segmented")
-                .bind(d("chain"))
-                .options(options(
-                    chains.iter().map(|chain| (*chain, chain_label(chain))),
-                ))
-        });
-        let fields: Vec<Node> = match *kind {
-            "cashu" => {
-                vec![field(el("mint"), "Mint URL", &d("mint")).placeholder("https://mint.example")]
-            }
-            "fedimint" => {
-                vec![field(el("invite"), "Invite code", &d("invite")).placeholder("fed1…")]
-            }
-            "arkade" | "bitcoin" => {
-                vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
-                    .placeholder("the public one")]
-            }
-            "lnd" => lnd_fields(&el, &d),
-            "bark" => bark_fields(&el, &d),
-            _ => Vec::new(),
-        };
-        column(format!("network/new/{kind}"))
-            .visible(cel(kind_is(kind)))
-            .children(chain)
-            .children(fields)
-    });
-    card("network/new")
-        .title("Add a network")
-        .child(row("network/new/kinds").wrap(true).children(picker))
-        .children(missing)
-        .children(details)
-        .child(submit(
-            "network/new/add",
-            "Add",
-            "network.add",
-            json!({"draft": "new_network"}),
-            "s.d.new_network.kind == '' \
-             || (s.d.new_network.kind == 'cashu' && s.d.new_network.mint.trim() == '') \
-             || (s.d.new_network.kind == 'fedimint' && s.d.new_network.invite.trim() == '')",
-        ))
-}
-
-fn chain_label(chain: &str) -> &str {
-    match chain {
-        "mainnet" => "Mainnet",
-        "mutinynet" => "Mutinynet",
-        "signet" => "Signet",
-        "testnet" => "Testnet",
-        "regtest" => "Regtest",
-        other => other,
-    }
-}
-
-/// The inputs of an LND node, under element ids from `el` and signal
-/// paths from `d`.
-fn lnd_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
-    vec![
-        field(el("lnd_rest_url"), "LND REST URL", &d("lnd_rest_url"))
-            .placeholder("https://127.0.0.1:8080"),
-        field(
-            el("lnd_tls_cert_path"),
-            "TLS certificate",
-            &d("lnd_tls_cert_path"),
-        )
-        .placeholder("/path/to/tls.cert"),
-        field(el("lnd_macaroon_path"), "Macaroon", &d("lnd_macaroon_path"))
-            .placeholder("/path/to/admin.macaroon"),
-    ]
-}
-
-/// The inputs of an Ark server for bark, like [`lnd_fields`].
-fn bark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
-    vec![
-        field(el("bark_server_url"), "Ark server", &d("bark_server_url"))
-            .placeholder("Second's server"),
-        field(
-            el("bark_esplora_url"),
-            "Esplora URL",
-            &d("bark_esplora_url"),
-        )
-        .placeholder("the default one"),
-    ]
 }
 
 fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
@@ -571,24 +266,6 @@ fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
     let el = |part: &str| format!("network/{id}/{part}");
     let kind = id.split_once("::").map_or(id, |(kind, _)| kind);
     let opened = ctx.networks.get(id);
-    let status = opened.map(|opened| &opened.status);
-    let applied = opened.is_some_and(|opened| opened.config == *network);
-    let (variant, status_text) = match status {
-        None | Some(Status::Opening) => ("info", "opening…".to_string()),
-        Some(Status::Open) if !applied => ("info", "applying changes…".to_string()),
-        Some(Status::Open) => ("success", "open".to_string()),
-        Some(Status::Failed(error)) => ("failure", format!("failed to open: {error}")),
-        Some(Status::Waiting(hops)) => (
-            "warning",
-            format!("open, changes apply once its {hops} hop(s) in flight settle"),
-        ),
-    };
-    let reopen = match status {
-        Some(Status::Failed(_)) => Some("Retry"),
-        Some(Status::Open) => Some("Reopen"),
-        _ => None,
-    }
-    .map(|label| act(el("open"), label, "network.open", json!({"id": id})));
     let fields: Vec<Node> = match kind {
         "arkade" | "bitcoin" => vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
             .placeholder("the public one")],
@@ -610,238 +287,24 @@ fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
         }
         _ => Vec::new(),
     };
-    let save = (!fields.is_empty()).then(|| {
-        submit(
-            el("save"),
-            "Save",
-            "network.set",
-            json!({"draft": draft, "id": id}),
-            "false",
-        )
-    });
     let wallet = opened
-        .and_then(|opened| Some(wallet(ctx, id, opened.can.as_ref()?, &opened.funds)))
+        .and_then(|opened| {
+            Some(wallets::view(
+                ctx.now,
+                id,
+                opened.can.as_ref()?,
+                &opened.funds,
+            ))
+        })
         .unwrap_or_default();
-    let settings = (!fields.is_empty()).then(|| divider(el("divider")));
-    card(format!("network/{id}"))
-        .title(id)
-        .child(badge(el("status")).variant(variant).text(status_text))
-        .children(wallet)
-        .children(settings)
-        .children(fields)
-        .child(row(el("actions")).children(save).children(reopen).child(
-            act(el("remove"), "Remove", "network.remove", json!({"id": id})).variant("failure"),
-        ))
-}
-
-/// What a network's wallet holds, what it last did, and the forms that
-/// move funds in and out of it, as far as it `can`.
-fn wallet(ctx: &Context, id: &str, can: &Can, funds: &Funds) -> Vec<Node> {
-    let el = |part: &str| format!("network/{id}/wallet/{part}");
-    let busy = funds.busy.is_some();
-    // A button running an operation, sending the draft of `form` if any.
-    let run = |form: &str, label: &str, draft: bool, blocked: &str| {
-        let mut payload = json!({"id": id});
-        if draft {
-            payload["draft"] = wallet_draft(id, form).into();
-        }
-        submit(
-            el(form),
-            label,
-            &format!("wallet.{form}"),
-            payload,
-            &format!("{busy} || ({blocked})"),
-        )
-    };
-    let d = |form: &str, field: &str| format!("d.{}.{field}", wallet_draft(id, form));
-    let empty = |form: &str, field: &str| format!("s.{}.trim() == ''", d(form, field));
-    let amount = |form: &str| {
-        number(
-            el(&format!("{form}/amount_sat")),
-            "Amount (sat)",
-            &d(form, "amount_sat"),
-        )
-    };
-
-    let mut nodes = Vec::new();
-    let amounts: Vec<Node> = match &funds.balances {
-        Some(Ok(balances)) => balances
-            .iter()
-            .enumerate()
-            .map(|(i, balance)| {
-                let el = |part: &str| el(&format!("balance/{i}/{part}"));
-                column(el("")).gap("none").children([
-                    text(el("label")).variant("caption").text(balance.label),
-                    text(el("amount"))
-                        .variant(if i == 0 { "h2" } else { "h3" })
-                        .text(sat(balance.msat)),
-                ])
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    let read = match (funds.reading, funds.read_at) {
-        (true, _) => "Reading…".to_string(),
-        (false, Some(at)) => format!("Read {}", ago(ctx.now, at)),
-        (false, None) => "Not read yet".to_string(),
-    };
-    nodes.push(row(el("balances")).justify("between").wrap(true).children([
-        row(el("amounts")).gap("large").wrap(true).children(amounts),
-        row(el("read")).children([
-            text(el("read/when")).variant("caption").text(read),
-            act(
-                el("refresh"),
-                "Refresh",
-                "wallet.refresh",
-                json!({"id": id}),
-            ),
-        ]),
-    ]));
-    if let Some(Err(error)) = &funds.balances {
-        nodes.push(
-            notice(el("balances/error"))
-                .variant("failure")
-                .title("Could not read the balance")
-                .text(error.as_str()),
-        );
-    }
-    let doing = funds
-        .busy
-        .map(|doing| badge(el("busy")).variant("info").text(format!("{doing}…")));
-    let waiting = (funds.waiting > 0).then(|| {
-        badge(el("waiting"))
-            .variant("info")
-            .text(format!("waiting for {} payment(s)", funds.waiting))
-    });
-    if doing.is_some() || waiting.is_some() {
-        nodes.push(row(el("doing")).children(doing).children(waiting));
-    }
-    if let Some(outcome) = &funds.outcome {
-        let (variant, message) = match outcome {
-            Ok(message) => ("success", message),
-            Err(error) => ("failure", error),
-        };
-        nodes.push(
-            notice(el("outcome"))
-                .variant(variant)
-                .text(message.as_str()),
-        );
-    }
-    if let Some(output) = &funds.output {
-        nodes.push(
-            column(el("output")).gap("small").children([
-                text(el("output/label"))
-                    .variant("caption")
-                    .text(format!("{}: copy it now, it is not kept", output.label)),
-                text(el("output/value"))
-                    .variant("code")
-                    .text(output.address.as_str()),
-                act(
-                    el("dismiss"),
-                    "Hide it",
-                    "wallet.dismiss",
-                    json!({"id": id}),
-                ),
-            ]),
-        );
-    }
-
-    let mut receive = Vec::new();
-    match &funds.addresses {
-        Some(Ok(addresses)) => {
-            for (i, address) in addresses.iter().enumerate() {
-                receive.push(fact(
-                    &el(&format!("address/{i}")),
-                    address.label,
-                    address.address.as_str(),
-                ));
-            }
-            if can.new_addresses && !addresses.is_empty() {
-                receive.push(act(
-                    el("address"),
-                    "New address",
-                    "wallet.address",
-                    json!({"id": id}),
-                ));
-            }
-        }
-        Some(Err(error)) => receive.extend([
-            notice(el("addresses/error"))
-                .variant("failure")
-                .title("Could not get a deposit address")
-                .text(error.as_str()),
-            act(el("address"), "Retry", "wallet.address", json!({"id": id})),
-        ]),
-        None => {}
-    }
-    if let Some(deposit) = can.deposit {
-        receive.push(run(
-            "deposit",
-            &format!("New {}", deposit.to_lowercase()),
-            false,
-            "false",
-        ));
-    }
-    if can.lightning {
-        receive.push(row(el("invoice/form")).align("end").wrap(true).children([
-            amount("invoice"),
-            run("invoice", "Create invoice", true, "false"),
-        ]));
-    }
-    if let Some(redeem) = can.redeem {
-        receive.extend([
-            field(el("redeem/token"), redeem, &d("redeem", "token")).variant("multiline"),
-            run("redeem", "Redeem", true, &empty("redeem", "token")),
-        ]);
-    }
-    if can.onboard {
-        receive.push(run("onboard", "Onboard", false, "false"));
-    }
-
-    let mut send = Vec::new();
-    if let Some(to) = can.send {
-        send.extend([
-            field(el("send/to"), to, &d("send", "to")),
-            row(el("send/form")).align("end").wrap(true).children([
-                amount("send"),
-                run("send", "Send", true, &empty("send", "to")),
-            ]),
-        ]);
-    }
-    if can.lightning {
-        send.extend([
-            field(el("pay/invoice"), "Lightning invoice", &d("pay", "invoice"))
-                .placeholder("lnbc…"),
-            run("pay", "Pay", true, &empty("pay", "invoice")),
-        ]);
-    }
-    if let Some(issue) = can.issue {
-        send.push(row(el("issue/form")).align("end").wrap(true).children([
-            amount("issue"),
-            run(
-                "issue",
-                &format!("Take out as {}", issue.to_lowercase()),
-                true,
-                "false",
-            ),
-        ]));
-    }
-
-    let note = can
-        .note
-        .map(|note| text(el("note")).variant("caption").text(note));
-    nodes.push(
-        tabs(el("tabs"))
-            .bind(format!("_wallet_{}", short_hash(id)))
-            .children([
-                tab(el("tab/receive"))
-                    .label("Receive")
-                    .children(receive)
-                    .children(note),
-                tab(el("tab/send")).label("Send").children(send),
-            ]),
-    );
-    nodes
+    card_of(NetworkCard {
+        id,
+        status: opened.map(|opened| &opened.status),
+        applied: opened.is_some_and(|opened| opened.config == *network),
+        unit: "hop",
+        fields,
+        wallet,
+    })
 }
 
 fn routes(ctx: &Context) -> Node {
@@ -1084,95 +547,6 @@ fn announced(id: &str, d_tag: &str, (variant, state): (&str, String)) -> Node {
         text(format!("{id}/hop")).text(hop_name(d_tag)),
         badge(format!("{id}/state")).variant(variant).text(state),
     ])
-}
-
-fn access_tab(ctx: &Context, access: &Access) -> Node {
-    let addresses = card("access/addresses").title("Addresses").children([
-        fact(
-            "access/http",
-            "On this machine, open to anyone on it",
-            ctx.http_url.as_deref().unwrap_or("off"),
-        ),
-        fact(
-            "access/iroh",
-            "Over iroh, to peers only",
-            ctx.iroh_url.as_deref().unwrap_or("off"),
-        ),
-    ]);
-    let pairing = ctx.pairing_link.as_ref().map(|link| {
-        card("access/pairing").title("Pairing link").children([
-            text("access/pairing/help").text(
-                "Lets in the first renderer that opens it, which is then a peer. A new \
-                 link replaces it, here and on the console.",
-            ),
-            text("access/pairing/link")
-                .variant("code")
-                .text(link.as_str()),
-            act("pairing/rotate", "New link", "pairing.rotate", json!({})),
-        ])
-    });
-    let peers = ctx.config.admin.peers.iter().map(|key| {
-        let you = (*access == Access::Peer(key.clone()))
-            .then(|| badge(format!("peer/{key}/you")).variant("info").text("you"));
-        row(format!("peer/{key}"))
-            .justify("between")
-            .child(
-                text(format!("peer/{key}/key"))
-                    .variant("code")
-                    .text(key.as_str()),
-            )
-            .children(you)
-            .child(
-                act(
-                    format!("peer/{key}/remove"),
-                    "Remove",
-                    "peer.remove",
-                    json!({"key": key}),
-                )
-                .variant("failure"),
-            )
-    });
-    let peers = card("access/peers").title("Peers").children([
-        list("peers").empty("No peers yet.").children(peers),
-        row("peer/new").children([
-            field("peer/new/key", "Renderer key", "d.new_peer.key")
-                .placeholder("64 hex characters"),
-            submit(
-                "peer/new/add",
-                "Add",
-                "peer.add",
-                json!({"draft": "new_peer"}),
-                "s.d.new_peer.key.trim() == ''",
-            ),
-        ]),
-    ]);
-    let admin = card("admin").title("Admin interface").children([
-        text("admin/help")
-            .variant("caption")
-            .text("Applies on restart."),
-        field(
-            "admin/listen",
-            "HTTP address, on loopback (empty for none)",
-            "d.admin.listen",
-        ),
-        checkbox("admin/iroh")
-            .variant("switch")
-            .label("Over iroh, to peers")
-            .bind("d.admin.iroh"),
-        submit(
-            "admin/save",
-            "Save",
-            "admin.set",
-            json!({"draft": "admin"}),
-            "false",
-        ),
-    ]);
-    tab("tab/access")
-        .label("Access")
-        .child(addresses)
-        .children(pairing)
-        .child(peers)
-        .child(admin)
 }
 
 fn settings(ctx: &Context) -> Node {

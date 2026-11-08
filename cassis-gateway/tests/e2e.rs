@@ -9,6 +9,8 @@
 //! `cargo test -p cassis-gateway --test e2e -- --ignored`
 
 use async_trait::async_trait;
+use cassis_admin::networks::{NetworkConfig, Networks, Opened, Opener, Status};
+use cassis_admin::{App, Args, ConfigFile, Refresh};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::node::{
     authorize_gateway, create_gateway_invoice, redeem_offline_payments, GatewayInvoiceRecord,
@@ -25,15 +27,22 @@ use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
+use cassis_gateway::admin::GatewayAdmin;
+use cassis_gateway::{config as gateway_config, ForwardRecord, ForwardState};
 use cassis_gateway::{Gateway, GatewayConfig, GatewayPolicy};
-use cassis_preimage_server::{Db, PreimageServer, ServerConfig};
+use cassis_preimage_server::admin::PreimageAdmin;
+use cassis_preimage_server::config as server_config;
+use cassis_preimage_server::{Db, PreimageServer, ServerConfig, Stats};
+use futures::future::BoxFuture;
+use hypereffect::json;
+use hypereffect::vtree::text;
 use iroh_base::PublicKey;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::Span;
 
-const NETWORK: &str = "mock::chain";
+const NETWORK: &str = "cashu::mock.chain";
 
 #[derive(Clone, Debug, PartialEq)]
 enum LockState {
@@ -185,6 +194,25 @@ impl Network for MockNetwork {
     }
 }
 
+/// Opens the gateway's side of the mock chain.
+struct MockOpener(Ledger);
+
+impl Opener<NetworkConfig> for MockOpener {
+    fn open<'a>(
+        &'a self,
+        _: &'a NetworkId,
+        _: &'a NetworkConfig,
+    ) -> BoxFuture<'a, Result<Opened, String>> {
+        Box::pin(async move {
+            let network: Arc<dyn Network> = MockNetwork::new(8, &self.0);
+            Ok(Opened {
+                network,
+                wallet: None,
+            })
+        })
+    }
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "cassis-gateway-{name}-{}",
@@ -330,6 +358,44 @@ impl Setup {
         self.payer.shutdown().await;
         self.gateway.shutdown().await;
         self.server.shutdown().await;
+    }
+
+    fn networks(&self) -> Arc<Networks<NetworkConfig>> {
+        let networks = Networks::new(MockOpener(self.ledger.clone()), Span::none(), false);
+        networks.attach(Arc::new(self.gateway.clone()));
+        networks
+    }
+
+    fn gateway_admin(&self, networks: Arc<Networks<NetworkConfig>>) -> Arc<GatewayAdmin> {
+        let template = format!("[networks.\"{NETWORK}\"]\n");
+        let file = ConfigFile::<gateway_config::Config>::load_or_create(
+            &temp_dir("gateway-admin"),
+            &template,
+        );
+        GatewayAdmin::new(
+            self.gateway.clone(),
+            file.unwrap(),
+            networks,
+            None,
+            Refresh::default(),
+        )
+    }
+
+    /// The tabs of the admin pages of the gateway and the server.
+    fn pages(&self) -> (String, String) {
+        let gateway = self.gateway_admin(self.networks());
+        let file = ConfigFile::load_or_create(&temp_dir("server-admin"), server_config::TEMPLATE);
+        let server = PreimageAdmin::new(
+            self.server.clone(),
+            file.unwrap(),
+            self.networks(),
+            None,
+            Refresh::default(),
+        );
+        (
+            format!("{:?}", gateway.tabs(text("access"))),
+            format!("{:?}", server.tabs(text("access"))),
+        )
     }
 
     /// The locks paying `hash`: the payer's to the gateway, and the
@@ -561,7 +627,136 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
         LockState::Claimed(preimage)
     );
 
+    // The admin pages show the payment, and neither gives its preimage
+    // away.
+    let (gateway_page, server_page) = setup.pages();
+    for page in [&gateway_page, &server_page] {
+        assert!(page.contains(&invoice.body.payment_hash.to_string()));
+        assert!(page.contains(&payee.key().to_string()));
+        assert!(page.contains("20 sat"), "{page}");
+        assert!(!page.contains(&preimage.to_string()));
+    }
+    assert!(gateway_page.contains("1 settled"), "{gateway_page}");
+    assert!(
+        gateway_page.contains("payee claimed") || gateway_page.contains("waiting for the payee")
+    );
+    assert_eq!(
+        setup.server.stats(),
+        Stats {
+            issued: 1,
+            released: 1,
+            refused: 0
+        }
+    );
+
+    // A forgotten authorization gives no more invoices.
+    let authorizations = setup.gateway.authorizations().unwrap();
+    assert_eq!(authorizations.len(), 1);
+    let id = authorizations[0].authorization.id().unwrap();
+    setup.gateway.forget_authorization(&id).unwrap();
+    assert!(matches!(
+        request(&asker, &setup.endpoints.gateway, ask(20_000)).await,
+        Response::GatewayInvoice(Err(_))
+    ));
+
     asker.close().await;
+    payee.transport.close().await;
+    setup.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs internet access for iroh relays"]
+async fn networks_and_terms_change_while_running() {
+    let setup = setup().await;
+    let network = NetworkId(NETWORK.into());
+    let payee = Payee::new(2, &setup.ledger).await;
+    let networks = setup.networks();
+    let wanted = BTreeMap::from([(NETWORK.to_string(), NetworkConfig::default())]);
+    let none = BTreeMap::new();
+    let timeout = DEFAULT_MIN_FINAL_TIMEOUT_SECS;
+
+    // A network removed takes effect at once, and comes back.
+    assert!(networks.sync(&wanted, None, &|| {}).await);
+    assert!(networks.sync(&none, None, &|| {}).await);
+    assert!(setup.gateway.network_ids().is_empty());
+    let error = payee.invoice(&setup.endpoints, 50_000, timeout).await;
+    assert!(error.is_err());
+    assert!(networks.sync(&wanted, None, &|| {}).await);
+    assert_eq!(setup.gateway.network_ids(), [network.clone()]);
+
+    // Terms apply to what comes next, through the file, which refuses
+    // nonsense.
+    let admin = setup.gateway_admin(networks.clone());
+    let set = |payload: hypereffect::Value| {
+        admin
+            .clone()
+            .act("terms.set", &Args(payload.as_object().unwrap().clone()))
+    };
+    assert!(set(json!({"forward_slack_secs": 0})).is_err());
+    set(json!({"max_final_timeout_secs": 60})).unwrap();
+    assert_eq!(setup.gateway.policy().max_final_timeout_secs, 60);
+    let error = payee.invoice(&setup.endpoints, 50_000, timeout).await;
+    assert!(error.unwrap_err().contains("gateway refused"));
+    // Back to the default, and the slacks of this setup.
+    set(json!({"max_final_timeout_secs": "", "forward_slack_secs": 60, "final_slack_secs": 60}))
+        .unwrap();
+
+    // A network paying a payee who has not claimed yet stays open, for
+    // the refund, until the payee does.
+    let invoice = payee
+        .invoice(&setup.endpoints, 50_000, timeout)
+        .await
+        .unwrap();
+    setup.payer.pay(&invoice, &network, &[]).await.unwrap();
+    assert_eq!(setup.gateway.in_flight(&network), 1);
+    assert!(!networks.sync(&none, None, &|| {}).await);
+    assert_eq!(setup.gateway.network_ids(), [network.clone()]);
+    assert_eq!(networks.slots()[NETWORK].status, Status::Waiting(1));
+    let report = payee.redeem(&setup.endpoints.preimage_server).await;
+    assert_eq!(report.claimed.len(), 1);
+    setup.gateway.settle_once().await;
+    assert_eq!(setup.gateway.in_flight(&network), 0);
+    assert!(networks.sync(&none, None, &|| {}).await);
+    assert!(setup.gateway.network_ids().is_empty());
+
+    // A forward whose network is not open waits for it instead of giving
+    // up on the money: here, one claiming as a gateway starts on nothing.
+    let store = Arc::new(Store::open(&temp_dir("resumed").join("store.db")).unwrap());
+    let hash = invoice.body.payment_hash.to_string();
+    let record: cassis_gateway::InvoiceRecord = setup
+        .gateway
+        .store()
+        .get(cassis_gateway::INVOICES, &hash)
+        .unwrap()
+        .unwrap();
+    store.put(cassis_gateway::INVOICES, &hash, &record).unwrap();
+    let mut forward: ForwardRecord = setup.gateway.forwards().unwrap().remove(0);
+    forward.state = ForwardState::Claiming;
+    store
+        .put(cassis_gateway::FORWARDS, &hash, &forward)
+        .unwrap();
+    let resumed = Gateway::start(GatewayConfig {
+        endpoint_secret: [33; 32],
+        store,
+        networks: Vec::new(),
+        policy: GatewayPolicy::default(),
+        span: Span::none(),
+    })
+    .await
+    .unwrap();
+    let state = || resumed.forwards().unwrap().remove(0).state;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(state(), ForwardState::Claiming);
+    resumed.add_network(MockNetwork::new(8, &setup.ledger));
+    for _ in 0..100 {
+        if state() != ForwardState::Claiming {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(state(), ForwardState::Settled);
+
+    resumed.shutdown().await;
     payee.transport.close().await;
     setup.shutdown().await;
 }

@@ -3,19 +3,26 @@
 //!
 //! ```text
 //! <dir>/seed                12-word mnemonic every key derives from
+//! <dir>/config.toml         networks, admin (see `cassis_preimage_server::config`)
 //! <dir>/releases.redb       HTLCs whose preimage was released, for their payees
 //! <dir>/<kind>/<variant>/   private data of one network's adapter
 //! ```
 //!
 //! Each network is compiled in by the cargo feature of the same name.
+//!
+//! It also serves an admin interface for hyperb renderers (see
+//! [`cassis_preimage_server::admin`]).
 
+use cassis_admin::networks::Networks;
+use cassis_admin::{reexec, shutdown_signal, ConfigFile, Refresh, Server, RESTART_GRACE};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
-use cassis_core::{Network, NetworkId};
+use cassis_preimage_server::admin::{PreimageAdmin, PreimageOpener};
+use cassis_preimage_server::config::{Config, TEMPLATE};
 use cassis_preimage_server::{Db, PreimageServer, ServerConfig};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, info_span, Span};
+use tracing::{info, info_span, warn};
 
 #[derive(Parser)]
 #[command(
@@ -27,11 +34,6 @@ struct Cli {
     /// else `~/.cassis-preimage-server`.
     #[arg(long, value_name = "DIR")]
     home: Option<PathBuf>,
-    /// Networks to verify HTLCs to payees on, e.g. `cashu::mint.host`,
-    /// `liquid`, `arkade::mutinynet`. Payees receiving on others are
-    /// refused.
-    #[arg(long = "network", required = true)]
-    networks: Vec<String>,
 }
 
 #[tokio::main]
@@ -55,21 +57,35 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let keys = NodeKeys::from_mnemonic(&read_or_create_seed(&dir)?).map_err(|e| e.to_string())?;
+    let file: ConfigFile<Config> = ConfigFile::load_or_create(&dir, TEMPLATE)?;
+    let config = file.get();
     let db = Db::open(dir.join("releases.redb")).map_err(|e| format!("open database: {e}"))?;
     let span = info_span!("preimage-server");
-    let mut networks = Vec::new();
-    for spec in &cli.networks {
-        let id = NetworkId::parse(spec)?;
-        networks.push(open_network(&dir, &keys, &id, &span).await?);
+    let networks = Networks::new(
+        PreimageOpener {
+            keys: keys.clone(),
+            dir: dir.clone(),
+            span: span.clone(),
+        },
+        span.clone(),
+        false,
+    );
+    let opened = networks.open_all(&config.networks).await;
+    if config.networks.is_empty() {
+        warn!(
+            "no networks in {}: add some under [networks], or from the admin interface",
+            dir.join(cassis_admin::config::FILE).display()
+        );
     }
     let server = PreimageServer::start(ServerConfig {
         endpoint_secret: keys.iroh,
         preimage_secret: keys.preimage_server_secret(),
         db: Arc::new(db),
-        networks,
+        networks: opened,
         span,
     })
     .await?;
+    networks.attach(Arc::new(server.clone()));
     let relay = server.home_relay().await;
     info!(
         "serving as {} (relay {}); Ctrl-C to stop",
@@ -77,92 +93,26 @@ async fn run(cli: Cli) -> Result<(), String> {
         relay.as_deref().unwrap_or("unknown")
     );
     println!("{}", server.peer_id());
-    tokio::signal::ctrl_c().await.ok();
+
+    let refresh = Refresh::default();
+    let admin = Server::new(
+        PreimageAdmin::new(server.clone(), file, networks, relay, refresh.clone()),
+        refresh,
+    );
+    admin.serve(keys.admin_endpoint_secret()).await;
+
+    let restart = tokio::select! {
+        _ = shutdown_signal() => false,
+        _ = admin.restart_requested() => true,
+    };
+    if restart {
+        tokio::time::sleep(RESTART_GRACE).await;
+    }
     server.shutdown().await;
+    if restart {
+        return Err(reexec());
+    }
     Ok(())
-}
-
-/// Open the adapter of `network`, if this binary was built with it.
-/// Its keys are the server's own: it only verifies HTLCs paying others.
-#[allow(unused_variables)]
-async fn open_network(
-    dir: &Path,
-    keys: &NodeKeys,
-    network: &NetworkId,
-    span: &Span,
-) -> Result<Arc<dyn Network>, String> {
-    let secret = keys.network_secret(network);
-    let data_dir = network_dir(dir, network);
-    Ok(match network.kind() {
-        #[cfg(feature = "cashu")]
-        "cashu" => Arc::new(cassis_cashu::CashuAdapter::open(
-            network.clone(),
-            secret,
-            &data_dir,
-            span,
-        )?),
-        #[cfg(feature = "liquid")]
-        "liquid" => Arc::new(
-            cassis_liquid::LiquidAdapter::open(network.clone(), secret, &data_dir, span).await?,
-        ),
-        #[cfg(feature = "bitcoin")]
-        "bitcoin" => Arc::new(cassis_bitcoin::BitcoinAdapter::open(
-            network.clone(),
-            secret,
-            span,
-        )?),
-        // `$CASSIS_ESPLORA_URL` overrides the chain API, as in cassis-wallet.
-        #[cfg(feature = "arkade")]
-        "arkade" => Arc::new(
-            cassis_arkade::ArkadeAdapter::open_with_esplora(
-                network.clone(),
-                secret,
-                std::env::var("CASSIS_ESPLORA_URL").ok().as_deref(),
-                span,
-            )
-            .await?,
-        ),
-        #[cfg(feature = "rootstock")]
-        "rootstock" => Arc::new(cassis_rootstock::RootstockAdapter::open(
-            network.clone(),
-            secret,
-            span,
-        )?),
-        #[cfg(feature = "fedimint")]
-        "fedimint" => Arc::new(
-            cassis_fedimint::FedimintAdapter::open(network.clone(), secret, &data_dir, span)
-                .await?,
-        ),
-        "lightning" => {
-            return Err(
-                "lightning cannot go through a preimage server: its hold invoices need the \
-                 payee online"
-                    .into(),
-            )
-        }
-        kind => {
-            return Err(format!(
-                "this cassis-preimage-server was built without the '{kind}' feature"
-            ))
-        }
-    })
-}
-
-/// `<dir>/<kind>/<variant>`, as cassis-wallet lays out network data.
-fn network_dir(dir: &Path, network: &NetworkId) -> PathBuf {
-    let variant: String = network
-        .param()
-        .unwrap_or("mainnet")
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    dir.join(network.kind()).join(variant)
 }
 
 fn read_or_create_seed(dir: &Path) -> Result<String, String> {

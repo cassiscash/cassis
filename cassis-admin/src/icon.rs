@@ -1,4 +1,4 @@
-//! The admin page's icon: a square of the router's color, as a PNG
+//! The admin page's icon: a square of the daemon's color, as a PNG
 //! `data:` URL, which every renderer shows.
 
 use base64::Engine;

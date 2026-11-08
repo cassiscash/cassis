@@ -15,21 +15,17 @@ liquid = ["cassis-networks/liquid"]
 rootstock = ["cassis-networks/rootstock"]
 
 [dependencies]
-axum = { workspace = true }
-base64 = { workspace = true }
+cassis-admin = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
 hypereffect = { workspace = true }
-iroh = { workspace = true }
 lowercase-hex = { workspace = true }
-rand = { workspace = true }
 ritualistic = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { workspace = true }
 toml_edit = { workspace = true }

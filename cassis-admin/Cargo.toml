@@ -1,0 +1,24 @@
+[package]
+name = "cassis-admin"
+version.workspace = true
+edition.workspace = true
+
+# The admin interface every Cassis daemon serves to hyperb renderers:
+# what is the same in cassis-routerd, cassis-gateway and
+# cassis-preimage-server.
+[dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+cassis-core = { workspace = true }
+cassis-networks = { workspace = true }
+futures = { workspace = true }
+hypereffect = { workspace = true }
+iroh = { workspace = true }
+lowercase-hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+tracing = { workspace = true }

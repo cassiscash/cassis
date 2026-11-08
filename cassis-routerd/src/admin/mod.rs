@@ -1,43 +1,24 @@
-//! The router's admin interface: a hypereffect app over the config
-//! file, for [hyperb](https://github.com/hypereffect/hyperb) renderers.
-//! It is served open over HTTP on loopback ([`http`]), and over iroh
-//! ([`iroh`]) to the renderers listed in `admin.peers`, or to the first
-//! one opening the pairing link printed on the console, which is then
-//! replaced by a new one.
-//!
-//! The page is a [`view`] of the config and of what the daemon runs,
-//! sent as a diff after each change. Every element that does something
-//! has an id naming what it acts on (`route/<from>/<to>/save`), and its
-//! action carries in its payload what it acts on, so actions can be
-//! sent from anywhere, like API calls (`hypb action <address> <name>
-//! --payload <json>`):
+//! The router's admin interface (see [`cassis_admin`]): a hypereffect
+//! app over the config file. The page is a [`view`] of the config and of
+//! what the daemon runs. Every element that does something has an id
+//! naming what it acts on (`route/<from>/<to>/save`), and its action
+//! carries in its payload what it acts on, so actions can be sent from
+//! anywhere, like API calls (`hypb action <address> <name> --payload
+//! <json>`):
 //!
 //! | action                | payload                                                   |
 //! | --------------------- | --------------------------------------------------------- |
 //! | `settings.set`        | `name`, `nostr_relays`, `max_reservations`                |
-//! | `admin.set`           | `listen`, `iroh`                                          |
+//! | `admin.set`           | `listen`, `iroh` (see [`cassis_admin`], as `peer.*`, `pairing.rotate` and `daemon.restart`) |
 //! | `network.add`         | `kind` (`arkade`, `cashu`, `liquid`, `lnd`, `bark`, `fedimint`, `bitcoin`, `rootstock`), `chain`, `mint`, `invite`, and the fields of `network.set` but `id` and `backend` |
 //! | `network.set`         | `id`, `esplora_url`, `backend` (`lnd`, `bark`, `none`), `lnd_rest_url`, `lnd_tls_cert_path`, `lnd_macaroon_path`, `bark_server_url`, `bark_esplora_url` |
 //! | `network.remove`      | `id`                                                      |
 //! | `network.open`        | `id`                                                      |
-//! | `wallet.refresh`      | `id`                                                      |
-//! | `wallet.address`      | `id`                                                      |
-//! | `wallet.send`         | `id`, `to`, `amount_sat`                                  |
-//! | `wallet.issue`        | `id`, `amount_sat`                                        |
-//! | `wallet.redeem`       | `id`, `token`                                             |
-//! | `wallet.onboard`      | `id`                                                      |
-//! | `wallet.invoice`      | `id`, `amount_sat`                                        |
-//! | `wallet.pay`          | `id`, `invoice`                                           |
-//! | `wallet.deposit`      | `id`                                                      |
-//! | `wallet.dismiss`      | `id`                                                      |
+//! | `wallet.*`            | see [`cassis_admin::wallets`]                             |
 //! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `max_incoming_lifetime_secs`, `test_money` |
 //! | `route.remove`        | `from`, `to`                                              |
 //! | `routes.announce`     |                                                           |
 //! | `announcements.check` |                                                           |
-//! | `peer.add`            | `key`                                                     |
-//! | `peer.remove`         | `key`                                                     |
-//! | `pairing.rotate`      |                                                           |
-//! | `daemon.restart`      |                                                           |
 //!
 //! `*.set` actions add what they name if it is missing, and change only
 //! the fields given (see [`edit::Args`]); a form's payload names its
@@ -48,81 +29,48 @@
 //! `result` notice of the page of the session that sent it; announcing
 //! and checking the relays run in the background, and show in the
 //! announcements card of the Routes tab.
-//!
-//! `wallet.*` actions move the funds of an open network, as far as its
-//! wallet can (see [`cassis_networks::Can`]), in the background: what
-//! they did, and what they hand out (a token, an invoice), shows in the
-//! network's card, as do its balances, read every minute while a page is
-//! open (`wallet.refresh` reads them now), and its deposit addresses
-//! (`wallet.address` asks for new ones).
 
 mod edit;
-mod http;
-mod icon;
-mod iroh;
 mod view;
 
-use crate::config::{self, AdminConfig, Config};
+use crate::config::{self, Config};
 use crate::networks::Networks;
+use cassis_admin::config::child;
+use cassis_admin::networks::{new_network_id, ALL_KINDS};
+use cassis_admin::{AdminConfig, AdminEdit, App, Args, Identity, Refresh};
 use cassis_core::node::Node;
 use cassis_core::routing::{autohue, autoname, fetch_published, Published};
 use cassis_core::store::Store;
 use cassis_core::{unix_now, NetworkId};
-use cassis_networks::{Op, Wallet};
-use edit::Args;
 use hypereffect::vtree;
-use hypereffect::{json, Action, Map, Metadata, RendererMessage, ServerMessage, Value};
+use hypereffect::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, Notify};
 use toml_edit::DocumentMut;
 use tracing::{info, warn};
 
-/// How often open pages are brought up to date with the hops and the
-/// config file.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-/// How often the balances of the wallets are read while a page is open.
-const FUNDS_INTERVAL: u64 = 60;
 /// How long after start the relays are first checked, leaving time for
 /// the first announcement.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(20);
 /// How often the relays are checked for this router's announcements.
 const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// Who a session is.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Access {
-    /// Over HTTP on loopback.
-    Local,
-    /// Over iroh, with the renderer's key.
-    Peer(String),
-}
-
 pub struct Admin {
     dir: PathBuf,
     node: Node,
     networks: Arc<Networks>,
     store: Arc<Store>,
-    /// The admin section served, which changes apply to on restart.
-    serving: AdminConfig,
+    refresh: Refresh,
     state: Mutex<State>,
     nostr: Mutex<Nostr>,
-    sessions: Mutex<Vec<Arc<Session>>>,
-    restart: Notify,
-    http_url: OnceLock<String>,
-    iroh_id: OnceLock<String>,
 }
 
 struct State {
     config: Config,
     /// When the config file was last read or written.
     modified: Option<SystemTime>,
-    /// The drafts of the config as every session has them.
-    drafts: Map<String, Value>,
-    /// The secret of the pairing link.
-    pairing: String,
 }
 
 /// What the relays keep of this router's announcements.
@@ -141,33 +89,6 @@ pub struct Nostr {
     pub found: BTreeMap<String, Result<Vec<Published>, String>>,
 }
 
-pub struct Session {
-    access: Access,
-    out: mpsc::UnboundedSender<String>,
-    shown: Mutex<Shown>,
-}
-
-#[derive(Default)]
-struct Shown {
-    /// The name in the metadata last sent.
-    name: String,
-    tree: Vec<vtree::Node>,
-    /// The outcome of the session's last action.
-    flash: Option<Result<String, String>>,
-}
-
-impl Session {
-    fn send(&self, lines: String) {
-        if !lines.is_empty() {
-            let _ = self.out.send(lines);
-        }
-    }
-
-    fn signal(&self, patch: Value) {
-        self.send(ServerMessage::signal(patch).to_line());
-    }
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -179,6 +100,7 @@ impl Admin {
         networks: Arc<Networks>,
         store: Arc<Store>,
         config: Config,
+        refresh: Refresh,
     ) -> Arc<Self> {
         let modified = modified(&dir);
         Arc::new(Self {
@@ -186,60 +108,15 @@ impl Admin {
             node,
             networks,
             store,
-            serving: config.admin.clone(),
-            state: Mutex::new(State {
-                drafts: view::drafts(&config),
-                config,
-                modified,
-                pairing: new_secret(),
-            }),
+            refresh,
+            state: Mutex::new(State { config, modified }),
             nostr: Default::default(),
-            sessions: Default::default(),
-            restart: Notify::new(),
-            http_url: OnceLock::new(),
-            iroh_id: OnceLock::new(),
         })
     }
 
-    /// Serve the interface as `admin` says, until the process ends.
-    pub async fn serve(self: &Arc<Self>, admin: &AdminConfig, iroh_secret: [u8; 32]) {
-        match admin.listen_addr() {
-            Ok(Some(addr)) => match http::serve(self.clone(), addr).await {
-                Ok(addr) => {
-                    let url = format!("hyperb://localhost:{}", addr.port());
-                    println!("admin interface on this machine: {url}");
-                    let _ = self.http_url.set(url);
-                }
-                Err(error) => warn!("admin over HTTP: {error}"),
-            },
-            Ok(None) => {}
-            Err(error) => warn!("admin over HTTP: {error}"),
-        }
-        if admin.iroh {
-            match iroh::serve(self.clone(), iroh_secret).await {
-                Ok(id) => {
-                    println!("admin interface over iroh, for peers: hyperb://{id}");
-                    let _ = self.iroh_id.set(id);
-                    self.print_pairing_link(&lock(&self.state).pairing);
-                }
-                Err(error) => warn!("admin over iroh: {error}"),
-            }
-        }
-        let admin = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(REFRESH_INTERVAL).await;
-                admin.reload_if_modified();
-                // Also picks up changes left waiting for hops to settle.
-                admin.sync_networks(None);
-                if !lock(&admin.sessions).is_empty() {
-                    for id in admin.networks.stale_funds(FUNDS_INTERVAL) {
-                        admin.read_funds(id, false);
-                    }
-                }
-                admin.refresh();
-            }
-        });
+    /// Check the relays for this router's announcements now and then,
+    /// until the process ends.
+    pub fn keep_checking_relays(self: &Arc<Self>) {
         let admin = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(FIRST_CHECK_DELAY).await;
@@ -256,14 +133,6 @@ impl Admin {
             .name
             .clone()
             .unwrap_or_else(|| autoname(&self.node.node_pubkey()))
-    }
-
-    /// The metadata of the page, under the router's name.
-    fn metadata(&self, name: &str) -> Metadata {
-        Metadata::new()
-            .name(format!("{name} (cassis router)"))
-            .description("Configure and run this Cassis router")
-            .icon(icon::square(autohue(&self.node.node_pubkey())))
     }
 
     /// Run the background job of the relays: publish the router's name
@@ -294,7 +163,7 @@ impl Admin {
                     });
                     announce
                 };
-                admin.refresh();
+                admin.refresh.now();
                 let config = lock(&admin.state).config.clone();
                 let relays = &config.nostr_relays;
                 let published = lock(&admin.nostr).published_name.clone();
@@ -326,121 +195,13 @@ impl Admin {
                 nostr.found = relays.iter().cloned().zip(found).collect();
                 nostr.checked_at = Some(unix_now());
             }
-            admin.refresh();
+            admin.refresh.now();
         });
-    }
-
-    /// Resolves when `daemon.restart` is asked for.
-    pub async fn restart_requested(&self) {
-        self.restart.notified().await
-    }
-
-    fn pairing_link(&self, secret: &str) -> Option<String> {
-        Some(format!("hyperb://{}#pair={secret}", self.iroh_id.get()?))
-    }
-
-    fn print_pairing_link(&self, secret: &str) {
-        if let Some(link) = self.pairing_link(secret) {
-            println!("admin pairing link, lets in the first renderer to open it: {link}");
-        }
-    }
-
-    fn allowed(&self, state: &State, access: &Access) -> bool {
-        match access {
-            Access::Local => true,
-            Access::Peer(key) => state.config.admin.peers.contains(key),
-        }
-    }
-
-    /// Start a session from its `hello`, sending `out` the page.
-    fn open(
-        self: &Arc<Self>,
-        access: Access,
-        params: &BTreeMap<String, String>,
-        out: mpsc::UnboundedSender<String>,
-    ) -> Arc<Session> {
-        let session = Arc::new(Session {
-            access,
-            out,
-            shown: Default::default(),
-        });
-        let name = self.name(&lock(&self.state).config);
-        let mut metadata = self.metadata(&name);
-        lock(&session.shown).name = name;
-        if let (Access::Peer(key), Some(secret)) = (&session.access, params.get("pair")) {
-            match self.pair(key, secret) {
-                Ok(true) => lock(&session.shown).flash = Some(Ok("Paired: you are a peer".into())),
-                Ok(false) => {}
-                Err(error) => lock(&session.shown).flash = Some(Err(error)),
-            }
-            // A used link is worth nothing: keep it out of the address.
-            metadata = metadata.extra("url", "/");
-        }
-        let mut lines = ServerMessage::from(metadata).to_line();
-        {
-            let state = lock(&self.state);
-            let mut drafts = state.drafts.clone();
-            drafts.extend(view::new_drafts(&state.config));
-            lines.push_str(&ServerMessage::signal(json!({"d": drafts, "_busy": false})).to_line());
-        }
-        session.send(lines);
-        lock(&self.sessions).push(session.clone());
-        self.refresh();
-        session
-    }
-
-    fn close(&self, session: &Arc<Session>) {
-        lock(&self.sessions).retain(|other| !Arc::ptr_eq(other, session));
-    }
-
-    /// Handle a line the renderer sent after its `hello`.
-    async fn receive(self: &Arc<Self>, session: &Arc<Session>, line: &str) {
-        match RendererMessage::parse(line) {
-            Ok(RendererMessage::Action(action)) => self.on_action(session, &action).await,
-            Ok(RendererMessage::Hello { .. }) => warn!("admin: ignoring a second hello"),
-            Err(error) => warn!("admin: ignoring a message: {error}"),
-        }
-    }
-
-    async fn on_action(self: &Arc<Self>, session: &Arc<Session>, action: &Action) {
-        let allowed = self.allowed(&lock(&self.state), &session.access);
-        let result = if allowed {
-            self.act(&action.name, &Args::of(action)).await
-        } else {
-            Err("not let in".to_string())
-        };
-        match &result {
-            Ok(message) => info!("admin {} ({:?}): {message}", action.name, session.access),
-            Err(error) => warn!("admin {} ({:?}): {error}", action.name, session.access),
-        }
-        let mut reset = json!({"_busy": false});
-        // A form that added or moved something is emptied for the next one.
-        if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("new_")) {
-            if result.is_ok() {
-                let fresh = view::new_drafts(&lock(&self.state).config);
-                reset["d"] = json!({draft: fresh.get(draft)});
-            }
-        }
-        if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("w_")) {
-            if result.is_ok() {
-                let fresh = view::drafts(&lock(&self.state).config);
-                reset["d"] = json!({draft: fresh.get(draft)});
-            }
-        }
-        session.signal(reset);
-        lock(&session.shown).flash = Some(result);
-        self.refresh();
     }
 
     /// Do what the action `name` says, returning what happened.
-    async fn act(self: &Arc<Self>, name: &str, args: &Args) -> Result<String, String> {
+    fn perform(self: &Arc<Self>, name: &str, args: &Args) -> Result<String, String> {
         let network = || NetworkId::parse(&args.required("id")?);
-        let amount = || {
-            args.number("amount_sat")?
-                .flatten()
-                .filter(|amount| *amount > 0)
-                .ok_or_else(|| "amount_sat is required".to_string())
-        };
         let ends = || {
             Ok::<_, String>((
                 NetworkId::parse(&args.required("from")?)?,
@@ -453,13 +214,9 @@ impl Admin {
                 Ok("Settings saved".into())
             }
             "network.add" => {
-                let id = edit::new_network_id(args)?;
+                let id = new_network_id(args, &ALL_KINDS)?;
                 self.edit(|doc| edit::add_network(doc, &id, args))?;
                 Ok(format!("{id} added, opening it"))
-            }
-            "admin.set" => {
-                self.edit(|doc| edit::admin(doc, args))?;
-                Ok("Admin interface settings saved".into())
             }
             "network.set" => {
                 let id = network()?;
@@ -468,75 +225,13 @@ impl Admin {
             }
             "network.open" => {
                 let id = network()?;
-                if !lock(&self.state).config.networks.contains_key(&id.0) {
-                    return Err(format!("{id} is not under [networks]"));
-                }
-                match self.networks.in_flight(&id.0) {
-                    0 => {}
-                    hops => {
-                        return Err(format!(
-                            "{id} has {hops} hop(s) in flight: wait for them to settle"
-                        ))
-                    }
-                }
+                let known = lock(&self.state).config.networks.contains_key(&id.0);
+                self.networks.can_reopen(&id, known)?;
                 self.sync_networks(Some(id.0.clone()));
                 Ok(format!("Opening {id}"))
             }
-            "wallet.refresh" | "wallet.address" => {
-                let id = network()?;
-                if !self.networks.has_wallet(&id.0) {
-                    return Err(format!("{id} is not open"));
-                }
-                self.read_funds(id.0.clone(), name == "wallet.address");
-                Ok(match name {
-                    "wallet.address" => format!("Asking {id} for new addresses"),
-                    _ => format!("Reading the wallet of {id}"),
-                })
-            }
-            "wallet.send" => self.wallet_op(
-                network()?,
-                "Sending",
-                Op::Send {
-                    to: args.required("to")?,
-                    amount_sat: amount()?,
-                },
-            ),
-            "wallet.issue" => self.wallet_op(
-                network()?,
-                "Taking funds out",
-                Op::Issue {
-                    amount_sat: amount()?,
-                },
-            ),
-            "wallet.redeem" => self.wallet_op(
-                network()?,
-                "Redeeming",
-                Op::Redeem {
-                    token: args.required("token")?,
-                },
-            ),
-            "wallet.onboard" => self.wallet_op(network()?, "Onboarding", Op::Onboard),
-            "wallet.invoice" => self.wallet_op(
-                network()?,
-                "Creating an invoice",
-                Op::Invoice {
-                    amount_sat: amount()?,
-                },
-            ),
-            "wallet.pay" => self.wallet_op(
-                network()?,
-                "Paying",
-                Op::Pay {
-                    invoice: args.required("invoice")?,
-                },
-            ),
-            "wallet.deposit" => {
-                self.wallet_op(network()?, "Creating a deposit address", Op::Deposit)
-            }
-            "wallet.dismiss" => {
-                let id = network()?;
-                self.networks.dismiss(&id.0);
-                Ok(format!("{id}: dismissed"))
+            name if name.starts_with("wallet.") => {
+                self.networks.wallets.act(name, args, &self.refresh)
             }
             "network.remove" => {
                 let id = network()?;
@@ -561,77 +256,8 @@ impl Admin {
                 self.nostr_job(false);
                 Ok("Checking the relays".into())
             }
-            "peer.add" => {
-                let key = edit::peer_key(&args.required("key")?)?;
-                self.edit(|doc| edit::add_peer(doc, &key))?;
-                Ok(format!("{key} is a peer"))
-            }
-            "peer.remove" => {
-                let key = edit::peer_key(&args.required("key")?)?;
-                self.edit(|doc| edit::remove_peer(doc, &key))?;
-                Ok(format!("{key} is no longer a peer"))
-            }
-            "pairing.rotate" => {
-                let mut state = lock(&self.state);
-                state.pairing = new_secret();
-                self.print_pairing_link(&state.pairing);
-                Ok("The old pairing link no longer works".into())
-            }
-            "daemon.restart" => {
-                self.restart.notify_one();
-                Ok("Restarting…".into())
-            }
             other => Err(format!("unknown action {other}")),
         }
-    }
-
-    /// Start `op` on the wallet of `id`, saying it is `doing` it, and run
-    /// it in the background.
-    fn wallet_op(
-        self: &Arc<Self>,
-        id: NetworkId,
-        doing: &'static str,
-        op: Op,
-    ) -> Result<String, String> {
-        let wallet = self.networks.start(&id.0, doing)?;
-        let admin = self.clone();
-        let network = id.0.clone();
-        tokio::spawn(async move {
-            admin
-                .networks
-                .run(&network, wallet, op, &|| admin.refresh())
-                .await;
-        });
-        Ok(format!("{id}: {doing}…"))
-    }
-
-    /// Read the funds of `id` in the background, and its addresses again
-    /// if `addresses`.
-    fn read_funds(self: &Arc<Self>, id: String, addresses: bool) {
-        let admin = self.clone();
-        tokio::spawn(async move {
-            admin
-                .networks
-                .read_funds(&id, addresses, &|| admin.refresh())
-                .await;
-        });
-    }
-
-    /// Let `key` in if `secret` is the pairing link's, replacing it.
-    /// Whether `key` was let in.
-    fn pair(self: &Arc<Self>, key: &str, secret: &str) -> Result<bool, String> {
-        let mut state = lock(&self.state);
-        if self.allowed(&state, &Access::Peer(key.to_string())) {
-            return Ok(false);
-        }
-        if secret != state.pairing {
-            return Err("This pairing link was used already: ask for a new one".into());
-        }
-        self.edit_locked(&mut state, |doc| edit::add_peer(doc, key))?;
-        state.pairing = new_secret();
-        info!("admin: paired {key}");
-        self.print_pairing_link(&state.pairing);
-        Ok(true)
     }
 
     fn edit(
@@ -693,7 +319,7 @@ impl Admin {
             let config = lock(&admin.state).config.clone();
             let changed = admin
                 .networks
-                .sync(&config, retry.as_deref(), &|| admin.refresh())
+                .sync(&config.networks, retry.as_deref(), &|| admin.refresh.now())
                 .await;
             if changed && !config.routes.is_empty() {
                 admin.nostr_job(true);
@@ -717,43 +343,57 @@ impl Admin {
             Err(error) => warn!("admin: keeping the config as it was: {error}"),
         }
     }
+}
 
-    /// Bring every session's page and drafts up to date.
-    fn refresh(&self) {
-        let mut state = lock(&self.state);
-        let drafts = view::drafts(&state.config);
-        let mut patch = Map::new();
-        for (key, value) in &drafts {
-            if state.drafts.get(key) != Some(value) {
-                patch.insert(key.clone(), value.clone());
-            }
+impl App for Admin {
+    fn identity(&self) -> Identity {
+        let key = self.node.node_pubkey();
+        Identity {
+            name: self.name(&lock(&self.state).config),
+            what: "router",
+            description: "Configure and run this Cassis router",
+            hue: autohue(&key),
         }
-        for key in state.drafts.keys() {
-            if !drafts.contains_key(key) {
-                patch.insert(key.clone(), Value::Null);
-            }
-        }
-        state.drafts = drafts;
+    }
+
+    fn admin(&self) -> AdminConfig {
+        lock(&self.state).config.admin.clone()
+    }
+
+    fn edit_admin(self: Arc<Self>, edit: &AdminEdit) -> Result<(), String> {
+        self.edit(|doc| edit.apply(child(doc.as_table_mut(), "admin", toml_edit::table)?))
+    }
+
+    fn drafts(&self) -> Map<String, Value> {
+        view::drafts(&lock(&self.state).config)
+    }
+
+    fn new_drafts(&self) -> Map<String, Value> {
+        view::new_drafts(&lock(&self.state).config)
+    }
+
+    fn tabs(&self, access: vtree::Node) -> Vec<vtree::Node> {
+        let state = lock(&self.state);
         let nostr = lock(&self.nostr);
-        let name = self.name(&state.config);
+        let wallets = &self.networks.wallets;
         let ctx = view::Context {
             config: &state.config,
-            serving: &self.serving,
             networks: self
                 .networks
                 .slots()
                 .iter()
                 .map(|(id, slot)| {
+                    let (can, funds) = wallets.get(id).unzip();
                     let network = view::Network {
                         config: slot.config.clone(),
                         status: slot.status.clone(),
-                        can: slot.wallet.as_ref().map(Wallet::can),
-                        funds: slot.funds.clone(),
+                        can,
+                        funds: funds.unwrap_or_default(),
                     };
                     (id.clone(), network)
                 })
                 .collect(),
-            name: name.clone(),
+            name: self.name(&state.config),
             autoname: autoname(&self.node.node_pubkey()),
             open: self
                 .node
@@ -767,30 +407,22 @@ impl Admin {
             hops: self.node.hops().unwrap_or_default(),
             node_pubkey: self.node.node_pubkey().to_hex(),
             iroh_peer_id: self.node.iroh_peer_id(),
-            http_url: self.http_url.get().cloned(),
-            iroh_url: self.iroh_id.get().map(|id| format!("hyperb://{id}")),
-            pairing_link: self.pairing_link(&state.pairing),
             nostr: &nostr,
             now: unix_now(),
         };
-        let patch = (!patch.is_empty()).then(|| ServerMessage::signal(json!({"d": patch})));
-        for session in lock(&self.sessions).iter() {
-            let mut lines = patch
-                .as_ref()
-                .map(ServerMessage::to_line)
-                .unwrap_or_default();
-            let mut shown = lock(&session.shown);
-            if shown.name != name {
-                lines.push_str(&ServerMessage::from(self.metadata(&name)).to_line());
-                shown.name = name.clone();
-            }
-            let allowed = self.allowed(&state, &session.access);
-            let tree = view::page(&ctx, &session.access, allowed, shown.flash.as_ref());
-            for message in vtree::diff_into(None, &shown.tree, &tree) {
-                lines.push_str(&message.to_line());
-            }
-            shown.tree = tree;
-            session.send(lines);
+        view::tabs(&ctx, access)
+    }
+
+    fn act(self: Arc<Self>, name: &str, args: &Args) -> Result<String, String> {
+        self.perform(name, args)
+    }
+
+    fn tick(self: Arc<Self>, pages_open: bool) {
+        self.reload_if_modified();
+        // Also picks up changes left waiting for hops to settle.
+        self.sync_networks(None);
+        if pages_open {
+            self.networks.wallets.keep_fresh(&self.refresh);
         }
     }
 }
@@ -799,8 +431,4 @@ fn modified(dir: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(dir.join(config::FILE))
         .and_then(|metadata| metadata.modified())
         .ok()
-}
-
-fn new_secret() -> String {
-    lowercase_hex::encode(rand::random::<[u8; 16]>())
 }

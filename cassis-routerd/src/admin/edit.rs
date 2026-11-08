@@ -2,113 +2,12 @@
 //! config document. Each edit leaves what its arguments do not name as
 //! it is, comments included.
 
+use cassis_admin::config::{child, implicit_table, put, put_text};
+use cassis_admin::Args;
 use cassis_core::node::RouteOffer;
 use cassis_core::NetworkId;
-use hypereffect::{Action, Map, Value};
+use hypereffect::Value;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike};
-
-/// An action's payload, over the fields of the draft it names with
-/// `draft` (the signal `d.<draft>`). Fields come as JSON values or as
-/// the strings inputs hold: absent means unchanged, and `null` or empty
-/// unsets what is optional.
-pub struct Args(Map<String, Value>);
-
-impl Args {
-    pub fn of(action: &Action) -> Self {
-        let mut payload = match &action.payload {
-            Some(Value::Object(payload)) => payload.clone(),
-            _ => Map::new(),
-        };
-        let mut args = payload
-            .remove("draft")
-            .and_then(|draft| {
-                action
-                    .signal(&format!("d.{}", draft.as_str()?))?
-                    .as_object()
-                    .cloned()
-            })
-            .unwrap_or_default();
-        args.extend(payload);
-        Args(args)
-    }
-
-    /// Whether the payload named the draft `draft`.
-    pub fn draft(action: &Action) -> Option<&str> {
-        action.payload.as_ref()?.get("draft")?.as_str()
-    }
-
-    pub fn text(&self, key: &str) -> Result<Option<String>, String> {
-        Ok(match self.0.get(key) {
-            None => None,
-            Some(Value::Null) => Some(String::new()),
-            Some(Value::String(text)) => Some(text.trim().to_string()),
-            Some(Value::Number(n)) => Some(n.to_string()),
-            Some(Value::Bool(b)) => Some(b.to_string()),
-            Some(_) => return Err(format!("{key}: expected text")),
-        })
-    }
-
-    pub fn required(&self, key: &str) -> Result<String, String> {
-        self.text(key)?
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| format!("{key} is required"))
-    }
-
-    pub fn number(&self, key: &str) -> Result<Option<Option<u64>>, String> {
-        let bad = || format!("{key}: expected a whole number");
-        Ok(match self.0.get(key) {
-            None => None,
-            Some(Value::Null) => Some(None),
-            Some(Value::Number(n)) => Some(Some(match n.as_u64() {
-                Some(n) => n,
-                None => n
-                    .as_f64()
-                    .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f <= i64::MAX as f64)
-                    .ok_or_else(bad)? as u64,
-            })),
-            Some(Value::String(text)) if text.trim().is_empty() => Some(None),
-            Some(Value::String(text)) => Some(Some(text.trim().parse().map_err(|_| bad())?)),
-            Some(_) => return Err(bad()),
-        })
-    }
-
-    /// A boolean, or empty for unset.
-    pub fn flag(&self, key: &str) -> Result<Option<Option<bool>>, String> {
-        Ok(match self.0.get(key) {
-            None => None,
-            Some(Value::Null) => Some(None),
-            Some(Value::Bool(b)) => Some(Some(*b)),
-            Some(Value::String(text)) => Some(match text.trim() {
-                "" => None,
-                "true" | "yes" | "on" => Some(true),
-                "false" | "no" | "off" => Some(false),
-                _ => return Err(format!("{key}: expected true or false")),
-            }),
-            Some(_) => return Err(format!("{key}: expected true or false")),
-        })
-    }
-
-    /// A list of strings, or one string of them separated by spaces or
-    /// commas.
-    pub fn list(&self, key: &str) -> Result<Option<Option<Vec<String>>>, String> {
-        let items: Vec<String> = match self.0.get(key) {
-            None => return Ok(None),
-            Some(Value::Null) => Vec::new(),
-            Some(Value::String(text)) => text
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect(),
-            Some(Value::Array(items)) => items
-                .iter()
-                .map(|item| item.as_str().map(|item| item.trim().to_string()))
-                .collect::<Option<_>>()
-                .ok_or_else(|| format!("{key}: expected a list of text"))?,
-            Some(_) => return Err(format!("{key}: expected a list of text")),
-        };
-        Ok(Some((!items.is_empty()).then_some(items)))
-    }
-}
 
 /// `name`, `nostr_relays`, `max_reservations`.
 pub fn settings(doc: &mut DocumentMut, args: &Args) -> Result<(), String> {
@@ -122,94 +21,7 @@ pub fn settings(doc: &mut DocumentMut, args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// `listen`, `iroh`.
-pub fn admin(doc: &mut DocumentMut, args: &Args) -> Result<(), String> {
-    let admin = child(doc.as_table_mut(), "admin", toml_edit::table)?;
-    if let Some(listen) = args.text("listen")? {
-        put(admin, "listen", Some(listen.into()));
-    }
-    if let Some(iroh) = args.flag("iroh")? {
-        put(admin, "iroh", iroh.filter(|b| !b).map(Value::from));
-    }
-    Ok(())
-}
-
-/// The kinds of network [`new_network_id`] takes, with their labels and
-/// whether this build has them.
-pub const KINDS: [(&str, &str, bool); 8] = [
-    ("arkade", "Arkade", cfg!(feature = "arkade")),
-    ("cashu", "Cashu", cfg!(feature = "cashu")),
-    ("liquid", "Liquid", cfg!(feature = "liquid")),
-    ("lnd", "Lightning (LND)", cfg!(feature = "lightning")),
-    ("bark", "Lightning (bark)", cfg!(feature = "bark-lightning")),
-    ("fedimint", "Fedimint", cfg!(feature = "fedimint")),
-    ("bitcoin", "Bitcoin", cfg!(feature = "bitcoin")),
-    ("rootstock", "Rootstock", cfg!(feature = "rootstock")),
-];
-
-/// The chains a kind of [`KINDS`] runs on, the first its default.
-pub fn chains(kind: &str) -> &'static [&'static str] {
-    match kind {
-        "arkade" => &["mainnet", "mutinynet"],
-        "bitcoin" => &["mainnet", "mutinynet", "regtest"],
-        "liquid" | "rootstock" => &["mainnet", "testnet"],
-        "lnd" | "bark" => &["mainnet", "signet", "mutinynet", "regtest"],
-        _ => &[],
-    }
-}
-
-/// The id of the network a `network.add` describes: `kind`, one of
-/// [`KINDS`], then `chain` (one of its [`chains`]), `mint` (a cashu
-/// mint's URL) or `invite` (a fedimint invite code).
-pub fn new_network_id(args: &Args) -> Result<NetworkId, String> {
-    let kind = args.required("kind")?;
-    let (_, label, built) = KINDS
-        .iter()
-        .find(|(name, ..)| *name == kind)
-        .ok_or_else(|| format!("kind {kind}: expected one of {}", kind_names()))?;
-    if !built {
-        return Err(format!("this build has no {label} support"));
-    }
-    let spec = match kind.as_str() {
-        "cashu" => {
-            let mint = args.required("mint")?;
-            let host = mint
-                .strip_prefix("https://")
-                .or_else(|| mint.strip_prefix("http://"))
-                .unwrap_or(&mint)
-                .trim_end_matches('/');
-            format!("cashu::{host}")
-        }
-        "fedimint" => format!("fedimint::{}", args.required("invite")?),
-        kind => {
-            let chains = chains(kind);
-            let chain = args.text("chain")?.filter(|chain| !chain.is_empty());
-            let chain = chain.as_deref().unwrap_or(chains[0]);
-            if !chains.contains(&chain) {
-                return Err(format!(
-                    "{label} runs on {}, not {chain}",
-                    chains.join(", ")
-                ));
-            }
-            let kind = if matches!(kind, "lnd" | "bark") {
-                "lightning"
-            } else {
-                kind
-            };
-            match chain {
-                "mainnet" => kind.to_string(),
-                chain => format!("{kind}::{chain}"),
-            }
-        }
-    };
-    NetworkId::parse(&spec)
-}
-
-fn kind_names() -> String {
-    KINDS.map(|(name, ..)| name).join(", ")
-}
-
-/// Adds the network [`new_network_id`] describes, with the fields of
+/// Adds the network `new_network_id` describes, with the fields of
 /// [`network`] and the backend its kind says.
 pub fn add_network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
     if doc
@@ -340,44 +152,6 @@ pub fn remove_route(doc: &mut DocumentMut, from: &NetworkId, to: &NetworkId) -> 
     Ok(())
 }
 
-/// `key`: a renderer's iroh key, which [`peer_key`] made canonical.
-pub fn add_peer(doc: &mut DocumentMut, key: &str) -> Result<(), String> {
-    let peers = peers(doc)?;
-    if !peers.iter().any(|peer| peer.as_str() == Some(key)) {
-        peers.push(key);
-    }
-    Ok(())
-}
-
-pub fn remove_peer(doc: &mut DocumentMut, key: &str) -> Result<(), String> {
-    let peers = peers(doc)?;
-    let before = peers.len();
-    peers.retain(|peer| peer.as_str() != Some(key));
-    if peers.len() == before {
-        return Err(format!("{key} is not a peer"));
-    }
-    Ok(())
-}
-
-/// A renderer key in its canonical form: lowercase hex.
-pub fn peer_key(key: &str) -> Result<String, String> {
-    key.trim()
-        .parse::<iroh::PublicKey>()
-        .map(|key| key.to_string())
-        .map_err(|e| format!("{key}: not an iroh key: {e}"))
-}
-
-fn peers(doc: &mut DocumentMut) -> Result<&mut toml_edit::Array, String> {
-    let admin = child(doc.as_table_mut(), "admin", toml_edit::table)?;
-    if admin.get("peers").is_none() {
-        admin.insert("peers", toml_edit::value(toml_edit::Array::new()));
-    }
-    admin
-        .get_mut("peers")
-        .and_then(Item::as_array_mut)
-        .ok_or_else(|| "admin.peers is not a list".to_string())
-}
-
 fn routes(doc: &mut DocumentMut) -> Result<&mut toml_edit::ArrayOfTables, String> {
     if doc.get("routes").is_none() {
         doc.insert("routes", Item::ArrayOfTables(Default::default()));
@@ -401,54 +175,8 @@ fn find_route(
     })
 }
 
-fn implicit_table() -> Item {
-    let mut table = Table::new();
-    table.set_implicit(true);
-    Item::Table(table)
-}
-
 fn inline_table() -> Item {
     toml_edit::value(InlineTable::new())
-}
-
-/// The table under `key`, made with `new` if missing.
-fn child<'a>(
-    table: &'a mut dyn TableLike,
-    key: &str,
-    new: fn() -> Item,
-) -> Result<&'a mut dyn TableLike, String> {
-    if table.get(key).is_none() {
-        table.insert(key, new());
-    }
-    table
-        .get_mut(key)
-        .and_then(Item::as_table_like_mut)
-        .ok_or_else(|| format!("{key} is not a table"))
-}
-
-/// Sets or removes `key`, keeping the comments around its old value
-/// and above its key.
-fn put(table: &mut dyn TableLike, key: &str, value: Option<Value>) {
-    let Some(value) = value else {
-        table.remove(key);
-        return;
-    };
-    let mut value = toml_value(value);
-    match table.get_mut(key).and_then(Item::as_value_mut) {
-        Some(old) => {
-            *value.decor_mut() = old.decor().clone();
-            *old = value;
-        }
-        None => {
-            table.insert(key, Item::Value(value));
-        }
-    }
-}
-
-fn put_text(table: &mut dyn TableLike, key: &str, change: Option<String>) {
-    if let Some(text) = change {
-        put(table, key, (!text.is_empty()).then(|| text.into()));
-    }
 }
 
 fn put_number(
@@ -475,24 +203,11 @@ fn toml_int(n: u64) -> Result<i64, String> {
     i64::try_from(n).map_err(|_| format!("{n} is too large"))
 }
 
-fn toml_value(value: Value) -> toml_edit::Value {
-    match value {
-        Value::Bool(b) => b.into(),
-        Value::Number(n) => n.as_i64().map_or_else(|| n.to_string().into(), Into::into),
-        Value::String(text) => text.into(),
-        Value::Array(items) => items
-            .into_iter()
-            .map(toml_value)
-            .collect::<toml_edit::Array>()
-            .into(),
-        other => other.to_string().into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypereffect::json;
+    use cassis_admin::networks::{new_network_id, ALL_KINDS};
+    use hypereffect::{json, Action, Map};
 
     fn args(payload: Value) -> Args {
         Args::of(&Action {
@@ -564,7 +279,7 @@ mod tests {
         let lnd = json!({"backend": "lnd", "lnd_rest_url": "https://127.0.0.1:8080", "bark_server_url": "ignored"});
         network(&mut doc, &lightning, &args(lnd)).unwrap();
         let cashu = args(json!({"kind": "cashu", "mint": "https://mint.example/"}));
-        let cashu_id = new_network_id(&cashu).unwrap();
+        let cashu_id = new_network_id(&cashu, &ALL_KINDS).unwrap();
         assert_eq!(cashu_id, id("cashu::mint.example"));
         add_network(&mut doc, &cashu_id, &cashu).unwrap();
         assert!(add_network(&mut doc, &cashu_id, &cashu).is_err());
@@ -579,7 +294,7 @@ mod tests {
 
     #[test]
     fn new_network_ids() {
-        let new = |payload| new_network_id(&args(payload));
+        let new = |payload| new_network_id(&args(payload), &ALL_KINDS);
         if cfg!(feature = "arkade") {
             assert_eq!(new(json!({"kind": "arkade"})), Ok(id("arkade")));
             assert_eq!(
@@ -595,19 +310,5 @@ mod tests {
             );
         }
         assert!(new(json!({"kind": "dogecoin"})).is_err());
-    }
-
-    #[test]
-    fn drafts_under_payloads() {
-        let mut signals = Map::new();
-        signals.insert("d".into(), json!({"f": {"a": "draft", "b": "draft"}}));
-        let args = Args::of(&Action {
-            name: "test".into(),
-            payload: Some(json!({"draft": "f", "b": "payload"})),
-            signals,
-        });
-        assert_eq!(args.text("a").unwrap().as_deref(), Some("draft"));
-        assert_eq!(args.text("b").unwrap().as_deref(), Some("payload"));
-        assert_eq!(args.text("draft").unwrap(), None);
     }
 }
