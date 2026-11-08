@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Bring the live environment up: relay, local mints, our federation, our
-# arkd, then every router home under $LIVE/nodes listed in ROUTERS.
+# arkd, then every router home under $LIVE/nodes listed in ROUTERS, and
+# the gateway and preimage server if they ever ran.
 # Idempotent across restarts: state lives under $LIVE. See README.md for
 # first-time setup and funding.
 set -euo pipefail
@@ -17,3 +18,4 @@ ROUTERS="${ROUTERS:-r1 r2 r3 r4 r5 r6 r7}"
 for router in $ROUTERS; do
   [ -d "$LIVE/nodes/$router" ] && "$S/node.sh" route "$router"
 done
+[ ! -d "$LIVE/nodes/gateway" ] || "$S/offline.sh" start

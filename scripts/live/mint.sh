@@ -11,12 +11,22 @@
 #       id it prints a bolt11 to pay (e.g. from faucet.mutinynet.com) and
 #       its quote id; with one it waits for the payment and redeems it
 #
-# Mint n is the network `cashu::127.0.0.1:<3337+n>`.
+# Mint n is the network `cashu::127.0.0.1:<3337+n>`. <node> may be a
+# running daemon: the token then goes through its admin interface.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
 port() { echo $((3337 + $1)); }
 dir() { echo "$LIVE/mint$1"; }
+
+# credit <node> <network> <token>
+credit() {
+  if daemon_up "$1"; then
+    wallet_op "$1" "$2" redeem "\"token\":\"$3\""
+  else
+    cassis "$1" cashu --network "$2" receive --token "$3"
+  fi
+}
 
 case "${1:-}" in
   start)
@@ -42,7 +52,7 @@ case "${1:-}" in
     cdk() { cdk-cli -w "$LIVE/cdk-cli" -n "$@"; }
     cdk mint "$url" "$sats" > /dev/null
     token="$(cdk send -a "$sats" --mint-url "$url" | grep -m1 -E '^cashu[AB]')"
-    cassis "$node" cashu --network "cashu::127.0.0.1:$(port "$n")" receive --token "$token"
+    credit "$node" "cashu::127.0.0.1:$(port "$n")" "$token"
     ;;
   fund-external)
     host="$2" node="$3" sats="$4"
@@ -59,7 +69,7 @@ case "${1:-}" in
     cdk mint "https://$host" "$sats" --quote-id "$5" > /dev/null
     # Real mints charge input fees: keep 1% for them.
     token="$(cdk send -a "$((sats * 99 / 100))" --mint-url "https://$host" | grep -m1 -E '^cashu[AB]')"
-    cassis "$node" cashu --network "cashu::$host" receive --token "$token"
+    credit "$node" "cashu::$host" "$token"
     ;;
   *) echo "usage: $0 start|stop <n> | fund <n> <node> <sats> | fund-external <host> <node> <sats> [quote]" >&2; exit 1 ;;
 esac
