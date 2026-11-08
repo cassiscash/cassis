@@ -7,7 +7,8 @@
 #   scripts/live/fedimint.sh invite    its network id, fedimint::<invite>
 #   scripts/live/fedimint.sh fund <node> <sats>
 #       peg <sats> in from the funder into <node>'s wallet (needs the
-#       peg-in's confirmations: a few minutes)
+#       peg-in's confirmations: a few minutes). <node> may be a running
+#       daemon: it then goes through its admin interface.
 #
 # fedimintd is `$CASSIS_FEDIMINTD`, or <workspace>/tmp/fedimintd-v0.12.1.
 # It is a nix bundle running in a chroot: paths given to it must be
@@ -18,8 +19,6 @@ source "$(dirname "$0")/env.sh"
 FEDIMINTD="${CASSIS_FEDIMINTD:-$WORKSPACE/tmp/fedimintd-v0.12.1}"
 DATA="$LIVE/fedimint"
 UI="http://127.0.0.1:18175"
-
-invite() { echo "fedimint::$(tr -d '[:space:]' < "$DATA/invite-code")"; }
 
 case "${1:-}" in
   start)
@@ -46,21 +45,27 @@ case "${1:-}" in
       curl -sf -c "$cookies" -b "$cookies" -X POST "$UI/start_dkg" > /dev/null
       until [ -f "$DATA/invite-code" ]; do sleep 1; done
     fi
-    echo "federation up: $(invite)"
+    echo "federation up: $(fedimint_network)"
     ;;
   # The bundle runs fedimintd under wrapper processes: signal the group.
   stop) kill -INT -- "-$(cat "$DATA/fedimintd.pid")" ;;
-  invite) invite ;;
+  invite) fedimint_network ;;
   fund)
-    node="$2" sats="$3"
+    node="$2" sats="$3" network="$(fedimint_network)"
+    if daemon_up "$node"; then
+      "$LIVE_SCRIPTS/funder.sh" send-btc "$(wallet_op "$node" "$network" deposit)" "$sats"
+      wallet_done "$node" "$network"
+      wallet_balance "$node" "$network"
+      exit 0
+    fi
     out="$LIVE/nodes/$node.pegin"
-    cassis "$node" fedimint --network "$(invite)" deposit --wait > "$out" &
+    cassis "$node" fedimint --network "$network" deposit --wait > "$out" &
     waiting=$!
     until [ -s "$out" ]; do sleep 0.5; done
     address="$(head -1 "$out")"
     "$LIVE_SCRIPTS/funder.sh" send-btc "$address" "$sats"
     wait "$waiting"
-    cassis "$node" fedimint --network "$(invite)" balance
+    cassis "$node" fedimint --network "$network" balance
     ;;
   *) echo "usage: $0 start | stop | invite | fund <node> <sats>" >&2; exit 1 ;;
 esac

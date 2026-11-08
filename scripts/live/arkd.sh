@@ -10,7 +10,8 @@
 #   scripts/live/arkd.sh balance          operator's on-chain balance
 #   scripts/live/arkd.sh note <sats>      issue an arknote
 #   scripts/live/arkd.sh give <node> <sats>
-#       issue an arknote and redeem it into <node>'s wallet
+#       issue an arknote and redeem it into <node>'s wallet; <node> may
+#       be a running daemon, reached through its admin interface
 #
 # Batches last `$ARKD_VTXO_TREE_EXPIRY` seconds (a multiple of 512),
 # 4h by default: longer than the HTLCs of the live routes, which must
@@ -78,6 +79,12 @@ case "${1:-}" in
   fund) "$LIVE_SCRIPTS/funder.sh" send-btc "$(admin GET /wallet/address | json address)" "$2" ;;
   balance) admin GET /wallet/balance; echo ;;
   note) admin POST /note -d "{\"amount\":$2,\"quantity\":1}" | sed -n 's/.*"notes": *\[ *"\([^"]*\)".*/\1/p' ;;
-  give) cassis "$2" arkade --network "$NETWORK" redeem-note "$("$0" note "$3")" ;;
+  give)
+    if daemon_up "$2"; then
+      wallet_op "$2" "$NETWORK" redeem "\"token\":\"$("$0" note "$3")\""
+    else
+      cassis "$2" arkade --network "$NETWORK" redeem-note "$("$0" note "$3")"
+    fi
+    ;;
   *) echo "usage: $0 start | stop | fund <sats> | balance | note <sats> | give <node> <sats>" >&2; exit 1 ;;
 esac
