@@ -1,0 +1,40 @@
+relay on ws://localhost:10547
+mint 1 up: cashu::127.0.0.1:3338
+mint 2 up: cashu::127.0.0.1:3339
+federation up: fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6
+arkd up: arkade::127.0.0.1:7070
+r1 running (pid 896348), admin on hyperb://localhost:7101, log at $LIVE/nodes/r1.log
+r1: cashu::127.0.0.1:3338 saved
+r1: cashu::127.0.0.1:3339 saved
+r1: Route cashu::127.0.0.1:3338 → cashu::127.0.0.1:3339 saved
+r1: Route cashu::127.0.0.1:3339 → cashu::127.0.0.1:3338 saved
+r2 running (pid 896601), admin on hyperb://localhost:7102, log at $LIVE/nodes/r2.log
+r2: cashu::127.0.0.1:3339 saved
+r2: rootstock::testnet saved
+r2: Route cashu::127.0.0.1:3339 → rootstock::testnet saved
+r2: Route rootstock::testnet → cashu::127.0.0.1:3339 saved
+r3 running (pid 897122), admin on hyperb://localhost:7103, log at $LIVE/nodes/r3.log
+r3: rootstock::testnet saved
+r3: fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 saved
+r3: Route rootstock::testnet → fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 saved
+r3: Route fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 → rootstock::testnet saved
+r4 running (pid 897663), admin on hyperb://localhost:7104, log at $LIVE/nodes/r4.log
+r4: fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 saved
+r4: arkade::mutinynet saved
+r4: Route fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 → arkade::mutinynet saved
+r4: Route arkade::mutinynet → fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 saved
+r5 running (pid 898312), admin on hyperb://localhost:7105, log at $LIVE/nodes/r5.log
+r5: arkade::mutinynet saved
+r5: arkade::127.0.0.1:7070 saved
+r5: Route arkade::mutinynet → arkade::127.0.0.1:7070 saved
+r5: Route arkade::127.0.0.1:7070 → arkade::mutinynet saved
+r6 running (pid 898685), admin on hyperb://localhost:7106, log at $LIVE/nodes/r6.log
+r6: cashu::127.0.0.1:3339 saved
+r6: cashu::cashu.mutinynet.com saved
+r6: Route cashu::127.0.0.1:3339 → cashu::cashu.mutinynet.com saved
+r6: Route cashu::cashu.mutinynet.com → cashu::127.0.0.1:3339 saved
+r7 running (pid 899065), admin on hyperb://localhost:7107, log at $LIVE/nodes/r7.log
+r7: arkade::127.0.0.1:7070 saved
+r7: cashu::127.0.0.1:3339 saved
+r7: Route arkade::127.0.0.1:7070 → cashu::127.0.0.1:3339 saved
+r7: Route cashu::127.0.0.1:3339 → arkade::127.0.0.1:7070 saved

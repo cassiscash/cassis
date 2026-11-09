@@ -1,0 +1,59 @@
+=== 1 hop cashu to cashu: alice pays bob 1000000 msat from cashu::127.0.0.1:3338 to cashu::127.0.0.1:3339 at 11:00:08
+1001500 msat over 1 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d9243c4a675c5 (forwards 1000000 msat)
+invoice 346e340: 1000000 msat to bob
+payer: paid; preimage 5e2b73fe2497ddea4eb0cc54fbf7fbc5a29a885b050da69e7d0a3ee8a601e35a (4s)
+payee: claimed
+exit 0
+=== 2 hops to rootstock: alice pays carol 1000000 msat from cashu::127.0.0.1:3338 to rootstock::testnet at 11:00:15
+1003000 msat over 2 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d9243c4a675c5 (forwards 1001500 msat)
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268afa66a4 (forwards 1000000 msat)
+invoice 32d6cbe: 1000000 msat to carol
+payer: paid; preimage ade9b60f0efbbf540e42bd5956247bd5abc323a6f8756bd06fb22edc0c85d66d (84s)
+payee: claimed
+exit 0
+=== 3 hops to fedimint: alice pays dave 1000000 msat from cashu::127.0.0.1:3338 to fedimint::fed11qgqpw9thwvaz7te at 11:01:41
+1004501 msat over 3 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d9243c4a675c5 (forwards 1003000 msat)
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268afa66a4 (forwards 1001500 msat)
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 via c
+invoice 6af9a1b: 1000000 msat to dave
+payer: paid; preimage bf4f65e1dd1e5c258b1527ab0b0ccfa6733e133e09b38488ac4390dec73eda39 (83s)
+payee: claimed
+exit 0
+=== 4 hops to arkade mutinynet: alice pays erin 1000000 msat from cashu::127.0.0.1:3338 to arkade::mutinynet at 11:03:07
+invoice 175e053: 1000000 msat to erin
+payer: error: route to arkade::mutinynet: leg 2 would run 2700s, its router accepts at most 2402s (2s)
+payee: not claimed
+exit 0
+=== 2 hops to our arkade: alice pays frank 500000 msat from cashu::127.0.0.1:3338 to arkade::127.0.0.1:7070 at 11:04:17
+502500 msat over 2 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d9243c4a675c5 (forwards 501250 msat)
+  2: cashu::127.0.0.1:3339 -> arkade::127.0.0.1:7070 via ac0beab4d9f9507593acdf06930cae94d585d047baf31bf70eef5634f26d6595 (forwards 500000 msat)
+invoice 4d40e69: 500000 msat to frank
+payer: paid; preimage 9b33ea3fbb9768ae5f5ec8ad2e607c61c1fe6aacca066c067f19a4d1f2137565 (5s)
+payee: claimed
+exit 0
+=== 2 hops to public mint: alice pays grace 1000000 msat from cashu::127.0.0.1:3338 to cashu::cashu.mutinynet.com at 11:04:24
+1003000 msat over 2 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d9243c4a675c5 (forwards 1001500 msat)
+  2: cashu::127.0.0.1:3339 -> cashu::cashu.mutinynet.com via fa187138e63e39edde36276e14aa397f688b562293eef5f1b516f659bf49656f (forwards 1000000 msat)
+invoice 5d58300: 1000000 msat to grace
+payer: paid; preimage 744e32b27e180f1b3283a09767d18699d0c528f59ce781e79760adbc04ea8070 (6s)
+payee: claimed
+exit 0
+=== 3 hops out of public mint: grace pays dave 300000 msat from cashu::cashu.mutinynet.com to fedimint::fed11qgqpw9thwvaz7te at 11:04:31
+303451 msat over 3 hop(s)
+  1: cashu::cashu.mutinynet.com -> cashu::127.0.0.1:3339 via fa187138e63e39edde36276e14aa397f688b562293eef5f1b516f659bf49656f (forwards 302300 msat)
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268afa66a4 (forwards 301150 msat)
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6 via c
+invoice 6d839e3: 300000 msat to dave
+payer: paid; preimage 0b206855420cd093145cd5c2e2854c01e21df360502048821a8360d7009e4eb4 (105s)
+payee: claimed
+exit 0
+=== arkade first to fedimint: henry pays dave 1000000 msat from arkade::127.0.0.1:7070 to fedimint::fed11qgqpw9thwvaz7te at 11:06:19
+invoice 8ec7791: 1000000 msat to dave
+payer: error: route to fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglvujfzg99gu7l6: leg 0 would run 5100s, its router accepts at most 2402s (2
+payee: not claimed
+exit 0

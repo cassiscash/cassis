@@ -18,6 +18,7 @@ source "$(dirname "$0")/env.sh"
 payer="$1" from="$2" payee="$3" amount="$4" hook="${5:-}"
 L="$LIVE/nodes"
 offline="${OFFLINE:-}"
+failed=0
 rm -f "$L/$payee.inv"
 if [ -n "$offline" ]; then
   read -ra endpoints <<< "$("$LIVE_SCRIPTS/offline.sh" endpoints)"
@@ -40,6 +41,7 @@ if cassis "$payer" pay --from "$from" --invoice "$invoice" --nostr-relay "$RELAY
   echo "payer: $(tail -1 "$L/$payer.pay.log") ($(($(date +%s) - start))s)"
 else
   echo "payer: $(grep -v DEBUG "$L/$payer.pay.log" | tail -1) ($(($(date +%s) - start))s)"
+  failed=1
 fi
 if [ -n "$offline" ]; then
   # The gateway pays the payee once it is paid, which takes a moment.
@@ -63,5 +65,7 @@ if grep -q '^claimed' "$L/$payee.inv"; then
   echo "payee: claimed"
 else
   echo "payee: not claimed"
+  failed=1
 fi
 kill -INT "$payee_pid" 2> /dev/null || true
+exit "$failed"

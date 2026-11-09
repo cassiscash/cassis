@@ -1,0 +1,79 @@
+r5: Route arkade::mutinynet → arkade::127.0.0.1:7070 removed
+r5: Route arkade::127.0.0.1:7070 → arkade::mutinynet removed
+
+=== 1 hop, cashu to cashu: alice pays bob 1000000 msat (11:19:55)
+1001500 msat over 1 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d92
+invoice d755dba: 1000000 msat to bob
+payer: paid; preimage e43242cd04b0bec861d4324abc8702e7ca3a8aee715006371f20d69a9a4977c6 (4s)
+payee: claimed
+exit 0
+
+=== 2 hops to rootstock: alice pays carol 1000000 msat (11:20:00)
+1003000 msat over 2 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d92
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268
+invoice 8d8c6e9: 1000000 msat to carol
+payer: paid; preimage c283b84eac0f1f0af6d72ccd129e0deccd5a93c2a386e21e37837bdd7cedddda (66s)
+payee: claimed
+exit 0
+
+=== 3 hops to fedimint: alice pays dave 1000000 msat (11:21:07)
+1004501 msat over 3 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d92
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthy
+invoice fb2bcac: 1000000 msat to dave
+payer: paid; preimage cf18ba0ee2047cd576c72d74dfbc33850cd08b52ee443412225649bc8ee6ac09 (75s)
+payee: claimed
+exit 0
+
+=== 4 hops to arkade mutinynet: alice pays erin 1000000 msat (11:22:25)
+1006003 msat over 4 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d92
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthy
+  4: fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglv
+invoice 1030365: 1000000 msat to erin
+payer: paid; preimage 9bbfcd2efbc9695fd52290ceb641953733ebfac12a958ae79eb78e0bff5e3451 (120s)
+payee: claimed
+exit 0
+
+=== 2 hops to our arkade: alice pays frank 500000 msat (11:24:36)
+502500 msat over 2 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d92
+  2: cashu::127.0.0.1:3339 -> arkade::127.0.0.1:7070 via ac0beab4d9f9507593acdf06930cae94d585d047baf31bf70eef5
+invoice 3edbf6c: 500000 msat to frank
+payer: paid; preimage 6133ab53bdd57a786bef0fc075a70dbd745d1e9b02f69b33c74ca75e4692918f (4s)
+payee: claimed
+exit 0
+
+=== 2 hops to the public mint: alice pays grace 1000000 msat (11:24:42)
+1003000 msat over 2 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d92
+  2: cashu::127.0.0.1:3339 -> cashu::cashu.mutinynet.com via fa187138e63e39edde36276e14aa397f688b562293eef5f1b
+invoice 9e6d879: 1000000 msat to grace
+payer: paid; preimage 6c16a6bba95778c5b3be64371e331fe10fa0bd9817c57e94893123f5e5f1fc7a (5s)
+payee: claimed
+exit 0
+
+=== 3 hops out of the public mint: grace pays dave 300000 msat (11:24:49)
+303451 msat over 3 hop(s)
+  1: cashu::cashu.mutinynet.com -> cashu::127.0.0.1:3339 via fa187138e63e39edde36276e14aa397f688b562293eef5f1b
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthy
+invoice 75b618e: 300000 msat to dave
+payer: paid; preimage 855cbbe9565b6f3655af2c918d95668c5fa6dc6eed8f75949c053ee5c7fd82d5 (40s)
+payee: claimed
+exit 0
+
+=== 3 hops, arkade first: henry pays dave 1000000 msat (11:25:32)
+1004501 msat over 3 hop(s)
+  1: arkade::127.0.0.1:7070 -> cashu::127.0.0.1:3339 via ac0beab4d9f9507593acdf06930cae94d585d047baf31bf70eef5
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthy
+invoice 0bf82bc: 1000000 msat to dave
+payer: paid; preimage 8ed8fe02564b31a14413cacb3bb75e81b3ca520258fd415d9c4f0538d8f8f267 (99s)
+payee: claimed
+exit 0
+r5: Route arkade::127.0.0.1:7070 → arkade::mutinynet saved

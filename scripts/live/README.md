@@ -48,6 +48,7 @@ node's home):
 | `arkd.sh` | our operator: `start`, `fund` (on-chain float), `note`, `give` |
 | `node.sh` | `route`/`stop` routers in the background, `sync`, `pay`, `route-of`; `balance`, `address`, `onboard`, `hops` of a running router |
 | `offline.sh` | the gateway and preimage server: `start`, `stop`, `endpoints` |
+| `demo.sh` | the demo payments of [DEMO.md](DEMO.md): `balances`, `online`, `offline` |
 | `pay.sh` | one payment with the payee serving its invoice, or offline with `OFFLINE=1`, plus an optional failure hook |
 | `up.sh` / `down.sh` | bring everything up / down again |
 | `hooks/` | `pay.sh` failure hooks: `kill-router.sh`, `kill-payee.sh` |
@@ -319,3 +320,17 @@ m. Redeeming an arknote into a wallet that already holds a live VTXO
    the SDK settles the note together with the VTXO and arkd builds a
    connector for the VTXO only. `arkd.sh give` only works on wallets
    without live VTXOs.
+n. Fedimint HTLCs have no margin between sender and receiver: the sender
+   locks as many blocks as the time left, and the receiver refuses if
+   fewer are left when it verifies, so the block count moving in between
+   refuses a good HTLC (`contract expires before the expiry`, 1 of 9 hops
+   on 2026-11-09) after it was funded, locking the route until expiry.
+o. routerd cannot raise what a network derives for
+   `max_incoming_lifetime_secs` as `enable --max-incoming-lifetime` could:
+   a route's value only shortens it. A router whose wallet only ever held
+   VTXOs of an operator's older, shorter batches (r5) announces too little,
+   and finding m keeps it from getting a new one.
+p. Payers do not try another route when the cheapest cannot carry the
+   payment's lifetime (`leg N would run ...`), though a longer one could.
+q. Payee wallets warn `listing invoices: decode record: invoice names
+   another endpoint than its payee` on invoices stored before 6c2ebe5.

@@ -1,0 +1,65 @@
+
+=== start the gateway and preimage server (11:18:06)
+gateway already running (pid 925962)
+preimage already running (pid 926001)
+gateway 16b40abca14dc570d4b53aa6c0a0aa1c2d8e035b57637165c19b70c71cb7112c
+preimage server 5629507e0769fb7fa436630770c801132385a29299b7451d0649002fb7ed5f3a
+
+=== fund the gateway, unless it has funds (11:18:21)
+Spendable: 17,500 sat
+Spendable: 2,500 sat
+
+=== A. one invoice: bob offline, alice pays on mint 1, the gateway pays bob on mint 2 (11:18:29)
+invoice 9836852: 1000000 msat to bob
+payer: paid; preimage 877800898ae90a36e30ac361997627643cb9081491d59a06af6674f644dfa297 (3s)
+payee: redeemed
+exit 0
+claimed 943708ec3579d30b74d24927a10a41526da9ce9b9c1b1552b4153d0ed9836852      1000000 msat on cashu::127.0.0.1:3339
+
+=== B. standing authorization: bob authorizes once and leaves (11:18:44)
+{"destinations":["cashu::127.0.0.1:3339"],"max_amount_msat":3000000,"min_amount_msat":1000}
+exit 0
+
+=== B1. alice asks the gateway for an invoice in bob's name, and pays it (11:18:48)
+{"payment_hash":"280b33093f8166ebf84e12931fdc2a677ed880020a73d123a374b1d182b52a49","amount_msat":1500000,"networks":["arkade::127.0.0.1:7070","cashu::127.0.0.1:3338","cashu::127.0.0.1:3339"]}
+paid; preimage 8546281b3c346b1e264dc58b6099a2fd43529483f340488082f3102016727f64
+exit 0
+
+=== B2. bob comes back and redeems it (11:18:56)
+claimed 280b33093f8166ebf84e12931fdc2a677ed880020a73d123a374b1d182b52a49      1500000 msat on cashu::127.0.0.1:3339
+
+=== B3. refused: above bob's limit (11:19:00)
+error: gateway refused: this payee authorized no invoice like this one
+exit 1
+
+=== B4. refused: a payee who never authorized (dave) (11:19:04)
+error: gateway refused: this payee authorized no invoice like this one
+exit 1
+
+=== C. routed to the gateway: grace pays from the public mint through r6 (11:19:08)
+invoice 0b5bef9: 300000 msat to bob
+payer: paid; preimage 2e83aa720f11410a0c6b47b0e478389ee538a22ba86aa2d95144df4936a22281 (4s)
+payee: redeemed
+exit 0
+claimed 05856df249decd51e4e5c770f617f88212c10a3f046fddaaab294aaf30b5bef9       300000 msat on cashu::127.0.0.1:3339
+
+=== D. refused: frank on arkade, with the default final timeout of a week (11:19:23)
+error: arkade::127.0.0.1:7070 takes HTLCs running at most 13162s, too short for a final timeout of 604800s
+exit 1
+
+=== D2. frank on arkade, offline for at most an hour (11:19:24)
+paid; preimage 681b5ce4f7a2bf9b908d9bd763346295b73cf8fc478e39623ceff3226cc76de0
+exit 0
+claimed 6e61ac0130ce1d4dbfcc839956f9a045ee143dcef71b8152e0c07628b733c201       500000 msat on arkade::127.0.0.1:7070
+
+=== what their pages say (11:19:36)
+forwards/counts: undefined
+forwards/count/settled: 8 settled
+invoices/counts: undefined
+invoices/count/pending: 0 pending
+invoices/count/paid: 8 paid
+invoices/count/expired: 0 expired
+released/amount/value: 6,600 sat
+released/payments/value: 8
+released/payees/value: 2
+released/open: 8 of their HTLCs have not reached their expiry yet.

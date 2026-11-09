@@ -1,0 +1,27 @@
+r1 cashu::127.0.0.1:3338: Spendable: 31,093 sat 
+r1 cashu::127.0.0.1:3339: Spendable: 7,934 sat 
+r2 cashu::127.0.0.1:3339: Spendable: 26,166 sat 
+r2 rootstock::testnet: Spendable: 5,847.908 sat 
+r3 rootstock::testnet: Spendable: 18,846.248 sat 
+r3 fedimint::fed11qgqpw9thwvaz7: Spendable: 4,524.544 sat 
+r4 fedimint::fed11qgqpw9thwvaz7: Spendable: 4,996.608 sat 
+r4 arkade::mutinynet: Spendable: 14,996 sat 
+r5 arkade::mutinynet: Spendable: 2,004 sat 
+r5 arkade::127.0.0.1:7070: Spendable: 8,000 sat 
+r6 cashu::127.0.0.1:3339: Spendable: 11,297 sat 
+r6 cashu::cashu.mutinynet.com: Spendable: 18,505 sat 
+r7 arkade::127.0.0.1:7070: Spendable: 2,020 sat 
+r7 cashu::127.0.0.1:3339: Spendable: 8,996 sat 
+alice cashu::127.0.0.1:3338: 18893000 msat
+bob cashu::127.0.0.1:3339: 8600000 msat
+carol rootstock::testnet: 4925284 msat
+dave fedimint::fed11qgqpw9thwvaz7: 9070080 msat
+erin arkade::mutinynet: 3000000 msat
+frank arkade::127.0.0.1:7070: 6000000 msat
+grace cashu::cashu.mutinynet.com: 1276000 msat
+henry arkade::127.0.0.1:7070: 1970000 msat
+gateway cashu::127.0.0.1:3338: Spendable: 6,000 sat 
+gateway cashu::127.0.0.1:3339: Spendable: 15,000 sat 
+gateway arkade::127.0.0.1:7070: Spendable: 2,000 sat 
+funder: mutinynet: 19380000 msat rootstock testnet: 17956959 msat 
+arkd: {"mainAccount":{"locked":"0.00000000","available":"0.00016284"},"conne

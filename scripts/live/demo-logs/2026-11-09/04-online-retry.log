@@ -1,0 +1,22 @@
+=== withdraw r5's routes
+r5: Route arkade::mutinynet → arkade::127.0.0.1:7070 removed
+r5: Route arkade::127.0.0.1:7070 → arkade::mutinynet removed
+=== 4 hops to arkade mutinynet (r5 withdrawn): alice pays erin 1000000 msat at 11:09:28
+1006003 msat over 4 hop(s)
+  1: cashu::127.0.0.1:3338 -> cashu::127.0.0.1:3339 via a0070508282b380e9c97864077cbce02d964c065c6aacdfd036d92
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthy
+  4: fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthyv6a7gz3acyhcsvzfn6tglv
+invoice 7542fbd: 1000000 msat to erin
+payer: error: hop 4 failed: incoming HTLC rejected: invalid: contract expires before the expiry; 1006003 msat stay locked on cashu::127.0.0.1:3338 until 1794228515 and are refunded by a serving node a
+payee: not claimed
+exit 1
+=== arkade first to fedimint (r5 withdrawn): henry pays dave 1000000 msat at 11:11:40
+1004501 msat over 3 hop(s)
+  1: arkade::127.0.0.1:7070 -> cashu::127.0.0.1:3339 via ac0beab4d9f9507593acdf06930cae94d585d047baf31bf70eef5
+  2: cashu::127.0.0.1:3339 -> rootstock::testnet via 91c7e15854e53183f2ab48e75ffd1887bffbcea1ca4fc26de82698268
+  3: rootstock::testnet -> fedimint::fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw338qcnwdp0qqqjpyl7kqk32cwms4fm6tpdsthy
+invoice 1673fdf: 1000000 msat to dave
+payer: paid; preimage 9efd46800dd96ca142ff4516074a8a5fc4f2f60d61a33e42de95f00765041323 (69s)
+payee: claimed
+exit 0

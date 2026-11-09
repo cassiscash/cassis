@@ -1,0 +1,29 @@
+=== r5's lifetime on our arkade, before
+[arkade] INFO  [routerd/arkade::127.0.0.1:7070] operator batches last 3602s
+=== onboard r5 on our arkade
+r5: Nothing to onboard
+exit 0
+Spendable: 8,000 sat
+[arkade] DEBUG [routerd/arkade::127.0.0.1:7070] arkade wallet ready: operator=http://127.0.0.1:7070 signer=02f5820d4daa3dc9711b4fc1452266039
+[arkade] INFO  [routerd/arkade::127.0.0.1:7070] operator batches last 3602s
+[arkade] INFO  [routerd/arkade::127.0.0.1:7070] settled boarding outputs in 79e7b4589b7deea927453c0448d6a19bfd0005ce785cb8066f8d57647c32c638
+r5: Announcing routes
+=== routes now
+=== give r5 a fresh arknote
+hypb: Error: arkade::127.0.0.1:7070: network: redeem note: Failed to join batch: batch failed de9cd379-ba34-4030-b231-1748d8c509e5: INTERNAL_ERROR (0): failed to create commitment tx: rpc error: code = Unknown desc = no coin selection possible
+exit 1
+Spendable: 8,000 sat
+[arkade] INFO  [cassis/arkade::127.0.0.1:7070] locked 1000 sats for 05b9b3c until 1793687995: tx a441be40f00a5b18bb33b808bd2c17e41a022e45c4a434e309e8a8f100d102f4
+[arkade] INFO  [routerd/arkade::127.0.0.1:7070] operator batches last 3602s
+[arkade] INFO  [routerd/arkade::127.0.0.1:7070] settled boarding outputs in 79e7b4589b7deea927453c0448d6a19bfd0005ce785cb8066f8d57647c32c638
+=== fund the operator
+d339670f75443c999973e057c26dcfac90a410f7dc51b554a8d2299e72ef37e7
+exit 0
+operator available after 15s: 0.00019454
+=== give r5 again
+hypb: Error: arkade::127.0.0.1:7070: network: redeem note: Failed to join batch: mismatch between VTXO count (2) and connector count (1)
+exit 1
+Spendable: 8,000 sat
+[arkade] INFO  [cassis/arkade::127.0.0.1:7070] locked 1000 sats for 05b9b3c until 1793687995: tx a441be40f00a5b18bb33b808bd2c17e41a022e45c4a434e309e8a8f100d102f4
+[arkade] INFO  [routerd/arkade::127.0.0.1:7070] operator batches last 3602s
+[arkade] INFO  [routerd/arkade::127.0.0.1:7070] settled boarding outputs in 79e7b4589b7deea927453c0448d6a19bfd0005ce785cb8066f8d57647c32c638

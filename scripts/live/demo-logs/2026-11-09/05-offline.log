@@ -1,0 +1,110 @@
+
+=== retry: 4 hops to arkade mutinynet (11:13:55)
+invoice 2760456: 1000000 msat to erin
+payer: paid; preimage f595fa60536adadcdccddf1c9b59b73c4a1cf200cef6bfe365e2fd99c4a5f1fa (73s)
+payee: claimed
+exit 0
+
+=== restore r5's routes (11:15:16)
+r5: Route arkade::127.0.0.1:7070 → arkade::mutinynet saved
+
+=== start gateway and preimage server on both mints and our arkade (11:15:22)
+gateway running (pid 925962), admin on hyperb://localhost:7980, log at $LIVE/nodes/gateway.log
+preimage running (pid 926001), admin on hyperb://localhost:7981, log at $LIVE/nodes/preimage.log
+exit 0
+gateway 16b40abca14dc570d4b53aa6c0a0aa1c2d8e035b57637165c19b70c71cb7112c
+preimage 5629507e0769fb7fa436630770c801132385a29299b7451d0649002fb7ed5f3a
+relay https://use1-1.relay.n0.iroh.link./
+
+=== fund the gateway (11:15:41)
+gateway: Received 20000 sat
+gateway: Redeemed the arknote in 3b157e7a16c87691c72b43c62db66dbfc2724574d8c9202094c091b33c560b96
+give exit 0
+Spendable: 20,000 sat
+Spendable: 3,000 sat
+
+=== A. one invoice, bob offline, alice pays on mint 1, gateway pays bob on mint 2 (11:15:55)
+invoice e69060b: 1000000 msat to bob
+payer: paid; preimage 52be05f31c2763670ed5376dbf26cde40db47d4d35e4ac99d2508351e0718c1a (5s)
+payee: redeemed
+exit 0
+claimed 522c366822ac6cfc89132524000af0ec8c7e73cebf44efe6dafac97c3e69060b      1000000 msat on cashu::127.0.0.1:3339
+
+=== A2. redeeming again claims nothing twice (11:16:11)
+this node receives through no preimage server
+exit 0
+
+=== B. standing authorization: bob authorizes once and leaves (11:16:12)
+bob key 06e098164986f1bf5fbacf15cf82b6ca40fe7cf475f21004d95ce8af4ca0ebe2
+{"destinations":["cashu::127.0.0.1:3339"],"max_amount_msat":3000000,"min_amount_msat":1000}
+exit 0
+
+=== B1. alice asks the gateway for an invoice in bob's name, and pays it (11:16:16)
+exit 0
+{"payment_hash":"f1b75be9a91cf69f720e1cfbf85e190a5decb82375c72203a41207762760a356","amount_msat":1500000,"networks":["arkade::127.0.0.1:7070","cashu::127.0.0.1:3338","cashu::127.0.0.1:3339"],"gateway":"16b40abca14dc570d4b53aa6c0a0aa1c2d8e035b57637165c19b70c71c
+paid; preimage 7610ba79f078e1f3e78304478f58a7fd2ebcd1071ac4035063168d5f3d0ee7d0
+exit 0 (4s)
+
+=== B2. bob comes back and redeems it (11:16:24)
+claimed f1b75be9a91cf69f720e1cfbf85e190a5decb82375c72203a41207762760a356      1500000 msat on cashu::127.0.0.1:3339
+
+=== B3. refused: above bob's limit (11:16:27)
+error: gateway refused: this payee authorized no invoice like this one
+exit 1
+
+=== B4. refused: a payee who never authorized (dave) (11:16:31)
+error: gateway refused: this payee authorized no invoice like this one
+exit 1
+
+=== C. routed to the gateway: grace pays from the public mint through r6 (11:16:35)
+invoice 23e37c3: 300000 msat to bob
+payer: paid; preimage 320343d17b7f47dbd43aa6edd28257697504a0583a415c0744de7dd923f1c718 (7s)
+payee: redeemed
+exit 0
+claimed 7ee52deb6d53e76445cd5c0c6fdb8e0893cfb2834dd8285e73bee491323e37c3       300000 msat on cashu::127.0.0.1:3339
+
+=== D. payee on arkade: frank offline, gateway pays his VHTLC on our operator, default final timeout (11:16:55)
+exit 1
+error: arkade::127.0.0.1:7070 takes HTLCs running at most 13162s, too short for a final timeout of 604800s
+
+=== D2. the same with a final timeout of 1h (11:16:56)
+exit 0
+paid; preimage 79f74b75a9b43409dfeeca91d8a70c0161dc4670f45844816ed328c6d1653bca
+pay exit 0 (4s)
+claimed f48c82dfa6830bc429e287c31b116ea68fe262ea86964d183283cdae912e0709       500000 msat on arkade::127.0.0.1:7070
+
+=== pages: gateway and preimage server (11:17:09)
+forwards/count/settled: 4 settled
+forwards/shown: The latest 100 of 4.
+forward/f48c82dfa6830bc429e287c31b116ea68fe262ea86964d183283cdae912e0709/route: cashu::127.0.0.1:3338 → arkade
+forward/f48c82dfa6830bc429e287c31b116ea68fe262ea86964d183283cdae912e0709/state: settled
+forward/f48c82dfa6830bc429e287c31b116ea68fe262ea86964d183283cdae912e0709/outgoing: waiting for the payee, refu
+forward/f48c82dfa6830bc429e287c31b116ea68fe262ea86964d183283cdae912e0709/hash: f48c82dfa6830bc429e287c31b116ea
+forward/7ee52deb6d53e76445cd5c0c6fdb8e0893cfb2834dd8285e73bee491323e37c3/route: cashu::127.0.0.1:3339 → cashu:
+forward/7ee52deb6d53e76445cd5c0c6fdb8e0893cfb2834dd8285e73bee491323e37c3/state: settled
+forward/7ee52deb6d53e76445cd5c0c6fdb8e0893cfb2834dd8285e73bee491323e37c3/outgoing: payee claimed
+forward/7ee52deb6d53e76445cd5c0c6fdb8e0893cfb2834dd8285e73bee491323e37c3/hash: 7ee52deb6d53e76445cd5c0c6fdb8e0
+forward/f1b75be9a91cf69f720e1cfbf85e190a5decb82375c72203a41207762760a356/route: cashu::127.0.0.1:3338 → cashu:
+forward/f1b75be9a91cf69f720e1cfbf85e190a5decb82375c72203a41207762760a356/state: settled
+forward/f1b75be9a91cf69f720e1cfbf85e190a5decb82375c72203a41207762760a356/outgoing: payee claimed
+forward/f1b75be9a91cf69f720e1cfbf85e190a5decb82375c72203a41207762760a356/hash: f1b75be9a91cf69f720e1cfbf85e190
+forward/522c366822ac6cfc89132524000af0ec8c7e73cebf44efe6dafac97c3e69060b/route: cashu::127.0.0.1:3338 → cashu:
+forward/522c366822ac6cfc89132524000af0ec8c7e73cebf44efe6dafac97c3e69060b/state: settled
+forward/522c366822ac6cfc89132524000af0ec8c7e73cebf44efe6dafac97c3e69060b/outgoing: payee claimed
+forward/522c366822ac6cfc89132524000af0ec8c7e73cebf44efe6dafac97c3e69060b/hash: 522c366822ac6cfc89132524000af0e
+invoices/count/pending: 0 pending
+invoices/count/paid: 4 paid
+invoices/count/expired: 0 expired
+invoices/shown: The latest 100 of 4.
+released/amount/label: Paid to payees
+released/amount/value: 3,300 sat
+released/payments/label: Payments
+released/payments/value: 4
+released/payees/label: Payees
+released/payees/value: 2
+released/open: 4 of their HTLCs have not reached their expiry yet.
+payments/help: HTLCs gateways funded to payees, whose preimage was released. Payees claim them on their networ
+payments/shown: The latest 100 of 4.
+Spendable: 3,000 sat
+Spendable: 17,500 sat
+Spendable: 2,500 sat
