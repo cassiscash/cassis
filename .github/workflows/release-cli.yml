@@ -1,8 +1,9 @@
 name: release-cli
 
 # Builds cassis-wallet and cassis-routerd for linux with each network feature alone, each pair
-# of network features, and all of them together, then publishes every
-# binary in a GitHub release.
+# of network features, and all of them together. Also builds cassis-gateway and
+# cassis-preimage-server with each network feature alone (except lightning) and with all
+# of them together. Every binary is published in a GitHub release.
 
 on:
   push:
@@ -30,6 +31,28 @@ jobs:
                       "fedimint", "lightning", "liquid", "rootstock"]
           combos = [list(c) for n in (1, 2) for c in itertools.combinations(features, n)]
           combos.append(features)
+          variants = [
+              {
+                  "features": ",".join(c),
+                  "name": "all" if c == features else "+".join(c),
+              }
+              for c in combos
+          ]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": variants}) + "\n")
+
+  variants-nodes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        shell: python
+        run: |
+          import json, os
+          # cassis-gateway and cassis-preimage-server do not support lightning.
+          features = ["arkade", "bitcoin", "cashu", "fedimint", "liquid", "rootstock"]
+          combos = [[f] for f in features] + [features]
           variants = [
               {
                   "features": ",".join(c),
@@ -83,8 +106,51 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-nodes:
+    needs: variants-nodes
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.variants-nodes.outputs.matrix) }}
+    name: build nodes (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nodes-${{ matrix.name }}
+
+      - name: Build
+        run: |
+          for bin in cassis-gateway cassis-preimage-server; do
+            cargo build --release --locked -p "$bin" \
+              --no-default-features --features "${{ matrix.features }}"
+          done
+
+      - name: Package
+        run: |
+          mkdir dist
+          for bin in cassis-gateway cassis-preimage-server; do
+            out="dist/$bin-${{ matrix.name }}-x86_64-linux"
+            cp "target/release/$bin" "$out"
+            strip "$out"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cassis-nodes-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, build-nodes]
     runs-on: ubuntu-latest
     permissions:
       contents: write
