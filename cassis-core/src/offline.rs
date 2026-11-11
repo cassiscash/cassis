@@ -21,6 +21,9 @@
 //!   without knowing Cassis' JSON.
 //! * [`PreimageIssuance`]: the preimage server vouches that it issued a
 //!   payment hash under an authorization.
+//! * [`GatewayMetadata`]: the gateway carries the authorization and the
+//!   issuance of an invoice in its metadata, signed, so payers hand it
+//!   back with PREPARE and COMMIT and the gateway stores no invoice.
 //!
 //! Invoices come in three [`InvoiceReceiver`](crate::protocol::InvoiceReceiver)s
 //! with their own signature rules (see
@@ -41,6 +44,8 @@ pub const DEFAULT_MIN_FINAL_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 const AUTHORIZATION_HEADER: &str = "Cassis receive authorization v1";
 /// First line of [`PreimageIssuance::message`].
 const ISSUANCE_HEADER: &str = "Cassis preimage issuance v1";
+/// Prefix of the message a gateway signs its [`GatewayMetadata`] with.
+const GATEWAY_METADATA_DOMAIN: &[u8] = b"cassis-gateway-metadata/v1\0";
 
 /// The public key of the iroh endpoint whose secret is `secret`.
 pub fn endpoint_public_key(secret: &[u8; 32]) -> PublicKey {
@@ -380,6 +385,91 @@ impl PreimageIssuance {
     }
 }
 
+/// The [`Metadata`] of every invoice a gateway issues: what paying it
+/// on takes, signed by the gateway. Payers hand the metadata back with
+/// PREPARE and COMMIT, so the gateway finds there, under its own
+/// signature, the invoice it issued: the payee's terms, the preimage
+/// server's issuance, which it presents to the preimage server with the
+/// HTLC to the payee, and the payee's own metadata, which the preimage
+/// server logs for the payee.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayMetadata {
+    pub authorization: ReceiveAuthorization,
+    pub issuance: PreimageIssuance,
+    /// Where the gateway reaches the preimage server.
+    pub preimage_server_relay: Option<String>,
+    /// The invoice's expiry.
+    pub expires_at: u64,
+    /// The payee's metadata, which `issuance` commits to.
+    pub payee_metadata: Option<Metadata>,
+    /// By the gateway, over [`GatewayMetadata::message`].
+    pub gateway_signature: Signature,
+}
+
+impl GatewayMetadata {
+    /// Sign the fields as the gateway whose secret is `gateway_secret`.
+    pub fn sign(
+        gateway_secret: &[u8; 32],
+        authorization: ReceiveAuthorization,
+        issuance: PreimageIssuance,
+        preimage_server_relay: Option<String>,
+        expires_at: u64,
+        payee_metadata: Option<Metadata>,
+    ) -> Result<Self, String> {
+        let mut metadata = Self {
+            authorization,
+            issuance,
+            preimage_server_relay,
+            expires_at,
+            payee_metadata,
+            gateway_signature: Signature([0; 64]),
+        };
+        metadata.gateway_signature = Signature::sign(gateway_secret, &metadata.message()?);
+        Ok(metadata)
+    }
+
+    /// The bytes the gateway signs: a domain prefix, then the JSON of
+    /// every field but the signature.
+    pub fn message(&self) -> Result<Vec<u8>, String> {
+        let fields = (
+            &self.authorization,
+            &self.issuance,
+            &self.preimage_server_relay,
+            self.expires_at,
+            &self.payee_metadata,
+        );
+        let mut message = GATEWAY_METADATA_DOMAIN.to_vec();
+        serde_json::to_writer(&mut message, &fields).map_err(|e| e.to_string())?;
+        Ok(message)
+    }
+
+    /// Check that `gateway` signed this, for its payment hash.
+    pub fn verify(&self, gateway: &PublicKey) -> Result<(), String> {
+        if self.authorization.gateway != *gateway {
+            return Err("the invoice was issued under another gateway's authorization".into());
+        }
+        self.gateway_signature
+            .verify(gateway, &self.message()?)
+            .map_err(|_| "the invoice metadata is not signed by this gateway".to_string())
+    }
+
+    /// The payment hash of the invoice.
+    pub fn payment_hash(&self) -> Bytes32 {
+        self.issuance.payment_hash
+    }
+
+    /// As invoice metadata.
+    pub fn to_metadata(&self) -> Result<Metadata, String> {
+        Metadata::new(serde_json::to_vec(self).map_err(|e| e.to_string())?)
+    }
+
+    /// Read it from the metadata of a gateway's invoice.
+    pub fn from_metadata(metadata: &Metadata) -> Result<Self, String> {
+        serde_json::from_slice(metadata.as_bytes())
+            .map_err(|e| format!("not a gateway's invoice metadata: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +571,45 @@ mod tests {
         let mut elsewhere = authorization;
         elsewhere.max_amount_msat += 1;
         assert!(issuance.verify(&key(3), &elsewhere).is_err());
+    }
+
+    #[test]
+    fn gateway_metadata_is_signed_by_the_gateway() {
+        let authorization = authorization(AuthorizationKind::Standing);
+        let payee_metadata = Metadata::new(b"order 42".to_vec()).unwrap();
+        let mut issuance = PreimageIssuance {
+            payment_hash: Bytes32([5; 32]),
+            amount_msat: 1000,
+            metadata_hash: Some(payee_metadata.hash()),
+            authorization: authorization.id().unwrap(),
+            nonce: Bytes32([6; 32]),
+            signature: Signature([0; 64]),
+        };
+        issuance.sign(&[3; 32]);
+        let carried = GatewayMetadata::sign(
+            &[2; 32],
+            authorization,
+            issuance,
+            Some("https://relay.example".into()),
+            1500,
+            Some(payee_metadata),
+        )
+        .unwrap();
+        let metadata = carried.to_metadata().unwrap();
+        let read = GatewayMetadata::from_metadata(&metadata).unwrap();
+        assert_eq!(read, carried);
+        read.verify(&key(2)).unwrap();
+        assert_eq!(read.payment_hash(), Bytes32([5; 32]));
+        // Another gateway's key, or anything changed, does not verify.
+        assert!(read.verify(&key(3)).is_err());
+        let mut changed = read.clone();
+        changed.expires_at += 1;
+        assert!(changed.verify(&key(2)).is_err());
+        let mut changed = read;
+        changed.payee_metadata = None;
+        assert!(changed.verify(&key(2)).is_err());
+        assert!(
+            GatewayMetadata::from_metadata(&Metadata::new(b"order 42".to_vec()).unwrap()).is_err()
+        );
     }
 }

@@ -1,13 +1,17 @@
 //! Payee role: issue invoices, vet PREPARE, claim on COMMIT.
 
-use super::{InvoiceRecord, InvoiceStatus, Node, INLINE_WAIT, INVOICES, VERIFY_RETRY_INTERVAL};
-use crate::keys::NodeKeys;
-use crate::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId};
-use crate::primitives::{unix_now, Bytes32};
-use crate::protocol::{
+use super::{db_error, Node, INLINE_WAIT, VERIFY_RETRY_INTERVAL};
+use crate::db::{
+    Db, Direction, Invoice as StoredInvoice, InvoiceHash, InvoiceState, Transaction,
+    TransactionHash,
+};
+use crate::stored::stored_metadata;
+use cassis_core::keys::NodeKeys;
+use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId};
+use cassis_core::protocol::{
     Commit, Invoice, InvoiceBody, InvoiceNetwork, Metadata, PreparePayee, Response,
 };
-use crate::store::Store;
+use cassis_core::{unix_now, Bytes32};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -26,7 +30,7 @@ pub(super) enum CommitState {
 /// an invoice can be issued while the node that will claim it is
 /// offline. `iroh_relay` is that node's home relay, if known.
 pub async fn create_invoice(
-    store: &Store,
+    db: &Db,
     keys: &NodeKeys,
     iroh_relay: Option<String>,
     networks: &[Arc<dyn Network>],
@@ -56,7 +60,6 @@ pub async fn create_invoice(
             network: network.id(),
             target,
             incoming_delta_secs: Some(network.incoming_delta_secs()),
-            max_incoming_lifetime_secs: network.max_incoming_lifetime_secs(),
         });
     }
     let invoice = Invoice::direct(
@@ -71,17 +74,21 @@ pub async fn create_invoice(
         },
         &keys.iroh,
     );
-    store.put(
-        INVOICES,
-        &payment_hash.to_string(),
-        &InvoiceRecord {
-            invoice: invoice.clone(),
-            preimage,
-            status: InvoiceStatus::Pending,
+    db.invoices()
+        .insert(&StoredInvoice {
+            payment_hash: InvoiceHash(payment_hash.to_string()),
+            amount_msat,
+            expires_at,
+            networks: invoice.body.networks.iter().map(Into::into).collect(),
+            description: invoice.body.description.clone(),
+            metadata: stored_metadata(&invoice.body.metadata),
+            preimage: Some(preimage.0),
+            delegation: None,
+            state: InvoiceState::Waiting,
             created_at: unix_now(),
             settled_at: None,
-        },
-    )?;
+        })
+        .map_err(db_error)?;
     Ok(invoice)
 }
 
@@ -90,7 +97,7 @@ impl Node {
     /// this node's endpoint.
     pub async fn create_invoice(
         &self,
-        networks: &[crate::network::NetworkId],
+        networks: &[NetworkId],
         amount_msat: u64,
         expires_at: u64,
         description: Option<String>,
@@ -102,7 +109,7 @@ impl Node {
             .collect::<Result<Vec<_>, _>>()?;
         let relay = self.0.transport.home_relay().await;
         create_invoice(
-            self.store(),
+            self.db(),
             &self.0.keys,
             relay,
             &networks,
@@ -131,11 +138,8 @@ impl Node {
     }
 
     fn check_prepare_payee(&self, prepare: &PreparePayee) -> Result<(), String> {
-        let record: InvoiceRecord = self
-            .store()
-            .get(INVOICES, &prepare.payment_hash.to_string())?
-            .ok_or("unknown invoice")?;
-        if record.status == InvoiceStatus::Claimed {
+        let record = self.invoice(&prepare.payment_hash)?;
+        if record.state == InvoiceState::Settled {
             return Err("invoice already paid".into());
         }
         self.payable_on(&record, &prepare.network, prepare.expiry)
@@ -148,18 +152,19 @@ impl Node {
     /// the HTLC would not allow claiming.
     fn payable_on(
         &self,
-        record: &InvoiceRecord,
+        record: &StoredInvoice,
         network: &NetworkId,
         expiry: u64,
     ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
-        if record.status == InvoiceStatus::Expired || record.invoice.body.expires_at <= unix_now() {
+        if record.state == InvoiceState::Expired || record.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
-        let target = record
-            .invoice
-            .target_for(network)
-            .cloned()
+        let entry = record
+            .networks
+            .iter()
+            .find(|entry| entry.network == network.0)
             .ok_or_else(|| format!("invoice is not payable on {network}"))?;
+        let target = HtlcTarget::try_from(&entry.target)?;
         let network = self.network(network)?;
         // The claim itself must land before the HTLC expires.
         let claim_by = expiry.saturating_sub(network.incoming_delta_secs());
@@ -191,10 +196,13 @@ impl Node {
         // Answer right away when claiming is quick.
         let deadline = tokio::time::Instant::now() + INLINE_WAIT;
         loop {
-            let record: Option<InvoiceRecord> =
-                self.store().get(INVOICES, &hash.to_string()).ok().flatten();
-            if let Some(record) = record.filter(|r| r.status == InvoiceStatus::Claimed) {
-                return Response::Committed(record.preimage);
+            let preimage = self
+                .invoice(&hash)
+                .ok()
+                .filter(|record| record.state == InvoiceState::Settled)
+                .and_then(|record| record.preimage);
+            if let Some(preimage) = preimage {
+                return Response::Committed(Bytes32(preimage));
             }
             {
                 let mut commits = self.0.commits.lock().unwrap_or_else(|e| e.into_inner());
@@ -234,16 +242,20 @@ impl Node {
         let _busy = self
             .busy(format!("invoice:{key}"))
             .ok_or("this invoice is already being claimed")?;
-        let mut record: InvoiceRecord =
-            self.store().get(INVOICES, &key)?.ok_or("unknown invoice")?;
-        if record.status == InvoiceStatus::Claimed {
+        let record = self.invoice(&commit.payment_hash)?;
+        if record.state == InvoiceState::Settled {
             return Ok(());
         }
+        let preimage = Bytes32(
+            record
+                .preimage
+                .ok_or("the invoice's preimage is not here")?,
+        );
         let (target, network, claim_by) =
             self.payable_on(&record, &commit.network, commit.expiry)?;
         let htlc = Htlc {
             payment_hash: commit.payment_hash,
-            amount_msat: record.invoice.body.amount_msat,
+            amount_msat: record.amount_msat,
             expiry: commit.expiry,
             target,
             descriptor: commit.descriptor,
@@ -270,36 +282,84 @@ impl Node {
             htlc.amount_msat, key, commit.network
         );
         network
-            .claim_incoming_htlc(&htlc, record.preimage)
+            .claim_incoming_htlc(&htlc, preimage)
             .await
             .map_err(|e| format!("claim failed: {e}"))?;
-        record.status = InvoiceStatus::Claimed;
-        record.settled_at = Some(unix_now());
-        self.store().put(INVOICES, &key, &record)?;
+        self.settle_invoice(&record, &commit.network, htlc.amount_msat, preimage)?;
         self.cancel_targets(&record, Some(&commit.network)).await;
         Ok(())
+    }
+
+    /// The invoice `hash` names.
+    pub(super) fn invoice(&self, hash: &Bytes32) -> Result<StoredInvoice, String> {
+        self.db()
+            .invoices()
+            .get(InvoiceHash(hash.to_string()))
+            .map_err(db_error)?
+            .ok_or_else(|| "unknown invoice".to_string())
+    }
+
+    /// Record that `record` was paid `amount_msat` on `network`.
+    pub(super) fn settle_invoice(
+        &self,
+        record: &StoredInvoice,
+        network: &NetworkId,
+        amount_msat: u64,
+        preimage: Bytes32,
+    ) -> Result<(), String> {
+        settle_invoice(self.db(), record, network, amount_msat, preimage)
     }
 
     /// Release what the invoice's networks, except `claimed_on`, set up
     /// to receive it.
     pub(super) async fn cancel_targets(
         &self,
-        record: &InvoiceRecord,
-        claimed_on: Option<&crate::network::NetworkId>,
+        record: &StoredInvoice,
+        claimed_on: Option<&NetworkId>,
     ) {
-        for entry in &record.invoice.body.networks {
-            if Some(&entry.network) == claimed_on {
+        let Ok(hash) = record.payment_hash.0.parse::<Bytes32>() else {
+            return;
+        };
+        for entry in &record.networks {
+            let id = NetworkId(entry.network.clone());
+            if Some(&id) == claimed_on {
                 continue;
             }
-            let Ok(network) = self.network(&entry.network) else {
+            let Ok(network) = self.network(&id) else {
                 continue;
             };
-            if let Err(error) = network
-                .cancel_receive(record.invoice.body.payment_hash)
-                .await
-            {
-                warn!("releasing invoice target on {}: {error}", entry.network);
+            if let Err(error) = network.cancel_receive(hash).await {
+                warn!("releasing invoice target on {id}: {error}");
             }
         }
     }
+}
+
+/// Record, at once, that `record` was paid `amount_msat` on `network`
+/// and the incoming transaction that paid it.
+pub(super) fn settle_invoice(
+    db: &Db,
+    record: &StoredInvoice,
+    network: &NetworkId,
+    amount_msat: u64,
+    preimage: Bytes32,
+) -> Result<(), String> {
+    let now = unix_now();
+    db.write(|tx| {
+        tx.invoices().update(&StoredInvoice {
+            state: InvoiceState::Settled,
+            settled_at: Some(now),
+            ..record.clone()
+        })?;
+        tx.transactions().insert(&Transaction {
+            payment_hash: TransactionHash(record.payment_hash.0.clone()),
+            direction: Direction::Incoming,
+            amount_msat,
+            network: network.0.clone(),
+            preimage: preimage.0,
+            at: now,
+            invoice: Some(record.payment_hash.clone()),
+        })
+    })
+    .map_err(db_error)
 }

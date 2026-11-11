@@ -21,22 +21,22 @@
 )))]
 compile_error!("cassis-wallet needs at least one network feature, e.g. `--features cashu`");
 
-mod home;
 mod order_demo;
 mod wallets;
 
-use cassis_core::node::{
-    authorize_gateway, create_gateway_invoice, redeem_offline_payments, GatewayInvoiceRecord,
-    InvoiceRecord, InvoiceStatus, Node, NodeConfig, OfflineEndpoints, PaymentRecord,
-    StandingAuthorizationRecord, GATEWAY_INVOICES, STANDING_AUTHORIZATIONS,
+use cassis_core::offline::{
+    endpoint_public_key, ReceiveAuthorization, DEFAULT_MIN_FINAL_TIMEOUT_SECS,
 };
-use cassis_core::offline::{endpoint_public_key, DEFAULT_MIN_FINAL_TIMEOUT_SECS};
 use cassis_core::protocol::{GatewayInvoiceFor, Request, Response};
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
 use cassis_core::transport::{PeerAddr, Transport};
 use cassis_core::{unix_now, Invoice, NetworkId};
+use cassis_wallet::db::{Direction, InvoiceHash, InvoiceState};
+use cassis_wallet::node::{
+    authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
+};
+use cassis_wallet::{Home, Node, NodeConfig};
 use clap::{Parser, Subcommand};
-use home::Home;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info_span, Span};
@@ -73,12 +73,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print the seed phrase.
+    /// Print the seed phrase the node's identity derives from.
     Seed,
     /// Print the node identity and its networks.
     Info,
     /// Add networks this wallet holds funds on, e.g. `cashu::mint.host`,
-    /// `liquid`, `arkade::mutinynet`, `lightning`.
+    /// `liquid`, `arkade::mutinynet`, `lightning`, each with a fresh key
+    /// written to its config.
     Enable {
         #[arg(required = true)]
         networks: Vec<String>,
@@ -100,13 +101,12 @@ enum Command {
         /// Esplora API of the Ark server's chain, with `--bark`.
         #[arg(long, value_name = "URL", requires = "bark")]
         bark_esplora: Option<String>,
-        /// Longest an HTLC received on these networks may run, instead
-        /// of what the network derives (e.g. from an arkade operator's
-        /// batch lifetime).
-        #[arg(long, value_name = "SECS")]
-        max_incoming_lifetime: Option<u64>,
+        /// Chain API of `arkade` and `bitcoin` networks, instead of the
+        /// public one.
+        #[arg(long, value_name = "URL")]
+        esplora_url: Option<String>,
     },
-    /// Remove networks from this wallet.
+    /// Remove networks, and their keys, from this wallet's config.
     Disable {
         #[arg(required = true)]
         networks: Vec<String>,
@@ -220,7 +220,8 @@ enum Command {
     },
     /// List the invoices this node issued.
     Invoices,
-    /// List the payments this node made.
+    /// List the money that moved in and out of this wallet, and the
+    /// payments still in flight.
     Payments,
     #[command(flatten)]
     Wallet(wallets::Command),
@@ -282,10 +283,10 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), String> {
     let relays = relays(&cli);
-    let home = Home::open(cli.home)?;
+    let mut home = Home::open(cli.home)?;
     let span = info_span!("node", node = "wallet");
     match cli.command {
-        Command::Seed => println!("{}", home.mnemonic()?),
+        Command::Seed => println!("{}", home.mnemonic()),
         Command::Info => {
             println!("node pubkey: {}", home.keys.node.pubkey().to_hex());
             println!(
@@ -305,47 +306,57 @@ async fn run(cli: Cli) -> Result<(), String> {
             bark,
             bark_server,
             bark_esplora,
-            max_incoming_lifetime,
+            esplora_url,
         } => {
-            let mut enabled = home.networks()?;
             for spec in &networks {
                 let network = NetworkId::parse(spec)?;
-                if network.kind() == "lightning" && bark {
-                    configure_bark(&home, &network, bark_server.clone(), bark_esplora.clone())?;
-                } else if network.kind() == "lightning" {
-                    configure_lnd(
-                        &home,
-                        lnd_rest_url.clone(),
-                        lnd_tls_cert.clone(),
-                        lnd_macaroon.clone(),
-                    )?;
-                }
-                if let Some(secs) = max_incoming_lifetime {
-                    home.set_max_incoming_lifetime(&network, secs)?;
-                }
+                home.enable(&network, |table| {
+                    if let Some(url) = &esplora_url {
+                        table.insert("esplora_url", toml_edit::value(url.as_str()));
+                    }
+                    if network.kind() == "lightning" && bark {
+                        let mut config = toml_edit::InlineTable::new();
+                        if let Some(server) = &bark_server {
+                            config.insert("server_url", server.as_str().into());
+                        }
+                        if let Some(esplora) = &bark_esplora {
+                            config.insert("esplora_url", esplora.as_str().into());
+                        }
+                        table.insert("bark", toml_edit::value(config));
+                    } else if network.kind() == "lightning" {
+                        if let Some(rest_url) = &lnd_rest_url {
+                            let mut config = toml_edit::InlineTable::new();
+                            config.insert("rest_url", rest_url.as_str().into());
+                            for (key, path) in [
+                                ("tls_cert_path", &lnd_tls_cert),
+                                ("macaroon_path", &lnd_macaroon),
+                            ] {
+                                if let Some(path) = path {
+                                    config.insert(key, path.display().to_string().into());
+                                }
+                            }
+                            table.insert("lnd", toml_edit::value(config));
+                        }
+                    }
+                    Ok(())
+                })?;
                 // Fail early on networks this binary cannot open.
                 home.open_network(&network, &span).await?;
-                if !enabled.contains(&network) {
-                    enabled.push(network);
-                }
             }
-            home.set_networks(&enabled)?;
         }
         Command::Disable { networks } => {
             let remove = networks
                 .iter()
                 .map(|spec| NetworkId::parse(spec))
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut enabled = home.networks()?;
-            enabled.retain(|network| !remove.contains(network));
-            home.set_networks(&enabled)?;
+            home.disable(&remove)?;
         }
         Command::Sync => {
             let networks = home.open_networks(&home.networks()?, &span).await?;
             let node = Node::start(
                 NodeConfig {
                     keys: home.keys.clone(),
-                    store: home.store.clone(),
+                    db: home.db.clone(),
                     span,
                     serve: false,
                 },
@@ -369,7 +380,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 let opened = home.open_networks(&networks, &span).await?;
                 let transport = Transport::bind_client(home.keys.iroh).await?;
                 let invoice = create_gateway_invoice(
-                    &home.store,
+                    &home.db,
                     &home.keys,
                     &transport,
                     endpoints,
@@ -422,7 +433,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let now = unix_now();
             let transport = Transport::bind_client(home.keys.iroh).await?;
             let authorization = authorize_gateway(
-                &home.store,
+                &home.db,
                 &home.keys,
                 &transport,
                 endpoints,
@@ -493,7 +504,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let node = Node::start(
                 NodeConfig {
                     keys: home.keys.clone(),
-                    store: home.store.clone(),
+                    db: home.db.clone(),
                     span,
                     serve: false,
                 },
@@ -522,7 +533,6 @@ async fn run(cli: Cli) -> Result<(), String> {
                 &route,
                 amount_msat,
                 to.default_incoming_delta(),
-                None,
                 cassis_core::unix_now(),
             )?;
             println!("{} msat over {} hop(s)", plan.amounts[0], route.len());
@@ -542,47 +552,59 @@ async fn run(cli: Cli) -> Result<(), String> {
             order_demo::run(node, home.keys.order_endpoint_secret(), &name).await?;
         }
         Command::Invoices => {
-            for record in home.store.list::<InvoiceRecord>("invoices")? {
+            for invoice in home.db.invoices().all().map_err(|e| e.to_string())? {
+                let via = invoice
+                    .delegation
+                    .as_ref()
+                    .map(|delegation| format!(" via gateway {}", delegation.gateway))
+                    .unwrap_or_default();
                 println!(
-                    "{} {:>12} msat {:?} expires {}",
-                    record.invoice.body.payment_hash,
-                    record.invoice.body.amount_msat,
-                    record.status,
-                    record.invoice.body.expires_at
+                    "{} {:>12} msat {:?} expires {}{via}",
+                    invoice.payment_hash.0, invoice.amount_msat, invoice.state, invoice.expires_at
                 );
             }
-            for record in home.store.list::<GatewayInvoiceRecord>(GATEWAY_INVOICES)? {
-                println!(
-                    "{} {:>12} msat {:?} expires {} via gateway {}",
-                    record.invoice.body.payment_hash,
-                    record.invoice.body.amount_msat,
-                    record.status,
-                    record.invoice.body.expires_at,
-                    record.endpoints.gateway.id
-                );
-            }
-            for record in home
-                .store
-                .list::<StandingAuthorizationRecord>(STANDING_AUTHORIZATIONS)?
+            for delegation in home
+                .db
+                .full_delegations()
+                .all()
+                .map_err(|e| e.to_string())?
             {
-                let authorization = &record.authorization;
+                let authorization = &delegation.authorization;
                 println!(
                     "standing: {}..{} msat until {} via gateway {}",
                     authorization.min_amount_msat,
                     authorization.max_amount_msat,
                     authorization.valid_until,
-                    record.endpoints.gateway.id
+                    delegation.gateway
                 );
             }
         }
         Command::Payments => {
-            for record in home.store.list::<PaymentRecord>("payments")? {
+            for transaction in home.db.transactions().all().map_err(|e| e.to_string())? {
+                let direction = match transaction.direction {
+                    Direction::Incoming => "in ",
+                    Direction::Outgoing => "out",
+                };
                 println!(
-                    "{} {:>12} msat on {} {:?}",
-                    record.invoice.body.payment_hash,
-                    record.htlc.amount_msat,
-                    record.network,
-                    record.status
+                    "{} {direction} {:>12} msat on {} at {}",
+                    transaction.payment_hash.0,
+                    transaction.amount_msat,
+                    transaction.network,
+                    transaction.at
+                );
+            }
+            for payment in home
+                .db
+                .pending_payments()
+                .all()
+                .map_err(|e| e.to_string())?
+            {
+                println!(
+                    "{} out {:>12} msat on {} pending until {}",
+                    payment.payment_hash.0,
+                    payment.htlc.amount_msat,
+                    payment.network,
+                    payment.htlc.expiry
                 );
             }
         }
@@ -600,7 +622,7 @@ async fn serve(home: &Home, span: &Span) -> Result<Node, String> {
     Node::start(
         NodeConfig {
             keys: home.keys.clone(),
-            store: home.store.clone(),
+            db: home.db.clone(),
             span: span.clone(),
             serve: true,
         },
@@ -622,21 +644,21 @@ fn print_invoice(invoice: &Invoice) -> Result<(), String> {
 const CLAIM_GRACE: Duration = Duration::from_secs(30);
 
 async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
-    let key = invoice.body.payment_hash.to_string();
+    let key = InvoiceHash(invoice.body.payment_hash.to_string());
     loop {
-        let record: InvoiceRecord = home
-            .store
-            .get("invoices", &key)?
+        let record = home
+            .db
+            .invoices()
+            .get(key.clone())
+            .map_err(|e| e.to_string())?
             .ok_or("invoice disappeared")?;
-        match record.status {
-            cassis_core::node::InvoiceStatus::Claimed => {
+        match record.state {
+            InvoiceState::Settled => {
                 println!("claimed");
                 return Ok(());
             }
-            cassis_core::node::InvoiceStatus::Expired => return Err("invoice expired".into()),
-            cassis_core::node::InvoiceStatus::Pending => {
-                tokio::time::sleep(Duration::from_secs(1)).await
-            }
+            InvoiceState::Expired => return Err("invoice expired".into()),
+            InvoiceState::Waiting => tokio::time::sleep(Duration::from_secs(1)).await,
         }
     }
 }
@@ -651,36 +673,53 @@ async fn redeem(
     since: u64,
 ) -> Result<(), String> {
     // Every preimage server this node receives through, with the
-    // networks it was paid on there.
+    // networks it was paid on there: those of its delegated invoices
+    // still waiting, and of its full delegations.
     let mut servers: Vec<(PeerAddr, Vec<NetworkId>)> = Vec::new();
-    let mut add = |server: &PeerAddr,
-                   authorization: &cassis_core::offline::ReceiveAuthorization| {
+    let mut add = |server: PeerAddr, authorization: ReceiveAuthorization| {
         let index = match servers.iter().position(|(known, _)| known.id == server.id) {
             Some(index) => index,
             None => {
-                servers.push((server.clone(), Vec::new()));
+                servers.push((server, Vec::new()));
                 servers.len() - 1
             }
         };
-        for destination in &authorization.destinations {
+        for destination in authorization.destinations {
             if !servers[index].1.contains(&destination.network) {
-                servers[index].1.push(destination.network.clone());
+                servers[index].1.push(destination.network);
             }
         }
     };
-    for record in home
-        .store
-        .list::<GatewayInvoiceRecord>(GATEWAY_INVOICES)?
+    let invoices = home
+        .db
+        .invoices()
+        .range_by_to_check_on_preimage_server(..)
+        .map_err(|e| e.to_string())?;
+    for delegation in invoices
         .into_iter()
-        .filter(|record| record.status == InvoiceStatus::Pending)
+        .filter_map(|invoice| invoice.delegation)
     {
-        add(&record.endpoints.preimage_server, &record.authorization);
+        add(
+            PeerAddr {
+                id: delegation.preimage_server,
+                relay: delegation.preimage_server_relay,
+            },
+            (&delegation.authorization).try_into()?,
+        );
     }
-    for record in home
-        .store
-        .list::<StandingAuthorizationRecord>(STANDING_AUTHORIZATIONS)?
+    for delegation in home
+        .db
+        .full_delegations()
+        .all()
+        .map_err(|e| e.to_string())?
     {
-        add(&record.endpoints.preimage_server, &record.authorization);
+        add(
+            PeerAddr {
+                id: delegation.preimage_server,
+                relay: delegation.preimage_server_relay,
+            },
+            (&delegation.authorization).try_into()?,
+        );
     }
     if let Some(id) = preimage_server {
         servers.retain(|(server, _)| server.id == id);
@@ -716,7 +755,7 @@ async fn redeem_from(
     for (preimage_server, networks) in servers {
         let opened = home.open_networks(&networks, span).await?;
         let report = redeem_offline_payments(
-            &home.store,
+            &home.db,
             &home.keys,
             transport,
             &preimage_server,
@@ -762,45 +801,4 @@ fn relays(cli: &Cli) -> Vec<String> {
         DEFAULT_NOSTR_RELAYS
     };
     defaults.iter().map(|relay| relay.to_string()).collect()
-}
-
-#[allow(unused_variables, unreachable_code)]
-fn configure_bark(
-    home: &Home,
-    network: &NetworkId,
-    server: Option<String>,
-    esplora: Option<String>,
-) -> Result<(), String> {
-    #[cfg(feature = "bark-lightning")]
-    {
-        let default = cassis_networks::bark_lightning::BarkConfig::default_for(network);
-        let config = cassis_networks::bark_lightning::BarkConfig {
-            server_url: server
-                .or_else(|| default.as_ref().map(|d| d.server_url.clone()))
-                .ok_or_else(|| {
-                    format!("{network} has no default Ark server: pass --bark-server")
-                })?,
-            esplora_url: esplora
-                .or_else(|| default.as_ref().map(|d| d.esplora_url.clone()))
-                .ok_or_else(|| format!("{network} has no default Esplora: pass --bark-esplora"))?,
-        };
-        return home.set_bark_config(network, &config);
-    }
-    Err("this cassis-wallet was built without the 'bark-lightning' feature".into())
-}
-
-#[allow(unused_variables)]
-fn configure_lnd(
-    home: &Home,
-    rest_url: Option<String>,
-    tls_cert: Option<PathBuf>,
-    macaroon: Option<PathBuf>,
-) -> Result<(), String> {
-    #[cfg(feature = "lightning")]
-    if let Some(rest_url) = rest_url {
-        home.set_lnd_config(&cassis_networks::lnd::LndConfig::new(
-            rest_url, tls_cert, macaroon,
-        ))?;
-    }
-    Ok(())
 }

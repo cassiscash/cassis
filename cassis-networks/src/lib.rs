@@ -35,7 +35,6 @@ pub struct NetworkSettings {
     pub dir: PathBuf,
     /// Longest an HTLC received on the network may run, instead of what
     /// the network derives.
-    pub max_incoming_lifetime_secs: Option<u64>,
     /// Chain API instead of the public one, for `arkade` and `bitcoin`
     /// (regtest has none).
     pub esplora_url: Option<String>,
@@ -156,10 +155,6 @@ pub async fn open_wallet(
         #[cfg(any(feature = "lightning", feature = "bark-lightning"))]
         "lightning" => open_lightning(network, settings, span).await?,
         kind => return Err(format!("this build has no '{kind}' support")),
-    };
-    let opened = match settings.max_incoming_lifetime_secs {
-        Some(secs) => cassis_core::with_max_incoming_lifetime(opened, secs),
-        None => opened,
     };
     Ok((opened, wallet))
 }

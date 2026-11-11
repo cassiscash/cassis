@@ -1,13 +1,14 @@
 //! Payer role: route, PREPARE, fund, EXECUTE, COMMIT.
 
-use super::{Node, PaymentRecord, PaymentStatus, PAYMENTS};
-use crate::network::{Htlc, NetworkId};
-use crate::primitives::{unix_now, Bytes32, OperationId};
-use crate::protocol::{
+use super::{db_error, Node};
+use crate::db::{Direction, PendingPayment, PendingPaymentHash, Transaction, TransactionHash};
+use cassis_core::network::{Htlc, NetworkId};
+use cassis_core::protocol::{
     Commit, Discard, Execute, Invoice, Prepare, PreparePayee, Request, Response, Settle,
 };
-use crate::routing::{self, RouteAnnouncement};
-use crate::transport::PeerAddr;
+use cassis_core::routing::{self, RouteAnnouncement};
+use cassis_core::transport::PeerAddr;
+use cassis_core::{unix_now, Bytes32, OperationId};
 use futures::future::join_all;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -21,9 +22,10 @@ impl Node {
     /// routers announced on `relays` when the invoice is not payable on
     /// `from` directly. Returns the preimage.
     ///
-    /// Once the first HTLC is funded the payment is journaled: if the
-    /// payment fails afterwards, a serving node refunds it after its
-    /// expiry.
+    /// Once the first HTLC is funded the payment is journaled as a
+    /// [`PendingPayment`]: if the payment fails afterwards, a serving
+    /// node refunds it after its expiry. Once claimed it is an outgoing
+    /// [`Transaction`].
     ///
     /// Hops and the payee may wait for their incoming HTLC to become
     /// final (to confirm, on Bitcoin), so this can take as long as the
@@ -45,24 +47,28 @@ impl Node {
         if invoice.body.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
+        let key = hash.to_string();
         if let Some(previous) = self
-            .store()
-            .get::<PaymentRecord>(PAYMENTS, &hash.to_string())?
+            .db()
+            .transactions()
+            .get(TransactionHash(key.clone()))
+            .map_err(db_error)?
         {
-            match previous.status {
-                PaymentStatus::Completed => {
-                    return previous
-                        .preimage
-                        .ok_or("completed payment without preimage".into())
-                }
-                PaymentStatus::Pending => {
-                    return Err(format!(
-                        "an earlier attempt is still locked until {}",
-                        previous.htlc.expiry
-                    ))
-                }
-                PaymentStatus::Refunded => {}
-            }
+            return match previous.direction {
+                Direction::Outgoing => Ok(Bytes32(previous.preimage)),
+                Direction::Incoming => Err("this wallet was paid this invoice".into()),
+            };
+        }
+        if let Some(previous) = self
+            .db()
+            .pending_payments()
+            .get(PendingPaymentHash(key.clone()))
+            .map_err(db_error)?
+        {
+            return Err(format!(
+                "an earlier attempt is still locked until {}",
+                previous.htlc.expiry
+            ));
         }
         let sender = self.network(from)?;
         let (route, payee_network) = self.choose_route(invoice, from, relays).await?;
@@ -81,7 +87,6 @@ impl Node {
             &route,
             invoice.body.amount_msat,
             invoice.incoming_delta_for(&payee_network),
-            invoice.max_incoming_lifetime_for(&payee_network),
             unix_now(),
         )?;
         let hops: Vec<Hop> = route
@@ -119,7 +124,6 @@ impl Node {
             network: payee_network.clone(),
             expiry: plan.expiries[hops.len()],
             metadata: invoice.body.metadata.clone(),
-            invoice: Some(invoice.clone()),
         });
         let (replies, payee_reply) = futures::join!(
             join_all(hops.iter().map(|hop| async move {
@@ -171,15 +175,15 @@ impl Node {
                 return Err(format!("cannot fund the first HTLC on {from}: {error}"));
             }
         };
-        let mut record = PaymentRecord {
-            invoice: invoice.clone(),
-            network: from.clone(),
-            htlc: first.clone(),
-            status: PaymentStatus::Pending,
-            preimage: None,
-            created_at: unix_now(),
-        };
-        self.store().put(PAYMENTS, &hash.to_string(), &record)?;
+        self.db()
+            .pending_payments()
+            .insert(&PendingPayment {
+                payment_hash: PendingPaymentHash(key.clone()),
+                network: from.0.clone(),
+                htlc: (&first).into(),
+                created_at: unix_now(),
+            })
+            .map_err(db_error)?;
         let locked = |reason: String| {
             format!(
                 "{reason}; {} msat stay locked on {from} until {} and are refunded by a \
@@ -222,7 +226,6 @@ impl Node {
             expiry: plan.expiries[hops.len()],
             descriptor,
             metadata: invoice.body.metadata.clone(),
-            invoice: Some(invoice.clone()),
         };
         let deadline = commit.expiry;
         let preimage = match self
@@ -240,9 +243,7 @@ impl Node {
                 )))
             }
         };
-        record.status = PaymentStatus::Completed;
-        record.preimage = Some(preimage);
-        self.store().put(PAYMENTS, &hash.to_string(), &record)?;
+        self.complete_payment(&key, from, &first, preimage)?;
         info!("paid {}: preimage {preimage}", hash.short());
 
         // Let every hop claim right away instead of waiting to observe
@@ -260,6 +261,32 @@ impl Node {
         }))
         .await;
         Ok(preimage)
+    }
+
+    /// Turn the pending payment of `htlc` on `network` into an outgoing
+    /// transaction: the payee claimed it with `preimage`.
+    pub(super) fn complete_payment(
+        &self,
+        key: &str,
+        network: &NetworkId,
+        htlc: &Htlc,
+        preimage: Bytes32,
+    ) -> Result<(), String> {
+        self.db()
+            .write(|tx| {
+                tx.pending_payments()
+                    .delete(PendingPaymentHash(key.to_string()))?;
+                tx.transactions().insert(&Transaction {
+                    payment_hash: TransactionHash(key.to_string()),
+                    direction: Direction::Outgoing,
+                    amount_msat: htlc.amount_msat,
+                    network: network.0.clone(),
+                    preimage: preimage.0,
+                    at: unix_now(),
+                    invoice: None,
+                })
+            })
+            .map_err(db_error)
     }
 
     /// The invoice network to pay and the route there: direct when the
@@ -295,7 +322,6 @@ impl Node {
                     &route,
                     invoice.body.amount_msat,
                     invoice.incoming_delta_for(&entry.network),
-                    invoice.max_incoming_lifetime_for(&entry.network),
                     unix_now(),
                 )
                 .map_err(|error| unplannable = Some(format!("route to {}: {error}", entry.network)))

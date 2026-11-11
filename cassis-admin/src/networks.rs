@@ -20,7 +20,7 @@ use crate::config::{child, implicit_table, put_text, ConfigFile, DaemonConfig};
 use crate::view::{act, field, options, quote, short_hash, submit};
 use crate::wallets::Wallets;
 use crate::{Args, Refresh};
-use cassis_core::keys::NodeKeys;
+use cassis_core::keys::new_network_secret;
 use cassis_core::{Network, NetworkId};
 use cassis_networks::{NetworkSettings, Wallet};
 use futures::future::BoxFuture;
@@ -370,19 +370,28 @@ async fn maintain(network: Arc<dyn Network>) {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Hex wallet key on this network, written when it is added.
+    pub secret: Option<String>,
     /// Chain API of `arkade` and `bitcoin`, instead of the public one.
     pub esplora_url: Option<String>,
 }
 
 impl NetworkConfig {
-    /// What opening `id` takes, with `keys`, its wallet under `dir`.
-    pub fn settings(&self, id: &NetworkId, keys: &NodeKeys, dir: &Path) -> NetworkSettings {
-        NetworkSettings {
-            secret: keys.network_secret(id),
+    /// What opening `id` takes, its wallet under `dir`.
+    pub fn settings(&self, id: &NetworkId, dir: &Path) -> Result<NetworkSettings, String> {
+        let hex = self
+            .secret
+            .as_deref()
+            .ok_or_else(|| format!("networks.\"{id}\" has no secret"))?;
+        let mut secret = [0u8; 32];
+        lowercase_hex::decode_to_slice(hex.trim(), &mut secret)
+            .map_err(|e| format!("{id} secret: expected 64 hex characters: {e}"))?;
+        Ok(NetworkSettings {
+            secret,
             dir: cassis_networks::network_dir(dir, id),
             esplora_url: self.esplora_url.clone(),
             ..Default::default()
-        }
+        })
     }
 
     /// The fields of its form.
@@ -443,10 +452,15 @@ fn has_network(doc: &DocumentMut, id: &NetworkId) -> bool {
         .is_some_and(|networks| networks.contains_key(&id.0))
 }
 
-/// Adds `id` if missing. Fields: `esplora_url`.
+/// Adds `id` if missing, with a fresh wallet key. Fields:
+/// `esplora_url`.
 fn set_network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
     let networks = child(doc.as_table_mut(), "networks", implicit_table)?;
     let network = child(networks, &id.0, toml_edit::table)?;
+    if !network.contains_key("secret") {
+        let secret = lowercase_hex::encode(new_network_secret());
+        crate::config::put(network, "secret", Some(secret.into()));
+    }
     put_text(network, "esplora_url", args.text("esplora_url")?);
     Ok(())
 }

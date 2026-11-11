@@ -45,6 +45,7 @@ pub use db::Db;
 
 #[orangedb::schema]
 pub mod db {
+    use cassis_wallet::stored::{StoredDescriptor, StoredTarget};
     /// A payee whose payment the server let through, by its key.
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
@@ -67,18 +68,16 @@ pub mod db {
         pub network: String,
         pub amount_msat: u64,
         pub expiry: u64,
-        /// JSON of the HTLC's `HtlcTarget`.
-        pub target: String,
-        /// JSON of the HTLC's `HtlcDescriptor`.
-        pub descriptor: String,
-        /// Hex.
-        pub preimage: String,
-        /// JSON of the invoice's `Metadata`, if any.
-        pub metadata: Option<String>,
+        pub target: StoredTarget,
+        pub descriptor: StoredDescriptor,
+        pub preimage: [u8; 32],
+        /// The invoice's metadata, if any.
+        pub metadata: Option<Vec<u8>>,
         pub released_at: u64,
     }
 }
 
+use cassis_wallet::stored::{self, stored_metadata};
 use db::{Payee, PayeeKey, Payment, PaymentHash};
 
 pub struct ServerConfig {
@@ -437,14 +436,10 @@ impl PreimageServer {
             network: network.0.clone(),
             amount_msat: htlc.amount_msat,
             expiry: htlc.expiry,
-            target: serde_json::to_string(&htlc.target).map_err(|e| e.to_string())?,
-            descriptor: serde_json::to_string(&htlc.descriptor).map_err(|e| e.to_string())?,
-            preimage: preimage.to_string(),
-            metadata: metadata
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| e.to_string())?,
+            target: (&htlc.target).into(),
+            descriptor: (&htlc.descriptor).into(),
+            preimage: preimage.0,
+            metadata: stored_metadata(&metadata),
             released_at: unix_now(),
         };
         let written = self.0.db.write(|tx| {
@@ -500,16 +495,10 @@ impl PreimageServer {
                     network: NetworkId(payment.network),
                     amount_msat: payment.amount_msat,
                     expiry: payment.expiry,
-                    target: serde_json::from_str(&payment.target)
-                        .map_err(|e| format!("stored target: {e}"))?,
-                    descriptor: serde_json::from_str(&payment.descriptor)
-                        .map_err(|e| format!("stored descriptor: {e}"))?,
-                    preimage: Bytes32::from_str(&payment.preimage)?,
-                    metadata: payment
-                        .metadata
-                        .map(|metadata| serde_json::from_str(&metadata))
-                        .transpose()
-                        .map_err(|e| format!("stored metadata: {e}"))?,
+                    target: (&payment.target).try_into()?,
+                    descriptor: (&payment.descriptor).try_into()?,
+                    preimage: Bytes32(payment.preimage),
+                    metadata: stored::metadata(&payment.metadata)?,
                     at: payment.released_at,
                 })
             })

@@ -264,11 +264,6 @@ impl Network for BarkLightningAdapter {
         (self.min_cltv_delta + self.htlc_expiry_delta + 1) * self.block_secs
     }
 
-    /// The longest CLTV the server grants a receive.
-    fn max_incoming_lifetime_secs(&self) -> Option<u64> {
-        Some((self.max_cltv_delta + self.htlc_expiry_delta) * self.block_secs)
-    }
-
     async fn receive_target(
         &self,
         payment_hash: Bytes32,

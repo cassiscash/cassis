@@ -12,27 +12,30 @@ use async_trait::async_trait;
 use cassis_admin::networks::{NetworkConfig, Networks, Opened, Opener, Status};
 use cassis_admin::{App, Args, ConfigFile, Refresh};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
-use cassis_core::node::{
-    authorize_gateway, create_gateway_invoice, redeem_offline_payments, GatewayInvoiceRecord,
-    InvoiceStatus, Node, NodeConfig, OfflineEndpoints, GATEWAY_INVOICES,
+use cassis_core::offline::{
+    endpoint_public_key, GatewayMetadata, ReceiveAuthorization, DEFAULT_MIN_FINAL_TIMEOUT_SECS,
 };
-use cassis_core::offline::{endpoint_public_key, DEFAULT_MIN_FINAL_TIMEOUT_SECS};
 use cassis_core::protocol::{
     GatewayInvoiceFor, Invoice, InvoiceReceiver, Metadata, PreimageRelease, ReceivedPayment,
     Request, Response,
 };
-use cassis_core::store::Store;
 use cassis_core::transport::{PeerAddr, Transport};
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
 use cassis_gateway::admin::GatewayAdmin;
-use cassis_gateway::{config as gateway_config, ForwardRecord, ForwardState};
+use cassis_gateway::config as gateway_config;
 use cassis_gateway::{Gateway, GatewayConfig, GatewayPolicy};
 use cassis_preimage_server::admin::PreimageAdmin;
 use cassis_preimage_server::config as server_config;
 use cassis_preimage_server::{Db, PreimageServer, ServerConfig, Stats};
+use cassis_wallet::db::{Db as WalletDb, InvoiceHash, InvoiceState};
+use cassis_wallet::node::{
+    authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
+    RedeemReport,
+};
+use cassis_wallet::{open_db, Node, NodeConfig};
 use futures::future::BoxFuture;
 use hypereffect::json;
 use hypereffect::vtree::text;
@@ -224,7 +227,7 @@ fn temp_dir(name: &str) -> PathBuf {
 
 struct Payee {
     keys: NodeKeys,
-    store: Store,
+    db: Arc<WalletDb>,
     network: Arc<dyn Network>,
     /// Client endpoint with the payee's identity, its iroh key.
     transport: Transport,
@@ -236,7 +239,7 @@ impl Payee {
         let transport = Transport::bind_client(keys.iroh).await.unwrap();
         Self {
             keys,
-            store: Store::open(&temp_dir("payee").join("store.db")).unwrap(),
+            db: open_db(&temp_dir("payee")).unwrap(),
             network: MockNetwork::new(key, ledger),
             transport,
         }
@@ -253,7 +256,7 @@ impl Payee {
         min_final_timeout_secs: u64,
     ) -> Result<Invoice, String> {
         create_gateway_invoice(
-            &self.store,
+            &self.db,
             &self.keys,
             &self.transport,
             endpoints.clone(),
@@ -267,9 +270,9 @@ impl Payee {
         .await
     }
 
-    async fn redeem(&self, server: &PeerAddr) -> cassis_core::node::RedeemReport {
+    async fn redeem(&self, server: &PeerAddr) -> RedeemReport {
         redeem_offline_payments(
-            &self.store,
+            &self.db,
             &self.keys,
             &self.transport,
             server,
@@ -279,6 +282,15 @@ impl Payee {
         .await
         .unwrap()
     }
+}
+
+fn gateway_db(name: &str) -> Arc<cassis_gateway::db::Db> {
+    Arc::new(cassis_gateway::db::Db::open(temp_dir(name).join("gateway.redb")).unwrap())
+}
+
+/// What a gateway's invoice carries in its metadata.
+fn carried(invoice: &Invoice) -> GatewayMetadata {
+    GatewayMetadata::from_metadata(invoice.body.metadata.as_ref().unwrap()).unwrap()
 }
 
 fn metadata(text: &str) -> Metadata {
@@ -312,7 +324,8 @@ async fn setup() -> Setup {
     let gateway_keys = NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap();
     let gateway = Gateway::start(GatewayConfig {
         endpoint_secret: gateway_keys.iroh,
-        store: Arc::new(Store::open(&temp_dir("gateway").join("store.db")).unwrap()),
+        db: gateway_db("gateway"),
+        wallet: open_db(&temp_dir("gateway-wallet")).unwrap(),
         networks: vec![MockNetwork::new(8, &ledger)],
         policy: GatewayPolicy {
             forward_slack_secs: 60,
@@ -336,7 +349,7 @@ async fn setup() -> Setup {
     let payer = Node::start(
         NodeConfig {
             keys: NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap(),
-            store: Arc::new(Store::open(&temp_dir("payer").join("store.db")).unwrap()),
+            db: open_db(&temp_dir("payer")).unwrap(),
             span: Span::none(),
             serve: false,
         },
@@ -367,7 +380,10 @@ impl Setup {
     }
 
     fn gateway_admin(&self, networks: Arc<Networks<NetworkConfig>>) -> Arc<GatewayAdmin> {
-        let template = format!("[networks.\"{NETWORK}\"]\n");
+        let template = format!(
+            "mnemonic = \"{}\"\n[networks.\"{NETWORK}\"]\n",
+            generate_mnemonic()
+        );
         let file = ConfigFile::<gateway_config::Config>::load_or_create(
             &temp_dir("gateway-admin"),
             &template,
@@ -430,7 +446,12 @@ async fn payee_offline_behind_a_gateway() {
     invoice.verify().unwrap();
     assert!(matches!(invoice.receiver, InvoiceReceiver::Gateway(_)));
     assert_eq!(*invoice.payee(), payee.key());
-    assert_eq!(invoice.body.metadata, Some(metadata("order 42")));
+    // The gateway carries the invoice's terms in its metadata, signed,
+    // around the payee's.
+    let terms = carried(&invoice);
+    terms.verify(&setup.gateway.key()).unwrap();
+    assert_eq!(terms.payee_metadata, Some(metadata("order 42")));
+    assert_eq!(terms.payment_hash(), invoice.body.payment_hash);
     assert_eq!(invoice.gateway().copied(), Some(setup.gateway.key()));
     assert_eq!(invoice.iroh_peer_id().to_string(), setup.gateway.peer_id());
 
@@ -472,12 +493,13 @@ async fn payee_offline_behind_a_gateway() {
         setup.locks(invoice.body.payment_hash, 2).1.state,
         LockState::Claimed(preimage)
     );
-    let record: GatewayInvoiceRecord = payee
-        .store
-        .get(GATEWAY_INVOICES, &invoice.body.payment_hash.to_string())
+    let record = payee
+        .db
+        .invoices()
+        .get(InvoiceHash(invoice.body.payment_hash.to_string()))
         .unwrap()
         .unwrap();
-    assert_eq!(record.status, InvoiceStatus::Claimed);
+    assert_eq!(record.state, InvoiceState::Settled);
     let again = payee.redeem(&setup.endpoints.preimage_server).await;
     assert!(again.claimed.is_empty() && again.failed.is_empty());
 
@@ -491,19 +513,10 @@ async fn payee_offline_behind_a_gateway() {
     // Nobody but the gateway gets preimages released, and nobody but
     // the payee sees its log.
     let intruder = Transport::bind_client([7; 32]).await.unwrap();
-    let record: cassis_gateway::InvoiceRecord = setup
-        .gateway
-        .store()
-        .get(
-            cassis_gateway::INVOICES,
-            &invoice.body.payment_hash.to_string(),
-        )
-        .unwrap()
-        .unwrap();
     let release = Request::PreimageRelease(PreimageRelease {
-        authorization: record.authorization,
-        issuance: record.issuance,
-        metadata: record.invoice.body.metadata,
+        authorization: terms.authorization,
+        issuance: terms.issuance,
+        metadata: terms.payee_metadata,
         network: network.clone(),
         htlc: Htlc {
             payment_hash: invoice.body.payment_hash,
@@ -556,7 +569,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     let payee = Payee::new(3, &setup.ledger).await;
     let now = unix_now();
     authorize_gateway(
-        &payee.store,
+        &payee.db,
         &payee.keys,
         &payee.transport,
         setup.endpoints.clone(),
@@ -582,10 +595,9 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
             metadata: Some(metadata("tip jar")),
         })
     };
-    let Response::GatewayInvoice(Ok(invoice)) =
-        request(&asker, &setup.endpoints.gateway, ask(20_000)).await
-    else {
-        panic!("expected an invoice");
+    let invoice = match request(&asker, &setup.endpoints.gateway, ask(20_000)).await {
+        Response::GatewayInvoice(Ok(invoice)) => invoice,
+        other => panic!("expected an invoice, got {other:?}"),
     };
     invoice.verify().unwrap();
     assert!(matches!(invoice.receiver, InvoiceReceiver::Delegated(_)));
@@ -650,10 +662,13 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     );
 
     // A forgotten authorization gives no more invoices.
-    let authorizations = setup.gateway.authorizations().unwrap();
-    assert_eq!(authorizations.len(), 1);
-    let id = authorizations[0].authorization.id().unwrap();
-    setup.gateway.forget_authorization(&id).unwrap();
+    let delegations = setup.gateway.delegations().unwrap();
+    assert_eq!(delegations.len(), 1);
+    let id = ReceiveAuthorization::try_from(&delegations[0].authorization)
+        .unwrap()
+        .id()
+        .unwrap();
+    setup.gateway.forget_delegation(&id).unwrap();
     assert!(matches!(
         request(&asker, &setup.endpoints.gateway, ask(20_000)).await,
         Response::GatewayInvoice(Err(_))
@@ -721,40 +736,34 @@ async fn networks_and_terms_change_while_running() {
 
     // A forward whose network is not open waits for it instead of giving
     // up on the money: here, one claiming as a gateway starts on nothing.
-    let store = Arc::new(Store::open(&temp_dir("resumed").join("store.db")).unwrap());
-    let hash = invoice.body.payment_hash.to_string();
-    let record: cassis_gateway::InvoiceRecord = setup
-        .gateway
-        .store()
-        .get(cassis_gateway::INVOICES, &hash)
-        .unwrap()
-        .unwrap();
-    store.put(cassis_gateway::INVOICES, &hash, &record).unwrap();
-    let mut forward: ForwardRecord = setup.gateway.forwards().unwrap().remove(0);
-    forward.state = ForwardState::Claiming;
-    store
-        .put(cassis_gateway::FORWARDS, &hash, &forward)
-        .unwrap();
+    let db = gateway_db("resumed");
+    let mut htlc = setup.gateway.payee_htlcs().unwrap().remove(0);
+    assert!(htlc.settled && htlc.preimage.is_some());
+    htlc.settled = false;
+    db.payee_htlcs().insert(&htlc).unwrap();
     let resumed = Gateway::start(GatewayConfig {
         endpoint_secret: [33; 32],
-        store,
+        db,
+        wallet: open_db(&temp_dir("resumed-wallet")).unwrap(),
         networks: Vec::new(),
         policy: GatewayPolicy::default(),
         span: Span::none(),
     })
     .await
     .unwrap();
-    let state = || resumed.forwards().unwrap().remove(0).state;
+    let settled = || resumed.payee_htlcs().unwrap().remove(0).settled;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    assert_eq!(state(), ForwardState::Claiming);
+    assert!(!settled());
     resumed.add_network(MockNetwork::new(8, &setup.ledger));
     for _ in 0..100 {
-        if state() != ForwardState::Claiming {
+        if settled() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_eq!(state(), ForwardState::Settled);
+    assert!(settled());
+    // ... and records what it was paid in its wallet.
+    assert_eq!(resumed.wallet().transactions().len().unwrap(), 1);
 
     resumed.shutdown().await;
     payee.transport.close().await;

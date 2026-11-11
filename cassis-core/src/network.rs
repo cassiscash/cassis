@@ -6,7 +6,7 @@
 //! refund"). Adapters keep no per-payment state: everything they need
 //! travels in the [`Htlc`] passed to them, and all coordination —
 //! reservations, journaling, retries, timeouts, polling — lives in the
-//! node (see `crate::node`).
+//! node (see `cassis-wallet`).
 
 use crate::primitives::{Bytes32, PubKey, XOnlyPubKey};
 use async_trait::async_trait;
@@ -307,14 +307,6 @@ pub trait Network: Send + Sync {
         self.id().default_incoming_delta()
     }
 
-    /// Longest an HTLC received on this network may run: its expiry at
-    /// most this many seconds after it is locked, or `None` for no
-    /// limit. Routers announce it and payers plan within it; see
-    /// [`with_max_incoming_lifetime`] to change it.
-    fn max_incoming_lifetime_secs(&self) -> Option<u64> {
-        None
-    }
-
     /// What a payer must lock an HTLC for `payment_hash` to so that this
     /// node can claim it. Idempotent per payment hash. Networks whose
     /// target is a claim key return it without side effects; Lightning
@@ -406,26 +398,14 @@ pub trait Network: Send + Sync {
 pub fn with_incoming_delta(network: Arc<dyn Network>, secs: u64) -> Arc<dyn Network> {
     Arc::new(Overridden {
         network,
-        incoming_delta_secs: Some(secs),
-        max_incoming_lifetime_secs: None,
+        incoming_delta_secs: secs,
     })
 }
 
-/// `network` accepting incoming HTLCs that run at most `secs` (see
-/// [`Network::max_incoming_lifetime_secs`]) instead of its own limit.
-pub fn with_max_incoming_lifetime(network: Arc<dyn Network>, secs: u64) -> Arc<dyn Network> {
-    Arc::new(Overridden {
-        network,
-        incoming_delta_secs: None,
-        max_incoming_lifetime_secs: Some(secs),
-    })
-}
-
-/// A network with some of its timelock parameters replaced.
+/// A network with its safety margin replaced.
 struct Overridden {
     network: Arc<dyn Network>,
-    incoming_delta_secs: Option<u64>,
-    max_incoming_lifetime_secs: Option<u64>,
+    incoming_delta_secs: u64,
 }
 
 #[async_trait]
@@ -436,12 +416,6 @@ impl Network for Overridden {
 
     fn incoming_delta_secs(&self) -> u64 {
         self.incoming_delta_secs
-            .unwrap_or_else(|| self.network.incoming_delta_secs())
-    }
-
-    fn max_incoming_lifetime_secs(&self) -> Option<u64> {
-        self.max_incoming_lifetime_secs
-            .or_else(|| self.network.max_incoming_lifetime_secs())
     }
 
     async fn receive_target(

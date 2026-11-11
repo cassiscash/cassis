@@ -63,7 +63,6 @@ async fn run(cli: Cli) -> Result<(), String> {
     let span = info_span!("preimage-server");
     let networks = Networks::new(
         PreimageOpener {
-            keys: keys.clone(),
             dir: dir.clone(),
             span: span.clone(),
         },

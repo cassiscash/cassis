@@ -14,7 +14,7 @@ cargo build -p cassis-wallet -p cassis-routerd -p cassis-gateway -p cassis-preim
 scripts/live/up.sh                 # some minutes: mints, federation, arkd, r1-r7
 scripts/live/demo.sh balances      # check the budget below first
 scripts/live/demo.sh offline       # ~2 min; starts the gateway and preimage server
-scripts/live/demo.sh online        # ~7 min; takes r5 out of routes, then back
+scripts/live/demo.sh online        # ~7 min
 scripts/live/down.sh               # once nothing is left to refund
 ```
 
@@ -93,7 +93,10 @@ will happen again. None came from moving routers to `cassis-routerd`.
    shortens. So `demo.sh online` removes r5's routes, which also deletes
    their announcements, and puts them back after. To do it by hand:
    `admin_act r5 route.remove '{"from":"…","to":"…"}'`, wait 15s, and
-   `node.sh route r5` to restore.
+   `node.sh route r5` to restore. *Since then routers announce no
+   lifetime and payers plan within none, so `demo.sh online` no longer
+   takes r5 out: arkade's batch expiry is left to its own checks until a
+   better rule replaces the lifetime.*
 2. **`hop 4 failed: incoming HTLC rejected: invalid: contract expires
    before the expiry`** on alice → erin (`04-online-retry.log`), which
    paid on retry. The fedimint sender locks exactly as many blocks as the

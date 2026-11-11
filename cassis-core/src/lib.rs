@@ -8,10 +8,10 @@
 //! * [`keys`] — key derivation from the node's mnemonic.
 //! * [`offline`] — receiving while offline: the payee's authorization
 //!   of a gateway and a preimage server, and their signed statements.
-//! * [`node`] (feature `node`, on by default) — the runtime that
-//!   coordinates networks to pay, route and receive, with its iroh
-//!   [`transport`] and its [`store`]. Without it the crate stays light
-//!   enough for network crates and wasm.
+//! * [`transport`] (feature `node`, on by default) — the iroh transport
+//!   nodes talk over. Without it the crate stays light enough for
+//!   network crates and wasm. Paying and receiving is `cassis-wallet`'s,
+//!   routing `cassis-routerd`'s.
 
 pub mod keys;
 pub mod logging;
@@ -22,15 +22,11 @@ pub mod protocol;
 pub mod routing;
 
 #[cfg(feature = "node")]
-pub mod node;
-#[cfg(feature = "node")]
-pub mod store;
-#[cfg(feature = "node")]
 pub mod transport;
 
 pub use network::{
-    network_span, with_incoming_delta, with_max_incoming_lifetime, Htlc, HtlcDescriptor,
-    HtlcTarget, Network, NetworkError, NetworkId, OutgoingState,
+    network_span, with_incoming_delta, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError,
+    NetworkId, OutgoingState,
 };
 pub use primitives::{
     sats_for_msat, unix_now, Bytes32, OperationId, PubKey, XOnlyPubKey, MSAT_PER_SAT,

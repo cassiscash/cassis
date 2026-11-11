@@ -17,9 +17,8 @@
 //!   (commitment transaction) they descend from, after which the
 //!   operator may sweep it and they can no longer be spent offchain.
 //!   An HTLC must therefore be over [`SWEEP_MARGIN_SECS`] before its
-//!   VHTLC's batch expires: receivers check it, senders refresh coins
-//!   into a new batch before locking them, and routers announce the
-//!   longest HTLC the operator's batch lifetime allows.
+//!   VHTLC's batch expires: receivers check it, and senders refresh
+//!   coins into a new batch before locking them.
 //! * **Preimage observation** (for routing): when the counterparty
 //!   claims our outgoing VHTLC, the preimage is embedded in the spend
 //!   transaction's PSBT under the `condition` unknown field; we poll
@@ -1004,16 +1003,6 @@ impl ArkadeAdapter {
 impl Network for ArkadeAdapter {
     fn id(&self) -> NetworkId {
         self.id.clone()
-    }
-
-    /// The operator's batch lifetime less [`SWEEP_MARGIN_SECS`]: a
-    /// sender refreshing its coins right before locking can make the
-    /// VHTLC's batch last at most that long. No limit until learnt.
-    fn max_incoming_lifetime_secs(&self) -> Option<u64> {
-        self.batch_lifetime_secs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .map(|lifetime| lifetime.saturating_sub(SWEEP_MARGIN_SECS))
     }
 
     async fn receive_target(

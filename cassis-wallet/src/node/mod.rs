@@ -1,134 +1,59 @@
-//! The node: coordinates the [`Network`] adapters of one Cassis node in
-//! its three roles.
+//! The node: coordinates the [`Network`] adapters of one wallet as a
+//! payer and a payee.
 //!
 //! * **Payer** ([`Node::pay`]): finds a route, PREPAREs every hop, funds
 //!   the first HTLC, EXECUTEs the hops in order and COMMITs to the payee.
-//! * **Router**: reserves hops on PREPARE, and on EXECUTE verifies the
-//!   incoming HTLC before funding the outgoing one.
 //! * **Payee**: on PREPARE checks it still expects the payment, on
 //!   COMMIT verifies the final HTLC and claims it.
 //!
-//! Every HTLC this node funds or must claim is journaled in the
-//! [`Store`] before or right after the network call, and a settlement
-//! loop drives each to an end: claim the incoming side once the
-//! preimage shows up downstream, refund the outgoing side once it
-//! expires.
+//! Routing is `cassis-routerd`'s: it hands this node the hop requests'
+//! handler ([`Node::route_with`]) and drives its hops on this node's
+//! networks and endpoint.
+//!
+//! Every HTLC this node funds is journaled in the [`Db`] as a
+//! [`PendingPayment`](crate::db::PendingPayment) right after the network
+//! call, and a settlement loop drives each to an end: a
+//! [`Transaction`](crate::db::Transaction) once the payee claims it, a
+//! refund once it expires.
 
 mod offline;
 mod payee;
 mod payer;
-mod router;
 mod settle;
 
-use crate::keys::NodeKeys;
-use crate::network::{Htlc, HtlcTarget, Network, NetworkId};
-use crate::primitives::{Bytes32, OperationId, XOnlyPubKey};
-use crate::protocol::{Invoice, Prepare, Request, Response};
-use crate::store::Store;
-use crate::transport::{Handler, Transport};
-use serde::{Deserialize, Serialize};
+use crate::db::Db;
+use cassis_core::keys::NodeKeys;
+use cassis_core::network::{Network, NetworkId};
+use cassis_core::protocol::{Request, Response};
+use cassis_core::transport::{Handler, Transport};
+use cassis_core::{Bytes32, XOnlyPubKey};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{Instrument, Span};
 
 pub use offline::{
-    authorize_gateway, create_gateway_invoice, redeem_offline_payments, GatewayInvoiceRecord,
-    OfflineClaim, OfflineEndpoints, RedeemReport, StandingAuthorizationRecord, GATEWAY_INVOICES,
-    OFFLINE_CLAIMS, STANDING_AUTHORIZATIONS,
+    authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
+    RedeemReport,
 };
 pub use payee::create_invoice;
-pub use router::{PrepareVeto, RouteOffer, RoutingPolicy};
+pub use settle::{settle_outgoing, Outcome};
 
-const INVOICES: &str = "invoices";
-const PAYMENTS: &str = "payments";
-const HOPS: &str = "hops";
-
-/// How long EXECUTE and COMMIT work before answering
-/// [`Response::Pending`] instead of the outcome.
-const INLINE_WAIT: Duration = Duration::from_secs(5);
+/// How long COMMIT works before answering [`Response::Pending`] instead
+/// of the outcome.
+pub const INLINE_WAIT: Duration = Duration::from_secs(5);
 /// How often an incoming HTLC that is not final yet is verified again.
-const VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-
-/// An invoice this node issued, with its secret preimage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InvoiceRecord {
-    pub invoice: Invoice,
-    pub preimage: Bytes32,
-    pub status: InvoiceStatus,
-    pub created_at: u64,
-    pub settled_at: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InvoiceStatus {
-    Pending,
-    Claimed,
-    Expired,
-}
-
-/// A payment this node made: the HTLC it funded on its own network.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PaymentRecord {
-    pub invoice: Invoice,
-    pub network: NetworkId,
-    pub htlc: Htlc,
-    pub status: PaymentStatus,
-    /// Proof of payment, once known.
-    pub preimage: Option<Bytes32>,
-    pub created_at: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PaymentStatus {
-    /// The HTLC is funded and neither claimed nor refunded yet.
-    Pending,
-    Completed,
-    Refunded,
-}
-
-/// A hop this node routes: an incoming HTLC it may claim and the
-/// outgoing HTLC it funded in exchange.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HopRecord {
-    pub operation_id: OperationId,
-    /// Iroh id of the payer that prepared and executed the hop.
-    pub owner: String,
-    pub prepare: Prepare,
-    pub incoming: Htlc,
-    /// Where EXECUTE asked to forward to.
-    pub outgoing_target: HtlcTarget,
-    pub outgoing: Option<Htlc>,
-    pub state: HopState,
-    /// Learned from downstream; claims `incoming`.
-    pub preimage: Option<Bytes32>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HopState {
-    /// Waiting for the incoming HTLC to verify (to confirm, say).
-    /// Nothing is funded yet.
-    Verifying,
-    /// Funding the outgoing HTLC.
-    Funding,
-    /// Outgoing HTLC funded; waiting for its preimage or its expiry.
-    Forwarded,
-    /// Incoming HTLC claimed.
-    Settled,
-    /// Outgoing HTLC refunded.
-    Refunded,
-    Failed(String),
-}
+pub const VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct NodeConfig {
     pub keys: NodeKeys,
-    pub store: Arc<Store>,
+    pub db: Arc<Db>,
     /// Span carrying the node's name; every task the node runs is
     /// instrumented with it.
     pub span: Span,
     /// Accept requests under the node's iroh identity: receive payments,
-    /// route, and settle journaled HTLCs in the background. Without it
-    /// the node can only pay, from an ephemeral endpoint.
+    /// and settle journaled HTLCs in the background. Without it the node
+    /// can only pay, from an ephemeral endpoint.
     pub serve: bool,
 }
 
@@ -138,12 +63,12 @@ pub struct Node(Arc<Inner>);
 
 struct Inner {
     keys: NodeKeys,
-    store: Arc<Store>,
+    db: Arc<Db>,
     transport: Transport,
     span: Span,
     networks: RwLock<HashMap<NetworkId, Arc<dyn Network>>>,
-    routing: RwLock<Option<RoutingPolicy>>,
-    reservations: tokio::sync::Mutex<HashMap<OperationId, router::Reservation>>,
+    /// Answers PREPARE, EXECUTE, DISCARD and SETTLE, when routing.
+    router: RwLock<Option<Handler>>,
     /// Keys of records some task is currently acting on; others skip
     /// them instead of acting twice.
     busy: Mutex<HashSet<String>>,
@@ -162,7 +87,7 @@ impl Node {
         let transport = Transport::bind(config.serve.then_some(config.keys.iroh)).await?;
         let node = Self(Arc::new(Inner {
             keys: config.keys,
-            store: config.store,
+            db: config.db,
             transport,
             span: config.span,
             networks: RwLock::new(
@@ -171,14 +96,12 @@ impl Node {
                     .map(|network| (network.id(), network))
                     .collect(),
             ),
-            routing: RwLock::new(None),
-            reservations: Default::default(),
+            router: RwLock::new(None),
             busy: Default::default(),
             commits: Default::default(),
             tasks: Default::default(),
         }));
         if config.serve {
-            node.resume_hops()?;
             let server = node.clone();
             let handler: Handler = Arc::new(move |request, peer| {
                 let node = server.clone();
@@ -193,7 +116,7 @@ impl Node {
 
     /// Run `task` in the background, under the node's span, until it
     /// ends or the node shuts down.
-    fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+    pub fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
         let handle = tokio::spawn(task.instrument(self.span()));
         let mut tasks = self.0.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.retain(|task| !task.is_finished());
@@ -201,7 +124,7 @@ impl Node {
     }
 
     /// Stop serving, routing and settling, and close the endpoint. The
-    /// journal stays in the store: a node started again on it resumes
+    /// journal stays in the database: a node started again on it resumes
     /// settling where this one stopped.
     pub async fn shutdown(&self) {
         for task in self
@@ -216,17 +139,22 @@ impl Node {
         self.0.transport.close().await;
     }
 
-    /// Payments this node made, settled or not.
-    pub fn payments(&self) -> Result<Vec<PaymentRecord>, String> {
-        self.store().list(PAYMENTS)
+    /// Answer the hop requests (PREPARE, EXECUTE, DISCARD, SETTLE) with
+    /// `router` from now on.
+    pub fn route_with(&self, router: Handler) {
+        *self.0.router.write().unwrap_or_else(|e| e.into_inner()) = Some(router);
     }
 
     pub fn span(&self) -> Span {
         self.0.span.clone()
     }
 
-    pub fn store(&self) -> &Store {
-        &self.0.store
+    pub fn db(&self) -> &Db {
+        &self.0.db
+    }
+
+    pub fn keys(&self) -> &NodeKeys {
+        &self.0.keys
     }
 
     pub fn node_pubkey(&self) -> XOnlyPubKey {
@@ -284,19 +212,25 @@ impl Node {
         ids
     }
 
-    async fn handle(&self, request: Request, peer: String) -> Response {
+    /// Answer one request from `peer`.
+    pub async fn handle(&self, request: Request, peer: String) -> Response {
         match request {
-            Request::Prepare(prepare) => Response::Prepared(self.prepare(prepare, peer).await),
             Request::PreparePayee(prepare) => Response::PayeePrepared(self.prepare_payee(prepare)),
-            Request::Execute(execute) => self.execute(execute, peer).await,
-            Request::Discard(discard) => {
-                self.discard(discard, peer).await;
-                Response::Discarded
-            }
             Request::Commit(commit) => self.commit(commit).await,
-            Request::Settle(settle) => {
-                self.settle_hop(settle, peer).await;
-                Response::Settled
+            Request::Prepare(_)
+            | Request::Execute(_)
+            | Request::Discard(_)
+            | Request::Settle(_) => {
+                let router = self
+                    .0
+                    .router
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                match router {
+                    Some(router) => router(request, peer).await,
+                    None => Response::Error("this node does not route".into()),
+                }
             }
             Request::PreimageIssue { .. }
             | Request::PreimageRelease(_)
@@ -310,7 +244,7 @@ impl Node {
     }
 
     /// Mark `key` as being acted on; `None` if another task already is.
-    fn busy(&self, key: String) -> Option<BusyGuard> {
+    pub fn busy(&self, key: String) -> Option<BusyGuard> {
         let mut busy = self.0.busy.lock().unwrap_or_else(|e| e.into_inner());
         busy.insert(key.clone()).then(|| BusyGuard {
             node: self.0.clone(),
@@ -319,7 +253,8 @@ impl Node {
     }
 }
 
-struct BusyGuard {
+/// Held while a task acts on a record: see [`Node::busy`].
+pub struct BusyGuard {
     node: Arc<Inner>,
     key: String,
 }
@@ -332,4 +267,9 @@ impl Drop for BusyGuard {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.key);
     }
+}
+
+/// A database error, as the node reports errors.
+pub(crate) fn db_error(error: orangedb::Error) -> String {
+    format!("database: {error}")
 }

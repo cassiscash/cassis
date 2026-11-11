@@ -44,8 +44,7 @@ lowercase-hex = "0.1.1"
 lwk_common = "0.19"
 lwk_signer = "0.19"
 lwk_wollet = { version = "0.19", default-features = false, features = ["esplora"] }
-minisqlite = { git = "https://github.com/cursor/minisqlite" }
-orangedb = "0.2.0"
+orangedb = "0.3.0"
 rand = "0.8.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ritualistic = "0.2.4"
@@ -106,6 +105,7 @@ fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint", rev = "cf55fd
 
 cassis-core = { path = "cassis-core", default-features = false }
 cassis-admin = { path = "cassis-admin" }
+cassis-wallet = { path = "cassis-wallet", default-features = false }
 cassis-networks = { path = "cassis-networks" }
 cassis-cashu = { path = "networks/cassis-cashu" }
 cassis-fedimint = { path = "networks/cassis-fedimint" }

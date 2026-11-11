@@ -15,7 +15,7 @@
 //! | `network.remove`      | `id`                                                      |
 //! | `network.open`        | `id`                                                      |
 //! | `wallet.*`            | see [`cassis_admin::wallets`]                             |
-//! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `max_incoming_lifetime_secs`, `test_money` |
+//! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `test_money` |
 //! | `route.remove`        | `from`, `to`                                              |
 //! | `routes.announce`     |                                                           |
 //! | `announcements.check` |                                                           |
@@ -38,10 +38,9 @@ use crate::networks::Networks;
 use cassis_admin::config::child;
 use cassis_admin::networks::{new_network_id, ALL_KINDS};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, Identity, Refresh};
-use cassis_core::node::Node;
 use cassis_core::routing::{autohue, autoname, fetch_published, Published};
-use cassis_core::store::Store;
 use cassis_core::{unix_now, NetworkId};
+use cassis_routerd::router::Router;
 use hypereffect::vtree;
 use hypereffect::{Map, Value};
 use std::collections::BTreeMap;
@@ -59,9 +58,8 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 pub struct Admin {
     dir: PathBuf,
-    node: Node,
+    router: Router,
     networks: Arc<Networks>,
-    store: Arc<Store>,
     refresh: Refresh,
     state: Mutex<State>,
     nostr: Mutex<Nostr>,
@@ -96,18 +94,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Admin {
     pub fn new(
         dir: PathBuf,
-        node: Node,
+        router: Router,
         networks: Arc<Networks>,
-        store: Arc<Store>,
         config: Config,
         refresh: Refresh,
     ) -> Arc<Self> {
         let modified = modified(&dir);
         Arc::new(Self {
             dir,
-            node,
+            router,
             networks,
-            store,
             refresh,
             state: Mutex::new(State { config, modified }),
             nostr: Default::default(),
@@ -132,7 +128,7 @@ impl Admin {
         config
             .name
             .clone()
-            .unwrap_or_else(|| autoname(&self.node.node_pubkey()))
+            .unwrap_or_else(|| autoname(&self.router.node().node_pubkey()))
     }
 
     /// Run the background job of the relays: publish the router's name
@@ -172,7 +168,7 @@ impl Admin {
                     && (published.is_some() || config.name.is_some())
                 {
                     let accepted = admin
-                        .node
+                        .router
                         .publish_name(relays, config.name.as_deref())
                         .await;
                     info!(
@@ -184,9 +180,9 @@ impl Admin {
                     }
                 }
                 if announce {
-                    admin.node.announce().await;
+                    admin.router.announce().await;
                 }
-                let router = admin.node.node_pubkey();
+                let router = admin.router.node().node_pubkey();
                 let found = futures::future::join_all(
                     relays.iter().map(|relay| fetch_published(relay, router)),
                 )
@@ -295,8 +291,8 @@ impl Admin {
         let renamed = state.config.name != config.name;
         state.config = config;
         if changed {
-            match crate::routing_policy(&state.config, &self.store) {
-                Ok(policy) => self.node.set_routing(policy),
+            match state.config.routing_policy() {
+                Ok(policy) => self.router.set_routing(policy),
                 Err(error) => warn!("admin: not routing under the new config: {error}"),
             }
         }
@@ -345,9 +341,33 @@ impl Admin {
     }
 }
 
+impl Admin {
+    /// What the router's database holds of its hops.
+    fn hops(&self) -> view::Hops {
+        let db = self.router.db();
+        let read = || -> orangedb::Result<view::Hops> {
+            let mut failed = BTreeMap::new();
+            for fail in db.fails().all()? {
+                *failed
+                    .entry(view::fail_kind(fail.reason).to_string())
+                    .or_default() += 1;
+            }
+            Ok(view::Hops {
+                in_flight: db.incomings().all()?,
+                settled: db.forwards().len()? as usize,
+                failed,
+            })
+        };
+        read().unwrap_or_else(|error| {
+            warn!("admin: reading hops: {error}");
+            view::Hops::default()
+        })
+    }
+}
+
 impl App for Admin {
     fn identity(&self) -> Identity {
-        let key = self.node.node_pubkey();
+        let key = self.router.node().node_pubkey();
         Identity {
             name: self.name(&lock(&self.state).config),
             what: "router",
@@ -376,6 +396,7 @@ impl App for Admin {
         let state = lock(&self.state);
         let nostr = lock(&self.nostr);
         let wallets = &self.networks.wallets;
+        let node = self.router.node();
         let ctx = view::Context {
             config: &state.config,
             networks: self
@@ -394,19 +415,11 @@ impl App for Admin {
                 })
                 .collect(),
             name: self.name(&state.config),
-            autoname: autoname(&self.node.node_pubkey()),
-            open: self
-                .node
-                .network_ids()
-                .into_iter()
-                .filter_map(|id| {
-                    let lifetime = self.node.network(&id).ok()?.max_incoming_lifetime_secs();
-                    Some((id.0, lifetime))
-                })
-                .collect(),
-            hops: self.node.hops().unwrap_or_default(),
-            node_pubkey: self.node.node_pubkey().to_hex(),
-            iroh_peer_id: self.node.iroh_peer_id(),
+            autoname: autoname(&node.node_pubkey()),
+            open: node.network_ids().into_iter().map(|id| id.0).collect(),
+            hops: self.hops(),
+            node_pubkey: node.node_pubkey().to_hex(),
+            iroh_peer_id: node.iroh_peer_id(),
             nostr: &nostr,
             now: unix_now(),
         };

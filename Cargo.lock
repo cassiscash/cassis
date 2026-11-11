@@ -2726,7 +2726,6 @@ dependencies = [
  "iroh-base 1.0.3",
  "js-sys",
  "lowercase-hex",
- "minisqlite",
  "rand 0.8.7",
  "ritualistic",
  "secp256k1 0.31.1",
@@ -2774,10 +2773,12 @@ dependencies = [
  "cassis-core",
  "cassis-networks",
  "cassis-preimage-server",
+ "cassis-wallet",
  "clap",
  "futures",
  "hypereffect",
  "iroh-base 1.0.3",
+ "orangedb",
  "ritualistic",
  "rustls",
  "serde",
@@ -2847,6 +2848,7 @@ dependencies = [
  "cassis-admin",
  "cassis-core",
  "cassis-networks",
+ "cassis-wallet",
  "clap",
  "futures",
  "hmac",
@@ -2878,13 +2880,16 @@ dependencies = [
 name = "cassis-routerd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "cassis-admin",
  "cassis-core",
  "cassis-networks",
+ "cassis-wallet",
  "clap",
  "futures",
  "hypereffect",
  "lowercase-hex",
+ "orangedb",
  "ritualistic",
  "rustls",
  "serde",
@@ -2902,12 +2907,19 @@ dependencies = [
  "cassis-core",
  "cassis-networks",
  "clap",
+ "futures",
  "hypereffect",
  "iroh 1.0.3",
- "minisqlite",
+ "iroh-base 1.0.3",
+ "lowercase-hex",
+ "orangedb",
+ "ritualistic",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tracing",
 ]
 
@@ -4257,15 +4269,6 @@ dependencies = [
  "serdect 0.2.0",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "elsa"
-version = "1.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9abf33c656a7256451ebb7d0082c5a471820c31269e49d807c538c252352186e"
-dependencies = [
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -7905,147 +7908,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minisqlite"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-engine",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-btree"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-fileformat",
- "minisqlite-pager",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-catalog"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-btree",
- "minisqlite-fileformat",
- "minisqlite-pager",
- "minisqlite-sql",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-engine"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-btree",
- "minisqlite-catalog",
- "minisqlite-exec",
- "minisqlite-fileformat",
- "minisqlite-pager",
- "minisqlite-plan",
- "minisqlite-sql",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-exec"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-btree",
- "minisqlite-catalog",
- "minisqlite-expr",
- "minisqlite-fileformat",
- "minisqlite-functions",
- "minisqlite-pager",
- "minisqlite-plan",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-expr"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-fileformat"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-functions"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-expr",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-journal"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-fileformat",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-pager"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "elsa",
- "minisqlite-fileformat",
- "minisqlite-journal",
- "minisqlite-types",
- "minisqlite-wal",
-]
-
-[[package]]
-name = "minisqlite-plan"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-catalog",
- "minisqlite-expr",
- "minisqlite-functions",
- "minisqlite-sql",
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-sql"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-types",
-]
-
-[[package]]
-name = "minisqlite-types"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-
-[[package]]
-name = "minisqlite-wal"
-version = "0.0.0"
-source = "git+https://github.com/cursor/minisqlite#4a5c1341fdde38beaf438e0241c9f45833c4b870"
-dependencies = [
- "minisqlite-fileformat",
- "minisqlite-types",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8968,9 +8830,9 @@ dependencies = [
 
 [[package]]
 name = "orangedb"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5915cb20d3d671e68f0de0951c61dfaec6b4992963dd0924f43c8ec1b0989324"
+checksum = "d5bf0aaa1fa091655773d38bd0d24d58565e8ec81b6b544390c231c72b054c9f"
 dependencies = [
  "orangedb-macros",
  "postcard",
@@ -8981,9 +8843,9 @@ dependencies = [
 
 [[package]]
 name = "orangedb-macros"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e167e666ef636a68ce09b38bbcd1afdee0231dd4353e579a3df8c55609a85245"
+checksum = "a4a3e4fff4b274bd3fa4cc56a776d9698d28635faa6516297ad538754a58ea4e"
 dependencies = [
  "proc-macro2",
  "quote",

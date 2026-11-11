@@ -1,11 +1,16 @@
-//! `<dir>/config.toml`: what the gateway does, written with nothing in it
-//! on first start, then read, and edited by the admin interface, which
-//! applies changes right away and keeps comments. Its keys stay in
-//! `<dir>/seed`.
+//! `<dir>/config.toml`: what the gateway does, written with a fresh
+//! mnemonic and nothing else on first start, then read, and edited by
+//! the admin interface, which applies changes right away and keeps
+//! comments. It is also a wallet config (see [`cassis_wallet::config`]),
+//! so `cassis-wallet --home <dir>` manages the gateway's funds.
 //!
 //! ```toml
+//! mnemonic = "twelve words ..."    # the gateway's identity derives from it
+//!
 //! [networks."cashu::mint.example"]
+//! secret = "<64 hex>"              # wallet key on this network, written when added
 //! [networks.arkade]
+//! secret = "<64 hex>"
 //! # esplora_url = "https://..."    # chain API of arkade and bitcoin
 //!
 //! [terms]                          # all optional, in seconds
@@ -24,6 +29,7 @@
 use crate::GatewayPolicy;
 use cassis_admin::networks::NetworkConfig;
 use cassis_admin::{AdminSection, DaemonConfig};
+use cassis_core::keys::NodeKeys;
 use cassis_core::NetworkId;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -31,12 +37,21 @@ use std::collections::BTreeMap;
 /// Where the admin page listens by default, next to a router's.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7980";
 
-pub const TEMPLATE: &str = r#"# cassis-gateway config, also edited by the admin interface, which keeps
-# comments and applies changes right away. Its keys are in the seed file.
+/// A fresh config, with `mnemonic`.
+pub fn template(mnemonic: &str) -> String {
+    format!(
+        r#"# cassis-gateway config, also edited by the admin interface, which keeps
+# comments and applies changes right away. The gateway's identity derives
+# from the mnemonic, and every network has a key of its own, written when
+# it is added: back this file up, it controls the gateway's funds.
+mnemonic = "{mnemonic}"
 
-# One table per network to be paid on and to pay payees on, e.g.:
+# One table per network to be paid on and to pay payees on, with its
+# wallet key, e.g.:
 # [networks."cashu::mint.example"]
+# secret = "<64 hex>"
 # [networks.arkade]
+# secret = "<64 hex>"
 # esplora_url = "https://..."
 [networks]
 
@@ -54,11 +69,14 @@ pub const TEMPLATE: &str = r#"# cassis-gateway config, also edited by the admin 
 # iroh = true
 # peers = []
 [admin]
-"#;
+"#
+    )
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub mnemonic: String,
     #[serde(default)]
     pub networks: BTreeMap<String, NetworkConfig>,
     #[serde(default)]
@@ -67,8 +85,15 @@ pub struct Config {
     pub admin: AdminSection,
 }
 
+impl Config {
+    pub fn keys(&self) -> Result<NodeKeys, String> {
+        NodeKeys::from_mnemonic(&self.mnemonic).map_err(|e| e.to_string())
+    }
+}
+
 impl DaemonConfig for Config {
     fn check(&self) -> Result<(), String> {
+        self.keys()?;
         self.admin.resolve(DEFAULT_LISTEN).check()?;
         for id in self.networks.keys() {
             NetworkId::parse(id)?;

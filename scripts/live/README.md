@@ -28,7 +28,7 @@ mutinynet's 30s-block difficulty retargets.
 All state lives in `tmp/live/` (git-ignored):
 
 ```text
-tmp/live/nodes/<name>/   homes (seed, store.db, wallets; daemons also config.toml)
+tmp/live/nodes/<name>/   homes (config.toml, wallet.redb, wallets; routers also router.redb)
 tmp/live/nodes/<name>.log|.pid   daemons running in the background
 tmp/live/mint<n>/        local cdk-mintd
 tmp/live/fedimint/       our fedimintd (invite-code here)
@@ -67,8 +67,8 @@ port 7100+n, `gateway` on 7980, `preimage` on 7981. Open one in a
 renderer to look around, or `hypb state hyperb://localhost:7101`.
 
 The one thing written by hand is a router's first `config.toml`, by
-`node.sh route`: the mnemonic, from the home's `seed`, so a wallet home
-keeps its keys and funds; the private relay, so nothing reaches the public
+`node.sh route`: the mnemonic, from the home's `config.toml`, so a wallet
+home keeps its identity, and the networks' keys are added next to it; the private relay, so nothing reaches the public
 ones; and its port, since they would otherwise all ask for 7979. Everything
 else goes through actions, which `node.sh route` sends again on every run:
 the networks and routes are in `router_networks` and `route_extras` there,
@@ -77,7 +77,7 @@ and overwrite fee changes made on a router's page.
 While a daemon runs, its wallets are its own: `cassis <router>` refuses,
 and `mint.sh fund`, `fedimint.sh fund` and `arkd.sh give` go through its
 admin interface. A stopped one can be reached with `cassis` as ever, its
-`seed` holding the same keys. `env.sh` has what the scripts use, as
+`config.toml` holding the same keys. `env.sh` has what the scripts use, as
 `admin_act <name> <action> <json>` and `wallet_op`.
 
 ## First-time setup
@@ -273,7 +273,9 @@ relay restarted so the shorter arkade route is not announced):
    `max_incoming_lifetime_secs` (the operator's batch lifetime, learnt
    from the wallet's VTXOs, less the margin; or a route's
    `max_incoming_lifetime_secs`), which payers plan within and PREPARE
-   enforces.
+   enforces. *That lifetime has since been removed everywhere, waiting
+   for a better rule; receivers still reject VHTLCs too close to their
+   batch's expiry, and senders still refresh before locking.*
 8. **Arkade sends could leave dust change.** The SDK's coin selection
    adds one more VTXO when the change would be below the operator's
    dust limit, but fails (`AMOUNT_TOO_LOW`) when there is none left,
@@ -329,8 +331,10 @@ o. routerd cannot raise what a network derives for
    `max_incoming_lifetime_secs` as `enable --max-incoming-lifetime` could:
    a route's value only shortens it. A router whose wallet only ever held
    VTXOs of an operator's older, shorter batches (r5) announces too little,
-   and finding m keeps it from getting a new one.
+   and finding m keeps it from getting a new one. *Moot: the lifetime is
+   gone.*
 p. Payers do not try another route when the cheapest cannot carry the
    payment's lifetime (`leg N would run ...`), though a longer one could.
+   *Moot as written: payers plan within no lifetime now.*
 q. Payee wallets warn `listing invoices: decode record: invoice names
    another endpoint than its payee` on invoices stored before 6c2ebe5.

@@ -9,8 +9,9 @@
 //! as the process runs, so reconnecting with the same pair shows the
 //! order again. A flow without an `id` gets an order of its own.
 
-use cassis_core::node::{InvoiceRecord, InvoiceStatus, Node};
 use cassis_core::{unix_now, Invoice};
+use cassis_wallet::db::{InvoiceHash, InvoiceState};
+use cassis_wallet::Node;
 use hypereffect::message::{encode_line, parse_line};
 use hypereffect::vtree::{self, button, card, column, input, list, notice, text};
 use hypereffect::{json, Action, Handler, Metadata, RendererMessage, ServerMessage};
@@ -380,7 +381,7 @@ impl Flow {
         .await?;
         let flow = self.clone();
         let payment_hash = invoice.body.payment_hash;
-        let key = payment_hash.to_string();
+        let key = InvoiceHash(payment_hash.to_string());
         let expires_at = invoice.body.expires_at;
         tokio::spawn(async move {
             while unix_now() < expires_at {
@@ -391,9 +392,8 @@ impl Flow {
                 {
                     return;
                 }
-                let record: Option<InvoiceRecord> =
-                    flow.node.store().get("invoices", &key).ok().flatten();
-                if record.is_some_and(|record| record.status == InvoiceStatus::Claimed) {
+                let record = flow.node.db().invoices().get(key.clone()).ok().flatten();
+                if record.is_some_and(|record| record.state == InvoiceState::Settled) {
                     let order = flow.update(|order| order.paid = true);
                     info!("order {} paid", flow.id);
                     let _ = flow.redraw(&order).await;

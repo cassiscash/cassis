@@ -24,16 +24,6 @@ pay() { # <label> <payer> <from> <payee> <msat> <to>
   echo "exit ${PIPESTATUS[0]}"
 }
 
-# r5 only ever held VTXOs of 1h batches, so it announces too short a
-# lifetime on our arkade, and being the cheapest it fails arkade routes
-# (DEMO.md): keep it out of them, and put it back at the end.
-withdraw_r5() {
-  admin_act r5 route.remove "{\"from\":\"$A\",\"to\":\"$AL\"}"
-  admin_act r5 route.remove "{\"from\":\"$AL\",\"to\":\"$A\"}"
-  sleep 15
-}
-restore_r5() { "$S/node.sh" route r5 2>&1 | tail -1 | cut -c1-100; }
-
 balances() {
   for pair in "r1 $M1" "r1 $M2" "r2 $M2" "r2 $R" "r3 $R" "r3 $F" "r4 $F" "r4 $A" "r5 $A" "r5 $AL" \
     "r6 $M2" "r6 $MM" "r7 $AL" "r7 $M2"; do
@@ -62,7 +52,6 @@ balances() {
 }
 
 online() {
-  withdraw_r5
   pay "1 hop, cashu to cashu" alice "$M1" bob 1000000 "$M2"
   pay "2 hops to rootstock" alice "$M1" carol 1000000 "$R"
   pay "3 hops to fedimint" alice "$M1" dave 1000000 "$F"
@@ -71,7 +60,6 @@ online() {
   pay "2 hops to the public mint" alice "$M1" grace 1000000 "$MM"
   pay "3 hops out of the public mint" grace "$MM" dave 300000 "$F"
   pay "3 hops, arkade first" henry "$AL" dave 1000000 "$F"
-  restore_r5
 }
 
 offline() {

@@ -48,7 +48,7 @@ pub fn init_logging() {
         .init();
 }
 
-/// `cassis_core::node::router` renders as `core::router`, in a color
+/// `cassis_wallet::node::payer` renders as `wallet::payer`, in a color
 /// picked from the crate name.
 fn context(target: &str) -> (&'static str, String) {
     const COLORS: &[&str] = &[

@@ -5,23 +5,25 @@ edition.workspace = true
 
 [features]
 default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
-arkade = ["cassis-networks/arkade"]
-bark-lightning = ["cassis-networks/bark-lightning"]
-bitcoin = ["cassis-networks/bitcoin"]
-cashu = ["cassis-networks/cashu"]
-fedimint = ["cassis-networks/fedimint"]
-lightning = ["cassis-networks/lightning"]
-liquid = ["cassis-networks/liquid"]
-rootstock = ["cassis-networks/rootstock"]
+arkade = ["cassis-networks/arkade", "cassis-wallet/arkade"]
+bark-lightning = ["cassis-networks/bark-lightning", "cassis-wallet/bark-lightning"]
+bitcoin = ["cassis-networks/bitcoin", "cassis-wallet/bitcoin"]
+cashu = ["cassis-networks/cashu", "cassis-wallet/cashu"]
+fedimint = ["cassis-networks/fedimint", "cassis-wallet/fedimint"]
+lightning = ["cassis-networks/lightning", "cassis-wallet/lightning"]
+liquid = ["cassis-networks/liquid", "cassis-wallet/liquid"]
+rootstock = ["cassis-networks/rootstock", "cassis-wallet/rootstock"]
 
 [dependencies]
 cassis-admin = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
+cassis-wallet = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
 hypereffect = { workspace = true }
 lowercase-hex = { workspace = true }
+orangedb = { workspace = true }
 ritualistic = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
@@ -30,3 +32,6 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

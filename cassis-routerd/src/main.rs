@@ -9,8 +9,9 @@
 //! edits the config and runs the daemon's actions.
 //!
 //! ```text
-//! <data dir>/config.toml        keys, networks, routes
-//! <data dir>/store.db           routed hops, announced relays
+//! <data dir>/config.toml        keys, networks with their wallet keys, routes
+//! <data dir>/wallet.redb        the router's own payments (see `cassis_wallet::db`)
+//! <data dir>/router.redb        routed hops (see `cassis_routerd::db`)
 //! <data dir>/<kind>/<variant>/  wallet of one network
 //! ```
 
@@ -32,19 +33,15 @@ mod networks;
 
 use admin::Admin;
 use cassis_admin::{reexec, shutdown_signal, Refresh, Server, RESTART_GRACE};
-use cassis_core::node::{Node, NodeConfig, RoutingPolicy};
-use cassis_core::store::Store;
+use cassis_routerd::db::Db;
+use cassis_routerd::router::Router;
+use cassis_wallet::{Node, NodeConfig};
 use clap::Parser;
 use config::Config;
 use networks::{Networks, RouterDaemon, RouterOpener};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, info_span, warn};
-
-const SETTINGS: &str = "settings";
-/// Every relay the router ever announced on, so it can still delete
-/// its announcements from relays the config no longer names.
-const ANNOUNCED_RELAYS: &str = "announced_relays";
 
 #[derive(Parser)]
 #[command(name = "cassis-routerd", about = "Cassis router daemon")]
@@ -75,14 +72,15 @@ async fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let config = Config::load_or_create(&dir)?;
     let keys = config.keys()?;
-    let store = Arc::new(Store::open(&dir.join("store.db"))?);
+    let wallet = cassis_wallet::open_db(&dir)?;
+    let path = dir.join("router.redb");
+    let db = Arc::new(Db::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?);
     let span = info_span!("node", node = "routerd");
 
     // Networks are opened before the node starts, so that it can resume
     // its hops on them.
     let networks = Networks::new(
         RouterOpener {
-            keys: keys.clone(),
             dir: dir.clone(),
             span: span.clone(),
         },
@@ -101,20 +99,21 @@ async fn run(cli: Cli) -> Result<(), String> {
     let node = Node::start(
         NodeConfig {
             keys: keys.clone(),
-            store: store.clone(),
+            db: wallet,
             span: span.clone(),
             serve: true,
         },
         opened,
     )
     .await?;
-    networks.attach(Arc::new(RouterDaemon(node.clone())));
+    let router = Router::start(node.clone(), db)?;
+    networks.attach(Arc::new(RouterDaemon(router.clone())));
 
-    let policy = routing_policy(&config, &store)?;
+    let policy = config.routing_policy()?;
     if policy.routes.is_empty() {
         warn!("no [[routes]] configured: not routing, only deleting old announcements");
     }
-    node.start_routing(policy);
+    router.start_routing(policy);
 
     info!(
         "routing as {} (node key {})",
@@ -122,7 +121,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         node.node_pubkey().to_hex()
     );
     let refresh = Refresh::default();
-    let admin = Admin::new(dir, node.clone(), networks, store, config, refresh.clone());
+    let admin = Admin::new(dir, router, networks, config, refresh.clone());
     let server = Server::new(admin.clone(), refresh);
     server.serve(admin_secret).await;
     admin.keep_checking_relays();
@@ -140,26 +139,4 @@ async fn run(cli: Cli) -> Result<(), String> {
         return Err(reexec());
     }
     Ok(())
-}
-
-/// What `config` routes under, deleting this node's announcements from
-/// every relay it ever announced on, which the store keeps.
-pub fn routing_policy(config: &Config, store: &Store) -> Result<RoutingPolicy, String> {
-    let mut policy = config.routing_policy()?;
-    let mut announced: Vec<String> = store.get(SETTINGS, ANNOUNCED_RELAYS)?.unwrap_or_default();
-    let known = announced.len();
-    for relay in policy.routes.iter().flat_map(|route| &route.nostr_relays) {
-        if !announced.contains(relay) {
-            announced.push(relay.clone());
-        }
-    }
-    if announced.len() != known {
-        store.put(SETTINGS, ANNOUNCED_RELAYS, &announced)?;
-    }
-    for relay in announced {
-        if !policy.cleanup_relays.contains(&relay) {
-            policy.cleanup_relays.push(relay);
-        }
-    }
-    Ok(policy)
 }

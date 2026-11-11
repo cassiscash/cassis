@@ -1,5 +1,5 @@
 //! The gateway's admin interface (see [`cassis_admin`]): what it
-//! forwards, the invoices and standing authorizations it holds, its
+//! forwards, the standing authorizations it holds, its
 //! networks with the funds it pays payees from, and the terms it accepts,
 //! over its [`config`](crate::config). Besides what every daemon has:
 //!
@@ -14,10 +14,8 @@
 //! payments in flight closes or reopens once they settle.
 
 use crate::config::Config;
-use crate::{
-    AuthorizationRecord, ForwardRecord, ForwardState, Gateway, InvoiceRecord, InvoiceStatus,
-    OutgoingOutcome, INTERRUPTED_FUNDING,
-};
+use crate::db::{HandledDelegation, PayeeHtlc, PayeeOutcome};
+use crate::{Gateway, INTERRUPTED_FUNDING};
 use cassis_admin::config::{child, put};
 use cassis_admin::networks::{
     config_cards, config_drafts, new_network, new_network_draft, Daemon, NetworkConfig, Networks,
@@ -25,8 +23,7 @@ use cassis_admin::networks::{
 };
 use cassis_admin::view::{act, ago, fact, number, sat, span, stat, submit, until};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity, Refresh};
-use cassis_core::keys::NodeKeys;
-use cassis_core::offline::AuthorizationKind;
+use cassis_core::offline::ReceiveAuthorization;
 use cassis_core::routing::{autohue, autoname};
 use cassis_core::{unix_now, Bytes32, Network, NetworkId, XOnlyPubKey};
 use futures::future::BoxFuture;
@@ -38,12 +35,12 @@ use std::sync::Arc;
 use toml_edit::DocumentMut;
 use tracing::{info, warn, Span};
 
-/// The most forwards or invoices a tab lists, newest first.
+/// The most forwards a tab lists, newest first.
 const LISTED: usize = 100;
 
-/// Opens a network with the gateway's keys, its wallet under `dir`.
+/// Opens a network with the key its config gives, its wallet under
+/// `dir`.
 pub struct GatewayOpener {
-    pub keys: NodeKeys,
     pub dir: PathBuf,
     pub span: Span,
 }
@@ -55,7 +52,7 @@ impl Opener<NetworkConfig> for GatewayOpener {
         config: &'a NetworkConfig,
     ) -> BoxFuture<'a, Result<Opened, String>> {
         Box::pin(async move {
-            let settings = config.settings(id, &self.keys, &self.dir);
+            let settings = config.settings(id, &self.dir)?;
             let (network, wallet) = cassis_networks::open_wallet(id, &settings, &self.span).await?;
             Ok(Opened {
                 network,
@@ -127,7 +124,7 @@ impl GatewayAdmin {
         })
     }
 
-    fn overview(&self, forwards: &[ForwardRecord], now: u64) -> Node {
+    fn overview(&self, forwards: &[PayeeHtlc], now: u64) -> Node {
         let identity = card("identity").title("Identity").children([
             fact(
                 "identity/key",
@@ -140,14 +137,11 @@ impl GatewayAdmin {
                 self.relay.as_deref().unwrap_or("unknown"),
             ),
         ]);
-        let settled: Vec<&ForwardRecord> = forwards
-            .iter()
-            .filter(|forward| forward.state == ForwardState::Settled)
-            .collect();
+        let settled: Vec<&PayeeHtlc> = forwards.iter().filter(|forward| forward.settled).collect();
         let locked: u64 = forwards
             .iter()
-            .filter(|forward| forward.outgoing_outcome.is_none())
-            .filter_map(|forward| forward.outgoing.as_ref())
+            .filter(|forward| forward.outcome.is_none())
+            .filter_map(|forward| forward.htlc.as_ref())
             .map(|htlc| htlc.amount_msat)
             .sum();
         let figures = row("figures").gap("large").wrap(true).children([
@@ -169,12 +163,7 @@ impl GatewayAdmin {
         });
         let active = forwards
             .iter()
-            .filter(|forward| {
-                !matches!(
-                    forward.state,
-                    ForwardState::Settled | ForwardState::Failed(_)
-                )
-            })
+            .filter(|forward| !forward.settled && forward.failed.is_none())
             .take(LISTED)
             .map(|forward| forward_row("active", forward, now));
         let activity = card("activity")
@@ -222,7 +211,7 @@ impl GatewayAdmin {
             ])
     }
 
-    fn forwards(&self, forwards: &[ForwardRecord], now: u64) -> Node {
+    fn forwards(&self, forwards: &[PayeeHtlc], now: u64) -> Node {
         tab("tab/forwards")
             .label("Forwards")
             .child(shown("forwards", forwards.len()))
@@ -236,31 +225,8 @@ impl GatewayAdmin {
             )
     }
 
-    fn invoices(&self, now: u64) -> Node {
-        let mut invoices = self.listed("invoices", self.gateway.invoices());
-        invoices.sort_by_key(|record| std::cmp::Reverse(record.created_at));
-        let count = |status| invoices.iter().filter(|r| r.status == status).count();
-        let counts = row("invoices/counts").wrap(true).children([
-            badge("invoices/count/pending")
-                .variant("info")
-                .text(format!("{} pending", count(InvoiceStatus::Pending))),
-            badge("invoices/count/paid")
-                .variant("success")
-                .text(format!("{} paid", count(InvoiceStatus::Paid))),
-            badge("invoices/count/expired")
-                .text(format!("{} expired", count(InvoiceStatus::Expired))),
-        ]);
-        tab("tab/invoices").label("Invoices").children([
-            counts,
-            shown("invoices", invoices.len()),
-            list("invoices")
-                .empty("No invoices issued yet.")
-                .children(invoices.iter().take(LISTED).map(|r| invoice_row(r, now))),
-        ])
-    }
-
     fn authorizations(&self, now: u64) -> Node {
-        let mut records = self.listed("authorizations", self.gateway.authorizations());
+        let mut records = self.listed("authorizations", self.gateway.delegations());
         records.sort_by_key(|record| std::cmp::Reverse(record.registered_at));
         tab("tab/authorizations")
             .label("Authorizations")
@@ -377,13 +343,12 @@ impl App for GatewayAdmin {
 
     fn tabs(&self, access: Node) -> Vec<Node> {
         let now = unix_now();
-        let mut forwards = self.listed("forwards", self.gateway.forwards());
+        let mut forwards = self.listed("forwards", self.gateway.payee_htlcs());
         forwards.sort_by_key(|forward| std::cmp::Reverse(forward.created_at));
         vec![
             self.overview(&forwards, now),
             self.networks(now),
             self.forwards(&forwards, now),
-            self.invoices(now),
             self.authorizations(now),
             access,
             self.terms(),
@@ -394,7 +359,7 @@ impl App for GatewayAdmin {
         match name {
             "authorization.forget" => {
                 let id = Bytes32::from_str(&args.required("id")?)?;
-                self.gateway.forget_authorization(&id)?;
+                self.gateway.forget_delegation(&id)?;
                 info!("admin: forgot authorization {id}");
                 Ok("Authorization forgotten".into())
             }
@@ -429,23 +394,19 @@ impl App for GatewayAdmin {
 }
 
 /// What a forward's states are called, in the order they come.
-const STATES: [&str; 6] = [
-    "verifying",
-    "funding",
-    "releasing",
-    "claiming",
-    "settled",
-    "failed",
-];
+const STATES: [&str; 5] = ["funding", "releasing", "claiming", "settled", "failed"];
 
-fn state_name(forward: &ForwardRecord) -> &'static str {
-    match forward.state {
-        ForwardState::Verifying => "verifying",
-        ForwardState::Funding => "funding",
-        ForwardState::Releasing => "releasing",
-        ForwardState::Claiming => "claiming",
-        ForwardState::Settled => "settled",
-        ForwardState::Failed(_) => "failed",
+fn state_name(forward: &PayeeHtlc) -> &'static str {
+    if forward.settled {
+        "settled"
+    } else if forward.failed.is_some() {
+        "failed"
+    } else if forward.preimage.is_some() {
+        "claiming"
+    } else if forward.htlc.is_some() {
+        "releasing"
+    } else {
+        "funding"
     }
 }
 
@@ -467,15 +428,10 @@ fn shown(what: &str, total: usize) -> Node {
 
 /// A row saying what to do about `forward`, if it needs someone to look
 /// at it: it may have cost the gateway money.
-fn attention(forward: &ForwardRecord, now: u64) -> Option<Node> {
-    let ForwardState::Failed(reason) = &forward.state else {
-        return None;
-    };
-    let hash = forward.payment_hash;
-    let out = forward
-        .outgoing_network
-        .as_ref()
-        .map_or("the payee's network".to_string(), ToString::to_string);
+fn attention(forward: &PayeeHtlc, now: u64) -> Option<Node> {
+    let reason = forward.failed.as_ref()?;
+    let hash = payment_hash(forward)?;
+    let out = &forward.network;
     let id = format!("attention/{hash}");
     if reason == INTERRUPTED_FUNDING {
         return Some(
@@ -488,8 +444,8 @@ fn attention(forward: &ForwardRecord, now: u64) -> Option<Node> {
                 )),
         );
     }
-    let htlc = forward.outgoing.as_ref()?;
-    if forward.outgoing_outcome.is_some() {
+    let htlc = forward.htlc.as_ref()?;
+    if forward.outcome.is_some() {
         return None;
     }
     Some(
@@ -508,18 +464,15 @@ fn attention(forward: &ForwardRecord, now: u64) -> Option<Node> {
     )
 }
 
-fn forward_row(prefix: &str, forward: &ForwardRecord, now: u64) -> Node {
-    let hash = forward.payment_hash;
+fn forward_row(prefix: &str, forward: &PayeeHtlc, now: u64) -> Node {
+    let hash = &forward.payment_hash.0;
     let el = |part: &str| format!("{prefix}/{hash}/{part}");
     let name = state_name(forward);
-    let to = forward
-        .outgoing_network
-        .as_ref()
-        .map_or("…".to_string(), ToString::to_string);
-    let outgoing = forward.outgoing.as_ref().map(|htlc| {
-        let (variant, label) = match forward.outgoing_outcome {
-            Some(OutgoingOutcome::Claimed) => ("success", "payee claimed".to_string()),
-            Some(OutgoingOutcome::Refunded) => ("warning", "refunded to the gateway".to_string()),
+    let to = &forward.network;
+    let outgoing = forward.htlc.as_ref().map(|htlc| {
+        let (variant, label) = match forward.outcome {
+            Some(PayeeOutcome::Claimed) => ("success", "payee claimed".to_string()),
+            Some(PayeeOutcome::Refunded) => ("warning", "refunded to the gateway".to_string()),
             None => (
                 "info",
                 format!("waiting for the payee, refund {}", until(now, htlc.expiry)),
@@ -527,12 +480,10 @@ fn forward_row(prefix: &str, forward: &ForwardRecord, now: u64) -> Node {
         };
         badge(el("outgoing")).variant(variant).text(label)
     });
-    let failed = match &forward.state {
-        ForwardState::Failed(reason) => {
-            Some(text(el("reason")).variant("caption").text(reason.as_str()))
-        }
-        _ => None,
-    };
+    let failed = forward
+        .failed
+        .as_ref()
+        .map(|reason| text(el("reason")).variant("caption").text(reason.as_str()));
     column(format!("{prefix}/{hash}"))
         .gap("small")
         .child(
@@ -556,47 +507,15 @@ fn forward_row(prefix: &str, forward: &ForwardRecord, now: u64) -> Node {
         )
 }
 
-fn invoice_row(record: &InvoiceRecord, now: u64) -> Node {
-    let body = &record.invoice.body;
-    let hash = body.payment_hash;
-    let el = |part: &str| format!("invoice/{hash}/{part}");
-    let (variant, status) = match record.status {
-        InvoiceStatus::Pending => ("info", format!("expires {}", until(now, body.expires_at))),
-        InvoiceStatus::Paid => ("success", "paid".to_string()),
-        InvoiceStatus::Expired => ("neutral", "expired".to_string()),
-    };
-    let kind = match record.authorization.kind {
-        AuthorizationKind::Single => "asked for by the payee",
-        AuthorizationKind::Standing => "under a standing authorization",
-    };
-    let description = body.description.as_ref().map(|description| {
-        text(el("description"))
-            .variant("caption")
-            .text(description.as_str())
-    });
-    column(format!("invoice/{hash}"))
-        .gap("small")
-        .child(row(el("line")).justify("between").wrap(true).children([
-            text(el("amount")).text(format!(
-                "{} · {} network(s)",
-                sat(body.amount_msat),
-                body.networks.len()
-            )),
-            badge(el("status")).variant(variant).text(status),
-        ]))
-        .children(description)
-        .child(text(el("payee")).variant("caption").text(format!(
-            "payee {} · {kind} · {}",
-            record.authorization.payee,
-            ago(now, record.created_at)
-        )))
-        .child(text(el("hash")).variant("caption").text(hash.to_string()))
+/// The payment hash of `forward`, as stored.
+fn payment_hash(forward: &PayeeHtlc) -> Option<Bytes32> {
+    forward.payment_hash.0.parse().ok()
 }
 
 /// A standing authorization, unless its signed terms no longer give an
 /// id: then it could not have been stored under one.
-fn authorization_row(record: &AuthorizationRecord, now: u64) -> Option<Node> {
-    let authorization = &record.authorization;
+fn authorization_row(record: &HandledDelegation, now: u64) -> Option<Node> {
+    let authorization = &ReceiveAuthorization::try_from(&record.authorization).ok()?;
     let id = authorization.id().ok()?;
     let el = |part: &str| format!("authorization/{id}/{part}");
     let ended = authorization.valid_until <= now;

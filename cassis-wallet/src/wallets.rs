@@ -4,9 +4,9 @@
 //! [`routine_checks`]).
 
 #[allow(unused_imports)]
-use crate::home::{routine_checks, Home};
-#[allow(unused_imports)]
 use cassis_core::NetworkId;
+#[allow(unused_imports)]
+use cassis_wallet::{routine_checks, Home};
 use clap::Subcommand;
 use tracing::Span;
 
@@ -185,7 +185,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "liquid")?;
             let wallet = cassis_networks::liquid::LiquidAdapter::open(
                 network.clone(),
-                home.secret(&network),
+                home.secret(&network)?,
                 &home.network_dir(&network),
                 span,
             )
@@ -213,7 +213,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "bitcoin")?;
             let wallet = cassis_networks::bitcoin::BitcoinAdapter::open(
                 network.clone(),
-                home.secret(&network),
+                home.secret(&network)?,
                 span,
             )?;
             routine_checks(&wallet).await;
@@ -292,7 +292,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "rootstock")?;
             let wallet = cassis_networks::rootstock::RootstockAdapter::open(
                 network.clone(),
-                home.secret(&network),
+                home.secret(&network)?,
                 span,
             )?;
             routine_checks(&wallet).await;
@@ -309,7 +309,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "fedimint")?;
             let wallet = cassis_networks::fedimint::FedimintAdapter::open(
                 network.clone(),
-                home.secret(&network),
+                home.secret(&network)?,
                 &home.network_dir(&network),
                 span,
             )

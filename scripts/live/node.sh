@@ -44,13 +44,12 @@ router_networks() {
 # What route.set says on top of the ends and fees of a route.
 route_extras() {
   case "$1:$2" in
-    # Under our arkd's 4h batches: see arkd.sh and README.md.
-    "r7:$AL") echo ',"max_incoming_lifetime_secs":13136' ;;
   esac
 }
 
-# What the daemon cannot be told through its admin interface: the keys
-# of its home, and a port of its own to have an interface on at all.
+# What the daemon cannot be told through its admin interface: the
+# mnemonic of its home, and a port of its own to have an interface on at
+# all. Its networks' keys are written to the config as they are added.
 write_config() {
   local name="$1" config="$LIVE/nodes/$1/config.toml" seed
   [ -f "$config" ] && return 0

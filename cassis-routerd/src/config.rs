@@ -3,16 +3,17 @@
 //! the admin interface through [`edit`], which keeps its comments.
 //!
 //! ```toml
-//! mnemonic = "twelve words ..."    # every key derives from it, unless set below
+//! mnemonic = "twelve words ..."    # identity keys derive from it, unless set below
 //! # iroh_secret = "<hex>"          # identity of the cassis-hop endpoint
 //! # nostr_secret = "nsec1..."      # node key: signs route announcements
 //! # name = "My router"             # published as its profile; else its autoname
 //! nostr_relays = ["wss://nostr.wine"]  # where routes are announced
 //!
 //! [networks."cashu::mint.example"]
-//! # secret = "<hex>"               # wallet key on this network
+//! secret = "<hex>"                 # wallet key on this network, written when added
 //!
 //! [networks.lightning]
+//! secret = "<hex>"
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
 //!
@@ -22,7 +23,6 @@
 //! fee_base_msat = 1000
 //! fee_ppm = 500
 //! # transit_slack_secs = 60
-//! # max_incoming_lifetime_secs = 3600  # below what the `from` network allows
 //! # test_money = true
 //!
 //! [admin]
@@ -34,13 +34,14 @@
 use cassis_admin::config::write_private;
 pub use cassis_admin::AdminConfig;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
-use cassis_core::node::{RouteOffer, RoutingPolicy};
 use cassis_core::routing::{DEFAULT_NOSTR_RELAYS, DEFAULT_TRANSIT_SLACK_SECS};
 use cassis_core::NetworkId;
-use cassis_networks::NetworkSettings;
+use cassis_routerd::router::{RouteOffer, RoutingPolicy};
+use cassis_wallet::config::parse_secret;
+pub use cassis_wallet::config::NetworkConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use toml_edit::DocumentMut;
 
 pub const FILE: &str = "config.toml";
@@ -69,37 +70,6 @@ pub struct Config {
     pub admin: AdminConfig,
 }
 
-#[derive(Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NetworkConfig {
-    /// Hex wallet key on this network, instead of the mnemonic's.
-    pub secret: Option<String>,
-    /// Chain API of `arkade` and `bitcoin`, instead of the public one.
-    pub esplora_url: Option<String>,
-    /// The LND node of a `lightning` network.
-    pub lnd: Option<LndConfig>,
-    /// The Ark server of a `lightning` network going through bark.
-    pub bark: Option<BarkConfig>,
-}
-
-#[derive(Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(not(feature = "lightning"), allow(dead_code))]
-pub struct LndConfig {
-    pub rest_url: String,
-    pub tls_cert_path: Option<PathBuf>,
-    pub macaroon_path: Option<PathBuf>,
-}
-
-#[derive(Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(not(feature = "bark-lightning"), allow(dead_code))]
-pub struct BarkConfig {
-    /// Second's server for mainnet and signet when unset.
-    pub server_url: Option<String>,
-    pub esplora_url: Option<String>,
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
@@ -109,9 +79,6 @@ pub struct RouteConfig {
     pub fee_ppm: u64,
     #[serde(default = "default_transit_slack")]
     pub transit_slack_secs: u64,
-    /// Longest an incoming HTLC may run, when shorter than what the
-    /// `from` network allows.
-    pub max_incoming_lifetime_secs: Option<u64>,
     /// Mark the route's announcement as test money.
     #[serde(default)]
     pub test_money: bool,
@@ -232,7 +199,6 @@ impl Config {
                     fee_ppm: route.fee_ppm,
                     transit_slack_secs: route.transit_slack_secs,
                     nostr_relays: self.nostr_relays.clone(),
-                    max_incoming_lifetime_secs: route.max_incoming_lifetime_secs,
                     test_money: route.test_money,
                 })
             })
@@ -242,65 +208,6 @@ impl Config {
             cleanup_relays: self.nostr_relays.clone(),
             max_reservations: self.max_reservations,
             ..RoutingPolicy::default()
-        })
-    }
-}
-
-impl NetworkConfig {
-    /// What opening `network` takes, its wallet kept under `dir`.
-    #[allow(unused_variables)]
-    pub fn settings(
-        &self,
-        network: &NetworkId,
-        keys: &NodeKeys,
-        dir: &Path,
-    ) -> Result<NetworkSettings, String> {
-        let secret = match &self.secret {
-            Some(hex) => parse_secret(hex).map_err(|e| format!("{network} secret: {e}"))?,
-            None => keys.network_secret(network),
-        };
-        #[cfg(not(feature = "lightning"))]
-        if self.lnd.is_some() {
-            return Err(format!("{network}: this build has no LND support"));
-        }
-        #[cfg(not(feature = "bark-lightning"))]
-        if self.bark.is_some() {
-            return Err(format!("{network}: this build has no bark support"));
-        }
-        #[cfg(feature = "bark-lightning")]
-        let bark = match &self.bark {
-            None => None,
-            Some(bark) => {
-                let default = cassis_networks::bark_lightning::BarkConfig::default_for(network);
-                Some(cassis_networks::bark_lightning::BarkConfig {
-                    server_url: bark
-                        .server_url
-                        .clone()
-                        .or_else(|| default.as_ref().map(|d| d.server_url.clone()))
-                        .ok_or_else(|| format!("{network} has no default Ark server"))?,
-                    esplora_url: bark
-                        .esplora_url
-                        .clone()
-                        .or_else(|| default.as_ref().map(|d| d.esplora_url.clone()))
-                        .ok_or_else(|| format!("{network} has no default Esplora"))?,
-                })
-            }
-        };
-        Ok(NetworkSettings {
-            secret,
-            dir: cassis_networks::network_dir(dir, network),
-            max_incoming_lifetime_secs: None,
-            esplora_url: self.esplora_url.clone(),
-            #[cfg(feature = "lightning")]
-            lnd: self.lnd.as_ref().map(|lnd| {
-                cassis_networks::lnd::LndConfig::new(
-                    lnd.rest_url.clone(),
-                    lnd.tls_cert_path.clone(),
-                    lnd.macaroon_path.clone(),
-                )
-            }),
-            #[cfg(feature = "bark-lightning")]
-            bark,
         })
     }
 }
@@ -325,13 +232,6 @@ pub fn edit(
     Ok(config)
 }
 
-fn parse_secret(hex: &str) -> Result<[u8; 32], String> {
-    let mut bytes = [0u8; 32];
-    lowercase_hex::decode_to_slice(hex.trim(), &mut bytes)
-        .map_err(|e| format!("expected 64 hex characters: {e}"))?;
-    Ok(bytes)
-}
-
 /// A config with a fresh mnemonic and nothing to route yet, readable by
 /// its owner only.
 fn write_new(path: &Path) -> Result<(), String> {
@@ -347,8 +247,9 @@ fn write_new(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("create {}: {e}", path.display()))?;
     let template = format!(
         r#"# cassis-routerd config, also edited by the admin interface, which
-# keeps comments. Every key derives from the mnemonic below unless
-# overridden: back it up, it controls the router's funds.
+# keeps comments. The router's identity derives from the mnemonic below
+# unless overridden, and every network has a key of its own, written
+# when it is added: back this file up, it controls the router's funds.
 #
 # iroh_secret = "<64 hex>"
 # nostr_secret = "nsec1..."
@@ -357,10 +258,11 @@ fn write_new(path: &Path) -> Result<(), String> {
 # autoname derived from its key):
 # name = "My router"
 #
-# One table per network to open, e.g.:
+# One table per network to open, with its wallet key, e.g.:
 # [networks."cashu::mint.example"]
-# [networks.arkade]
+# secret = "<64 hex>"
 # [networks.lightning]
+# secret = "<64 hex>"
 # lnd = {{ rest_url = "https://127.0.0.1:8080", tls_cert_path = "/path/tls.cert", macaroon_path = "/path/admin.macaroon" }}
 #
 # One entry per hop to offer and announce, e.g.:

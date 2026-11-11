@@ -25,7 +25,8 @@
 
 use crate::network::{Htlc, HtlcDescriptor, HtlcTarget, NetworkId};
 use crate::offline::{
-    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
+    endpoint_public_key, AuthorizationKind, GatewayMetadata, PreimageIssuance,
+    ReceiveAuthorization, Signature,
 };
 use crate::primitives::{Bytes32, OperationId};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -34,7 +35,7 @@ use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// Protocol identifier negotiated on every connection.
-pub const ALPN: &[u8] = b"cassis-hop/6";
+pub const ALPN: &[u8] = b"cassis-hop/7";
 
 /// Most bytes [`Metadata`] may hold.
 pub const MAX_METADATA_BYTES: usize = 128 * 1024;
@@ -224,11 +225,6 @@ pub struct InvoiceNetwork {
     /// least this long after COMMIT. The network's default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_delta_secs: Option<u64>,
-    /// Longest the receiver lets its HTLC on this network run (see
-    /// [`crate::Network::max_incoming_lifetime_secs`]); no limit when
-    /// absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_incoming_lifetime_secs: Option<u64>,
 }
 
 impl Invoice {
@@ -441,9 +437,24 @@ impl Invoice {
                 }
                 let issuance = &receiver.preimage_server_issuance;
                 issuance.verify(&receiver.preimage_server, authorization)?;
+                // The metadata is the gateway's, around the payee's, which
+                // the issuance commits to.
+                let carried = GatewayMetadata::from_metadata(
+                    self.body
+                        .metadata
+                        .as_ref()
+                        .ok_or("a delegated invoice carries the gateway's metadata")?,
+                )?;
+                carried.verify(&receiver.gateway)?;
+                if carried.issuance != *issuance
+                    || carried.authorization != *authorization
+                    || carried.expires_at != self.body.expires_at
+                {
+                    return Err("the gateway's metadata is for another invoice".into());
+                }
                 if issuance.payment_hash != self.body.payment_hash
                     || issuance.amount_msat != self.body.amount_msat
-                    || !issuance.matches_metadata(self.body.metadata.as_ref())
+                    || !issuance.matches_metadata(carried.payee_metadata.as_ref())
                 {
                     return Err("the preimage server issued the hash for another payment".into());
                 }
@@ -630,15 +641,6 @@ impl Invoice {
             .and_then(|entry| entry.incoming_delta_secs)
             .unwrap_or_else(|| network.default_incoming_delta())
     }
-
-    /// Longest the receiver lets its HTLC on `network` run.
-    pub fn max_incoming_lifetime_for(&self, network: &NetworkId) -> Option<u64> {
-        self.body
-            .networks
-            .iter()
-            .find(|entry| entry.network == *network)
-            .and_then(|entry| entry.max_incoming_lifetime_secs)
-    }
 }
 
 /// The flat JSON form of an [`Invoice`], kept so its bytes (and so its
@@ -732,9 +734,6 @@ pub struct PreparePayee {
     /// The invoice's [`InvoiceBody::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// The whole invoice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invoice: Option<Invoice>,
 }
 
 /// Payer to payee: the final HTLC is funded on `network`; claim it and
@@ -748,9 +747,6 @@ pub struct Commit {
     /// The invoice's [`InvoiceBody::metadata`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// The whole invoice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invoice: Option<Invoice>,
 }
 
 /// Payer to router: the preimage of an executed hop, so the router can
@@ -964,7 +960,6 @@ mod tests {
                         .pubkey(),
                 ),
                 incoming_delta_secs: None,
-                max_incoming_lifetime_secs: None,
             }],
             description: Some("coffee".into()),
             metadata: Some(Metadata::new(b"order 42".to_vec()).unwrap()),
@@ -1027,8 +1022,19 @@ mod tests {
     /// Issued by the gateway alone.
     fn delegated_invoice() -> Invoice {
         let authorization = authorization(AuthorizationKind::Standing);
+        let mut body = body();
+        let carried = GatewayMetadata::sign(
+            &GATEWAY,
+            authorization.clone(),
+            issuance(&authorization),
+            None,
+            body.expires_at,
+            body.metadata.take(),
+        )
+        .unwrap();
+        body.metadata = Some(carried.to_metadata().unwrap());
         Invoice::delegated(
-            body(),
+            body,
             authorization.payee,
             &GATEWAY,
             authorization.preimage_server,
@@ -1154,9 +1160,25 @@ mod tests {
         assert!(renamed.verify().is_err());
         // Other metadata than the preimage server issued the hash for.
         let mut relabeled = invoice.clone();
-        relabeled.body.metadata = Some(Metadata::new(b"order 43".to_vec()).unwrap());
+        let mut carried =
+            GatewayMetadata::from_metadata(relabeled.body.metadata.as_ref().unwrap()).unwrap();
+        carried = GatewayMetadata::sign(
+            &GATEWAY,
+            carried.authorization,
+            carried.issuance,
+            None,
+            carried.expires_at,
+            Some(Metadata::new(b"order 43".to_vec()).unwrap()),
+        )
+        .unwrap();
+        relabeled.body.metadata = Some(carried.to_metadata().unwrap());
         relabeled.sign_as_gateway(&GATEWAY).unwrap();
         assert!(relabeled.verify().unwrap_err().contains("another payment"));
+        // Metadata that is not the gateway's.
+        let mut stripped = invoice.clone();
+        stripped.body.metadata = Some(Metadata::new(b"order 42".to_vec()).unwrap());
+        stripped.sign_as_gateway(&GATEWAY).unwrap();
+        assert!(stripped.verify().is_err());
         // A hash the gateway made up.
         let mut made_up = invoice.clone();
         made_up.body.payment_hash = Bytes32([2; 32]);

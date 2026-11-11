@@ -14,7 +14,6 @@ use cassis_admin::networks::{
 };
 use cassis_admin::view::{ago, fact, sat, stat, until};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity, Refresh};
-use cassis_core::keys::NodeKeys;
 use cassis_core::routing::{autohue, autoname};
 use cassis_core::{unix_now, Network, NetworkId, XOnlyPubKey};
 use futures::future::BoxFuture;
@@ -28,10 +27,10 @@ use tracing::{warn, Span};
 /// The most payments a tab lists, newest first.
 const LISTED: usize = 100;
 
-/// Opens a network with the server's keys, its data under `dir`. It only
-/// verifies HTLCs paying others, so it has no use for its wallet.
+/// Opens a network with the key its config gives, its data under `dir`.
+/// It only verifies HTLCs paying others, so it has no use for its
+/// wallet.
 pub struct PreimageOpener {
-    pub keys: NodeKeys,
     pub dir: PathBuf,
     pub span: Span,
 }
@@ -50,7 +49,7 @@ impl Opener<NetworkConfig> for PreimageOpener {
                         .into(),
                 );
             }
-            let settings = config.settings(id, &self.keys, &self.dir);
+            let settings = config.settings(id, &self.dir)?;
             Ok(Opened {
                 network: cassis_networks::open(id, &settings, &self.span).await?,
                 wallet: None,

@@ -98,6 +98,21 @@ fn hmac(seed: &[u8; 64], label: &[u8], counter: Option<u32>) -> [u8; 32] {
         .expect("32 bytes")
 }
 
+/// A fresh wallet key for one network, from the OS CSPRNG: a valid
+/// secp256k1 scalar, which every network takes. Daemons and wallets
+/// write it to their config when a network is added; nothing derives
+/// it.
+pub fn new_network_secret() -> [u8; 32] {
+    use rand::RngCore;
+    loop {
+        let mut candidate = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut candidate);
+        if secp256k1::SecretKey::from_byte_array(candidate).is_ok() {
+            return candidate;
+        }
+    }
+}
+
 /// Fresh 12-word mnemonic from the OS CSPRNG.
 pub fn generate_mnemonic() -> String {
     use rand::RngCore;

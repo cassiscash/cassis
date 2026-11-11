@@ -4,8 +4,9 @@
 
 use cassis_admin::config::{child, implicit_table, put, put_text};
 use cassis_admin::Args;
-use cassis_core::node::RouteOffer;
 use cassis_core::NetworkId;
+use cassis_routerd::router::RouteOffer;
+use cassis_wallet::config::new_secret;
 use hypereffect::Value;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike};
 
@@ -39,12 +40,15 @@ pub fn add_network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result
     network(doc, id, &args)
 }
 
-/// Adds `id` if missing. Fields: `esplora_url`, `backend` (`lnd`,
-/// `bark` or `none`), and the `lnd_*` and `bark_*` fields of whichever
-/// backend the network has.
+/// Adds `id` if missing, with a fresh wallet key. Fields:
+/// `esplora_url`, `backend` (`lnd`, `bark` or `none`), and the `lnd_*`
+/// and `bark_*` fields of whichever backend the network has.
 pub fn network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
     let networks = child(doc.as_table_mut(), "networks", implicit_table)?;
     let network = child(networks, &id.0, toml_edit::table)?;
+    if !network.contains_key("secret") {
+        put(network, "secret", Some(new_secret().into()));
+    }
     put_text(network, "esplora_url", args.text("esplora_url")?);
     match args.text("backend")?.as_deref() {
         None => {}
@@ -94,7 +98,7 @@ pub fn remove_network(doc: &mut DocumentMut, id: &NetworkId) -> Result<(), Strin
 
 /// Adds `from -> to` if missing, at the default fees unless given.
 /// Fields: `fee_base_msat`, `fee_ppm`, `transit_slack_secs`,
-/// `max_incoming_lifetime_secs`, `test_money`.
+/// `test_money`.
 pub fn route(
     doc: &mut DocumentMut,
     from: &NetworkId,
@@ -129,11 +133,6 @@ pub fn route(
         route,
         "transit_slack_secs",
         args.number("transit_slack_secs")?,
-    )?;
-    put_number(
-        route,
-        "max_incoming_lifetime_secs",
-        args.number("max_incoming_lifetime_secs")?,
     )?;
     if let Some(test_money) = args.flag("test_money")? {
         put(
@@ -231,24 +230,24 @@ mod tests {
             &mut doc,
             &from,
             &to,
-            &args(json!({"fee_base_msat": "7", "max_incoming_lifetime_secs": 600, "test_money": true})),
+            &args(json!({"fee_base_msat": "7", "transit_slack_secs": 600, "test_money": true})),
         )
         .unwrap();
         let text = doc.to_string();
         assert!(text.contains("# top\n"));
         assert!(text.contains("fee_base_msat = 7 # base\n"));
         assert!(text.contains("fee_ppm = 2\n"));
-        assert!(text.contains("max_incoming_lifetime_secs = 600\n"));
+        assert!(text.contains("transit_slack_secs = 600\n"));
         assert!(text.contains("test_money = true\n"));
         // Empty unsets what is optional, and is refused for what is not.
         route(
             &mut doc,
             &from,
             &to,
-            &args(json!({"max_incoming_lifetime_secs": "", "test_money": false})),
+            &args(json!({"transit_slack_secs": "", "test_money": false})),
         )
         .unwrap();
-        assert!(!doc.to_string().contains("max_incoming_lifetime_secs"));
+        assert!(!doc.to_string().contains("transit_slack_secs"));
         assert!(!doc.to_string().contains("test_money"));
         assert!(route(&mut doc, &from, &to, &args(json!({"fee_ppm": null}))).is_err());
         remove_route(&mut doc, &from, &to).unwrap();
@@ -283,8 +282,21 @@ mod tests {
         assert_eq!(cashu_id, id("cashu::mint.example"));
         add_network(&mut doc, &cashu_id, &cashu).unwrap();
         assert!(add_network(&mut doc, &cashu_id, &cashu).is_err());
+        // Each network gets a key of its own.
+        let text = doc.to_string();
+        let secrets: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("secret = "))
+            .collect();
+        assert_eq!(secrets.len(), 2);
+        assert_ne!(secrets[0], secrets[1]);
+        let rest: String = text
+            .lines()
+            .filter(|line| !line.starts_with("secret = "))
+            .map(|line| format!("{line}\n"))
+            .collect();
         assert_eq!(
-            doc.to_string(),
+            rest,
             "[networks.lightning]\nlnd = { rest_url = \"https://127.0.0.1:8080\" }\n\n[networks.\"cashu::mint.example\"]\n"
         );
         network(&mut doc, &lightning, &args(json!({"backend": "bark"}))).unwrap();

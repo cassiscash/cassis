@@ -13,48 +13,51 @@
 //!   preimage server for.
 //!
 //! Either way the gateway refuses terms it does not want to meet (a
-//! final timeout it finds too long, say). Payers PREPARE and COMMIT
-//! here, as with any payee. On COMMIT the gateway verifies the incoming
-//! HTLC, funds an HTLC to the payee on one of its destinations, at
-//! least as long as the payee asked for, and presents it to the
-//! preimage server ([`Request::PreimageRelease`]), which releases the
-//! preimage. The gateway claims the incoming HTLC with it and answers
-//! the COMMIT.
+//! final timeout it finds too long, say), and keeps no invoice: it puts
+//! the invoice's terms in its metadata, signed ([`GatewayMetadata`]),
+//! which payers hand back with PREPARE and COMMIT, as with any payee.
+//! On COMMIT the gateway checks its signature there, verifies the
+//! incoming HTLC, funds an HTLC to the payee on one of its
+//! destinations, at least as long as the payee asked for, and presents
+//! it to the preimage server ([`Request::PreimageRelease`]) with the
+//! issuance and the payee's metadata the invoice carried, and the server
+//! releases the preimage. The gateway claims the incoming HTLC with it,
+//! records it as an incoming transaction of its wallet, and answers the
+//! COMMIT.
 //!
-//! Every forward is journaled in the [`Store`]. A settlement loop
-//! resumes interrupted ones and refunds HTLCs to payees who never
-//! claimed them before they expired.
+//! Every HTLC to a payee is journaled in the [`Db`] as a [`PayeeHtlc`].
+//! A settlement loop resumes interrupted ones and refunds those whose
+//! preimage never came before they expired.
 
 pub mod admin;
 pub mod config;
+pub mod db;
 
+use crate::db::{
+    Db, HandledDelegation, HandledDelegationId, PayeeHtlc, PayeeHtlcHash, PayeeOutcome,
+};
 use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId, OutgoingState};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization,
+    endpoint_public_key, AuthorizationKind, Destination, GatewayMetadata, PreimageIssuance,
+    ReceiveAuthorization,
 };
 use cassis_core::protocol::{
     Commit, GatewayInvoiceFor, GatewayInvoiceRequest, Invoice, InvoiceBody, InvoiceNetwork,
     Metadata, PreimageRelease, PreparePayee, Request, Response,
 };
-use cassis_core::store::Store;
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
+use cassis_wallet::db::{Direction, Transaction, TransactionHash};
+use cassis_wallet::stored::{metadata, stored_metadata};
 use iroh_base::PublicKey;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{error, info, warn, Instrument, Span};
 
-/// Standing authorizations, by [`ReceiveAuthorization::id`].
-pub const AUTHORIZATIONS: &str = "gateway_authorizations";
-/// Invoices this gateway issued, by payment hash.
-pub const INVOICES: &str = "gateway_invoices";
-/// Payments it forwards, by payment hash.
-pub const FORWARDS: &str = "gateway_forwards";
-
-/// Why a forward left mid-funding by a restart failed: whether its HTLC
-/// to the payee exists is unknown.
+/// Why an HTLC to a payee left mid-funding by a restart failed: whether
+/// it exists is unknown.
 pub const INTERRUPTED_FUNDING: &str = "interrupted while funding";
 
 /// How long COMMIT works before answering [`Response::Pending`].
@@ -100,77 +103,13 @@ impl Default for GatewayPolicy {
 pub struct GatewayConfig {
     /// Secret of the gateway's iroh endpoint, which signs its invoices.
     pub endpoint_secret: [u8; 32],
-    pub store: Arc<Store>,
+    pub db: Arc<Db>,
+    /// The gateway's wallet, where what it is paid is recorded.
+    pub wallet: Arc<cassis_wallet::db::Db>,
     /// Networks the gateway is paid on and pays payees on.
     pub networks: Vec<Arc<dyn Network>>,
     pub policy: GatewayPolicy,
     pub span: Span,
-}
-
-/// A standing authorization a payee gave this gateway.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AuthorizationRecord {
-    pub authorization: ReceiveAuthorization,
-    pub preimage_server_relay: Option<String>,
-    pub registered_at: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InvoiceStatus {
-    Pending,
-    Paid,
-    Expired,
-}
-
-/// An invoice this gateway issued, with what paying it on takes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InvoiceRecord {
-    pub invoice: Invoice,
-    pub authorization: ReceiveAuthorization,
-    pub issuance: PreimageIssuance,
-    pub preimage_server: PeerAddr,
-    pub status: InvoiceStatus,
-    pub created_at: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ForwardState {
-    /// Waiting for the incoming HTLC to verify. Nothing is funded yet.
-    Verifying,
-    /// Funding the HTLC to the payee.
-    Funding,
-    /// HTLC to the payee funded; waiting for the preimage server to
-    /// release the preimage.
-    Releasing,
-    /// Preimage known; claiming the incoming HTLC.
-    Claiming,
-    /// Incoming HTLC claimed.
-    Settled,
-    Failed(String),
-}
-
-/// What became of the HTLC to the payee.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OutgoingOutcome {
-    Claimed,
-    Refunded,
-}
-
-/// A payment this gateway forwards: the payer's HTLC it claims and the
-/// HTLC it funded to the payee in exchange.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ForwardRecord {
-    pub payment_hash: Bytes32,
-    pub incoming_network: NetworkId,
-    pub incoming: Htlc,
-    /// The incoming claim must start by then.
-    pub claim_by: u64,
-    pub outgoing_network: Option<NetworkId>,
-    pub outgoing: Option<Htlc>,
-    pub outgoing_outcome: Option<OutgoingOutcome>,
-    pub state: ForwardState,
-    pub preimage: Option<Bytes32>,
-    pub created_at: u64,
 }
 
 /// Handle to a running gateway. Cheap to clone.
@@ -179,27 +118,40 @@ pub struct Gateway(Arc<Inner>);
 
 struct Inner {
     endpoint_secret: [u8; 32],
-    store: Arc<Store>,
+    db: Arc<Db>,
+    wallet: Arc<cassis_wallet::db::Db>,
     networks: Mutex<HashMap<NetworkId, Arc<dyn Network>>>,
     policy: Mutex<GatewayPolicy>,
     transport: Transport,
     span: Span,
     /// Payment hashes some task is forwarding; others leave them be.
     busy: Mutex<HashSet<Bytes32>>,
+    /// Why COMMITs failed before anything was paid to the payee, until a
+    /// repeated COMMIT collects it.
+    refused: Mutex<HashMap<Bytes32, String>>,
     /// Preimages the settlement loop learned from payees' claims, for
     /// forwards still waiting on the preimage server.
     learned: Mutex<HashMap<Bytes32, Bytes32>>,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
+/// A COMMIT checked against the invoice its metadata carries.
+struct Forward {
+    carried: GatewayMetadata,
+    incoming_network: NetworkId,
+    incoming: Htlc,
+    claim_by: u64,
+}
+
 impl Gateway {
-    /// Bind the gateway's endpoint, resume journaled forwards and answer
-    /// requests until [`Gateway::shutdown`].
+    /// Bind the gateway's endpoint, resume journaled HTLCs to payees and
+    /// answer requests until [`Gateway::shutdown`].
     pub async fn start(config: GatewayConfig) -> Result<Self, String> {
         let transport = Transport::bind(Some(config.endpoint_secret)).await?;
         let gateway = Self(Arc::new(Inner {
             endpoint_secret: config.endpoint_secret,
-            store: config.store,
+            db: config.db,
+            wallet: config.wallet,
             networks: Mutex::new(
                 config
                     .networks
@@ -211,6 +163,7 @@ impl Gateway {
             transport: transport.clone(),
             span: config.span,
             busy: Default::default(),
+            refused: Default::default(),
             learned: Default::default(),
             tasks: Default::default(),
         }));
@@ -259,26 +212,31 @@ impl Gateway {
         self.0.transport.close().await;
     }
 
-    pub fn store(&self) -> &Store {
-        &self.0.store
+    pub fn db(&self) -> &Db {
+        &self.0.db
     }
 
-    pub fn forwards(&self) -> Result<Vec<ForwardRecord>, String> {
-        self.store().list(FORWARDS)
+    /// The gateway's wallet database.
+    pub fn wallet(&self) -> &cassis_wallet::db::Db {
+        &self.0.wallet
     }
 
-    pub fn invoices(&self) -> Result<Vec<InvoiceRecord>, String> {
-        self.store().list(INVOICES)
+    pub fn payee_htlcs(&self) -> Result<Vec<PayeeHtlc>, String> {
+        self.db().payee_htlcs().all().map_err(db_error)
     }
 
-    pub fn authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
-        self.store().list(AUTHORIZATIONS)
+    pub fn delegations(&self) -> Result<Vec<HandledDelegation>, String> {
+        self.db().handled_delegations().all().map_err(db_error)
     }
 
     /// Stop issuing invoices under the standing authorization `id`.
     /// Invoices issued before stay payable: they carry their own copy.
-    pub fn forget_authorization(&self, id: &Bytes32) -> Result<(), String> {
-        self.store().delete(AUTHORIZATIONS, &id.to_string())
+    pub fn forget_delegation(&self, id: &Bytes32) -> Result<(), String> {
+        self.db()
+            .handled_delegations()
+            .delete(HandledDelegationId(id.to_string()))
+            .map(|_| ())
+            .map_err(db_error)
     }
 
     /// The terms it accepts now.
@@ -310,26 +268,17 @@ impl Gateway {
         ids
     }
 
-    /// The forwards that still need `id`: to claim or fund while in
-    /// progress, and to see the payee claim its HTLC or refund it.
+    /// The HTLCs to payees that still need `id`: to claim or fund while
+    /// in progress, and to see the payee claim its HTLC or refund it.
     pub fn in_flight(&self, id: &NetworkId) -> usize {
-        let Ok(forwards) = self.forwards() else {
+        let Ok(htlcs) = self.payee_htlcs() else {
             // Unable to tell: do not let go of the network.
             return 1;
         };
-        forwards
+        htlcs
             .iter()
-            .filter(|forward| {
-                let on_outgoing = forward.outgoing_network.as_ref() == Some(id);
-                let on_either = on_outgoing || forward.incoming_network == *id;
-                let open_outgoing =
-                    forward.outgoing.is_some() && forward.outgoing_outcome.is_none();
-                match forward.state {
-                    ForwardState::Settled => open_outgoing && on_outgoing,
-                    // Claimable with the preimage the payee reveals.
-                    ForwardState::Failed(_) => open_outgoing && on_either,
-                    _ => on_either,
-                }
+            .filter(|htlc| {
+                htlc.in_flight() && (htlc.network == id.0 || htlc.incoming_network == id.0)
             })
             .count()
     }
@@ -456,15 +405,18 @@ impl Gateway {
         if expires_at > authorization.valid_until {
             return Err("the invoice would outlive its authorization".into());
         }
-        let preimage_server = PeerAddr {
-            id: authorization.preimage_server.to_string(),
-            relay: preimage_server_relay,
-        };
-        let body = self
-            .build(&issuance, expires_at, description, metadata)
-            .await?;
-        let invoice = Invoice::gateway_invoice(body, authorization.payee, &self.0.endpoint_secret);
-        self.record(invoice, authorization, issuance, preimage_server)
+        let payee = authorization.payee;
+        let carried = GatewayMetadata::sign(
+            &self.0.endpoint_secret,
+            authorization,
+            issuance,
+            preimage_server_relay,
+            expires_at,
+            metadata,
+        )?;
+        let body = self.build(&carried, description).await?;
+        let invoice = Invoice::gateway_invoice(body, payee, &self.0.endpoint_secret);
+        Ok(self.issued(invoice))
     }
 
     /// Keep a standing authorization, so invoices can be issued under it.
@@ -482,34 +434,38 @@ impl Gateway {
             authorization.max_amount_msat,
             authorization.valid_until
         );
-        self.store().put(
-            AUTHORIZATIONS,
-            &id.to_string(),
-            &AuthorizationRecord {
-                authorization,
+        self.db()
+            .handled_delegations()
+            .upsert(&HandledDelegation {
+                authorization_id: HandledDelegationId(id.to_string()),
+                payee: authorization.payee.to_string(),
+                authorization: (&authorization).into(),
                 preimage_server_relay,
                 registered_at: unix_now(),
-            },
-        )
+            })
+            .map_err(db_error)
     }
 
     /// An invoice in the name of an offline payee, under its standing
     /// authorization that runs longest among those allowing the amount.
     async fn invoice_for(&self, request: GatewayInvoiceFor) -> Result<Invoice, String> {
         let now = unix_now();
-        let record = self
-            .store()
-            .list::<AuthorizationRecord>(AUTHORIZATIONS)?
+        let mut candidates = Vec::new();
+        for delegation in self
+            .db()
+            .handled_delegations()
+            .by_payee(request.payee.to_string())
+            .map_err(db_error)?
+        {
+            let authorization = ReceiveAuthorization::try_from(&delegation.authorization)?;
+            if authorization.is_valid_at(now) && authorization.allows_amount(request.amount_msat) {
+                candidates.push((authorization, delegation.preimage_server_relay));
+            }
+        }
+        let (authorization, preimage_server_relay) = candidates
             .into_iter()
-            .filter(|record| {
-                let authorization = &record.authorization;
-                authorization.payee == request.payee
-                    && authorization.is_valid_at(now)
-                    && authorization.allows_amount(request.amount_msat)
-            })
-            .max_by_key(|record| record.authorization.valid_until)
+            .max_by_key(|(authorization, _)| authorization.valid_until)
             .ok_or("this payee authorized no invoice like this one")?;
-        let authorization = record.authorization;
         let expires_at = request
             .expires_at
             .unwrap_or(now + self.policy().default_invoice_expiry_secs)
@@ -519,7 +475,7 @@ impl Gateway {
         }
         let preimage_server = PeerAddr {
             id: authorization.preimage_server.to_string(),
-            relay: record.preimage_server_relay,
+            relay: preimage_server_relay.clone(),
         };
         let issue = Request::PreimageIssue {
             authorization: authorization.clone(),
@@ -539,41 +495,40 @@ impl Gateway {
         {
             return Err("preimage server issued the hash for another payment".into());
         }
-        let body = self
-            .build(&issuance, expires_at, request.description, request.metadata)
-            .await?;
+        let carried = GatewayMetadata::sign(
+            &self.0.endpoint_secret,
+            authorization.clone(),
+            issuance.clone(),
+            preimage_server_relay,
+            expires_at,
+            request.metadata,
+        )?;
+        let body = self.build(&carried, request.description).await?;
         let invoice = Invoice::delegated(
             body,
             authorization.payee,
             &self.0.endpoint_secret,
             authorization.preimage_server,
-            issuance.clone(),
-            authorization.clone(),
+            issuance,
+            authorization,
         );
         invoice.verify()?;
-        self.record(invoice, authorization, issuance, preimage_server)
+        Ok(self.issued(invoice))
     }
 
-    /// The terms of an invoice for `issuance`, payable to this gateway
-    /// on every network it is on.
+    /// The terms of an invoice carrying `carried` as its metadata,
+    /// payable to this gateway on every network it is on.
     async fn build(
         &self,
-        issuance: &PreimageIssuance,
-        expires_at: u64,
+        carried: &GatewayMetadata,
         description: Option<String>,
-        metadata: Option<Metadata>,
     ) -> Result<InvoiceBody, String> {
+        let expires_at = carried.expires_at;
         if expires_at <= unix_now() {
             return Err("invoice expiry must be in the future".into());
         }
-        let payment_hash = issuance.payment_hash;
-        if self
-            .store()
-            .get::<InvoiceRecord>(INVOICES, &payment_hash.to_string())?
-            .is_some()
-        {
-            return Err("this gateway already issued an invoice for the hash".into());
-        }
+        let payment_hash = carried.payment_hash();
+        let amount_msat = carried.issuance.amount_msat;
         let forward_slack_secs = self.policy().forward_slack_secs;
         let mut networks: Vec<Arc<dyn Network>> =
             lock(&self.0.networks).values().cloned().collect();
@@ -581,7 +536,7 @@ impl Gateway {
         let mut targets = Vec::with_capacity(networks.len());
         for network in networks {
             match network
-                .receive_target(payment_hash, issuance.amount_msat, expires_at)
+                .receive_target(payment_hash, amount_msat, expires_at)
                 .await
             {
                 Ok(target) => targets.push(InvoiceNetwork {
@@ -592,7 +547,6 @@ impl Gateway {
                             .incoming_delta_secs()
                             .saturating_add(forward_slack_secs),
                     ),
-                    max_incoming_lifetime_secs: network.max_incoming_lifetime_secs(),
                 }),
                 Err(error) => warn!("cannot receive on {}: {error}", network.id()),
             }
@@ -602,66 +556,63 @@ impl Gateway {
         }
         Ok(InvoiceBody {
             payment_hash,
-            amount_msat: issuance.amount_msat,
+            amount_msat,
             expires_at,
             networks: targets,
             description,
-            metadata,
+            metadata: Some(carried.to_metadata()?),
             iroh_relay: self.home_relay().await,
         })
     }
 
-    fn record(
-        &self,
-        invoice: Invoice,
-        authorization: ReceiveAuthorization,
-        issuance: PreimageIssuance,
-        preimage_server: PeerAddr,
-    ) -> Result<Invoice, String> {
+    fn issued(&self, invoice: Invoice) -> Invoice {
         info!(
             "issued invoice {} of {} msat for payee {}",
             invoice.body.payment_hash.short(),
             invoice.body.amount_msat,
-            authorization.payee
+            invoice.receiver.payee()
         );
-        self.store().put(
-            INVOICES,
-            &invoice.body.payment_hash.to_string(),
-            &InvoiceRecord {
-                invoice: invoice.clone(),
-                authorization,
-                issuance,
-                preimage_server,
-                status: InvoiceStatus::Pending,
-                created_at: unix_now(),
-            },
-        )?;
-        Ok(invoice)
+        invoice
     }
 
-    fn invoice_record(&self, payment_hash: &Bytes32) -> Result<InvoiceRecord, String> {
-        self.store()
-            .get(INVOICES, &payment_hash.to_string())?
-            .ok_or_else(|| "unknown invoice".to_string())
-    }
-
-    /// The target and network of an HTLC paying `record` on `network`
-    /// expiring at `expiry`, and the time its claim must start by.
-    fn payable_on(
+    /// The invoice this gateway issued for `payment_hash`, as the
+    /// metadata a payer handed back carries it.
+    fn carried(
         &self,
-        record: &InvoiceRecord,
+        metadata: Option<&Metadata>,
+        payment_hash: &Bytes32,
+    ) -> Result<GatewayMetadata, String> {
+        let carried =
+            GatewayMetadata::from_metadata(metadata.ok_or("no invoice of this gateway's")?)?;
+        carried.verify(&self.key())?;
+        if carried.payment_hash() != *payment_hash {
+            return Err("the invoice metadata is for another payment".into());
+        }
+        Ok(carried)
+    }
+
+    /// The target and network of an HTLC paying `carried`'s invoice on
+    /// `network` expiring at `expiry`, and the time its claim must start
+    /// by.
+    async fn payable_on(
+        &self,
+        carried: &GatewayMetadata,
         network: &NetworkId,
         expiry: u64,
     ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
-        if record.status == InvoiceStatus::Expired || record.invoice.body.expires_at <= unix_now() {
+        if carried.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
-        let target = record
-            .invoice
-            .target_for(network)
-            .cloned()
-            .ok_or_else(|| format!("invoice is not payable on {network}"))?;
         let opened = self.network(network)?;
+        // Claim-key networks give the target of the invoice again.
+        let target = opened
+            .receive_target(
+                carried.payment_hash(),
+                carried.issuance.amount_msat,
+                carried.expires_at,
+            )
+            .await
+            .map_err(|e| format!("cannot receive on {network}: {e}"))?;
         let claim_by = expiry.saturating_sub(opened.incoming_delta_secs());
         if claim_by.saturating_sub(self.policy().forward_slack_secs) <= unix_now() {
             return Err("HTLC expires too soon to pay the payee on".into());
@@ -693,18 +644,25 @@ impl Gateway {
         })
     }
 
+    fn payee_htlc(&self, payment_hash: &Bytes32) -> Result<Option<PayeeHtlc>, String> {
+        self.db()
+            .payee_htlcs()
+            .get(PayeeHtlcHash(payment_hash.to_string()))
+            .map_err(db_error)
+    }
+
     async fn prepare(&self, prepare: &PreparePayee) -> Result<(), String> {
-        let record = self.invoice_record(&prepare.payment_hash)?;
-        if record.status == InvoiceStatus::Paid
-            || self
-                .store()
-                .get::<ForwardRecord>(FORWARDS, &prepare.payment_hash.to_string())?
-                .is_some_and(|forward| !matches!(forward.state, ForwardState::Failed(_)))
-        {
-            return Err("invoice already paid".into());
+        let carried = self.carried(prepare.metadata.as_ref(), &prepare.payment_hash)?;
+        // The payee was paid already: a new payment cannot start over.
+        if let Some(htlc) = self.payee_htlc(&prepare.payment_hash)? {
+            return Err(match htlc.failed {
+                Some(reason) => format!("an earlier payment of this invoice failed: {reason}"),
+                None => "invoice already paid".into(),
+            });
         }
-        self.payable_on(&record, &prepare.network, prepare.expiry)?;
-        self.destination(&record.authorization, record.invoice.body.amount_msat)
+        self.payable_on(&carried, &prepare.network, prepare.expiry)
+            .await?;
+        self.destination(&carried.authorization, carried.issuance.amount_msat)
             .await?;
         info!(
             "PREPARE {} accepted on {}",
@@ -719,24 +677,26 @@ impl Gateway {
     /// is claimed, [`Response::Pending`] while it is in progress.
     async fn commit(&self, commit: Commit) -> Response {
         let hash = commit.payment_hash;
-        if let Err(reason) = self.start_forward(commit) {
+        if let Err(reason) = self.start_forward(commit).await {
             warn!("COMMIT {} refused: {reason}", hash.short());
             return Response::Error(reason);
         }
         let deadline = tokio::time::Instant::now() + INLINE_WAIT;
         loop {
-            match self
-                .store()
-                .get::<ForwardRecord>(FORWARDS, &hash.to_string())
-            {
-                Ok(Some(forward)) => match (forward.state, forward.preimage) {
-                    (ForwardState::Settled, Some(preimage)) => {
-                        return Response::Committed(preimage)
-                    }
-                    (ForwardState::Failed(reason), _) => return Response::Error(reason),
+            match self.payee_htlc(&hash) {
+                Ok(Some(htlc)) => match (htlc.settled, htlc.preimage, htlc.failed) {
+                    (true, Some(preimage), _) => return Response::Committed(Bytes32(preimage)),
+                    (_, _, Some(reason)) => return Response::Error(reason),
                     _ => {}
                 },
-                Ok(None) => return Response::Error("forward disappeared".into()),
+                Ok(None) => {
+                    if let Some(reason) = lock(&self.0.refused).remove(&hash) {
+                        return Response::Error(reason);
+                    }
+                    if !lock(&self.0.busy).contains(&hash) {
+                        return Response::Error("forward disappeared".into());
+                    }
+                }
                 Err(error) => return Response::Error(error),
             }
             if tokio::time::Instant::now() >= deadline {
@@ -746,53 +706,35 @@ impl Gateway {
         }
     }
 
-    /// Journal a forward for `commit` and drive it in the background,
-    /// unless one is already under way. A forward that failed before
-    /// funding anything starts over.
-    fn start_forward(&self, commit: Commit) -> Result<(), String> {
+    /// Check `commit` against the invoice its metadata carries and
+    /// forward it in the background, unless a forward of its payment is
+    /// already under way or done.
+    async fn start_forward(&self, commit: Commit) -> Result<(), String> {
         let hash = commit.payment_hash;
-        let key = hash.to_string();
-        if let Some(forward) = self.store().get::<ForwardRecord>(FORWARDS, &key)? {
-            let restartable =
-                matches!(forward.state, ForwardState::Failed(_)) && forward.outgoing.is_none();
-            if !restartable {
-                return Ok(());
-            }
-            if forward.incoming.descriptor == commit.descriptor
-                && forward.incoming_network == commit.network
-            {
-                // The same HTLC failed already: report it again.
-                return Ok(());
-            }
+        if self.payee_htlc(&hash)?.is_some() {
+            return Ok(());
         }
-        let record = self.invoice_record(&hash)?;
-        if record.status == InvoiceStatus::Paid {
-            return Err("invoice already paid".into());
-        }
-        let (target, _, claim_by) = self.payable_on(&record, &commit.network, commit.expiry)?;
-        let forward = ForwardRecord {
-            payment_hash: hash,
-            incoming_network: commit.network,
+        let carried = self.carried(commit.metadata.as_ref(), &hash)?;
+        let (target, _, claim_by) = self
+            .payable_on(&carried, &commit.network, commit.expiry)
+            .await?;
+        let Some(busy) = self.busy(hash) else {
+            return Ok(());
+        };
+        lock(&self.0.refused).remove(&hash);
+        let forward = Forward {
             incoming: Htlc {
                 payment_hash: hash,
-                amount_msat: record.invoice.body.amount_msat,
+                amount_msat: carried.issuance.amount_msat,
                 expiry: commit.expiry,
                 target,
                 descriptor: commit.descriptor,
             },
+            carried,
+            incoming_network: commit.network,
             claim_by,
-            outgoing_network: None,
-            outgoing: None,
-            outgoing_outcome: None,
-            state: ForwardState::Verifying,
-            preimage: None,
-            created_at: unix_now(),
         };
-        let Some(busy) = self.busy(hash) else {
-            return Ok(());
-        };
-        self.save(&forward)?;
-        self.spawn(self.clone().drive(forward, busy));
+        self.spawn(self.clone().forward(forward, busy));
         Ok(())
     }
 
@@ -804,45 +746,36 @@ impl Gateway {
         })
     }
 
-    fn save(&self, forward: &ForwardRecord) -> Result<(), String> {
-        self.store()
-            .put(FORWARDS, &forward.payment_hash.to_string(), forward)
-    }
-
-    /// Save `forward`, logging failures: the forward goes on either way.
-    fn journal(&self, forward: &ForwardRecord) {
-        if let Err(error) = self.save(forward) {
-            error!("journaling forward {}: {error}", forward.payment_hash);
+    /// Save `htlc`, logging failures: the forward goes on either way.
+    fn journal(&self, htlc: &PayeeHtlc) {
+        if let Err(error) = self.db().payee_htlcs().update(htlc) {
+            error!(
+                "journaling the HTLC to the payee {}: {error}",
+                htlc.payment_hash.0
+            );
         }
     }
 
-    /// Drive `forward` from its state to its end.
-    async fn drive(self, mut forward: ForwardRecord, _busy: BusyGuard) {
-        loop {
-            let next = match &forward.state {
-                ForwardState::Verifying => self.verify_and_fund(&mut forward).await,
-                ForwardState::Releasing => self.release(&mut forward).await,
-                ForwardState::Claiming => self.claim(&mut forward).await,
-                ForwardState::Funding | ForwardState::Settled | ForwardState::Failed(_) => return,
-            };
-            forward.state = match next {
-                Ok(state) => state,
-                Err(reason) => {
-                    warn!("forward {} failed: {reason}", forward.payment_hash.short());
-                    if forward.outgoing.is_none() {
-                        self.release_targets(&forward.payment_hash, None).await;
-                    }
-                    ForwardState::Failed(reason)
-                }
-            };
-            self.journal(&forward);
+    /// Verify the incoming HTLC of `forward`, fund the HTLC to the payee,
+    /// and go on as [`Gateway::finish`] does. A failure before anything
+    /// is funded is reported to the next COMMIT, and a new COMMIT may
+    /// start over.
+    async fn forward(self, forward: Forward, busy: BusyGuard) {
+        let hash = forward.incoming.payment_hash;
+        match self.verify_and_fund(&forward).await {
+            Ok(htlc) => self.finish(htlc, busy).await,
+            Err(reason) => {
+                warn!("forward {} failed: {reason}", hash.short());
+                self.release_targets(&hash, None).await;
+                lock(&self.0.refused).insert(hash, reason);
+            }
         }
     }
 
     /// Wait for the incoming HTLC to verify, then fund the HTLC to the
-    /// payee.
-    async fn verify_and_fund(&self, forward: &mut ForwardRecord) -> Result<ForwardState, String> {
-        let hash = forward.payment_hash;
+    /// payee, journaled before the network call.
+    async fn verify_and_fund(&self, forward: &Forward) -> Result<PayeeHtlc, String> {
+        let hash = forward.incoming.payment_hash;
         let incoming = self
             .network_by(&forward.incoming_network, forward.claim_by)
             .await?;
@@ -860,9 +793,8 @@ impl Gateway {
                 Err(error) => return Err(format!("HTLC rejected: {error}")),
             }
         }
-        let record = self.invoice_record(&hash)?;
-        let authorization = &record.authorization;
-        let amount_msat = record.issuance.amount_msat;
+        let authorization = &forward.carried.authorization;
+        let amount_msat = forward.carried.issuance.amount_msat;
         let (destination, outgoing) = self.destination(authorization, amount_msat).await?;
         if forward
             .claim_by
@@ -874,60 +806,116 @@ impl Gateway {
         let expiry = unix_now()
             .saturating_add(authorization.min_final_timeout_secs)
             .saturating_add(self.policy().final_slack_secs);
-        forward.state = ForwardState::Funding;
-        forward.outgoing_network = Some(destination.network.clone());
-        self.save(forward)?;
-        let descriptor = outgoing
+        let mut htlc = PayeeHtlc {
+            payment_hash: PayeeHtlcHash(hash.to_string()),
+            incoming_network: forward.incoming_network.0.clone(),
+            incoming: (&forward.incoming).into(),
+            claim_by: forward.claim_by,
+            authorization: authorization.into(),
+            issuance: (&forward.carried.issuance).into(),
+            preimage_server_relay: forward.carried.preimage_server_relay.clone(),
+            payee_metadata: stored_metadata(&forward.carried.payee_metadata),
+            network: destination.network.0.clone(),
+            htlc: None,
+            outcome: None,
+            preimage: None,
+            settled: false,
+            failed: None,
+            created_at: unix_now(),
+        };
+        self.db().payee_htlcs().insert(&htlc).map_err(db_error)?;
+        let funded = outgoing
             .create_outgoing_htlc(hash, amount_msat, expiry, &destination.target)
-            .await
-            .map_err(|e| format!("cannot pay the payee on {}: {e}", destination.network))?;
-        forward.outgoing = Some(Htlc {
-            payment_hash: hash,
-            amount_msat,
-            expiry,
-            target: destination.target,
-            descriptor,
-        });
+            .await;
+        let descriptor = match funded {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                // Nothing was paid: a new COMMIT may start over.
+                if let Err(error) = self.db().payee_htlcs().delete(htlc.payment_hash.clone()) {
+                    error!("forgetting the HTLC to the payee {hash}: {error}");
+                }
+                return Err(format!(
+                    "cannot pay the payee on {}: {error}",
+                    destination.network
+                ));
+            }
+        };
+        htlc.htlc = Some(
+            (&Htlc {
+                payment_hash: hash,
+                amount_msat,
+                expiry,
+                target: destination.target,
+                descriptor,
+            })
+                .into(),
+        );
+        self.journal(&htlc);
         info!(
             "COMMIT {}: locked {amount_msat} msat to payee {} on {} until {expiry}",
             hash.short(),
             authorization.payee,
             destination.network
         );
-        Ok(ForwardState::Releasing)
+        Ok(htlc)
     }
 
-    /// Present the HTLC to the payee to the preimage server until it
-    /// releases the preimage.
-    async fn release(&self, forward: &mut ForwardRecord) -> Result<ForwardState, String> {
-        let hash = forward.payment_hash;
-        let record = self.invoice_record(&hash)?;
-        let (Some(network), Some(htlc)) = (&forward.outgoing_network, &forward.outgoing) else {
-            return Err("nothing was paid to the payee".into());
-        };
+    /// Have the preimage of a funded `htlc` released, unless known, and
+    /// claim the payer's HTLC with it.
+    async fn finish(&self, mut htlc: PayeeHtlc, _busy: BusyGuard) {
+        if htlc.preimage.is_none() {
+            match self.release(&mut htlc).await {
+                Ok(preimage) => {
+                    info!("COMMIT {}: preimage released", short(&htlc));
+                    htlc.preimage = Some(preimage.0);
+                    self.journal(&htlc);
+                }
+                Err(reason) => {
+                    warn!("forward {} failed: {reason}", short(&htlc));
+                    htlc.failed = Some(reason);
+                    return self.journal(&htlc);
+                }
+            }
+        }
+        if let Err(reason) = self.claim(&mut htlc).await {
+            warn!("forward {} failed: {reason}", short(&htlc));
+            htlc.failed = Some(reason);
+            self.journal(&htlc);
+        }
+    }
+
+    /// Present the HTLC to the payee to the preimage server, with what
+    /// the invoice carried from it, until it releases the preimage.
+    async fn release(&self, htlc: &mut PayeeHtlc) -> Result<Bytes32, String> {
+        let hash = htlc
+            .payment_hash
+            .0
+            .parse::<Bytes32>()
+            .map_err(|_| "stored payment hash is invalid".to_string())?;
+        let authorization = ReceiveAuthorization::try_from(&htlc.authorization)?;
+        let funded = htlc.htlc.as_ref().ok_or("nothing was paid to the payee")?;
         let request = Request::PreimageRelease(PreimageRelease {
-            authorization: record.authorization.clone(),
-            issuance: record.issuance.clone(),
-            metadata: record.invoice.body.metadata.clone(),
-            network: network.clone(),
-            htlc: htlc.clone(),
+            issuance: PreimageIssuance::try_from(&htlc.issuance)?,
+            metadata: metadata(&htlc.payee_metadata)?,
+            network: NetworkId(htlc.network.clone()),
+            htlc: Htlc::try_from(funded)?,
+            authorization: authorization.clone(),
         });
+        let preimage_server = PeerAddr {
+            id: authorization.preimage_server.to_string(),
+            relay: htlc.preimage_server_relay.clone(),
+        };
         let mut waiting = false;
         loop {
-            if let Some(preimage) = forward.preimage {
-                // Learned meanwhile, from the payee's claim.
-                return Ok(self.with_preimage(forward, preimage));
+            // Learned meanwhile, from the payee's claim.
+            if let Some(preimage) = lock(&self.0.learned).remove(&hash) {
+                return Ok(preimage);
             }
-            match self
-                .0
-                .transport
-                .request(&record.preimage_server, &request)
-                .await
-            {
+            match self.0.transport.request(&preimage_server, &request).await {
                 Ok(Response::PreimageReleased(Ok(preimage)))
                     if hash.matches_preimage(&preimage) =>
                 {
-                    return Ok(self.with_preimage(forward, preimage))
+                    return Ok(preimage)
                 }
                 Ok(Response::PreimageReleased(Ok(_))) => {
                     return Err("preimage server released a wrong preimage".into())
@@ -939,7 +927,7 @@ impl Gateway {
                 Ok(other) => warn!("unexpected answer from preimage server: {other:?}"),
                 Err(error) => warn!("asking the preimage server again: {error}"),
             }
-            if unix_now() >= forward.claim_by {
+            if unix_now() >= htlc.claim_by {
                 return Err("the preimage server did not release the preimage in time".into());
             }
             if !waiting {
@@ -947,59 +935,54 @@ impl Gateway {
                 waiting = true;
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
-            // The settlement loop may have seen the payee claim.
-            forward.preimage = self
-                .0
-                .learned
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&hash);
         }
     }
 
-    fn with_preimage(&self, forward: &mut ForwardRecord, preimage: Bytes32) -> ForwardState {
-        info!("COMMIT {}: preimage released", forward.payment_hash.short());
-        forward.preimage = Some(preimage);
-        ForwardState::Claiming
-    }
-
-    /// Claim the incoming HTLC, retrying until it expires.
-    async fn claim(&self, forward: &mut ForwardRecord) -> Result<ForwardState, String> {
-        let hash = forward.payment_hash;
-        let preimage = forward.preimage.ok_or("no preimage to claim with")?;
+    /// Claim the payer's HTLC, retrying until it expires, and record it
+    /// as an incoming transaction.
+    async fn claim(&self, htlc: &mut PayeeHtlc) -> Result<(), String> {
+        let preimage = Bytes32(htlc.preimage.ok_or("no preimage to claim with")?);
+        let incoming_network = NetworkId(htlc.incoming_network.clone());
+        let incoming_htlc = Htlc::try_from(&htlc.incoming)?;
         let incoming = self
-            .network_by(&forward.incoming_network, forward.incoming.expiry)
+            .network_by(&incoming_network, incoming_htlc.expiry)
             .await?;
         loop {
-            match incoming
-                .claim_incoming_htlc(&forward.incoming, preimage)
-                .await
-            {
+            match incoming.claim_incoming_htlc(&incoming_htlc, preimage).await {
                 Ok(()) => break,
-                Err(error) if unix_now() >= forward.incoming.expiry => {
+                Err(error) if unix_now() >= incoming_htlc.expiry => {
                     return Err(format!("claim failed before the HTLC expired: {error}"))
                 }
                 Err(error) => {
-                    warn!("claiming {}: {error}; retrying", hash.short());
+                    warn!("claiming {}: {error}; retrying", short(htlc));
                     tokio::time::sleep(RETRY_INTERVAL).await;
                 }
             }
         }
         info!(
-            "COMMIT {}: claimed {} msat on {}",
-            hash.short(),
-            forward.incoming.amount_msat,
-            forward.incoming_network
+            "COMMIT {}: claimed {} msat on {incoming_network}",
+            short(htlc),
+            incoming_htlc.amount_msat,
         );
-        if let Ok(mut record) = self.invoice_record(&hash) {
-            record.status = InvoiceStatus::Paid;
-            if let Err(error) = self.store().put(INVOICES, &hash.to_string(), &record) {
-                warn!("saving invoice {hash}: {error}");
-            }
-        }
-        self.release_targets(&hash, Some(&forward.incoming_network))
+        self.0
+            .wallet
+            .transactions()
+            .insert(&Transaction {
+                payment_hash: TransactionHash(htlc.payment_hash.0.clone()),
+                direction: Direction::Incoming,
+                amount_msat: incoming_htlc.amount_msat,
+                network: incoming_network.0.clone(),
+                preimage: preimage.0,
+                at: unix_now(),
+                invoice: None,
+            })
+            .map_err(|e| format!("claimed, but recording the transaction failed: {e}"))?;
+        htlc.settled = true;
+        htlc.failed = None;
+        self.journal(htlc);
+        self.release_targets(&incoming_htlc.payment_hash, Some(&incoming_network))
             .await;
-        Ok(ForwardState::Settled)
+        Ok(())
     }
 
     /// Release what the gateway's networks, except `claimed_on`, set up
@@ -1022,23 +1005,26 @@ impl Gateway {
     /// the payee exists is unknown, and funding it again could pay
     /// twice.
     fn resume(&self) -> Result<(), String> {
-        for mut forward in self.forwards()? {
-            match forward.state {
-                ForwardState::Verifying | ForwardState::Releasing | ForwardState::Claiming => {
-                    if let Some(busy) = self.busy(forward.payment_hash) {
-                        self.spawn(self.clone().drive(forward, busy));
-                    }
-                }
-                ForwardState::Funding => {
-                    error!(
-                        "forward {} was interrupted while paying the payee on {:?}; check that \
-                         wallet for a lock to it",
-                        forward.payment_hash, forward.outgoing_network
-                    );
-                    forward.state = ForwardState::Failed(INTERRUPTED_FUNDING.into());
-                    self.save(&forward)?;
-                }
-                _ => {}
+        for mut htlc in self.payee_htlcs()? {
+            if htlc.settled || htlc.failed.is_some() {
+                continue;
+            }
+            if htlc.htlc.is_none() {
+                error!(
+                    "the HTLC to the payee {} was interrupted while funding on {}; check that \
+                     wallet for a lock to it",
+                    htlc.payment_hash.0, htlc.network
+                );
+                htlc.failed = Some(INTERRUPTED_FUNDING.into());
+                self.journal(&htlc);
+                continue;
+            }
+            let Ok(hash) = htlc.payment_hash.0.parse() else {
+                continue;
+            };
+            if let Some(busy) = self.busy(hash) {
+                let gateway = self.clone();
+                self.spawn(async move { gateway.finish(htlc, busy).await });
             }
         }
         Ok(())
@@ -1053,77 +1039,49 @@ impl Gateway {
         }
     }
 
-    /// One pass over HTLCs to payees still open, and expired invoices.
+    /// One pass over the HTLCs to payees still open.
     pub async fn settle_once(&self) {
-        match self.forwards() {
-            Ok(forwards) => {
-                for forward in forwards {
-                    if forward.outgoing.is_some() && forward.outgoing_outcome.is_none() {
-                        self.settle_outgoing(forward).await;
-                    }
+        match self.db().payee_htlcs().by_open(true) {
+            Ok(htlcs) => {
+                for htlc in htlcs {
+                    self.settle_outgoing(htlc).await;
                 }
             }
-            Err(error) => warn!("listing forwards: {error}"),
-        }
-        match self.store().list::<InvoiceRecord>(INVOICES) {
-            Ok(invoices) => {
-                for mut record in invoices {
-                    if record.status == InvoiceStatus::Pending
-                        && record.invoice.body.expires_at <= unix_now()
-                    {
-                        let hash = record.invoice.body.payment_hash;
-                        if self
-                            .store()
-                            .get::<ForwardRecord>(FORWARDS, &hash.to_string())
-                            .ok()
-                            .flatten()
-                            .is_some_and(|forward| {
-                                !matches!(forward.state, ForwardState::Failed(_))
-                            })
-                        {
-                            continue;
-                        }
-                        record.status = InvoiceStatus::Expired;
-                        self.release_targets(&hash, None).await;
-                        if let Err(error) = self.store().put(INVOICES, &hash.to_string(), &record) {
-                            warn!("expiring invoice {hash}: {error}");
-                        }
-                    }
-                }
-            }
-            Err(error) => warn!("listing invoices: {error}"),
+            Err(error) => warn!("listing HTLCs to payees: {error}"),
         }
     }
 
     /// See whether the payee claimed its HTLC (which also reveals the
     /// preimage to a forward still waiting for it), and refund it once
-    /// expired.
-    async fn settle_outgoing(&self, forward: ForwardRecord) {
-        let hash = forward.payment_hash;
-        let (Some(network), Some(htlc)) = (&forward.outgoing_network, &forward.outgoing) else {
+    /// expired if no preimage came back.
+    async fn settle_outgoing(&self, saved: PayeeHtlc) {
+        let (Ok(hash), Some(Ok(htlc))) = (
+            saved.payment_hash.0.parse::<Bytes32>(),
+            saved.htlc.as_ref().map(Htlc::try_from),
+        ) else {
             return;
         };
-        let Ok(network) = self.network(network) else {
+        let Ok(network) = self.network(&NetworkId(saved.network.clone())) else {
             return;
         };
-        let outcome = match network.check_outgoing_htlc(htlc).await {
+        let outcome = match network.check_outgoing_htlc(&htlc).await {
             Ok(OutgoingState::Claimed(preimage)) if hash.matches_preimage(&preimage) => {
-                Some((OutgoingOutcome::Claimed, Some(preimage)))
+                Some((PayeeOutcome::Claimed, Some(preimage)))
             }
             Ok(OutgoingState::Claimed(_)) => {
                 warn!("{} reported a wrong preimage", network.id());
                 None
             }
-            Ok(OutgoingState::Refunded) => Some((OutgoingOutcome::Refunded, None)),
-            Ok(OutgoingState::Pending) if unix_now() >= htlc.expiry => {
-                match network.refund_outgoing_htlc(htlc).await {
+            Ok(OutgoingState::Refunded) => Some((PayeeOutcome::Refunded, None)),
+            Ok(OutgoingState::Pending) if unix_now() >= htlc.expiry && saved.preimage.is_none() => {
+                match network.refund_outgoing_htlc(&htlc).await {
                     Ok(()) => {
                         info!(
-                            "{}: the payee did not claim; refunded on {}",
+                            "{}: no preimage came back; refunded on {}",
                             hash.short(),
                             network.id()
                         );
-                        Some((OutgoingOutcome::Refunded, None))
+                        Some((PayeeOutcome::Refunded, None))
                     }
                     Err(error) => {
                         warn!("refunding {} on {}: {error}", hash.short(), network.id());
@@ -1144,42 +1102,49 @@ impl Gateway {
             // A forward in progress owns its record: only tell it the
             // preimage, and record the outcome on a later pass.
             if let Some(preimage) = preimage {
-                self.0
-                    .learned
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(hash, preimage);
+                lock(&self.0.learned).insert(hash, preimage);
             }
             return;
         };
-        let Ok(Some(mut saved)) = self
-            .store()
-            .get::<ForwardRecord>(FORWARDS, &hash.to_string())
-        else {
+        let Ok(Some(mut saved)) = self.payee_htlc(&hash) else {
             return;
         };
-        if outcome == OutgoingOutcome::Claimed {
+        if outcome == PayeeOutcome::Claimed {
             info!("{}: the payee claimed", hash.short());
         }
-        saved.outgoing_outcome = Some(outcome);
-        saved.preimage = saved.preimage.or(preimage);
+        saved.outcome = Some(outcome);
+        saved.preimage = saved.preimage.or(preimage.map(|preimage| preimage.0));
         // A forward that gave up on the preimage server can still claim
         // with the preimage the payee revealed.
-        let claimable = matches!(saved.state, ForwardState::Failed(_))
+        let claimable = !saved.settled
+            && saved.failed.is_some()
             && saved.preimage.is_some()
-            && unix_now() < saved.incoming.expiry;
+            && Htlc::try_from(&saved.incoming).is_ok_and(|incoming| unix_now() < incoming.expiry);
         if claimable {
-            saved.state = ForwardState::Claiming;
+            saved.failed = None;
         }
         self.journal(&saved);
         if claimable {
-            self.spawn(self.clone().drive(saved, busy));
+            let gateway = self.clone();
+            self.spawn(async move { gateway.finish(saved, busy).await });
         }
     }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn short(htlc: &PayeeHtlc) -> String {
+    htlc.payment_hash
+        .0
+        .parse::<Bytes32>()
+        .map(|hash| hash.short())
+        .unwrap_or_else(|_| htlc.payment_hash.0.clone())
+}
+
+fn db_error(error: orangedb::Error) -> String {
+    format!("database: {error}")
 }
 
 struct BusyGuard {

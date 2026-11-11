@@ -1,4 +1,4 @@
-//! Receiving offline, the payee's side (see [`crate::offline`]): issue
+//! Receiving offline, the payee's side (see [`cassis_core::offline`]): issue
 //! invoices through a gateway and a preimage server, or let the gateway
 //! issue them alone, and later claim what the preimage server logged.
 //!
@@ -9,29 +9,28 @@
 //! ([`super::Node::transport`]); otherwise bind a client one with
 //! [`Transport::bind_client`].
 
-use super::InvoiceStatus;
-use crate::keys::NodeKeys;
-use crate::network::{Htlc, Network, NetworkError, NetworkId};
-use crate::offline::{
-    endpoint_public_key, AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization,
+use super::db_error;
+use super::payee::settle_invoice;
+use crate::db::{
+    Db, Delegation, Direction, FullDelegation, FullDelegationId, Invoice as StoredInvoice,
+    InvoiceHash, InvoiceState, Transaction, TransactionHash,
 };
-use crate::primitives::{unix_now, Bytes32};
-use crate::protocol::{
+use crate::stored::stored_metadata;
+use cassis_core::keys::NodeKeys;
+use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
+use cassis_core::offline::{
+    endpoint_public_key, AuthorizationKind, Destination, GatewayMetadata, PreimageIssuance,
+    ReceiveAuthorization,
+};
+use cassis_core::protocol::{
     GatewayInvoiceRequest, Invoice, InvoiceReceiver, Metadata, ReceivedPayment, Request, Response,
 };
-use crate::store::Store;
-use crate::transport::{PeerAddr, Transport};
+use cassis_core::transport::{PeerAddr, Transport};
+use cassis_core::{unix_now, Bytes32};
 use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
-
-/// Table of invoices issued through a gateway, one at a time.
-pub const GATEWAY_INVOICES: &str = "gateway_invoices";
-/// Table of standing authorizations given to gateways, by id.
-pub const STANDING_AUTHORIZATIONS: &str = "standing_authorizations";
-/// Table of HTLCs claimed from preimage server logs, by payment hash.
-pub const OFFLINE_CLAIMS: &str = "offline_claims";
 
 /// The gateway and preimage server a payee receives through.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,43 +39,10 @@ pub struct OfflineEndpoints {
     pub preimage_server: PeerAddr,
 }
 
-/// An invoice issued through a gateway. It keeps no preimage: the
-/// preimage server holds it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GatewayInvoiceRecord {
-    pub invoice: Invoice,
-    pub authorization: ReceiveAuthorization,
-    pub endpoints: OfflineEndpoints,
-    pub status: InvoiceStatus,
-    pub created_at: u64,
-    pub settled_at: Option<u64>,
-}
-
-/// A standing authorization this node gave a gateway.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StandingAuthorizationRecord {
-    pub authorization: ReceiveAuthorization,
-    pub endpoints: OfflineEndpoints,
-    pub created_at: u64,
-}
-
-/// An HTLC claimed from a preimage server's log.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OfflineClaim {
-    pub payment_hash: Bytes32,
-    pub network: NetworkId,
-    pub amount_msat: u64,
-    pub claimed_at: u64,
-}
-
 /// Where the gateway may pay this node: its claim key on each of
-/// `networks`, which must let HTLCs run for `min_final_timeout_secs`
-/// and more. Lightning is refused: its hold invoices need this node
+/// `networks`. Lightning is refused: its hold invoices need this node
 /// online.
-async fn destinations(
-    networks: &[Arc<dyn Network>],
-    min_final_timeout_secs: u64,
-) -> Result<Vec<Destination>, String> {
+async fn destinations(networks: &[Arc<dyn Network>]) -> Result<Vec<Destination>, String> {
     if networks.is_empty() {
         return Err("receiving offline needs at least one network".into());
     }
@@ -86,16 +52,6 @@ async fn destinations(
         if id.kind() == "lightning" {
             return Err(format!(
                 "{id} cannot be paid to an offline payee: its hold invoices need it online"
-            ));
-        }
-        let lifetime = min_final_timeout_secs.saturating_add(network.incoming_delta_secs());
-        if let Some(max) = network
-            .max_incoming_lifetime_secs()
-            .filter(|max| *max <= lifetime)
-        {
-            return Err(format!(
-                "{id} takes HTLCs running at most {max}s, too short for a final timeout of \
-                 {min_final_timeout_secs}s"
             ));
         }
         // Claim-key networks give the same target whatever the hash.
@@ -139,7 +95,7 @@ fn payee_secret(keys: &NodeKeys, transport: &Transport) -> Result<[u8; 32], Stri
 /// long.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_gateway_invoice(
-    store: &Store,
+    db: &Db,
     keys: &NodeKeys,
     transport: &Transport,
     endpoints: OfflineEndpoints,
@@ -168,7 +124,7 @@ pub async fn create_gateway_invoice(
         amount_msat,
         amount_msat,
         min_final_timeout_secs,
-        destinations(networks, min_final_timeout_secs).await?,
+        destinations(networks).await?,
     )?;
     let mut invoice = issue(
         transport,
@@ -184,18 +140,27 @@ pub async fn create_gateway_invoice(
     if !matches!(invoice.receiver, InvoiceReceiver::Gateway(_)) {
         return Err("the gateway's invoice is not a gateway invoice".into());
     }
-    store.put(
-        GATEWAY_INVOICES,
-        &invoice.body.payment_hash.to_string(),
-        &GatewayInvoiceRecord {
-            invoice: invoice.clone(),
-            authorization,
-            endpoints,
-            status: InvoiceStatus::Pending,
+    db.invoices()
+        .insert(&StoredInvoice {
+            payment_hash: InvoiceHash(invoice.body.payment_hash.to_string()),
+            amount_msat,
+            expires_at,
+            networks: invoice.body.networks.iter().map(Into::into).collect(),
+            description: invoice.body.description.clone(),
+            metadata: stored_metadata(&invoice.body.metadata),
+            preimage: None,
+            delegation: Some(Delegation {
+                gateway: endpoints.gateway.id.clone(),
+                gateway_relay: endpoints.gateway.relay.clone(),
+                preimage_server: endpoints.preimage_server.id.clone(),
+                preimage_server_relay: endpoints.preimage_server.relay.clone(),
+                authorization: (&authorization).into(),
+            }),
+            state: InvoiceState::Waiting,
             created_at: now,
             settled_at: None,
-        },
-    )?;
+        })
+        .map_err(db_error)?;
     Ok(invoice)
 }
 
@@ -244,6 +209,15 @@ async fn issue(
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     };
+    // The gateway's own record of the invoice, which it gets back with
+    // every PREPARE and COMMIT.
+    let carried = invoice
+        .body
+        .metadata
+        .as_ref()
+        .ok_or_else(|| "the gateway's invoice carries no metadata".to_string())
+        .and_then(GatewayMetadata::from_metadata)?;
+    carried.verify(&authorization.gateway)?;
     let asked = match &invoice {
         Invoice {
             body,
@@ -253,7 +227,10 @@ async fn issue(
                 && body.amount_msat == amount_msat
                 && body.expires_at == expires_at
                 && body.description == description
-                && body.metadata == metadata
+                && carried.payee_metadata == metadata
+                && carried.issuance == issuance
+                && carried.authorization == *authorization
+                && carried.expires_at == expires_at
                 && receiver.gateway == authorization.gateway
                 && receiver.payee == authorization.payee
                 && receiver.gateway_signature.is_some()
@@ -276,7 +253,7 @@ async fn issue(
 /// [`redeem_offline_payments`] knows where to look.
 #[allow(clippy::too_many_arguments)]
 pub async fn authorize_gateway(
-    store: &Store,
+    db: &Db,
     keys: &NodeKeys,
     transport: &Transport,
     endpoints: OfflineEndpoints,
@@ -301,7 +278,7 @@ pub async fn authorize_gateway(
         min_amount_msat,
         max_amount_msat,
         min_final_timeout_secs,
-        destinations(networks, min_final_timeout_secs).await?,
+        destinations(networks).await?,
     )?;
     let answer = transport
         .request(
@@ -319,15 +296,17 @@ pub async fn authorize_gateway(
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     }
-    store.put(
-        STANDING_AUTHORIZATIONS,
-        &authorization.id()?.to_string(),
-        &StandingAuthorizationRecord {
-            authorization: authorization.clone(),
-            endpoints,
+    db.full_delegations()
+        .upsert(&FullDelegation {
+            authorization_id: FullDelegationId(authorization.id()?.to_string()),
+            gateway: endpoints.gateway.id,
+            gateway_relay: endpoints.gateway.relay,
+            preimage_server: endpoints.preimage_server.id,
+            preimage_server_relay: endpoints.preimage_server.relay,
+            authorization: (&authorization).into(),
             created_at: unix_now(),
-        },
-    )?;
+        })
+        .map_err(db_error)?;
     Ok(authorization)
 }
 
@@ -351,7 +330,7 @@ pub struct RedeemReport {
 /// since `since` (unix seconds) and claim them on `networks`, before
 /// they expire.
 pub async fn redeem_offline_payments(
-    store: &Store,
+    db: &Db,
     keys: &NodeKeys,
     transport: &Transport,
     preimage_server: &PeerAddr,
@@ -405,27 +384,35 @@ pub async fn redeem_offline_payments(
             ),
         };
         let key = payment_hash.to_string();
-        if store.get::<OfflineClaim>(OFFLINE_CLAIMS, &key)?.is_some() {
+        if db
+            .transactions()
+            .contains(TransactionHash(key.clone()))
+            .map_err(db_error)?
+        {
             continue;
         }
         match redeem(networks, &network, &htlc, preimage).await {
             Ok(()) => {
-                store.put(
-                    OFFLINE_CLAIMS,
-                    &key,
-                    &OfflineClaim {
-                        payment_hash,
-                        network: network.clone(),
-                        amount_msat: htlc.amount_msat,
-                        claimed_at: unix_now(),
-                    },
-                )?;
-                if let Some(mut record) =
-                    store.get::<GatewayInvoiceRecord>(GATEWAY_INVOICES, &key)?
+                match db
+                    .invoices()
+                    .get(InvoiceHash(key.clone()))
+                    .map_err(db_error)?
                 {
-                    record.status = InvoiceStatus::Claimed;
-                    record.settled_at = Some(unix_now());
-                    store.put(GATEWAY_INVOICES, &key, &record)?;
+                    Some(invoice) => {
+                        settle_invoice(db, &invoice, &network, htlc.amount_msat, preimage)?
+                    }
+                    None => db
+                        .transactions()
+                        .insert(&Transaction {
+                            payment_hash: TransactionHash(key.clone()),
+                            direction: Direction::Incoming,
+                            amount_msat: htlc.amount_msat,
+                            network: network.0.clone(),
+                            preimage: preimage.0,
+                            at: unix_now(),
+                            invoice: None,
+                        })
+                        .map_err(db_error)?,
                 }
                 report
                     .claimed

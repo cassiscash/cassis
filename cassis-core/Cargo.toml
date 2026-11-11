@@ -5,9 +5,9 @@ edition.workspace = true
 
 [features]
 default = ["node"]
-# The node runtime: iroh transport, sqlite store and the payer, router
-# and payee coordination. Network crates and wasm builds go without.
-node = ["dep:futures", "dep:iroh", "dep:minisqlite", "dep:tokio"]
+# The iroh transport nodes talk over. Network crates and wasm builds go
+# without.
+node = ["dep:futures", "dep:iroh", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -32,7 +32,6 @@ tracing-subscriber = { workspace = true }
 
 futures = { workspace = true, optional = true }
 iroh = { workspace = true, optional = true }
-minisqlite = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

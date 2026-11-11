@@ -2,20 +2,20 @@
 //! Nostr relay, with an in-memory mock network on each side.
 //!
 //! Needs internet access (iroh relays), so it is ignored by default:
-//! `cargo test -p cassis-core --test payment_flow -- --ignored`
+//! `cargo test -p cassis-routerd --test payment_flow -- --ignored`
 
 use async_trait::async_trait;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
-use cassis_core::node::{
-    HopRecord, HopState, Node, NodeConfig, PaymentRecord, PaymentStatus, RouteOffer, RoutingPolicy,
-};
 use cassis_core::offline::endpoint_public_key;
 use cassis_core::protocol::{InvoiceReceiver, Metadata};
-use cassis_core::store::Store;
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
+use cassis_routerd::db::{Db as RouterDb, IncomingState};
+use cassis_routerd::router::{RouteOffer, Router, RoutingPolicy};
+use cassis_wallet::db::{PendingPaymentHash, TransactionHash};
+use cassis_wallet::{open_db, Node, NodeConfig};
 use ritualistic::server::{CustomRelay, RelayInternals};
 use ritualistic::{Event, Filter};
 use std::collections::HashMap;
@@ -189,12 +189,11 @@ impl CustomRelay for MemoryRelay {
 
 /// A serving node, and its keys to sign doctored invoices with.
 async fn start_node(name: &str, networks: Vec<Arc<dyn Network>>) -> (Node, NodeKeys) {
-    let dir = std::env::temp_dir().join(format!("cassis-flow-{name}-{}", rand_suffix()));
     let keys = NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap();
     let node = Node::start(
         NodeConfig {
             keys: keys.clone(),
-            store: Arc::new(Store::open(&dir.join("store.db")).unwrap()),
+            db: open_db(&dir(name)).unwrap(),
             span: Span::none(),
             serve: true,
         },
@@ -203,6 +202,10 @@ async fn start_node(name: &str, networks: Vec<Arc<dyn Network>>) -> (Node, NodeK
     .await
     .unwrap();
     (node, keys)
+}
+
+fn dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("cassis-flow-{name}-{}", rand_suffix()))
 }
 
 fn rand_suffix() -> u64 {
@@ -229,7 +232,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     let a = "cashu::a.example";
     let b = "cashu::b.example";
     let (payer, _) = start_node("payer", vec![MockNetwork::new(a, 1, &chain_a)]).await;
-    let (router, router_keys) = start_node(
+    let (router_node, router_keys) = start_node(
         "router",
         vec![
             MockNetwork::new(a, 2, &chain_a),
@@ -237,6 +240,13 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         ],
     )
     .await;
+    let router_dir = dir("router-hops");
+    std::fs::create_dir_all(&router_dir).unwrap();
+    let router = Router::start(
+        router_node,
+        Arc::new(RouterDb::open(router_dir.join("router.redb")).unwrap()),
+    )
+    .unwrap();
     let (payee, payee_keys) = start_node("payee", vec![MockNetwork::new(b, 4, &chain_b)]).await;
     let offer = |from: &str, to: &str| RouteOffer {
         nostr_relays: vec![RELAY.into()],
@@ -273,12 +283,18 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .await
         .unwrap();
     assert!(invoice.body.payment_hash.matches_preimage(&preimage));
-    let hops: Vec<HopRecord> = router.store().list("hops").unwrap();
-    assert_eq!(hops.len(), 1);
+    // The SETTLE fanout claimed the router's incoming HTLC: the hop is
+    // a forward, no longer in flight.
+    let forwards = router.db().forwards().all().unwrap();
+    assert_eq!(forwards.len(), 1);
     // Fee: 1000 base + 500 ppm of 100_000.
-    assert_eq!(hops[0].prepare.amount_msat, 101_050);
-    // The SETTLE fanout claimed the router's incoming HTLC.
-    assert_eq!(hops[0].state, HopState::Settled);
+    assert_eq!(forwards[0].incoming_amount_msat, 101_050);
+    assert_eq!(forwards[0].fee_msat(), 1_050);
+    assert!(router.db().incomings().is_empty().unwrap());
+    // The payer and the payee each have their transaction.
+    let key = TransactionHash(invoice.body.payment_hash.to_string());
+    assert!(payer.db().transactions().contains(key.clone()).unwrap());
+    assert!(payee.db().transactions().contains(key).unwrap());
     let claimed_upstream = chain_a
         .0
         .lock()
@@ -299,11 +315,11 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .await
         .unwrap_err();
     assert!(error.contains("invalid invoice signature"), "{error}");
-    assert!(payer
-        .store()
-        .get::<PaymentRecord>("payments", &tampered.body.payment_hash.to_string())
-        .unwrap()
-        .is_none());
+    assert!(!payer
+        .db()
+        .pending_payments()
+        .contains(PendingPaymentHash(tampered.body.payment_hash.to_string()))
+        .unwrap());
 
     // The endpoint named for the payee does not know the invoice: it
     // refuses at PREPARE, before anything is funded.
@@ -320,11 +336,13 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .await
         .unwrap_err();
     assert!(error.contains("payee refused: unknown invoice"), "{error}");
-    assert!(payer
-        .store()
-        .get::<PaymentRecord>("payments", &misdirected.body.payment_hash.to_string())
-        .unwrap()
-        .is_none());
+    assert!(!payer
+        .db()
+        .pending_payments()
+        .contains(PendingPaymentHash(
+            misdirected.body.payment_hash.to_string()
+        ))
+        .unwrap());
 
     // The payer locks to a key the payee does not claim with: PREPARE
     // passes, COMMIT fails after funding, and both funded HTLCs stay
@@ -344,17 +362,22 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .await
         .unwrap_err();
     assert!(error.contains("payee did not claim"), "{error}");
-    let payment: PaymentRecord = payer
-        .store()
-        .get("payments", &unreachable.body.payment_hash.to_string())
-        .unwrap()
+    assert!(payer
+        .db()
+        .pending_payments()
+        .contains(PendingPaymentHash(
+            unreachable.body.payment_hash.to_string()
+        ))
+        .unwrap());
+    let forwarded = router
+        .db()
+        .incomings()
+        .by_payment_hash(unreachable.body.payment_hash.to_string())
         .unwrap();
-    assert_eq!(payment.status, PaymentStatus::Pending);
-    let forwarded: Vec<HopRecord> = router.store().list("hops").unwrap();
-    assert!(forwarded.iter().any(
-        |hop| hop.prepare.payment_hash == unreachable.body.payment_hash
-            && hop.state == HopState::Forwarded
-    ));
+    assert!(forwarded
+        .iter()
+        .any(|hop| hop.state == IncomingState::Forwarded));
+    assert_eq!(router.db().outgoings().len().unwrap(), 1);
     // Nothing is refunded before the expiry.
     router.settle_once().await;
     payer.settle_once().await;

@@ -9,15 +9,15 @@ use cassis_admin::networks::{
     bark_fields, closing_notice, lnd_fields, network_card as card_of, network_draft, new_network,
     new_network_draft, NetworkCard, Status, ALL_KINDS,
 };
-use cassis_admin::view::{act, ago, fact, field, number, options, quote, short_hash, submit};
+use cassis_admin::view::{act, ago, fact, field, number, options, short_hash, submit};
 use cassis_admin::wallets::{self, Funds};
-use cassis_core::node::{HopRecord, HopState};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
 use cassis_networks::Can;
+use cassis_routerd::db::{FailReason, Incoming, IncomingState};
 use hypereffect::vtree::{badge, card, checkbox, column, list, row, select, tab, text, Node};
 use hypereffect::{cel, json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What the page shows, besides the config.
 pub struct Context<'a> {
@@ -27,10 +27,9 @@ pub struct Context<'a> {
     /// The name the router goes by: its own, else its autoname.
     pub name: String,
     pub autoname: String,
-    /// Networks the node has open, with the longest an incoming HTLC
-    /// may run on each.
-    pub open: BTreeMap<String, Option<u64>>,
-    pub hops: Vec<HopRecord>,
+    /// Networks the node has open.
+    pub open: BTreeSet<String>,
+    pub hops: Hops,
     pub node_pubkey: String,
     pub iroh_peer_id: String,
     pub nostr: &'a Nostr,
@@ -48,18 +47,32 @@ pub struct Network {
     pub funds: Funds,
 }
 
+/// The hops the router routed.
+#[derive(Default)]
+pub struct Hops {
+    pub in_flight: Vec<Incoming>,
+    pub settled: usize,
+    /// Failed by reason.
+    pub failed: BTreeMap<String, usize>,
+}
+
+impl Hops {
+    fn total(&self) -> usize {
+        self.in_flight.len() + self.settled + self.failed.values().sum::<usize>()
+    }
+}
+
+/// How a hop that failed for `reason` is counted.
+pub fn fail_kind(reason: FailReason) -> &'static str {
+    match reason {
+        FailReason::PreimageNotReceived => "refunded",
+        _ => "failed",
+    }
+}
+
 impl Context<'_> {
     fn is_open(&self, id: &str) -> bool {
-        self.open.contains_key(id)
-    }
-
-    /// What a route's incoming lifetime is when it sets none.
-    fn lifetime_default(&self, from: &str) -> String {
-        match self.open.get(from) {
-            Some(Some(secs)) => format!("{secs}, the most {from} allows"),
-            Some(None) => format!("no limit: {from} sets none now"),
-            None => format!("what {from} allows once open"),
-        }
+        self.open.contains(id)
     }
 }
 
@@ -115,7 +128,6 @@ fn route_values(route: &RouteConfig) -> Value {
         "fee_base_msat": route.fee_base_msat,
         "fee_ppm": route.fee_ppm,
         "transit_slack_secs": route.transit_slack_secs,
-        "max_incoming_lifetime_secs": route.max_incoming_lifetime_secs,
         "test_money": route.test_money,
     })
 }
@@ -135,7 +147,6 @@ pub fn new_drafts(config: &Config) -> Map<String, Value> {
             "to": to,
             "fee_base_msat": 1000,
             "fee_ppm": 500,
-            "max_incoming_lifetime_secs": null,
             "test_money": false,
         }),
     );
@@ -171,60 +182,56 @@ fn overview(ctx: &Context) -> Node {
         ),
         fact("identity/iroh", "Iroh id (cassis-hop)", &ctx.iroh_peer_id),
     ]);
-    const STATES: [&str; 6] = [
-        "verifying",
-        "funding",
-        "forwarded",
-        "settled",
-        "refunded",
-        "failed",
-    ];
-    let state_name = |state: &HopState| match state {
-        HopState::Verifying => "verifying",
-        HopState::Funding => "funding",
-        HopState::Forwarded => "forwarded",
-        HopState::Settled => "settled",
-        HopState::Refunded => "refunded",
-        HopState::Failed(_) => "failed",
+    let state_name = |state: IncomingState| match state {
+        IncomingState::Verifying => "verifying",
+        IncomingState::Funding => "funding",
+        IncomingState::Forwarded => "forwarded",
     };
-    let counts = STATES.iter().filter_map(|name| {
+    let in_flight = ["verifying", "funding", "forwarded"].map(|name| {
         let count = ctx
             .hops
+            .in_flight
             .iter()
-            .filter(|hop| state_name(&hop.state) == *name)
+            .filter(|hop| state_name(hop.state) == name)
             .count();
-        (count > 0).then(|| {
+        (name, count)
+    });
+    let ended = [
+        ("settled", ctx.hops.settled),
+        (
+            "refunded",
+            ctx.hops.failed.get("refunded").copied().unwrap_or(0),
+        ),
+        (
+            "failed",
+            ctx.hops.failed.get("failed").copied().unwrap_or(0),
+        ),
+    ];
+    let counts = in_flight
+        .into_iter()
+        .chain(ended)
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, count)| {
             badge(format!("hops/count/{name}"))
-                .variant(match *name {
+                .variant(match name {
                     "settled" => "success",
                     "failed" => "failure",
                     "refunded" => "warning",
                     _ => "info",
                 })
                 .text(format!("{count} {name}"))
-        })
-    });
-    let active = ctx
-        .hops
-        .iter()
-        .filter(|hop| {
-            matches!(
-                hop.state,
-                HopState::Verifying | HopState::Funding | HopState::Forwarded
-            )
-        })
-        .map(|hop| {
-            let prepare = &hop.prepare;
-            text(format!("hop/{}", hop.operation_id)).text(format!(
-                "{} → {} · {} msat · {}",
-                prepare.incoming_network,
-                prepare.outgoing_network,
-                prepare.outgoing_amount_msat,
-                state_name(&hop.state)
-            ))
         });
+    let active = ctx.hops.in_flight.iter().map(|hop| {
+        text(format!("hop/{}", hop.operation_id.0)).text(format!(
+            "{} → {} · {} msat · {}",
+            hop.network,
+            hop.outgoing_network,
+            hop.outgoing_amount_msat,
+            state_name(hop.state)
+        ))
+    });
     let hops = card("hops")
-        .title(format!("Hops · {}", ctx.hops.len()))
+        .title(format!("Hops · {}", ctx.hops.total()))
         .child(row("hops/counts").wrap(true).children(counts))
         .child(
             list("hops/active")
@@ -336,7 +343,6 @@ fn routes(ctx: &Context) -> Node {
                     "Transit slack (seconds)",
                     &d("transit_slack_secs"),
                 ),
-                lifetime(&el(""), &d("")).placeholder(ctx.lifetime_default(from)),
                 test_money(&el(""), &d("")),
                 row(el("actions")).children([
                     submit(
@@ -362,13 +368,6 @@ fn routes(ctx: &Context) -> Node {
             .title("Add a route")
             .child(text("route/new/help").text("A route needs two networks: add them first."))
     } else {
-        // The default of the network picked, without a round trip.
-        let defaults = config
-            .networks
-            .keys()
-            .map(|id| format!("{}: {}", quote(id), quote(&ctx.lifetime_default(id))))
-            .collect::<Vec<_>>()
-            .join(", ");
         card("route/new").title("Add a route").children([
             row("route/new/ends").wrap(true).children([
                 select("route/new/from")
@@ -381,8 +380,6 @@ fn routes(ctx: &Context) -> Node {
                     .options(networks),
             ]),
             fees("route/new/", "d.new_route."),
-            lifetime("route/new/", "d.new_route.")
-                .placeholder(cel(format!("{{{defaults}}}[s.d.new_route.from]"))),
             test_money("route/new/", "d.new_route."),
             submit(
                 "route/new/add",
@@ -417,15 +414,6 @@ fn fees(el: &str, d: &str) -> Node {
             &format!("{d}fee_ppm"),
         ),
     ])
-}
-
-/// A route's incoming lifetime input, like [`fees`].
-fn lifetime(el: &str, d: &str) -> Node {
-    number(
-        format!("{el}max_incoming_lifetime_secs"),
-        "Longest incoming HTLC (seconds)",
-        &format!("{d}max_incoming_lifetime_secs"),
-    )
 }
 
 /// A route's test money switch, like [`fees`].

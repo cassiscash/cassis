@@ -3,9 +3,9 @@
 //! managed with `cassis-wallet --home <dir>` while it is stopped:
 //!
 //! ```text
-//! <dir>/seed                12-word mnemonic every key derives from
-//! <dir>/config.toml         networks, terms, admin (see `cassis_gateway::config`)
-//! <dir>/store.db            authorizations, invoices and forwards
+//! <dir>/config.toml         mnemonic, networks with their keys, terms, admin (see `cassis_gateway::config`)
+//! <dir>/wallet.redb         what it was paid (see `cassis_wallet::db`)
+//! <dir>/gateway.redb        standing authorizations and HTLCs to payees (see `cassis_gateway::db`)
 //! <dir>/<kind>/<variant>/   private data of one network's wallet
 //! ```
 //!
@@ -16,13 +16,13 @@
 
 use cassis_admin::networks::Networks;
 use cassis_admin::{reexec, shutdown_signal, ConfigFile, Refresh, Server, RESTART_GRACE};
-use cassis_core::keys::{generate_mnemonic, NodeKeys};
-use cassis_core::store::Store;
+use cassis_core::keys::generate_mnemonic;
 use cassis_gateway::admin::{GatewayAdmin, GatewayOpener};
-use cassis_gateway::config::{Config, TEMPLATE};
+use cassis_gateway::config::{template, Config};
+use cassis_gateway::db::Db;
 use cassis_gateway::{Gateway, GatewayConfig};
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, info_span, warn};
 
@@ -58,17 +58,19 @@ async fn run(cli: Cli) -> Result<(), String> {
         },
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let keys = NodeKeys::from_mnemonic(&read_or_create_seed(&dir)?).map_err(|e| e.to_string())?;
-    let file: ConfigFile<Config> = ConfigFile::load_or_create(&dir, TEMPLATE)?;
+    let file: ConfigFile<Config> =
+        ConfigFile::load_or_create(&dir, &template(&generate_mnemonic()))?;
     let config = file.get();
-    let store = Arc::new(Store::open(&dir.join("store.db"))?);
+    let keys = config.keys()?;
+    let wallet = cassis_wallet::open_db(&dir)?;
+    let path = dir.join("gateway.redb");
+    let db = Arc::new(Db::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?);
     let span = info_span!("node", node = "gateway");
     // Networks are opened before the gateway starts, so that it can
     // resume its forwards on them. Forwards through one that does not
     // open wait for it.
     let networks = Networks::new(
         GatewayOpener {
-            keys: keys.clone(),
             dir: dir.clone(),
             span: span.clone(),
         },
@@ -85,7 +87,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
     let gateway = Gateway::start(GatewayConfig {
         endpoint_secret: keys.iroh,
-        store,
+        db,
+        wallet,
         networks: opened,
         policy: config.terms,
         span,
@@ -117,28 +120,4 @@ async fn run(cli: Cli) -> Result<(), String> {
         return Err(reexec());
     }
     Ok(())
-}
-
-fn read_or_create_seed(dir: &Path) -> Result<String, String> {
-    let path = dir.join("seed");
-    if !path.exists() {
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&path)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
-        writeln!(file, "{}", generate_mnemonic()).map_err(|e| e.to_string())?;
-        eprintln!(
-            "generated a new seed at {}; back it up: it holds the gateway's funds",
-            path.display()
-        );
-    }
-    std::fs::read_to_string(&path)
-        .map(|seed| seed.trim().to_string())
-        .map_err(|e| format!("read {}: {e}", path.display()))
 }

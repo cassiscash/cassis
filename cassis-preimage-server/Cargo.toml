@@ -16,6 +16,7 @@ rootstock = ["cassis-networks/rootstock"]
 cassis-admin = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
+cassis-wallet = { workspace = true }
 clap = { workspace = true }
 hmac = { workspace = true }
 futures = { workspace = true }
