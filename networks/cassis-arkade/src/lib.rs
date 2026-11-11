@@ -38,6 +38,7 @@ use ark_client::Client;
 use ark_client::InMemorySwapStorage;
 use ark_client::OfflineClient;
 use ark_client::OfflineClientConfig;
+use ark_client::SqliteContractStore;
 use ark_core::contract::{SpendPath, SpendPathKind};
 use ark_core::intent::{self, IntentMessage};
 use ark_core::send::build_offchain_transactions;
@@ -75,6 +76,7 @@ use cassis_core::{
     sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError,
     NetworkId, OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
 };
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -209,10 +211,15 @@ pub struct ArkadeAdapter {
 
 impl ArkadeAdapter {
     /// Connect to the operator of `arkade`, `arkade::mutinynet` or
-    /// `arkade::<host>`. Wallet state lives with the operator and
-    /// on-chain.
-    pub async fn open(id: NetworkId, secret: [u8; 32], span: &Span) -> Result<Self, String> {
-        Self::open_with_esplora(id, secret, None, span).await
+    /// `arkade::<host>`. VTXOs live with the operator and on-chain;
+    /// contract rows are persisted in `data_dir/contracts.db`.
+    pub async fn open(
+        id: NetworkId,
+        secret: [u8; 32],
+        data_dir: &Path,
+        span: &Span,
+    ) -> Result<Self, String> {
+        Self::open_with_esplora(id, secret, data_dir, None, span).await
     }
 
     /// [`open`](Self::open), reading the chain from the Esplora API at
@@ -221,6 +228,7 @@ impl ArkadeAdapter {
     pub async fn open_with_esplora(
         id: NetworkId,
         secret: [u8; 32],
+        data_dir: &Path,
         esplora_url: Option<&str>,
         span: &Span,
     ) -> Result<Self, String> {
@@ -258,6 +266,10 @@ impl ArkadeAdapter {
             timeout: Duration::from_secs(BATCH_TIMEOUT_SECS),
             ..Default::default()
         };
+        // Persist the SDK's contract rows (VHTLCs and their state) so a
+        // restart does not lose them; the operator only knows VTXOs.
+        let contracts = SqliteContractStore::new(data_dir.join("contracts.db"))
+            .map_err(|e| format!("arkade contract store: {e}"))?;
         let client = OfflineClient::with_keypair(
             client_config,
             keypair,
@@ -265,6 +277,7 @@ impl ArkadeAdapter {
             wallet,
             Arc::new(InMemorySwapStorage::new()),
         )
+        .with_contract_store(Box::new(contracts))
         .connect()
         .await
         .map_err(|e| format!("connect to arkade operator {server_url}: {e}"))?;

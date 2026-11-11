@@ -76,7 +76,12 @@ alloy = { version = "2.4", default-features = false, features = [
   "eips",
   "rlp",
 ] }
-ark-client = { version = "0.12", default-features = false, features = ["tls-webpki-roots"] }
+# `sqlite` persists the SDK contract store (VHTLC rows), so they
+# survive restarts; it enables both sqlx and rusqlite upstream.
+ark-client = { version = "0.12", default-features = false, features = [
+  "sqlite",
+  "tls-webpki-roots",
+] }
 ark-core = "0.12"
 ark-grpc = { version = "0.12", default-features = false, features = ["tls-webpki-roots"] }
 ark-bdk-wallet = "0.12"
@@ -113,5 +118,5 @@ cassis-bark-lightning = { path = "networks/cassis-bark-lightning" }
 
 # Bark with hash-only lightning receives (preimage given later), from
 # our fork of https://gitlab.com/ark-bitcoin/bark.
-bark-wallet = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "96ea65bd433376597b2d4bf931f27c36d7b78f2b", default-features = false, features = ["sqlite", "native", "rand", "tls-webpki-roots"] }
-bark-bitcoin-ext = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "96ea65bd433376597b2d4bf931f27c36d7b78f2b" }
+bark-wallet = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "7d735a7382c15c1e530c6d85ebe0f96519843332", default-features = false, features = ["sqlite", "native", "rand", "tls-webpki-roots"] }
+bark-bitcoin-ext = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "7d735a7382c15c1e530c6d85ebe0f96519843332" }

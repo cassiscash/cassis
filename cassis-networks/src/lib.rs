@@ -136,6 +136,7 @@ pub async fn open_wallet(
             cassis_arkade::ArkadeAdapter::open_with_esplora(
                 network.clone(),
                 secret,
+                dir,
                 settings.esplora_url.as_deref(),
                 span,
             )

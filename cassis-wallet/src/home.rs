@@ -168,6 +168,7 @@ impl Home {
         let adapter = arkade::ArkadeAdapter::open_with_esplora(
             network.clone(),
             self.secret(network),
+            &self.network_dir(network),
             esplora.as_deref(),
             span,
         )
