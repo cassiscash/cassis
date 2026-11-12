@@ -406,6 +406,18 @@ pub struct GatewayMetadata {
     pub gateway_signature: Signature,
 }
 
+/// How [`GatewayMetadata`] is encoded as [`Metadata`]: Postcard, so the
+/// payee's metadata and the gateway's signature stay raw bytes.
+#[derive(Serialize, Deserialize)]
+struct GatewayMetadataWire {
+    authorization: ReceiveAuthorization,
+    issuance: PreimageIssuance,
+    preimage_server_relay: Option<String>,
+    expires_at: u64,
+    payee_metadata: Option<Vec<u8>>,
+    gateway_signature: Vec<u8>,
+}
+
 impl GatewayMetadata {
     /// Sign the fields as the gateway whose secret is `gateway_secret`.
     pub fn sign(
@@ -458,15 +470,43 @@ impl GatewayMetadata {
         self.issuance.payment_hash
     }
 
-    /// As invoice metadata.
+    /// As invoice metadata, with the payee's metadata and the signature
+    /// as raw bytes.
     pub fn to_metadata(&self) -> Result<Metadata, String> {
-        Metadata::new(serde_json::to_vec(self).map_err(|e| e.to_string())?)
+        let wire = GatewayMetadataWire {
+            authorization: self.authorization.clone(),
+            issuance: self.issuance.clone(),
+            preimage_server_relay: self.preimage_server_relay.clone(),
+            expires_at: self.expires_at,
+            payee_metadata: self
+                .payee_metadata
+                .as_ref()
+                .map(|metadata| metadata.as_bytes().to_vec()),
+            gateway_signature: self.gateway_signature.0.to_vec(),
+        };
+        let bytes = postcard::to_allocvec(&wire).map_err(|e| format!("encoding metadata: {e}"))?;
+        Metadata::new(bytes)
     }
 
     /// Read it from the metadata of a gateway's invoice.
     pub fn from_metadata(metadata: &Metadata) -> Result<Self, String> {
-        serde_json::from_slice(metadata.as_bytes())
-            .map_err(|e| format!("not a gateway's invoice metadata: {e}"))
+        let (wire, rest) = postcard::take_from_bytes::<GatewayMetadataWire>(metadata.as_bytes())
+            .map_err(|e| format!("not a gateway's invoice metadata: {e}"))?;
+        if !rest.is_empty() {
+            return Err("not a gateway's invoice metadata: trailing bytes".into());
+        }
+        Ok(Self {
+            authorization: wire.authorization,
+            issuance: wire.issuance,
+            preimage_server_relay: wire.preimage_server_relay,
+            expires_at: wire.expires_at,
+            payee_metadata: wire.payee_metadata.map(Metadata::new).transpose()?,
+            gateway_signature: Signature(
+                wire.gateway_signature
+                    .try_into()
+                    .map_err(|_| "not a gateway's invoice metadata: bad signature".to_string())?,
+            ),
+        })
     }
 }
 

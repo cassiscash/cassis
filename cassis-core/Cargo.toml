@@ -19,6 +19,7 @@ hmac = { workspace = true }
 # invoices are checked without the node runtime too (wasm).
 iroh-base = { workspace = true }
 lowercase-hex = { workspace = true, features = ["alloc"] }
+postcard = { workspace = true }
 rand = { workspace = true }
 ritualistic = { workspace = true }
 secp256k1 = { workspace = true }

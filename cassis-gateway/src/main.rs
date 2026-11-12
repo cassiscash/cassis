@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! <dir>/config.toml         mnemonic, networks with their keys, terms, admin (see `cassis_gateway::config`)
-//! <dir>/wallet.redb         what it was paid (see `cassis_wallet::db`)
+//! <dir>/wallet.redb         a `cassis-wallet` home for its funds (see `cassis_wallet::db`)
 //! <dir>/gateway.redb        standing authorizations and HTLCs to payees (see `cassis_gateway::db`)
 //! <dir>/<kind>/<variant>/   private data of one network's wallet
 //! ```
@@ -62,7 +62,6 @@ async fn run(cli: Cli) -> Result<(), String> {
         ConfigFile::load_or_create(&dir, &template(&generate_mnemonic()))?;
     let config = file.get();
     let keys = config.keys()?;
-    let wallet = cassis_wallet::open_db(&dir)?;
     let path = dir.join("gateway.redb");
     let db = Arc::new(Db::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?);
     let span = info_span!("node", node = "gateway");
@@ -88,7 +87,6 @@ async fn run(cli: Cli) -> Result<(), String> {
     let gateway = Gateway::start(GatewayConfig {
         endpoint_secret: keys.iroh,
         db,
-        wallet,
         networks: opened,
         policy: config.terms,
         span,

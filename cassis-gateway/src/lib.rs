@@ -21,9 +21,8 @@
 //! destinations, at least as long as the payee asked for, and presents
 //! it to the preimage server ([`Request::PreimageRelease`]) with the
 //! issuance and the payee's metadata the invoice carried, and the server
-//! releases the preimage. The gateway claims the incoming HTLC with it,
-//! records it as an incoming transaction of its wallet, and answers the
-//! COMMIT.
+//! releases the preimage. The gateway claims the incoming HTLC with it
+//! and answers the COMMIT.
 //!
 //! Every HTLC to a payee is journaled in the [`Db`] as a [`PayeeHtlc`].
 //! A settlement loop resumes interrupted ones and refunds those whose
@@ -47,7 +46,6 @@ use cassis_core::protocol::{
 };
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
-use cassis_wallet::db::{Direction, Transaction, TransactionHash};
 use cassis_wallet::stored::{metadata, stored_metadata};
 use iroh_base::PublicKey;
 use serde::Deserialize;
@@ -104,8 +102,6 @@ pub struct GatewayConfig {
     /// Secret of the gateway's iroh endpoint, which signs its invoices.
     pub endpoint_secret: [u8; 32],
     pub db: Arc<Db>,
-    /// The gateway's wallet, where what it is paid is recorded.
-    pub wallet: Arc<cassis_wallet::db::Db>,
     /// Networks the gateway is paid on and pays payees on.
     pub networks: Vec<Arc<dyn Network>>,
     pub policy: GatewayPolicy,
@@ -119,7 +115,6 @@ pub struct Gateway(Arc<Inner>);
 struct Inner {
     endpoint_secret: [u8; 32],
     db: Arc<Db>,
-    wallet: Arc<cassis_wallet::db::Db>,
     networks: Mutex<HashMap<NetworkId, Arc<dyn Network>>>,
     policy: Mutex<GatewayPolicy>,
     transport: Transport,
@@ -151,7 +146,6 @@ impl Gateway {
         let gateway = Self(Arc::new(Inner {
             endpoint_secret: config.endpoint_secret,
             db: config.db,
-            wallet: config.wallet,
             networks: Mutex::new(
                 config
                     .networks
@@ -216,11 +210,6 @@ impl Gateway {
         &self.0.db
     }
 
-    /// The gateway's wallet database.
-    pub fn wallet(&self) -> &cassis_wallet::db::Db {
-        &self.0.wallet
-    }
-
     pub fn payee_htlcs(&self) -> Result<Vec<PayeeHtlc>, String> {
         self.db().payee_htlcs().all().map_err(db_error)
     }
@@ -278,7 +267,7 @@ impl Gateway {
         htlcs
             .iter()
             .filter(|htlc| {
-                htlc.in_flight() && (htlc.network == id.0 || htlc.incoming_network == id.0)
+                htlc.in_flight() && (&htlc.network == id || &htlc.incoming_network == id)
             })
             .count()
     }
@@ -647,7 +636,7 @@ impl Gateway {
     fn payee_htlc(&self, payment_hash: &Bytes32) -> Result<Option<PayeeHtlc>, String> {
         self.db()
             .payee_htlcs()
-            .get(PayeeHtlcHash(payment_hash.to_string()))
+            .get(PayeeHtlcHash(payment_hash.0))
             .map_err(db_error)
     }
 
@@ -751,7 +740,7 @@ impl Gateway {
         if let Err(error) = self.db().payee_htlcs().update(htlc) {
             error!(
                 "journaling the HTLC to the payee {}: {error}",
-                htlc.payment_hash.0
+                Bytes32(htlc.payment_hash.0)
             );
         }
     }
@@ -807,15 +796,15 @@ impl Gateway {
             .saturating_add(authorization.min_final_timeout_secs)
             .saturating_add(self.policy().final_slack_secs);
         let mut htlc = PayeeHtlc {
-            payment_hash: PayeeHtlcHash(hash.to_string()),
-            incoming_network: forward.incoming_network.0.clone(),
+            payment_hash: PayeeHtlcHash(hash.0),
+            incoming_network: forward.incoming_network.clone(),
             incoming: (&forward.incoming).into(),
             claim_by: forward.claim_by,
             authorization: authorization.into(),
             issuance: (&forward.carried.issuance).into(),
             preimage_server_relay: forward.carried.preimage_server_relay.clone(),
             payee_metadata: stored_metadata(&forward.carried.payee_metadata),
-            network: destination.network.0.clone(),
+            network: destination.network.clone(),
             htlc: None,
             outcome: None,
             preimage: None,
@@ -887,17 +876,13 @@ impl Gateway {
     /// Present the HTLC to the payee to the preimage server, with what
     /// the invoice carried from it, until it releases the preimage.
     async fn release(&self, htlc: &mut PayeeHtlc) -> Result<Bytes32, String> {
-        let hash = htlc
-            .payment_hash
-            .0
-            .parse::<Bytes32>()
-            .map_err(|_| "stored payment hash is invalid".to_string())?;
+        let hash = Bytes32(htlc.payment_hash.0);
         let authorization = ReceiveAuthorization::try_from(&htlc.authorization)?;
         let funded = htlc.htlc.as_ref().ok_or("nothing was paid to the payee")?;
         let request = Request::PreimageRelease(PreimageRelease {
             issuance: PreimageIssuance::try_from(&htlc.issuance)?,
             metadata: metadata(&htlc.payee_metadata)?,
-            network: NetworkId(htlc.network.clone()),
+            network: htlc.network.clone(),
             htlc: Htlc::try_from(funded)?,
             authorization: authorization.clone(),
         });
@@ -938,14 +923,13 @@ impl Gateway {
         }
     }
 
-    /// Claim the payer's HTLC, retrying until it expires, and record it
-    /// as an incoming transaction.
+    /// Claim the payer's HTLC, retrying until it expires.
     async fn claim(&self, htlc: &mut PayeeHtlc) -> Result<(), String> {
         let preimage = Bytes32(htlc.preimage.ok_or("no preimage to claim with")?);
-        let incoming_network = NetworkId(htlc.incoming_network.clone());
+        let incoming_network = &htlc.incoming_network;
         let incoming_htlc = Htlc::try_from(&htlc.incoming)?;
         let incoming = self
-            .network_by(&incoming_network, incoming_htlc.expiry)
+            .network_by(incoming_network, incoming_htlc.expiry)
             .await?;
         loop {
             match incoming.claim_incoming_htlc(&incoming_htlc, preimage).await {
@@ -964,23 +948,10 @@ impl Gateway {
             short(htlc),
             incoming_htlc.amount_msat,
         );
-        self.0
-            .wallet
-            .transactions()
-            .insert(&Transaction {
-                payment_hash: TransactionHash(htlc.payment_hash.0.clone()),
-                direction: Direction::Incoming,
-                amount_msat: incoming_htlc.amount_msat,
-                network: incoming_network.0.clone(),
-                preimage: preimage.0,
-                at: unix_now(),
-                invoice: None,
-            })
-            .map_err(|e| format!("claimed, but recording the transaction failed: {e}"))?;
         htlc.settled = true;
         htlc.failed = None;
         self.journal(htlc);
-        self.release_targets(&incoming_htlc.payment_hash, Some(&incoming_network))
+        self.release_targets(&incoming_htlc.payment_hash, Some(incoming_network))
             .await;
         Ok(())
     }
@@ -1013,15 +984,14 @@ impl Gateway {
                 error!(
                     "the HTLC to the payee {} was interrupted while funding on {}; check that \
                      wallet for a lock to it",
-                    htlc.payment_hash.0, htlc.network
+                    Bytes32(htlc.payment_hash.0),
+                    htlc.network
                 );
                 htlc.failed = Some(INTERRUPTED_FUNDING.into());
                 self.journal(&htlc);
                 continue;
             }
-            let Ok(hash) = htlc.payment_hash.0.parse() else {
-                continue;
-            };
+            let hash = Bytes32(htlc.payment_hash.0);
             if let Some(busy) = self.busy(hash) {
                 let gateway = self.clone();
                 self.spawn(async move { gateway.finish(htlc, busy).await });
@@ -1055,13 +1025,11 @@ impl Gateway {
     /// preimage to a forward still waiting for it), and refund it once
     /// expired if no preimage came back.
     async fn settle_outgoing(&self, saved: PayeeHtlc) {
-        let (Ok(hash), Some(Ok(htlc))) = (
-            saved.payment_hash.0.parse::<Bytes32>(),
-            saved.htlc.as_ref().map(Htlc::try_from),
-        ) else {
+        let hash = Bytes32(saved.payment_hash.0);
+        let Some(Ok(htlc)) = saved.htlc.as_ref().map(Htlc::try_from) else {
             return;
         };
-        let Ok(network) = self.network(&NetworkId(saved.network.clone())) else {
+        let Ok(network) = self.network(&saved.network) else {
             return;
         };
         let outcome = match network.check_outgoing_htlc(&htlc).await {
@@ -1136,11 +1104,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn short(htlc: &PayeeHtlc) -> String {
-    htlc.payment_hash
-        .0
-        .parse::<Bytes32>()
-        .map(|hash| hash.short())
-        .unwrap_or_else(|_| htlc.payment_hash.0.clone())
+    Bytes32(htlc.payment_hash.0).short()
 }
 
 fn db_error(error: orangedb::Error) -> String {

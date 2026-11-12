@@ -25,8 +25,7 @@
 
 use crate::network::{Htlc, HtlcDescriptor, HtlcTarget, NetworkId};
 use crate::offline::{
-    endpoint_public_key, AuthorizationKind, GatewayMetadata, PreimageIssuance,
-    ReceiveAuthorization, Signature,
+    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
 };
 use crate::primitives::{Bytes32, OperationId};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -437,24 +436,10 @@ impl Invoice {
                 }
                 let issuance = &receiver.preimage_server_issuance;
                 issuance.verify(&receiver.preimage_server, authorization)?;
-                // The metadata is the gateway's, around the payee's, which
-                // the issuance commits to.
-                let carried = GatewayMetadata::from_metadata(
-                    self.body
-                        .metadata
-                        .as_ref()
-                        .ok_or("a delegated invoice carries the gateway's metadata")?,
-                )?;
-                carried.verify(&receiver.gateway)?;
-                if carried.issuance != *issuance
-                    || carried.authorization != *authorization
-                    || carried.expires_at != self.body.expires_at
-                {
-                    return Err("the gateway's metadata is for another invoice".into());
-                }
+                // The metadata is for the gateway (or the payee): the
+                // payer only carries it back, unread.
                 if issuance.payment_hash != self.body.payment_hash
                     || issuance.amount_msat != self.body.amount_msat
-                    || !issuance.matches_metadata(carried.payee_metadata.as_ref())
                 {
                     return Err("the preimage server issued the hash for another payment".into());
                 }
@@ -895,6 +880,7 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::offline::GatewayMetadata;
 
     #[test]
     fn requests_round_trip_through_json() {
@@ -1158,7 +1144,9 @@ mod tests {
             receiver.payee = endpoint_public_key(&[11; 32]);
         }
         assert!(renamed.verify().is_err());
-        // Other metadata than the preimage server issued the hash for.
+        // Metadata is the receiver's: the payer carries it back without
+        // reading it, so another payload under the gateway's signature
+        // still passes here (the gateway itself rejects it on COMMIT).
         let mut relabeled = invoice.clone();
         let mut carried =
             GatewayMetadata::from_metadata(relabeled.body.metadata.as_ref().unwrap()).unwrap();
@@ -1173,12 +1161,11 @@ mod tests {
         .unwrap();
         relabeled.body.metadata = Some(carried.to_metadata().unwrap());
         relabeled.sign_as_gateway(&GATEWAY).unwrap();
-        assert!(relabeled.verify().unwrap_err().contains("another payment"));
-        // Metadata that is not the gateway's.
-        let mut stripped = invoice.clone();
-        stripped.body.metadata = Some(Metadata::new(b"order 42".to_vec()).unwrap());
-        stripped.sign_as_gateway(&GATEWAY).unwrap();
-        assert!(stripped.verify().is_err());
+        relabeled.verify().unwrap();
+        let mut opaque = invoice.clone();
+        opaque.body.metadata = Some(Metadata::new(b"order 42".to_vec()).unwrap());
+        opaque.sign_as_gateway(&GATEWAY).unwrap();
+        opaque.verify().unwrap();
         // A hash the gateway made up.
         let mut made_up = invoice.clone();
         made_up.body.payment_hash = Bytes32([2; 32]);

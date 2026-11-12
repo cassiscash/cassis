@@ -325,7 +325,6 @@ async fn setup() -> Setup {
     let gateway = Gateway::start(GatewayConfig {
         endpoint_secret: gateway_keys.iroh,
         db: gateway_db("gateway"),
-        wallet: open_db(&temp_dir("gateway-wallet")).unwrap(),
         networks: vec![MockNetwork::new(8, &ledger)],
         policy: GatewayPolicy {
             forward_slack_secs: 60,
@@ -744,7 +743,6 @@ async fn networks_and_terms_change_while_running() {
     let resumed = Gateway::start(GatewayConfig {
         endpoint_secret: [33; 32],
         db,
-        wallet: open_db(&temp_dir("resumed-wallet")).unwrap(),
         networks: Vec::new(),
         policy: GatewayPolicy::default(),
         span: Span::none(),
@@ -762,8 +760,6 @@ async fn networks_and_terms_change_while_running() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(settled());
-    // ... and records what it was paid in its wallet.
-    assert_eq!(resumed.wallet().transactions().len().unwrap(), 1);
 
     resumed.shutdown().await;
     payee.transport.close().await;

@@ -465,7 +465,8 @@ fn attention(forward: &PayeeHtlc, now: u64) -> Option<Node> {
 }
 
 fn forward_row(prefix: &str, forward: &PayeeHtlc, now: u64) -> Node {
-    let hash = &forward.payment_hash.0;
+    let hash = Bytes32(forward.payment_hash.0);
+    let hash = &hash;
     let el = |part: &str| format!("{prefix}/{hash}/{part}");
     let name = state_name(forward);
     let to = &forward.network;
@@ -507,9 +508,9 @@ fn forward_row(prefix: &str, forward: &PayeeHtlc, now: u64) -> Node {
         )
 }
 
-/// The payment hash of `forward`, as stored.
+/// The payment hash of `forward`.
 fn payment_hash(forward: &PayeeHtlc) -> Option<Bytes32> {
-    forward.payment_hash.0.parse().ok()
+    Some(Bytes32(forward.payment_hash.0))
 }
 
 /// A standing authorization, unless its signed terms no longer give an

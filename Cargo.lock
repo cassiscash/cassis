@@ -2726,6 +2726,7 @@ dependencies = [
  "iroh-base 1.0.3",
  "js-sys",
  "lowercase-hex",
+ "postcard",
  "rand 0.8.7",
  "ritualistic",
  "secp256k1 0.31.1",
