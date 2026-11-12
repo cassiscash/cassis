@@ -4,9 +4,7 @@
 //! wallet, the router and the gateway.
 
 use cassis_core::network::{Htlc, HtlcDescriptor, HtlcTarget};
-use cassis_core::offline::{
-    AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization, Signature,
-};
+use cassis_core::offline::{AuthorizationKind, Destination, ReceiveAuthorization, Signature};
 use cassis_core::protocol::{InvoiceNetwork, Metadata};
 use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
 use iroh_base::PublicKey;
@@ -105,25 +103,13 @@ pub struct StoredAuthorization {
     pub payee: [u8; 32],
     pub gateway: [u8; 32],
     pub preimage_server: [u8; 32],
+    pub preimage_server_relay: Option<String>,
     pub valid_from: u64,
     pub valid_until: u64,
     pub min_amount_msat: u64,
     pub max_amount_msat: u64,
     pub min_final_timeout_secs: u64,
     pub destinations: Vec<StoredDestination>,
-    /// 64 bytes.
-    pub signature: Vec<u8>,
-}
-
-/// A [`PreimageIssuance`].
-#[orangedb::embed]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredIssuance {
-    pub payment_hash: [u8; 32],
-    pub amount_msat: u64,
-    pub metadata_hash: Option<[u8; 32]>,
-    pub authorization: [u8; 32],
-    pub nonce: [u8; 32],
     /// 64 bytes.
     pub signature: Vec<u8>,
 }
@@ -352,6 +338,7 @@ impl From<&ReceiveAuthorization> for StoredAuthorization {
             payee: *authorization.payee.as_bytes(),
             gateway: *authorization.gateway.as_bytes(),
             preimage_server: *authorization.preimage_server.as_bytes(),
+            preimage_server_relay: authorization.preimage_server_relay.clone(),
             valid_from: authorization.valid_from,
             valid_until: authorization.valid_until,
             min_amount_msat: authorization.min_amount_msat,
@@ -382,6 +369,7 @@ impl TryFrom<&StoredAuthorization> for ReceiveAuthorization {
             payee: endpoint_key(&authorization.payee)?,
             gateway: endpoint_key(&authorization.gateway)?,
             preimage_server: endpoint_key(&authorization.preimage_server)?,
+            preimage_server_relay: authorization.preimage_server_relay.clone(),
             valid_from: authorization.valid_from,
             valid_until: authorization.valid_until,
             min_amount_msat: authorization.min_amount_msat,
@@ -398,34 +386,6 @@ impl TryFrom<&StoredAuthorization> for ReceiveAuthorization {
                 })
                 .collect::<Result<_, String>>()?,
             signature: signature(&authorization.signature)?,
-        })
-    }
-}
-
-impl From<&PreimageIssuance> for StoredIssuance {
-    fn from(issuance: &PreimageIssuance) -> Self {
-        Self {
-            payment_hash: issuance.payment_hash.0,
-            amount_msat: issuance.amount_msat,
-            metadata_hash: issuance.metadata_hash.map(|hash| hash.0),
-            authorization: issuance.authorization.0,
-            nonce: issuance.nonce.0,
-            signature: issuance.signature.0.to_vec(),
-        }
-    }
-}
-
-impl TryFrom<&StoredIssuance> for PreimageIssuance {
-    type Error = String;
-
-    fn try_from(issuance: &StoredIssuance) -> Result<Self, String> {
-        Ok(Self {
-            payment_hash: Bytes32(issuance.payment_hash),
-            amount_msat: issuance.amount_msat,
-            metadata_hash: issuance.metadata_hash.map(Bytes32),
-            authorization: Bytes32(issuance.authorization),
-            nonce: Bytes32(issuance.nonce),
-            signature: signature(&issuance.signature)?,
         })
     }
 }
@@ -477,6 +437,7 @@ mod tests {
             AuthorizationKind::Standing,
             endpoint_public_key(&[2; 32]),
             endpoint_public_key(&[3; 32]),
+            Some("https://relay.example".into()),
             1000,
             2000,
             1,

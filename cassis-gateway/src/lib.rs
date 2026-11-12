@@ -13,7 +13,7 @@
 //!   preimage server for.
 //!
 //! Either way the gateway refuses terms it does not want to meet (a
-//! final timeout it finds too long, say), and keeps no invoice: it puts
+//! final timeout it finds too long, say), and keeps no invoice: it seals
 //! the invoice's terms in its metadata, signed ([`GatewayMetadata`]),
 //! which payers hand back with PREPARE and COMMIT, as with any payee.
 //! On COMMIT the gateway checks its signature there, verifies the
@@ -37,7 +37,7 @@ use crate::db::{
 };
 use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId, OutgoingState};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, Destination, GatewayMetadata, PreimageIssuance,
+    endpoint_public_key, AuthorizationKind, Destination, GatewayMetadata, GatewayTerms,
     ReceiveAuthorization,
 };
 use cassis_core::protocol::{
@@ -132,7 +132,8 @@ struct Inner {
 
 /// A COMMIT checked against the invoice its metadata carries.
 struct Forward {
-    carried: GatewayMetadata,
+    preimage_metadata: Metadata,
+    terms: GatewayTerms,
     incoming_network: NetworkId,
     incoming: Htlc,
     claim_by: u64,
@@ -277,13 +278,9 @@ impl Gateway {
             Request::GatewayInvoice(request) => {
                 Response::GatewayInvoice(log_refusal("invoice", self.invoice(request, &peer).await))
             }
-            Request::GatewayAuthorize {
-                authorization,
-                preimage_server_relay,
-            } => Response::GatewayAuthorized(log_refusal(
-                "authorization",
-                self.authorize(authorization, preimage_server_relay),
-            )),
+            Request::GatewayAuthorize { authorization } => Response::GatewayAuthorized(
+                log_refusal("authorization", self.authorize(authorization)),
+            ),
             Request::GatewayInvoiceFor(request) => {
                 Response::GatewayInvoice(log_refusal("invoice", self.invoice_for(request).await))
             }
@@ -373,7 +370,6 @@ impl Gateway {
             expires_at,
             description,
             metadata,
-            preimage_server_relay,
         } = request;
         self.check_authorization(&authorization, AuthorizationKind::Single)?;
         if peer
@@ -395,25 +391,25 @@ impl Gateway {
             return Err("the invoice would outlive its authorization".into());
         }
         let payee = authorization.payee;
+        let terms = GatewayTerms {
+            payment_hash: issuance.payment_hash,
+            amount_msat: issuance.amount_msat,
+            authorization,
+            expires_at,
+            payee_metadata: metadata,
+        };
         let carried = GatewayMetadata::sign(
             &self.0.endpoint_secret,
-            authorization,
-            issuance,
-            preimage_server_relay,
-            expires_at,
-            metadata,
+            issuance.to_metadata()?,
+            terms.clone(),
         )?;
-        let body = self.build(&carried, description).await?;
+        let body = self.build(&carried, &terms, description).await?;
         let invoice = Invoice::gateway_invoice(body, payee, &self.0.endpoint_secret);
         Ok(self.issued(invoice))
     }
 
     /// Keep a standing authorization, so invoices can be issued under it.
-    fn authorize(
-        &self,
-        authorization: ReceiveAuthorization,
-        preimage_server_relay: Option<String>,
-    ) -> Result<(), String> {
+    fn authorize(&self, authorization: ReceiveAuthorization) -> Result<(), String> {
         self.check_authorization(&authorization, AuthorizationKind::Standing)?;
         let id = authorization.id()?;
         info!(
@@ -427,9 +423,8 @@ impl Gateway {
             .handled_delegations()
             .upsert(&HandledDelegation {
                 authorization_id: HandledDelegationId(id.to_string()),
-                payee: authorization.payee.to_string(),
+                payee: *authorization.payee.as_bytes(),
                 authorization: (&authorization).into(),
-                preimage_server_relay,
                 registered_at: unix_now(),
             })
             .map_err(db_error)
@@ -443,17 +438,17 @@ impl Gateway {
         for delegation in self
             .db()
             .handled_delegations()
-            .by_payee(request.payee.to_string())
+            .by_payee(*request.payee.as_bytes())
             .map_err(db_error)?
         {
             let authorization = ReceiveAuthorization::try_from(&delegation.authorization)?;
             if authorization.is_valid_at(now) && authorization.allows_amount(request.amount_msat) {
-                candidates.push((authorization, delegation.preimage_server_relay));
+                candidates.push(authorization);
             }
         }
-        let (authorization, preimage_server_relay) = candidates
+        let authorization = candidates
             .into_iter()
-            .max_by_key(|(authorization, _)| authorization.valid_until)
+            .max_by_key(|authorization| authorization.valid_until)
             .ok_or("this payee authorized no invoice like this one")?;
         let expires_at = request
             .expires_at
@@ -464,7 +459,7 @@ impl Gateway {
         }
         let preimage_server = PeerAddr {
             id: authorization.preimage_server.to_string(),
-            relay: preimage_server_relay.clone(),
+            relay: authorization.preimage_server_relay.clone(),
         };
         let issue = Request::PreimageIssue {
             authorization: authorization.clone(),
@@ -484,15 +479,19 @@ impl Gateway {
         {
             return Err("preimage server issued the hash for another payment".into());
         }
+        let terms = GatewayTerms {
+            payment_hash: issuance.payment_hash,
+            amount_msat: issuance.amount_msat,
+            authorization: authorization.clone(),
+            expires_at,
+            payee_metadata: request.metadata,
+        };
         let carried = GatewayMetadata::sign(
             &self.0.endpoint_secret,
-            authorization.clone(),
-            issuance.clone(),
-            preimage_server_relay,
-            expires_at,
-            request.metadata,
+            issuance.to_metadata()?,
+            terms.clone(),
         )?;
-        let body = self.build(&carried, request.description).await?;
+        let body = self.build(&carried, &terms, request.description).await?;
         let invoice = Invoice::delegated(
             body,
             authorization.payee,
@@ -510,14 +509,15 @@ impl Gateway {
     async fn build(
         &self,
         carried: &GatewayMetadata,
+        terms: &GatewayTerms,
         description: Option<String>,
     ) -> Result<InvoiceBody, String> {
-        let expires_at = carried.expires_at;
+        let expires_at = terms.expires_at;
         if expires_at <= unix_now() {
             return Err("invoice expiry must be in the future".into());
         }
-        let payment_hash = carried.payment_hash();
-        let amount_msat = carried.issuance.amount_msat;
+        let payment_hash = terms.payment_hash;
+        let amount_msat = terms.amount_msat;
         let forward_slack_secs = self.policy().forward_slack_secs;
         let mut networks: Vec<Arc<dyn Network>> =
             lock(&self.0.networks).values().cloned().collect();
@@ -565,41 +565,37 @@ impl Gateway {
     }
 
     /// The invoice this gateway issued for `payment_hash`, as the
-    /// metadata a payer handed back carries it.
+    /// metadata a payer handed back carries it, and its opened terms.
     fn carried(
         &self,
         metadata: Option<&Metadata>,
         payment_hash: &Bytes32,
-    ) -> Result<GatewayMetadata, String> {
+    ) -> Result<(GatewayMetadata, GatewayTerms), String> {
         let carried =
             GatewayMetadata::from_metadata(metadata.ok_or("no invoice of this gateway's")?)?;
-        carried.verify(&self.key())?;
-        if carried.payment_hash() != *payment_hash {
-            return Err("the invoice metadata is for another payment".into());
+        let terms = carried.open(&self.0.endpoint_secret, payment_hash)?;
+        if terms.authorization.gateway != self.key() {
+            return Err("the invoice was issued under another gateway's authorization".into());
         }
-        Ok(carried)
+        Ok((carried, terms))
     }
 
-    /// The target and network of an HTLC paying `carried`'s invoice on
+    /// The target and network of an HTLC paying `terms`'s invoice on
     /// `network` expiring at `expiry`, and the time its claim must start
     /// by.
     async fn payable_on(
         &self,
-        carried: &GatewayMetadata,
+        terms: &GatewayTerms,
         network: &NetworkId,
         expiry: u64,
     ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
-        if carried.expires_at <= unix_now() {
+        if terms.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
         let opened = self.network(network)?;
         // Claim-key networks give the target of the invoice again.
         let target = opened
-            .receive_target(
-                carried.payment_hash(),
-                carried.issuance.amount_msat,
-                carried.expires_at,
-            )
+            .receive_target(terms.payment_hash, terms.amount_msat, terms.expires_at)
             .await
             .map_err(|e| format!("cannot receive on {network}: {e}"))?;
         let claim_by = expiry.saturating_sub(opened.incoming_delta_secs());
@@ -641,7 +637,7 @@ impl Gateway {
     }
 
     async fn prepare(&self, prepare: &PreparePayee) -> Result<(), String> {
-        let carried = self.carried(prepare.metadata.as_ref(), &prepare.payment_hash)?;
+        let (_, terms) = self.carried(prepare.metadata.as_ref(), &prepare.payment_hash)?;
         // The payee was paid already: a new payment cannot start over.
         if let Some(htlc) = self.payee_htlc(&prepare.payment_hash)? {
             return Err(match htlc.failed {
@@ -649,9 +645,9 @@ impl Gateway {
                 None => "invoice already paid".into(),
             });
         }
-        self.payable_on(&carried, &prepare.network, prepare.expiry)
+        self.payable_on(&terms, &prepare.network, prepare.expiry)
             .await?;
-        self.destination(&carried.authorization, carried.issuance.amount_msat)
+        self.destination(&terms.authorization, terms.amount_msat)
             .await?;
         info!(
             "PREPARE {} accepted on {}",
@@ -703,9 +699,9 @@ impl Gateway {
         if self.payee_htlc(&hash)?.is_some() {
             return Ok(());
         }
-        let carried = self.carried(commit.metadata.as_ref(), &hash)?;
+        let (carried, terms) = self.carried(commit.metadata.as_ref(), &hash)?;
         let (target, _, claim_by) = self
-            .payable_on(&carried, &commit.network, commit.expiry)
+            .payable_on(&terms, &commit.network, commit.expiry)
             .await?;
         let Some(busy) = self.busy(hash) else {
             return Ok(());
@@ -714,12 +710,13 @@ impl Gateway {
         let forward = Forward {
             incoming: Htlc {
                 payment_hash: hash,
-                amount_msat: carried.issuance.amount_msat,
+                amount_msat: terms.amount_msat,
                 expiry: commit.expiry,
                 target,
                 descriptor: commit.descriptor,
             },
-            carried,
+            preimage_metadata: carried.preimage_metadata,
+            terms,
             incoming_network: commit.network,
             claim_by,
         };
@@ -782,8 +779,8 @@ impl Gateway {
                 Err(error) => return Err(format!("HTLC rejected: {error}")),
             }
         }
-        let authorization = &forward.carried.authorization;
-        let amount_msat = forward.carried.issuance.amount_msat;
+        let authorization = &forward.terms.authorization;
+        let amount_msat = forward.terms.amount_msat;
         let (destination, outgoing) = self.destination(authorization, amount_msat).await?;
         if forward
             .claim_by
@@ -801,9 +798,8 @@ impl Gateway {
             incoming: (&forward.incoming).into(),
             claim_by: forward.claim_by,
             authorization: authorization.into(),
-            issuance: (&forward.carried.issuance).into(),
-            preimage_server_relay: forward.carried.preimage_server_relay.clone(),
-            payee_metadata: stored_metadata(&forward.carried.payee_metadata),
+            preimage_metadata: forward.preimage_metadata.as_bytes().to_vec(),
+            payee_metadata: stored_metadata(&forward.terms.payee_metadata),
             network: destination.network.clone(),
             htlc: None,
             outcome: None,
@@ -880,7 +876,7 @@ impl Gateway {
         let authorization = ReceiveAuthorization::try_from(&htlc.authorization)?;
         let funded = htlc.htlc.as_ref().ok_or("nothing was paid to the payee")?;
         let request = Request::PreimageRelease(PreimageRelease {
-            issuance: PreimageIssuance::try_from(&htlc.issuance)?,
+            preimage_metadata: Metadata::new(htlc.preimage_metadata.clone())?,
             metadata: metadata(&htlc.payee_metadata)?,
             network: htlc.network.clone(),
             htlc: Htlc::try_from(funded)?,
@@ -888,7 +884,7 @@ impl Gateway {
         });
         let preimage_server = PeerAddr {
             id: authorization.preimage_server.to_string(),
-            relay: htlc.preimage_server_relay.clone(),
+            relay: authorization.preimage_server_relay.clone(),
         };
         let mut waiting = false;
         loop {

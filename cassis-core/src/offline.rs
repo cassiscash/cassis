@@ -21,9 +21,10 @@
 //!   without knowing Cassis' JSON.
 //! * [`PreimageIssuance`]: the preimage server vouches that it issued a
 //!   payment hash under an authorization.
-//! * [`GatewayMetadata`]: the gateway carries the authorization and the
-//!   issuance of an invoice in its metadata, signed, so payers hand it
-//!   back with PREPARE and COMMIT and the gateway stores no invoice.
+//! * [`GatewayMetadata`]: the gateway carries the preimage server's
+//!   opaque metadata and its own sealed terms in the invoice metadata,
+//!   signed, so payers hand it back with PREPARE and COMMIT and the
+//!   gateway stores no invoice.
 //!
 //! Invoices come in three [`InvoiceReceiver`](crate::protocol::InvoiceReceiver)s
 //! with their own signature rules (see
@@ -32,8 +33,12 @@
 use crate::network::{HtlcTarget, NetworkId};
 use crate::primitives::Bytes32;
 use crate::protocol::Metadata;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::{ChaCha20, Key as ChachaKey, Nonce as ChachaNonce};
+use hmac::{Hmac, Mac};
 use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// Default of [`ReceiveAuthorization::min_final_timeout_secs`]: how
@@ -46,6 +51,8 @@ const AUTHORIZATION_HEADER: &str = "Cassis receive authorization v1";
 const ISSUANCE_HEADER: &str = "Cassis preimage issuance v1";
 /// Prefix of the message a gateway signs its [`GatewayMetadata`] with.
 const GATEWAY_METADATA_DOMAIN: &[u8] = b"cassis-gateway-metadata/v1\0";
+/// Prefix of the key a gateway seals its [`GatewayTerms`] with.
+const GATEWAY_METADATA_KEY_DOMAIN: &[u8] = b"cassis-gateway-metadata-key/v1\0";
 
 /// The public key of the iroh endpoint whose secret is `secret`.
 pub fn endpoint_public_key(secret: &[u8; 32]) -> PublicKey {
@@ -136,6 +143,9 @@ pub struct ReceiveAuthorization {
     pub payee: PublicKey,
     pub gateway: PublicKey,
     pub preimage_server: PublicKey,
+    /// Where the gateway reaches the preimage server.
+    #[serde(default)]
+    pub preimage_server_relay: Option<String>,
     /// Unix seconds.
     pub valid_from: u64,
     /// Unix seconds; invoices made under it expire by then.
@@ -156,6 +166,7 @@ impl ReceiveAuthorization {
         kind: AuthorizationKind,
         gateway: PublicKey,
         preimage_server: PublicKey,
+        preimage_server_relay: Option<String>,
         valid_from: u64,
         valid_until: u64,
         min_amount_msat: u64,
@@ -168,6 +179,7 @@ impl ReceiveAuthorization {
             payee: endpoint_public_key(payee_secret),
             gateway,
             preimage_server,
+            preimage_server_relay,
             valid_from,
             valid_until,
             min_amount_msat,
@@ -189,6 +201,7 @@ impl ReceiveAuthorization {
     /// payee: <hex key>
     /// gateway: <hex key>
     /// preimage server: <hex key>
+    /// preimage server relay: <"some <url>" or "none">
     /// valid from: <unix seconds>
     /// valid until: <unix seconds>
     /// min amount msat: <n>
@@ -209,6 +222,7 @@ impl ReceiveAuthorization {
              payee: {}\n\
              gateway: {}\n\
              preimage server: {}\n\
+             preimage server relay: {}\n\
              valid from: {}\n\
              valid until: {}\n\
              min amount msat: {}\n\
@@ -218,6 +232,9 @@ impl ReceiveAuthorization {
             self.payee,
             self.gateway,
             self.preimage_server,
+            self.preimage_server_relay
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |relay| format!("some {relay}"),),
             self.valid_from,
             self.valid_until,
             self.min_amount_msat,
@@ -253,6 +270,13 @@ impl ReceiveAuthorization {
         }
         if self.min_final_timeout_secs == 0 {
             return Err("the final HTLC needs a timeout".into());
+        }
+        if let Some(relay) = &self.preimage_server_relay {
+            if relay.is_empty() || relay.chars().any(char::is_whitespace) {
+                return Err(
+                    "the preimage server relay cannot be written in an authorization".into(),
+                );
+            }
         }
         if self.destinations.is_empty() {
             return Err("authorization names no destination".into());
@@ -383,105 +407,187 @@ impl PreimageIssuance {
             .verify(preimage_server, self.message(preimage_server).as_bytes())
             .map_err(|_| "invalid preimage server signature on the payment hash".to_string())
     }
+
+    /// As opaque metadata a gateway can carry for this server: Postcard,
+    /// with the signature raw.
+    pub fn to_metadata(&self) -> Result<Metadata, String> {
+        #[derive(Serialize, Deserialize)]
+        struct Wire {
+            payment_hash: [u8; 32],
+            amount_msat: u64,
+            metadata_hash: Option<[u8; 32]>,
+            authorization: [u8; 32],
+            nonce: [u8; 32],
+            signature: Vec<u8>,
+        }
+        let wire = Wire {
+            payment_hash: self.payment_hash.0,
+            amount_msat: self.amount_msat,
+            metadata_hash: self.metadata_hash.map(|hash| hash.0),
+            authorization: self.authorization.0,
+            nonce: self.nonce.0,
+            signature: self.signature.0.to_vec(),
+        };
+        let bytes = postcard::to_allocvec(&wire).map_err(|e| format!("encoding issuance: {e}"))?;
+        Metadata::new(bytes)
+    }
+
+    /// Read what [`PreimageIssuance::to_metadata`] wrote.
+    pub fn from_metadata(metadata: &Metadata) -> Result<Self, String> {
+        #[derive(Serialize, Deserialize)]
+        struct Wire {
+            payment_hash: [u8; 32],
+            amount_msat: u64,
+            metadata_hash: Option<[u8; 32]>,
+            authorization: [u8; 32],
+            nonce: [u8; 32],
+            signature: Vec<u8>,
+        }
+        let (wire, rest) = postcard::take_from_bytes::<Wire>(metadata.as_bytes())
+            .map_err(|e| format!("not a preimage server's issuance: {e}"))?;
+        if !rest.is_empty() {
+            return Err("not a preimage server's issuance: trailing bytes".into());
+        }
+        Ok(Self {
+            payment_hash: Bytes32(wire.payment_hash),
+            amount_msat: wire.amount_msat,
+            metadata_hash: wire.metadata_hash.map(Bytes32),
+            authorization: Bytes32(wire.authorization),
+            nonce: Bytes32(wire.nonce),
+            signature: Signature(
+                wire.signature
+                    .try_into()
+                    .map_err(|_| "not a preimage server's issuance: bad signature".to_string())?,
+            ),
+        })
+    }
 }
 
-/// The [`Metadata`] of every invoice a gateway issues: what paying it
-/// on takes, signed by the gateway. Payers hand the metadata back with
-/// PREPARE and COMMIT, so the gateway finds there, under its own
-/// signature, the invoice it issued: the payee's terms, the preimage
-/// server's issuance, which it presents to the preimage server with the
-/// HTLC to the payee, and the payee's own metadata, which the preimage
-/// server logs for the payee.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The [`Metadata`] of every invoice a gateway issues: the preimage
+/// server's opaque metadata, the gateway's sealed terms, and the
+/// gateway's signature. Payers hand it back with PREPARE and COMMIT,
+/// and only the gateway can open the terms.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayMetadata {
-    pub authorization: ReceiveAuthorization,
-    pub issuance: PreimageIssuance,
-    /// Where the gateway reaches the preimage server.
-    pub preimage_server_relay: Option<String>,
-    /// The invoice's expiry.
-    pub expires_at: u64,
-    /// The payee's metadata, which `issuance` commits to.
-    pub payee_metadata: Option<Metadata>,
+    /// What the preimage server needs to release the preimage (or what
+    /// the payee handed the gateway for its own invoice), raw.
+    pub preimage_metadata: Metadata,
+    /// The gateway's terms, sealed with a key from its secret.
+    sealed: Vec<u8>,
     /// By the gateway, over [`GatewayMetadata::message`].
     pub gateway_signature: Signature,
 }
 
-/// How [`GatewayMetadata`] is encoded as [`Metadata`]: Postcard, so the
-/// payee's metadata and the gateway's signature stay raw bytes.
+/// The terms a gateway seals into the metadata of its invoices.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayTerms {
+    pub payment_hash: Bytes32,
+    pub amount_msat: u64,
+    pub authorization: ReceiveAuthorization,
+    pub expires_at: u64,
+    /// The payee's metadata, which the issuance commits to.
+    pub payee_metadata: Option<Metadata>,
+}
+
+/// How [`GatewayMetadata`] is encoded as [`Metadata`]: Postcard, with
+/// the preimage metadata, the sealed terms and the signature raw.
 #[derive(Serialize, Deserialize)]
 struct GatewayMetadataWire {
-    authorization: ReceiveAuthorization,
-    issuance: PreimageIssuance,
-    preimage_server_relay: Option<String>,
-    expires_at: u64,
-    payee_metadata: Option<Vec<u8>>,
+    preimage_metadata: Vec<u8>,
+    sealed: Vec<u8>,
     gateway_signature: Vec<u8>,
 }
 
+/// The key a gateway seals its terms with, derived from its signing
+/// secret so the signing key itself is not reused as a cipher key.
+fn metadata_key(secret: &[u8; 32]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(GATEWAY_METADATA_KEY_DOMAIN);
+    mac.finalize().into_bytes().into()
+}
+
+/// The ChaCha20 nonce for an invoice: its payment hash is unique.
+fn metadata_nonce(payment_hash: &Bytes32) -> [u8; 12] {
+    payment_hash.0[..12]
+        .try_into()
+        .expect("payment hashes are 32 bytes")
+}
+
 impl GatewayMetadata {
-    /// Sign the fields as the gateway whose secret is `gateway_secret`.
+    /// Seal `terms` and sign the result as the gateway whose secret is
+    /// `gateway_secret`.
     pub fn sign(
         gateway_secret: &[u8; 32],
-        authorization: ReceiveAuthorization,
-        issuance: PreimageIssuance,
-        preimage_server_relay: Option<String>,
-        expires_at: u64,
-        payee_metadata: Option<Metadata>,
+        preimage_metadata: Metadata,
+        terms: GatewayTerms,
     ) -> Result<Self, String> {
+        let key = metadata_key(gateway_secret);
+        let nonce = metadata_nonce(&terms.payment_hash);
+        let mut sealed =
+            postcard::to_allocvec(&terms).map_err(|e| format!("encoding gateway terms: {e}"))?;
+        let mut cipher =
+            ChaCha20::new(ChachaKey::from_slice(&key), ChachaNonce::from_slice(&nonce));
+        cipher.apply_keystream(&mut sealed);
         let mut metadata = Self {
-            authorization,
-            issuance,
-            preimage_server_relay,
-            expires_at,
-            payee_metadata,
+            preimage_metadata,
+            sealed,
             gateway_signature: Signature([0; 64]),
         };
-        metadata.gateway_signature = Signature::sign(gateway_secret, &metadata.message()?);
+        metadata.gateway_signature = Signature::sign(gateway_secret, &metadata.message());
         Ok(metadata)
     }
 
-    /// The bytes the gateway signs: a domain prefix, then the JSON of
-    /// every field but the signature.
-    pub fn message(&self) -> Result<Vec<u8>, String> {
-        let fields = (
-            &self.authorization,
-            &self.issuance,
-            &self.preimage_server_relay,
-            self.expires_at,
-            &self.payee_metadata,
-        );
+    /// The bytes the gateway signs: a domain prefix and the hash of the
+    /// preimage metadata and sealed terms.
+    pub fn message(&self) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update([1u8]);
+        hasher.update((self.preimage_metadata.as_bytes().len() as u64).to_be_bytes());
+        hasher.update(self.preimage_metadata.as_bytes());
+        hasher.update(&self.sealed);
         let mut message = GATEWAY_METADATA_DOMAIN.to_vec();
-        serde_json::to_writer(&mut message, &fields).map_err(|e| e.to_string())?;
-        Ok(message)
+        message.extend_from_slice(&hasher.finalize());
+        message
     }
 
-    /// Check that `gateway` signed this, for its payment hash.
+    /// Check that `gateway` signed this.
     pub fn verify(&self, gateway: &PublicKey) -> Result<(), String> {
-        if self.authorization.gateway != *gateway {
-            return Err("the invoice was issued under another gateway's authorization".into());
-        }
         self.gateway_signature
-            .verify(gateway, &self.message()?)
+            .verify(gateway, &self.message())
             .map_err(|_| "the invoice metadata is not signed by this gateway".to_string())
     }
 
-    /// The payment hash of the invoice.
-    pub fn payment_hash(&self) -> Bytes32 {
-        self.issuance.payment_hash
+    /// Open the terms for the invoice whose payment hash is
+    /// `payment_hash`, as the gateway whose secret is `gateway_secret`.
+    pub fn open(
+        &self,
+        gateway_secret: &[u8; 32],
+        payment_hash: &Bytes32,
+    ) -> Result<GatewayTerms, String> {
+        self.verify(&endpoint_public_key(gateway_secret))?;
+        let key = metadata_key(gateway_secret);
+        let nonce = metadata_nonce(payment_hash);
+        let mut plaintext = self.sealed.clone();
+        let mut cipher =
+            ChaCha20::new(ChachaKey::from_slice(&key), ChachaNonce::from_slice(&nonce));
+        cipher.apply_keystream(&mut plaintext);
+        let (terms, rest) = postcard::take_from_bytes::<GatewayTerms>(&plaintext)
+            .map_err(|e| format!("not a gateway's invoice metadata: {e}"))?;
+        if !rest.is_empty() {
+            return Err("not a gateway's invoice metadata: trailing bytes".into());
+        }
+        if terms.payment_hash != *payment_hash {
+            return Err("the gateway's metadata is for another payment".into());
+        }
+        Ok(terms)
     }
 
-    /// As invoice metadata, with the payee's metadata and the signature
-    /// as raw bytes.
+    /// As invoice metadata, with the preimage metadata, the sealed terms
+    /// and the signature as raw bytes.
     pub fn to_metadata(&self) -> Result<Metadata, String> {
         let wire = GatewayMetadataWire {
-            authorization: self.authorization.clone(),
-            issuance: self.issuance.clone(),
-            preimage_server_relay: self.preimage_server_relay.clone(),
-            expires_at: self.expires_at,
-            payee_metadata: self
-                .payee_metadata
-                .as_ref()
-                .map(|metadata| metadata.as_bytes().to_vec()),
+            preimage_metadata: self.preimage_metadata.as_bytes().to_vec(),
+            sealed: self.sealed.clone(),
             gateway_signature: self.gateway_signature.0.to_vec(),
         };
         let bytes = postcard::to_allocvec(&wire).map_err(|e| format!("encoding metadata: {e}"))?;
@@ -496,11 +602,8 @@ impl GatewayMetadata {
             return Err("not a gateway's invoice metadata: trailing bytes".into());
         }
         Ok(Self {
-            authorization: wire.authorization,
-            issuance: wire.issuance,
-            preimage_server_relay: wire.preimage_server_relay,
-            expires_at: wire.expires_at,
-            payee_metadata: wire.payee_metadata.map(Metadata::new).transpose()?,
+            preimage_metadata: Metadata::new(wire.preimage_metadata)?,
+            sealed: wire.sealed,
             gateway_signature: Signature(
                 wire.gateway_signature
                     .try_into()
@@ -524,6 +627,7 @@ mod tests {
             kind,
             key(2),
             key(3),
+            Some("https://relay.example".into()),
             1000,
             2000,
             1,
@@ -549,8 +653,12 @@ mod tests {
         assert_eq!(lines[0], "Cassis receive authorization v1");
         assert_eq!(lines[1], "kind: standing");
         assert_eq!(lines[2], format!("payee: {}", key(1)));
-        assert_eq!(lines[9], "min final timeout secs: 604800");
-        assert!(lines[10].starts_with("destination: cashu::localhost xonly:"));
+        assert_eq!(
+            lines[5],
+            "preimage server relay: some https://relay.example"
+        );
+        assert_eq!(lines[10], "min final timeout secs: 604800");
+        assert!(lines[11].starts_with("destination: cashu::localhost xonly:"));
         assert!(message.ends_with('\n'));
         authorization.verify().unwrap();
     }
@@ -566,6 +674,9 @@ mod tests {
         assert!(tampered.verify().is_err());
         let mut tampered = authorization.clone();
         tampered.gateway = key(9);
+        assert!(tampered.verify().is_err());
+        let mut tampered = authorization.clone();
+        tampered.preimage_server_relay = None;
         assert!(tampered.verify().is_err());
         let mut tampered = authorization;
         tampered.destinations[0].network = NetworkId("cashu::elsewhere".into());
@@ -614,6 +725,28 @@ mod tests {
     }
 
     #[test]
+    fn issuance_metadata_round_trips() {
+        let authorization = authorization(AuthorizationKind::Standing);
+        let mut issuance = PreimageIssuance {
+            payment_hash: Bytes32([5; 32]),
+            amount_msat: 1000,
+            metadata_hash: Some(Metadata::new(b"order 42".to_vec()).unwrap().hash()),
+            authorization: authorization.id().unwrap(),
+            nonce: Bytes32([6; 32]),
+            signature: Signature([0; 64]),
+        };
+        issuance.sign(&[3; 32]);
+        let metadata = issuance.to_metadata().unwrap();
+        assert_eq!(
+            PreimageIssuance::from_metadata(&metadata).unwrap(),
+            issuance
+        );
+        let mut trailing = metadata.as_bytes().to_vec();
+        trailing.push(0);
+        assert!(PreimageIssuance::from_metadata(&Metadata::new(trailing).unwrap()).is_err());
+    }
+
+    #[test]
     fn gateway_metadata_is_signed_by_the_gateway() {
         let authorization = authorization(AuthorizationKind::Standing);
         let payee_metadata = Metadata::new(b"order 42".to_vec()).unwrap();
@@ -626,27 +759,30 @@ mod tests {
             signature: Signature([0; 64]),
         };
         issuance.sign(&[3; 32]);
-        let carried = GatewayMetadata::sign(
-            &[2; 32],
+        let terms = GatewayTerms {
+            payment_hash: issuance.payment_hash,
+            amount_msat: issuance.amount_msat,
             authorization,
-            issuance,
-            Some("https://relay.example".into()),
-            1500,
-            Some(payee_metadata),
-        )
-        .unwrap();
+            expires_at: 1500,
+            payee_metadata: Some(payee_metadata),
+        };
+        let carried =
+            GatewayMetadata::sign(&[2; 32], issuance.to_metadata().unwrap(), terms.clone())
+                .unwrap();
         let metadata = carried.to_metadata().unwrap();
         let read = GatewayMetadata::from_metadata(&metadata).unwrap();
         assert_eq!(read, carried);
         read.verify(&key(2)).unwrap();
-        assert_eq!(read.payment_hash(), Bytes32([5; 32]));
-        // Another gateway's key, or anything changed, does not verify.
-        assert!(read.verify(&key(3)).is_err());
+        assert_eq!(read.open(&[2; 32], &Bytes32([5; 32])).unwrap(), terms);
+        // Another gateway's key, a different payment, or anything
+        // changed, does not open.
+        assert!(read.open(&[3; 32], &Bytes32([5; 32])).is_err());
+        assert!(read.open(&[2; 32], &Bytes32([6; 32])).is_err());
         let mut changed = read.clone();
-        changed.expires_at += 1;
+        changed.sealed[0] ^= 1;
         assert!(changed.verify(&key(2)).is_err());
         let mut changed = read;
-        changed.payee_metadata = None;
+        changed.preimage_metadata = Metadata::new(b"other".to_vec()).unwrap();
         assert!(changed.verify(&key(2)).is_err());
         assert!(
             GatewayMetadata::from_metadata(&Metadata::new(b"order 42".to_vec()).unwrap()).is_err()

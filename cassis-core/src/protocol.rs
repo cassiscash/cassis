@@ -748,7 +748,9 @@ pub struct Settle {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreimageRelease {
     pub authorization: ReceiveAuthorization,
-    pub issuance: PreimageIssuance,
+    /// The preimage server's opaque metadata for the hash, as carried
+    /// in the invoice.
+    pub preimage_metadata: Metadata,
     /// The invoice's metadata, which the issuance commits to; logged
     /// for the payee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -768,9 +770,6 @@ pub struct GatewayInvoiceRequest {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// Where the gateway reaches the preimage server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preimage_server_relay: Option<String>,
 }
 
 /// Anyone to gateway: an invoice paying `payee`, issued under one of
@@ -843,9 +842,6 @@ pub enum Request {
     /// authorization.
     GatewayAuthorize {
         authorization: ReceiveAuthorization,
-        /// Where the gateway reaches the preimage server.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preimage_server_relay: Option<String>,
     },
     GatewayInvoiceFor(GatewayInvoiceFor),
 }
@@ -880,7 +876,7 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::offline::GatewayMetadata;
+    use crate::offline::{GatewayMetadata, GatewayTerms};
 
     #[test]
     fn requests_round_trip_through_json() {
@@ -967,6 +963,7 @@ mod tests {
             kind,
             endpoint_public_key(&GATEWAY),
             endpoint_public_key(&PREIMAGE_SERVER),
+            None,
             1000,
             5000,
             1000,
@@ -1009,13 +1006,17 @@ mod tests {
     fn delegated_invoice() -> Invoice {
         let authorization = authorization(AuthorizationKind::Standing);
         let mut body = body();
+        let preimage_issuance = issuance(&authorization);
         let carried = GatewayMetadata::sign(
             &GATEWAY,
-            authorization.clone(),
-            issuance(&authorization),
-            None,
-            body.expires_at,
-            body.metadata.take(),
+            preimage_issuance.to_metadata().unwrap(),
+            GatewayTerms {
+                payment_hash: body.payment_hash,
+                amount_msat: body.amount_msat,
+                authorization: authorization.clone(),
+                expires_at: body.expires_at,
+                payee_metadata: body.metadata.take(),
+            },
         )
         .unwrap();
         body.metadata = Some(carried.to_metadata().unwrap());
@@ -1148,17 +1149,14 @@ mod tests {
         // reading it, so another payload under the gateway's signature
         // still passes here (the gateway itself rejects it on COMMIT).
         let mut relabeled = invoice.clone();
-        let mut carried =
+        let carried =
             GatewayMetadata::from_metadata(relabeled.body.metadata.as_ref().unwrap()).unwrap();
-        carried = GatewayMetadata::sign(
-            &GATEWAY,
-            carried.authorization,
-            carried.issuance,
-            None,
-            carried.expires_at,
-            Some(Metadata::new(b"order 43".to_vec()).unwrap()),
-        )
-        .unwrap();
+        let mut terms = carried
+            .open(&GATEWAY, &relabeled.body.payment_hash)
+            .unwrap();
+        terms.payee_metadata = Some(Metadata::new(b"order 43".to_vec()).unwrap());
+        let carried =
+            GatewayMetadata::sign(&GATEWAY, carried.preimage_metadata.clone(), terms).unwrap();
         relabeled.body.metadata = Some(carried.to_metadata().unwrap());
         relabeled.sign_as_gateway(&GATEWAY).unwrap();
         relabeled.verify().unwrap();

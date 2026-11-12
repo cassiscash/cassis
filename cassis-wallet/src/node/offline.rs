@@ -19,8 +19,7 @@ use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
 use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, Destination, GatewayMetadata, PreimageIssuance,
-    ReceiveAuthorization,
+    endpoint_public_key, AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization,
 };
 use cassis_core::protocol::{
     GatewayInvoiceRequest, Invoice, InvoiceReceiver, Metadata, ReceivedPayment, Request, Response,
@@ -119,6 +118,7 @@ pub async fn create_gateway_invoice(
         AuthorizationKind::Single,
         endpoint_key(&endpoints.gateway)?,
         endpoint_key(&endpoints.preimage_server)?,
+        endpoints.preimage_server.relay.clone(),
         now,
         expires_at,
         amount_msat,
@@ -153,7 +153,6 @@ pub async fn create_gateway_invoice(
                 gateway: endpoints.gateway.id.clone(),
                 gateway_relay: endpoints.gateway.relay.clone(),
                 preimage_server: endpoints.preimage_server.id.clone(),
-                preimage_server_relay: endpoints.preimage_server.relay.clone(),
                 authorization: (&authorization).into(),
             }),
             state: InvoiceState::Waiting,
@@ -200,7 +199,6 @@ async fn issue(
         expires_at,
         description: description.clone(),
         metadata: metadata.clone(),
-        preimage_server_relay: endpoints.preimage_server.relay.clone(),
     });
     let invoice = match transport.request(&endpoints.gateway, &request).await? {
         Response::GatewayInvoice(Ok(invoice)) => invoice,
@@ -209,15 +207,9 @@ async fn issue(
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     };
-    // The gateway's own record of the invoice, which it gets back with
-    // every PREPARE and COMMIT.
-    let carried = invoice
-        .body
-        .metadata
-        .as_ref()
-        .ok_or_else(|| "the gateway's invoice carries no metadata".to_string())
-        .and_then(GatewayMetadata::from_metadata)?;
-    carried.verify(&authorization.gateway)?;
+    // The gateway's metadata is opaque to the payee: the invoice's
+    // signatures cover it, and the preimage server checks what the hash
+    // was issued for when it releases.
     let asked = match &invoice {
         Invoice {
             body,
@@ -227,10 +219,7 @@ async fn issue(
                 && body.amount_msat == amount_msat
                 && body.expires_at == expires_at
                 && body.description == description
-                && carried.payee_metadata == metadata
-                && carried.issuance == issuance
-                && carried.authorization == *authorization
-                && carried.expires_at == expires_at
+                && body.metadata.is_some()
                 && receiver.gateway == authorization.gateway
                 && receiver.payee == authorization.payee
                 && receiver.gateway_signature.is_some()
@@ -273,6 +262,7 @@ pub async fn authorize_gateway(
         AuthorizationKind::Standing,
         endpoint_key(&endpoints.gateway)?,
         endpoint_key(&endpoints.preimage_server)?,
+        endpoints.preimage_server.relay.clone(),
         valid_from,
         valid_until,
         min_amount_msat,
@@ -285,7 +275,6 @@ pub async fn authorize_gateway(
             &endpoints.gateway,
             &Request::GatewayAuthorize {
                 authorization: authorization.clone(),
-                preimage_server_relay: endpoints.preimage_server.relay.clone(),
             },
         )
         .await?;
@@ -302,7 +291,6 @@ pub async fn authorize_gateway(
             gateway: endpoints.gateway.id,
             gateway_relay: endpoints.gateway.relay,
             preimage_server: endpoints.preimage_server.id,
-            preimage_server_relay: endpoints.preimage_server.relay,
             authorization: (&authorization).into(),
             created_at: unix_now(),
         })

@@ -6,8 +6,8 @@
 //!   the payee's preimage server, with the payer's HTLC it claims once
 //!   the preimage is released.
 //!
-//! It keeps no invoice: an invoice it issued carries its terms in its
-//! metadata, signed by the gateway (see
+//! It keeps no invoice: an invoice it issued carries its terms sealed
+//! in its metadata, signed by the gateway (see
 //! [`GatewayMetadata`](cassis_core::offline::GatewayMetadata)), which
 //! payers hand back with PREPARE and COMMIT.
 
@@ -16,7 +16,7 @@ pub use db::*;
 #[orangedb::schema]
 pub mod db {
     use cassis_core::network::NetworkId;
-    use cassis_wallet::stored::{StoredAuthorization, StoredHtlc, StoredIssuance};
+    use cassis_wallet::stored::{StoredAuthorization, StoredHtlc};
 
     /// A standing authorization a payee gave this gateway.
     #[entity]
@@ -25,12 +25,10 @@ pub mod db {
         /// Hex [`ReceiveAuthorization::id`](cassis_core::offline::ReceiveAuthorization::id).
         #[id(String)]
         pub authorization_id: HandledDelegationId,
-        /// Hex iroh key.
+        /// The payee's iroh key.
         #[index]
-        pub payee: String,
+        pub payee: [u8; 32],
         pub authorization: StoredAuthorization,
-        /// Where the gateway reaches the preimage server.
-        pub preimage_server_relay: Option<String>,
         pub registered_at: u64,
     }
 
@@ -61,8 +59,9 @@ pub mod db {
         pub claim_by: u64,
         /// The invoice's terms, from its metadata.
         pub authorization: StoredAuthorization,
-        pub issuance: StoredIssuance,
-        pub preimage_server_relay: Option<String>,
+        /// What the preimage server needs to release the preimage, as
+        /// carried in the invoice: opaque to the gateway.
+        pub preimage_metadata: Vec<u8>,
         pub payee_metadata: Option<Vec<u8>>,
         /// The HTLC to the payee, once funded; while `None`, funding is
         /// under way, or was interrupted.

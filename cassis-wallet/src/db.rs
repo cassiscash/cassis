@@ -36,7 +36,6 @@ pub mod db {
         pub gateway_relay: Option<String>,
         /// Hex iroh key.
         pub preimage_server: String,
-        pub preimage_server_relay: Option<String>,
         pub authorization: StoredAuthorization,
     }
 
@@ -152,7 +151,6 @@ pub mod db {
         /// Hex iroh key.
         #[index]
         pub preimage_server: String,
-        pub preimage_server_relay: Option<String>,
         pub authorization: StoredAuthorization,
         pub created_at: u64,
     }

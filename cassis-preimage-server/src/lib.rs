@@ -6,10 +6,11 @@
 //!   ([`Request::PreimageIssue`]) under the payee's signed
 //!   [`ReceiveAuthorization`], for an invoice of some amount and
 //!   metadata. The server keeps no record of it: the preimage is an
-//!   HMAC, keyed by a secret only the server knows, over the
-//!   authorization, the amount, the metadata's hash and a random nonce,
-//!   all in the [`PreimageIssuance`] it signs and returns. Without that
-//!   secret nobody, the gateway included, can work the preimage out.
+//!   HMAC, keyed by a secret only the server knows, over a random nonce
+//!   in the [`PreimageIssuance`] it signs and returns. What the hash was
+//!   issued for is bound by that signature and checked again when the
+//!   preimage is released. Without the secret nobody, the gateway
+//!   included, can work the preimage out.
 //! * The gateway, paid for the invoice, funds an HTLC to one of the
 //!   payee's destinations and presents it ([`Request::PreimageRelease`]).
 //!   The server checks it against the authorization (destination,
@@ -245,20 +246,12 @@ impl PreimageServer {
     }
 
     /// The preimage of `issuance`'s hash: the HMAC by the server's
-    /// secret over everything it issued the hash for.
+    /// secret over its nonce. What the hash was issued for is bound by
+    /// the signed issuance and checked when the preimage is released.
     fn preimage(&self, issuance: &PreimageIssuance) -> Bytes32 {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.0.preimage_secret)
             .expect("hmac accepts any key length");
         mac.update(b"cassis/preimage-server/v3\0");
-        mac.update(&issuance.authorization.0);
-        mac.update(&issuance.amount_msat.to_be_bytes());
-        match &issuance.metadata_hash {
-            Some(hash) => {
-                mac.update(&[1]);
-                mac.update(&hash.0);
-            }
-            None => mac.update(&[0]),
-        }
         mac.update(&issuance.nonce.0);
         Bytes32(mac.finalize().into_bytes().into())
     }
@@ -356,13 +349,12 @@ impl PreimageServer {
     /// preimage, logging the HTLC for the payee. [`Response::Pending`]
     /// while the HTLC is not final yet: the gateway asks again.
     async fn release(&self, peer: &str, release: PreimageRelease) -> Response {
-        let hash = release.issuance.payment_hash;
         match self.try_release(peer, release).await {
             Ok(Some(preimage)) => Response::PreimageReleased(Ok(preimage)),
             Ok(None) => Response::Pending,
             Err(reason) => {
                 self.0.counters.refused.fetch_add(1, Ordering::Relaxed);
-                warn!("RELEASE {} refused: {reason}", hash.short());
+                warn!("RELEASE refused: {reason}");
                 Response::PreimageReleased(Err(reason))
             }
         }
@@ -375,15 +367,17 @@ impl PreimageServer {
     ) -> Result<Option<Bytes32>, String> {
         let PreimageRelease {
             authorization,
-            issuance,
+            preimage_metadata,
             metadata,
             network,
             htlc,
         } = release;
+        let issuance = PreimageIssuance::from_metadata(&preimage_metadata)?;
         let id = self.check_authorization(&authorization)?;
         if peer_key(peer)? != authorization.gateway {
             return Err("only the authorized gateway gets preimages released".into());
         }
+        issuance.verify(&self.key(), &authorization)?;
         if issuance.authorization != id {
             return Err("the hash was issued under another authorization".into());
         }

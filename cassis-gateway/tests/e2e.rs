@@ -13,7 +13,8 @@ use cassis_admin::networks::{NetworkConfig, Networks, Opened, Opener, Status};
 use cassis_admin::{App, Args, ConfigFile, Refresh};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::offline::{
-    endpoint_public_key, GatewayMetadata, ReceiveAuthorization, DEFAULT_MIN_FINAL_TIMEOUT_SECS,
+    endpoint_public_key, GatewayMetadata, GatewayTerms, ReceiveAuthorization,
+    DEFAULT_MIN_FINAL_TIMEOUT_SECS,
 };
 use cassis_core::protocol::{
     GatewayInvoiceFor, Invoice, InvoiceReceiver, Metadata, PreimageRelease, ReceivedPayment,
@@ -288,9 +289,11 @@ fn gateway_db(name: &str) -> Arc<cassis_gateway::db::Db> {
     Arc::new(cassis_gateway::db::Db::open(temp_dir(name).join("gateway.redb")).unwrap())
 }
 
-/// What a gateway's invoice carries in its metadata.
-fn carried(invoice: &Invoice) -> GatewayMetadata {
-    GatewayMetadata::from_metadata(invoice.body.metadata.as_ref().unwrap()).unwrap()
+/// What a gateway's invoice carries in its metadata, opened.
+fn carried(invoice: &Invoice, secret: &[u8; 32]) -> (GatewayMetadata, GatewayTerms) {
+    let metadata = GatewayMetadata::from_metadata(invoice.body.metadata.as_ref().unwrap()).unwrap();
+    let terms = metadata.open(secret, &invoice.body.payment_hash).unwrap();
+    (metadata, terms)
 }
 
 fn metadata(text: &str) -> Metadata {
@@ -305,6 +308,7 @@ struct Setup {
     ledger: Ledger,
     server: PreimageServer,
     gateway: Gateway,
+    gateway_secret: [u8; 32],
     endpoints: OfflineEndpoints,
     payer: Node,
 }
@@ -322,8 +326,9 @@ async fn setup() -> Setup {
     .await
     .unwrap();
     let gateway_keys = NodeKeys::from_mnemonic(&generate_mnemonic()).unwrap();
+    let gateway_secret = gateway_keys.iroh;
     let gateway = Gateway::start(GatewayConfig {
-        endpoint_secret: gateway_keys.iroh,
+        endpoint_secret: gateway_secret,
         db: gateway_db("gateway"),
         networks: vec![MockNetwork::new(8, &ledger)],
         policy: GatewayPolicy {
@@ -360,6 +365,7 @@ async fn setup() -> Setup {
         ledger,
         server,
         gateway,
+        gateway_secret,
         endpoints,
         payer,
     }
@@ -447,10 +453,10 @@ async fn payee_offline_behind_a_gateway() {
     assert_eq!(*invoice.payee(), payee.key());
     // The gateway carries the invoice's terms in its metadata, signed,
     // around the payee's.
-    let terms = carried(&invoice);
-    terms.verify(&setup.gateway.key()).unwrap();
+    let (carried, terms) = carried(&invoice, &setup.gateway_secret);
+    carried.verify(&setup.gateway.key()).unwrap();
     assert_eq!(terms.payee_metadata, Some(metadata("order 42")));
-    assert_eq!(terms.payment_hash(), invoice.body.payment_hash);
+    assert_eq!(terms.payment_hash, invoice.body.payment_hash);
     assert_eq!(invoice.gateway().copied(), Some(setup.gateway.key()));
     assert_eq!(invoice.iroh_peer_id().to_string(), setup.gateway.peer_id());
 
@@ -514,7 +520,7 @@ async fn payee_offline_behind_a_gateway() {
     let intruder = Transport::bind_client([7; 32]).await.unwrap();
     let release = Request::PreimageRelease(PreimageRelease {
         authorization: terms.authorization,
-        issuance: terms.issuance,
+        preimage_metadata: carried.preimage_metadata,
         metadata: terms.payee_metadata,
         network: network.clone(),
         htlc: Htlc {

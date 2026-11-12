@@ -2720,6 +2720,7 @@ dependencies = [
  "base64 0.22.1",
  "bip32",
  "bip39",
+ "chacha20 0.9.1",
  "futures",
  "hmac",
  "iroh 1.0.3",

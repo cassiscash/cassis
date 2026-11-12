@@ -699,12 +699,13 @@ async fn redeem(
         .into_iter()
         .filter_map(|invoice| invoice.delegation)
     {
+        let authorization: ReceiveAuthorization = (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
                 id: delegation.preimage_server,
-                relay: delegation.preimage_server_relay,
+                relay: authorization.preimage_server_relay.clone(),
             },
-            (&delegation.authorization).try_into()?,
+            authorization,
         );
     }
     for delegation in home
@@ -713,12 +714,13 @@ async fn redeem(
         .all()
         .map_err(|e| e.to_string())?
     {
+        let authorization: ReceiveAuthorization = (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
                 id: delegation.preimage_server,
-                relay: delegation.preimage_server_relay,
+                relay: authorization.preimage_server_relay.clone(),
             },
-            (&delegation.authorization).try_into()?,
+            authorization,
         );
     }
     if let Some(id) = preimage_server {
