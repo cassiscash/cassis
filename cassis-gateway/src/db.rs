@@ -59,9 +59,6 @@ pub mod db {
         pub claim_by: u64,
         /// The invoice's terms, from its metadata.
         pub authorization: StoredAuthorization,
-        /// What the preimage server needs to release the preimage, as
-        /// carried in the invoice: opaque to the gateway.
-        pub preimage_metadata: Vec<u8>,
         pub payee_metadata: Option<Vec<u8>>,
         /// The HTLC to the payee, once funded; while `None`, funding is
         /// under way, or was interrupted.

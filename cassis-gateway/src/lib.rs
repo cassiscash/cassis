@@ -696,10 +696,33 @@ impl Gateway {
     /// already under way or done.
     async fn start_forward(&self, commit: Commit) -> Result<(), String> {
         let hash = commit.payment_hash;
-        if self.payee_htlc(&hash)?.is_some() {
+        let (carried, terms) = self.carried(commit.metadata.as_ref(), &hash)?;
+        // A repeated COMMIT finishes a forward that is already funded:
+        // it brings the preimage metadata again, so the gateway does not
+        // need to have stored it.
+        if let Some(mut htlc) = self.payee_htlc(&hash)? {
+            if htlc.outcome == Some(PayeeOutcome::Refunded) {
+                return Err("the payee HTLC was refunded".into());
+            }
+            if htlc.settled {
+                return Ok(());
+            }
+            if htlc.failed.is_some() && htlc.preimage.is_some() {
+                htlc.failed = None;
+                self.journal(&htlc);
+            }
+            if htlc.failed.is_some() {
+                return Ok(());
+            }
+            let Some(busy) = self.busy(hash) else {
+                return Ok(());
+            };
+            lock(&self.0.refused).remove(&hash);
+            let preimage_metadata = htlc.preimage.is_none().then_some(carried.preimage_metadata);
+            let gateway = self.clone();
+            self.spawn(async move { gateway.finish(htlc, preimage_metadata, busy).await });
             return Ok(());
         }
-        let (carried, terms) = self.carried(commit.metadata.as_ref(), &hash)?;
         let (target, _, claim_by) = self
             .payable_on(&terms, &commit.network, commit.expiry)
             .await?;
@@ -749,7 +772,10 @@ impl Gateway {
     async fn forward(self, forward: Forward, busy: BusyGuard) {
         let hash = forward.incoming.payment_hash;
         match self.verify_and_fund(&forward).await {
-            Ok(htlc) => self.finish(htlc, busy).await,
+            Ok(htlc) => {
+                self.finish(htlc, Some(forward.preimage_metadata), busy)
+                    .await
+            }
             Err(reason) => {
                 warn!("forward {} failed: {reason}", hash.short());
                 self.release_targets(&hash, None).await;
@@ -798,7 +824,6 @@ impl Gateway {
             incoming: (&forward.incoming).into(),
             claim_by: forward.claim_by,
             authorization: authorization.into(),
-            preimage_metadata: forward.preimage_metadata.as_bytes().to_vec(),
             payee_metadata: stored_metadata(&forward.terms.payee_metadata),
             network: destination.network.clone(),
             htlc: None,
@@ -847,9 +872,21 @@ impl Gateway {
 
     /// Have the preimage of a funded `htlc` released, unless known, and
     /// claim the payer's HTLC with it.
-    async fn finish(&self, mut htlc: PayeeHtlc, _busy: BusyGuard) {
+    async fn finish(
+        &self,
+        mut htlc: PayeeHtlc,
+        preimage_metadata: Option<Metadata>,
+        _busy: BusyGuard,
+    ) {
         if htlc.preimage.is_none() {
-            match self.release(&mut htlc).await {
+            let Some(preimage_metadata) = preimage_metadata else {
+                warn!(
+                    "forward {} is funded but has no preimage metadata to release with",
+                    short(&htlc)
+                );
+                return;
+            };
+            match self.release(&mut htlc, &preimage_metadata).await {
                 Ok(preimage) => {
                     info!("COMMIT {}: preimage released", short(&htlc));
                     htlc.preimage = Some(preimage.0);
@@ -871,12 +908,16 @@ impl Gateway {
 
     /// Present the HTLC to the payee to the preimage server, with what
     /// the invoice carried from it, until it releases the preimage.
-    async fn release(&self, htlc: &mut PayeeHtlc) -> Result<Bytes32, String> {
+    async fn release(
+        &self,
+        htlc: &mut PayeeHtlc,
+        preimage_metadata: &Metadata,
+    ) -> Result<Bytes32, String> {
         let hash = Bytes32(htlc.payment_hash.0);
         let authorization = ReceiveAuthorization::try_from(&htlc.authorization)?;
         let funded = htlc.htlc.as_ref().ok_or("nothing was paid to the payee")?;
         let request = Request::PreimageRelease(PreimageRelease {
-            preimage_metadata: Metadata::new(htlc.preimage_metadata.clone())?,
+            preimage_metadata: preimage_metadata.clone(),
             metadata: metadata(&htlc.payee_metadata)?,
             network: htlc.network.clone(),
             htlc: Htlc::try_from(funded)?,
@@ -967,10 +1008,12 @@ impl Gateway {
         }
     }
 
-    /// After a restart: go on with forwards in progress, and fail those
-    /// left mid-funding, which cannot be resumed: whether their HTLC to
-    /// the payee exists is unknown, and funding it again could pay
-    /// twice.
+    /// After a restart: claim forwards whose preimage was learned, and
+    /// fail those left mid-funding, which cannot be resumed: whether
+    /// their HTLC to the payee exists is unknown, and funding it again
+    /// could pay twice. A funded forward still waiting for its preimage
+    /// waits for a repeated COMMIT, which carries the preimage metadata
+    /// again, or for the payee to claim.
     fn resume(&self) -> Result<(), String> {
         for mut htlc in self.payee_htlcs()? {
             if htlc.settled || htlc.failed.is_some() {
@@ -987,10 +1030,16 @@ impl Gateway {
                 self.journal(&htlc);
                 continue;
             }
+            if htlc.preimage.is_none() {
+                // The COMMIT that carries the preimage metadata again
+                // resumes it; the settlement loop refunds it if none
+                // comes.
+                continue;
+            }
             let hash = Bytes32(htlc.payment_hash.0);
             if let Some(busy) = self.busy(hash) {
                 let gateway = self.clone();
-                self.spawn(async move { gateway.finish(htlc, busy).await });
+                self.spawn(async move { gateway.finish(htlc, None, busy).await });
             }
         }
         Ok(())
@@ -1090,7 +1139,7 @@ impl Gateway {
         self.journal(&saved);
         if claimable {
             let gateway = self.clone();
-            self.spawn(async move { gateway.finish(saved, busy).await });
+            self.spawn(async move { gateway.finish(saved, None, busy).await });
         }
     }
 }
