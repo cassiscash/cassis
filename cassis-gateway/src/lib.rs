@@ -63,7 +63,7 @@ const INLINE_WAIT: Duration = Duration::from_secs(5);
 /// How often an HTLC not final yet is verified again, and a preimage
 /// not released yet asked for again.
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
-const SETTLE_INTERVAL: Duration = Duration::from_secs(10);
+const SETTLE_INTERVAL: Duration = Duration::from_secs(25);
 
 /// Terms the gateway accepts from payees.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
