@@ -316,20 +316,15 @@ impl Network for CashuAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.target != HtlcTarget::XOnlyPubKey(self.claim_pubkey) {
+        if htlc.descriptor.target() != HtlcTarget::XOnlyPubKey(self.claim_pubkey) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
     }
 
     async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let proofs = decode_proofs(&htlc.descriptor)?;
-        let HtlcTarget::XOnlyPubKey(receiver) = &htlc.target else {
-            return Err(NetworkError::invalid(
-                "cashu HTLCs are locked to an x-only key",
-            ));
-        };
-        let claim_key = cashu_key(receiver)?;
+        let (proofs, receiver) = decode_proofs(&htlc.descriptor)?;
+        let claim_key = cashu_key(&receiver)?;
         for proof in &proofs {
             let terms = HtlcTerms::of(proof)?;
             if terms.payment_hash != htlc.payment_hash {
@@ -380,7 +375,7 @@ impl Network for CashuAdapter {
         htlc: &Htlc,
         preimage: Bytes32,
     ) -> Result<(), NetworkError> {
-        let mut proofs = decode_proofs(&htlc.descriptor)?;
+        let (mut proofs, _) = decode_proofs(&htlc.descriptor)?;
         info!(parent: &self.span, "revealing preimage to the mint for {}", htlc.payment_hash.short());
         for proof in &mut proofs {
             proof.add_preimage(lowercase_hex::encode(preimage.0));
@@ -416,11 +411,11 @@ impl Network for CashuAdapter {
             sum_sats(&proofs),
             payment_hash.short()
         );
-        encode_proofs(&proofs)
+        encode_proofs(&proofs, *receiver)
     }
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
-        let proofs = decode_proofs(&htlc.descriptor)?;
+        let (proofs, _) = decode_proofs(&htlc.descriptor)?;
         for state in self.states(&proofs).await? {
             if state.state != State::Spent {
                 continue;
@@ -436,7 +431,7 @@ impl Network for CashuAdapter {
     }
 
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let mut proofs = decode_proofs(&htlc.descriptor)?;
+        let (mut proofs, _) = decode_proofs(&htlc.descriptor)?;
         for proof in &mut proofs {
             sign_refund(proof, &self.secret_key)?;
         }
@@ -503,29 +498,31 @@ fn plain_outputs(
     Ok(())
 }
 
-fn encode_proofs(proofs: &Proofs) -> Result<HtlcDescriptor, NetworkError> {
+fn encode_proofs(proofs: &Proofs, target: XOnlyPubKey) -> Result<HtlcDescriptor, NetworkError> {
     let proofs_b64 = proofs
         .iter()
         .map(|proof| serde_json::to_string(proof).map(|json| BASE64.encode(json)))
         .collect::<Result<_, _>>()
         .map_err(NetworkError::invalid)?;
-    Ok(HtlcDescriptor::Cashu { proofs_b64 })
+    Ok(HtlcDescriptor::Cashu { proofs_b64, target })
 }
 
-fn decode_proofs(descriptor: &HtlcDescriptor) -> Result<Proofs, NetworkError> {
-    let HtlcDescriptor::Cashu { proofs_b64 } = descriptor else {
+/// The proofs of a cashu HTLC and the key they are locked to.
+fn decode_proofs(descriptor: &HtlcDescriptor) -> Result<(Proofs, XOnlyPubKey), NetworkError> {
+    let HtlcDescriptor::Cashu { proofs_b64, target } = descriptor else {
         return Err(NetworkError::invalid("not a cashu HTLC"));
     };
     if proofs_b64.is_empty() {
         return Err(NetworkError::invalid("cashu HTLC without proofs"));
     }
-    proofs_b64
+    let proofs = proofs_b64
         .iter()
         .map(|encoded| {
             let json = BASE64.decode(encoded).map_err(NetworkError::invalid)?;
             serde_json::from_slice(&json).map_err(NetworkError::invalid)
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok((proofs, *target))
 }
 
 #[cfg(test)]
@@ -546,8 +543,16 @@ mod tests {
             r#"{"amount":2,"id":"009a1f293253e41e","secret":"407915bc212be61a77e3e6d2aeb4c727980bda51cd06a6afc29e2861768a7837","C":"02bc9097997d81afb2cc7346b5e4345a9346bd2a506eb7958598a72f0cf85163ea"}"#,
         )
         .unwrap();
-        let descriptor = encode_proofs(&vec![proof.clone()]).unwrap();
-        assert_eq!(decode_proofs(&descriptor).unwrap(), vec![proof]);
-        assert!(decode_proofs(&HtlcDescriptor::Lightning).is_err());
+        let compressed = cdk::nuts::nut01::SecretKey::from_slice(&[1; 32])
+            .unwrap()
+            .public_key()
+            .to_bytes();
+        let target = XOnlyPubKey::from_bytes(compressed[1..].try_into().unwrap()).unwrap();
+        let descriptor = encode_proofs(&vec![proof.clone()], target).unwrap();
+        assert_eq!(decode_proofs(&descriptor).unwrap(), (vec![proof], target));
+        let lightning = HtlcDescriptor::Lightning {
+            target: "lnbc".into(),
+        };
+        assert!(decode_proofs(&lightning).is_err());
     }
 }

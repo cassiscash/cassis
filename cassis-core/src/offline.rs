@@ -16,9 +16,7 @@
 //! talks to the others with:
 //!
 //! * [`ReceiveAuthorization`]: the payee lets a gateway and a preimage
-//!   server act for it, within limits. Its signed message is a fixed
-//!   text ([`ReceiveAuthorization::message`]), so anyone can check it
-//!   without knowing Cassis' JSON.
+//!   server act for it, within limits.
 //! * [`PreimageIssuance`]: the preimage server vouches that it issued a
 //!   payment hash under an authorization.
 //! * [`GatewayMetadata`]: the gateway carries the preimage server's
@@ -26,13 +24,17 @@
 //!   signed, so payers hand it back with PREPARE and COMMIT and the
 //!   gateway stores no invoice.
 //!
+//! Each signature covers the statement's canonical bytes, written as
+//! [`crate::signing`] and `SPEC.md` lay out, never its JSON.
+//!
 //! Invoices come in three [`InvoiceReceiver`](crate::protocol::InvoiceReceiver)s
 //! with their own signature rules (see
 //! [`Invoice::verify`](crate::protocol::Invoice::verify)).
 
 use crate::network::{HtlcTarget, NetworkId};
-use crate::primitives::Bytes32;
+use crate::primitives::{Bytes32, PubKey, XOnlyPubKey};
 use crate::protocol::Metadata;
+use crate::signing::SigningMessage;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::{ChaCha20, Key as ChachaKey, Nonce as ChachaNonce};
 use hmac::{Hmac, Mac};
@@ -45,12 +47,12 @@ use std::fmt;
 /// long the payee may stay offline after a payment before it claims.
 pub const DEFAULT_MIN_FINAL_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 
-/// First line of [`ReceiveAuthorization::message`].
-const AUTHORIZATION_HEADER: &str = "Cassis receive authorization v1";
-/// First line of [`PreimageIssuance::message`].
-const ISSUANCE_HEADER: &str = "Cassis preimage issuance v1";
-/// Prefix of the message a gateway signs its [`GatewayMetadata`] with.
-const GATEWAY_METADATA_DOMAIN: &[u8] = b"cassis-gateway-metadata/v1\0";
+/// Domain of [`ReceiveAuthorization::message`].
+const AUTHORIZATION_DOMAIN: &str = "cassis/receive-authorization/v2";
+/// Domain of [`PreimageIssuance::message`].
+const ISSUANCE_DOMAIN: &str = "cassis/preimage-issuance/v2";
+/// Domain of [`GatewayMetadata::message`].
+const GATEWAY_METADATA_DOMAIN: &str = "cassis/gateway-metadata/v2";
 /// Prefix of the key a gateway seals its [`GatewayTerms`] with.
 const GATEWAY_METADATA_KEY_DOMAIN: &[u8] = b"cassis-gateway-metadata-key/v1\0";
 
@@ -114,20 +116,125 @@ pub enum AuthorizationKind {
 }
 
 impl AuthorizationKind {
-    fn as_str(&self) -> &'static str {
+    /// Its tag in [`ReceiveAuthorization::message`].
+    fn tag(&self) -> u8 {
         match self {
-            Self::Single => "single",
-            Self::Standing => "standing",
+            Self::Single => 0,
+            Self::Standing => 1,
         }
     }
 }
 
 /// Where the gateway pays the payee: an HTLC on `network` locked to
-/// `target`.
+/// `target`, with one variant per network kind an offline payee can
+/// receive on. Lightning has none: its hold invoices need the payee
+/// online.
+///
+/// Crosses the wire as `{network, target}`, read through
+/// [`GatewayDestination::new`] so the variant always is the network's kind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Destination {
-    pub network: NetworkId,
-    pub target: HtlcTarget,
+#[serde(try_from = "WireGatewayDestination", into = "WireGatewayDestination")]
+pub enum GatewayDestination {
+    Cashu {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Fedimint {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Arkade {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Bitcoin {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Liquid {
+        network: NetworkId,
+        target: PubKey,
+    },
+    Rootstock {
+        network: NetworkId,
+        target: PubKey,
+    },
+}
+
+impl GatewayDestination {
+    /// The destination paying `target` on `network`, if `target` is the
+    /// kind of claim key `network` locks HTLCs to.
+    pub fn new(network: NetworkId, target: HtlcTarget) -> Result<Self, String> {
+        let kind = network.kind().to_string();
+        Ok(match (kind.as_str(), target) {
+            ("cashu", HtlcTarget::XOnlyPubKey(target)) => Self::Cashu { network, target },
+            ("fedimint", HtlcTarget::XOnlyPubKey(target)) => Self::Fedimint { network, target },
+            ("arkade", HtlcTarget::XOnlyPubKey(target)) => Self::Arkade { network, target },
+            ("bitcoin", HtlcTarget::XOnlyPubKey(target)) => Self::Bitcoin { network, target },
+            ("liquid", HtlcTarget::PubKey(target)) => Self::Liquid { network, target },
+            ("rootstock", HtlcTarget::PubKey(target)) => Self::Rootstock { network, target },
+            ("cashu" | "fedimint" | "arkade" | "bitcoin", _) => {
+                return Err(format!("{network} pays to an x-only key"));
+            }
+            ("liquid" | "rootstock", _) => {
+                return Err(format!("{network} pays to a full public key"));
+            }
+            ("lightning", _) => {
+                return Err(format!(
+                    "{network} cannot be paid to an offline payee: its hold invoices need it \
+                     online"
+                ));
+            }
+            _ => return Err(format!("{network} is not a network kind Cassis supports")),
+        })
+    }
+
+    pub fn network(&self) -> &NetworkId {
+        match self {
+            Self::Cashu { network, .. }
+            | Self::Fedimint { network, .. }
+            | Self::Arkade { network, .. }
+            | Self::Bitcoin { network, .. }
+            | Self::Liquid { network, .. }
+            | Self::Rootstock { network, .. } => network,
+        }
+    }
+
+    pub fn target(&self) -> HtlcTarget {
+        match self {
+            Self::Cashu { target, .. }
+            | Self::Fedimint { target, .. }
+            | Self::Arkade { target, .. }
+            | Self::Bitcoin { target, .. } => HtlcTarget::XOnlyPubKey(*target),
+            Self::Liquid { target, .. } | Self::Rootstock { target, .. } => {
+                HtlcTarget::PubKey(*target)
+            }
+        }
+    }
+}
+
+/// A [`GatewayDestination`] on the wire.
+#[derive(Serialize, Deserialize)]
+struct WireGatewayDestination {
+    network: NetworkId,
+    target: HtlcTarget,
+}
+
+impl TryFrom<WireGatewayDestination> for GatewayDestination {
+    type Error = String;
+
+    fn try_from(destination: WireGatewayDestination) -> Result<Self, String> {
+        Self::new(destination.network, destination.target)
+    }
+}
+
+impl From<GatewayDestination> for WireGatewayDestination {
+    fn from(destination: GatewayDestination) -> Self {
+        Self {
+            target: destination.target(),
+            network: destination.network().clone(),
+        }
+    }
 }
 
 /// The payee's signed statement: "I, `payee`, authorize `gateway` and
@@ -136,7 +243,8 @@ pub struct Destination {
 /// `min_amount_msat` and `max_amount_msat`; the gateway pays each one
 /// with an HTLC to one of my `destinations` that cannot be refunded
 /// before `min_final_timeout_secs` after the preimage server releases
-/// its preimage."
+/// its preimage, and the invoices it issues say the `description` I
+/// pinned, if I pinned one."
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiveAuthorization {
     pub kind: AuthorizationKind,
@@ -146,6 +254,10 @@ pub struct ReceiveAuthorization {
     /// Where the gateway reaches the preimage server.
     #[serde(default)]
     pub preimage_server_relay: Option<String>,
+    /// What every invoice issued under this authorization must say, if
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Unix seconds.
     pub valid_from: u64,
     /// Unix seconds; invoices made under it expire by then.
@@ -153,7 +265,7 @@ pub struct ReceiveAuthorization {
     pub min_amount_msat: u64,
     pub max_amount_msat: u64,
     pub min_final_timeout_secs: u64,
-    pub destinations: Vec<Destination>,
+    pub destinations: Vec<GatewayDestination>,
     /// By `payee`, over [`ReceiveAuthorization::message`].
     pub signature: Signature,
 }
@@ -167,12 +279,13 @@ impl ReceiveAuthorization {
         gateway: PublicKey,
         preimage_server: PublicKey,
         preimage_server_relay: Option<String>,
+        description: Option<String>,
         valid_from: u64,
         valid_until: u64,
         min_amount_msat: u64,
         max_amount_msat: u64,
         min_final_timeout_secs: u64,
-        destinations: Vec<Destination>,
+        destinations: Vec<GatewayDestination>,
     ) -> Result<Self, String> {
         let mut authorization = Self {
             kind,
@@ -180,6 +293,7 @@ impl ReceiveAuthorization {
             gateway,
             preimage_server,
             preimage_server_relay,
+            description,
             valid_from,
             valid_until,
             min_amount_msat,
@@ -189,72 +303,63 @@ impl ReceiveAuthorization {
             signature: Signature([0; 64]),
         };
         let message = authorization.message()?;
-        authorization.signature = Signature::sign(payee_secret, message.as_bytes());
+        authorization.signature = Signature::sign(payee_secret, &message);
         Ok(authorization)
     }
 
-    /// The text the payee signs, one `name: value` line per term:
+    /// The bytes the payee signs, in [`crate::signing`]'s encoding:
     ///
     /// ```text
-    /// Cassis receive authorization v1
-    /// kind: standing
-    /// payee: <hex key>
-    /// gateway: <hex key>
-    /// preimage server: <hex key>
-    /// preimage server relay: <"some <url>" or "none">
-    /// valid from: <unix seconds>
-    /// valid until: <unix seconds>
-    /// min amount msat: <n>
-    /// max amount msat: <n>
-    /// min final timeout secs: <n>
-    /// destination: <network id> <xonly|pubkey>:<hex key>
+    /// str     "cassis/receive-authorization/v2"
+    /// u8      kind: 0 single, 1 standing
+    /// key     payee
+    /// key     gateway
+    /// key     preimage server
+    /// option  str  preimage server relay
+    /// option  str  description
+    /// u64     valid from (unix seconds)
+    /// u64     valid until (unix seconds)
+    /// u64     min amount msat
+    /// u64     max amount msat
+    /// u64     min final timeout secs
+    /// count   destinations, each:
+    ///   str     network id
+    ///   target  claim key
     /// ```
     ///
-    /// with one `destination` line per destination, in order, and a
-    /// final newline. Fails on terms that cannot be written this way
-    /// unambiguously, or that make no sense (see
+    /// Fails on terms that make no sense (see
     /// [`ReceiveAuthorization::check_terms`]).
-    pub fn message(&self) -> Result<String, String> {
+    pub fn message(&self) -> Result<Vec<u8>, String> {
         self.check_terms()?;
-        let mut message = format!(
-            "{AUTHORIZATION_HEADER}\n\
-             kind: {}\n\
-             payee: {}\n\
-             gateway: {}\n\
-             preimage server: {}\n\
-             preimage server relay: {}\n\
-             valid from: {}\n\
-             valid until: {}\n\
-             min amount msat: {}\n\
-             max amount msat: {}\n\
-             min final timeout secs: {}\n",
-            self.kind.as_str(),
-            self.payee,
-            self.gateway,
-            self.preimage_server,
-            self.preimage_server_relay
-                .as_ref()
-                .map_or_else(|| "none".to_string(), |relay| format!("some {relay}"),),
-            self.valid_from,
-            self.valid_until,
-            self.min_amount_msat,
-            self.max_amount_msat,
-            self.min_final_timeout_secs,
-        );
+        Ok(self.encode())
+    }
+
+    /// [`ReceiveAuthorization::message`], whatever the terms.
+    fn encode(&self) -> Vec<u8> {
+        let mut message = SigningMessage::new(AUTHORIZATION_DOMAIN);
+        message
+            .u8(self.kind.tag())
+            .key(&self.payee)
+            .key(&self.gateway)
+            .key(&self.preimage_server)
+            .option(self.preimage_server_relay.as_deref(), SigningMessage::str)
+            .option(self.description.as_deref(), SigningMessage::str)
+            .u64(self.valid_from)
+            .u64(self.valid_until)
+            .u64(self.min_amount_msat)
+            .u64(self.max_amount_msat)
+            .u64(self.min_final_timeout_secs)
+            .count(self.destinations.len());
         for destination in &self.destinations {
-            let target = match &destination.target {
-                HtlcTarget::XOnlyPubKey(key) => format!("xonly:{}", key.to_hex()),
-                HtlcTarget::PubKey(key) => format!("pubkey:{}", key.to_hex()),
-                HtlcTarget::LightningInvoice(_) => unreachable!("refused by check_terms"),
-            };
-            message.push_str(&format!("destination: {} {target}\n", destination.network));
+            message
+                .str(&destination.network().0)
+                .htlc_target(&destination.target());
         }
-        Ok(message)
+        message.into_bytes()
     }
 
     /// Terms every authorization must meet: three distinct parties, a
-    /// window, an amount range, a timeout and claim-key destinations on
-    /// network ids without whitespace.
+    /// window, an amount range, a timeout and a destination.
     pub fn check_terms(&self) -> Result<(), String> {
         if self.payee == self.gateway
             || self.payee == self.preimage_server
@@ -271,29 +376,8 @@ impl ReceiveAuthorization {
         if self.min_final_timeout_secs == 0 {
             return Err("the final HTLC needs a timeout".into());
         }
-        if let Some(relay) = &self.preimage_server_relay {
-            if relay.is_empty() || relay.chars().any(char::is_whitespace) {
-                return Err(
-                    "the preimage server relay cannot be written in an authorization".into(),
-                );
-            }
-        }
         if self.destinations.is_empty() {
             return Err("authorization names no destination".into());
-        }
-        for destination in &self.destinations {
-            let id = &destination.network.0;
-            if id.is_empty() || id.chars().any(char::is_whitespace) {
-                return Err(format!(
-                    "network id {id:?} cannot be written in an authorization"
-                ));
-            }
-            if matches!(destination.target, HtlcTarget::LightningInvoice(_)) {
-                return Err(format!(
-                    "{id}: lightning cannot be paid to an offline payee, its hold invoices need it \
-                     online"
-                ));
-            }
         }
         Ok(())
     }
@@ -302,22 +386,28 @@ impl ReceiveAuthorization {
     pub fn verify(&self) -> Result<(), String> {
         let message = self.message()?;
         self.signature
-            .verify(&self.payee, message.as_bytes())
+            .verify(&self.payee, &message)
             .map_err(|_| "invalid payee signature on the receive authorization".to_string())
     }
 
     /// SHA-256 of [`ReceiveAuthorization::message`]: what a
     /// [`PreimageIssuance`] refers to it by.
     pub fn id(&self) -> Result<Bytes32, String> {
-        use sha2::{Digest, Sha256};
-        Ok(Bytes32(Sha256::digest(self.message()?.as_bytes()).into()))
+        self.check_terms()?;
+        Ok(self.digest())
+    }
+
+    /// [`ReceiveAuthorization::id`], whatever the terms: what an invoice
+    /// signature covers it by.
+    pub(crate) fn digest(&self) -> Bytes32 {
+        Bytes32(Sha256::digest(self.encode()).into())
     }
 
     /// The destination on `network`, if any.
-    pub fn destination(&self, network: &NetworkId) -> Option<&Destination> {
+    pub fn destination(&self, network: &NetworkId) -> Option<&GatewayDestination> {
         self.destinations
             .iter()
-            .find(|destination| destination.network == *network)
+            .find(|destination| destination.network() == network)
     }
 
     /// Whether `now` is inside the authorization's window.
@@ -327,6 +417,14 @@ impl ReceiveAuthorization {
 
     pub fn allows_amount(&self, amount_msat: u64) -> bool {
         (self.min_amount_msat..=self.max_amount_msat).contains(&amount_msat)
+    }
+
+    /// Whether an invoice with `description` is one this authorization
+    /// allows: if it names a description, the invoice must carry it.
+    pub fn allows_description(&self, description: Option<&str>) -> bool {
+        self.description
+            .as_deref()
+            .is_none_or(|required| description == Some(required))
     }
 }
 
@@ -354,30 +452,26 @@ pub struct PreimageIssuance {
 }
 
 impl PreimageIssuance {
-    /// The text the preimage server signs:
+    /// The bytes the preimage server signs, in [`crate::signing`]'s
+    /// encoding:
     ///
     /// ```text
-    /// Cassis preimage issuance v1
-    /// preimage server: <hex key>
-    /// authorization: <hex id>
-    /// payment hash: <hex>
-    /// amount msat: <n>
-    /// metadata: <hex hash, or "none">
+    /// str     "cassis/preimage-issuance/v2"
+    /// key     preimage server
+    /// bytes32 authorization id
+    /// bytes32 payment hash
+    /// u64     amount msat
+    /// option  bytes32  metadata hash
     /// ```
-    pub fn message(&self, preimage_server: &PublicKey) -> String {
-        format!(
-            "{ISSUANCE_HEADER}\n\
-             preimage server: {preimage_server}\n\
-             authorization: {}\n\
-             payment hash: {}\n\
-             amount msat: {}\n\
-             metadata: {}\n",
-            self.authorization,
-            self.payment_hash,
-            self.amount_msat,
-            self.metadata_hash
-                .map_or_else(|| "none".to_string(), |hash| hash.to_string())
-        )
+    pub fn message(&self, preimage_server: &PublicKey) -> Vec<u8> {
+        let mut message = SigningMessage::new(ISSUANCE_DOMAIN);
+        message
+            .key(preimage_server)
+            .bytes32(&self.authorization)
+            .bytes32(&self.payment_hash)
+            .u64(self.amount_msat)
+            .option(self.metadata_hash.as_ref(), SigningMessage::bytes32);
+        message.into_bytes()
     }
 
     /// Whether the hash was issued for an invoice carrying `metadata`.
@@ -388,7 +482,7 @@ impl PreimageIssuance {
     /// Sign as the preimage server whose secret is `secret`.
     pub fn sign(&mut self, secret: &[u8; 32]) {
         let message = self.message(&endpoint_public_key(secret));
-        self.signature = Signature::sign(secret, message.as_bytes());
+        self.signature = Signature::sign(secret, &message);
     }
 
     /// Check that `preimage_server` issued this under `authorization`.
@@ -404,7 +498,7 @@ impl PreimageIssuance {
             return Err("the hash was issued under another authorization".into());
         }
         self.signature
-            .verify(preimage_server, self.message(preimage_server).as_bytes())
+            .verify(preimage_server, &self.message(preimage_server))
             .map_err(|_| "invalid preimage server signature on the payment hash".to_string())
     }
 
@@ -537,17 +631,19 @@ impl GatewayMetadata {
         Ok(metadata)
     }
 
-    /// The bytes the gateway signs: a domain prefix and the hash of the
-    /// preimage metadata and sealed terms.
+    /// The bytes the gateway signs, in [`crate::signing`]'s encoding:
+    ///
+    /// ```text
+    /// str     "cassis/gateway-metadata/v2"
+    /// bytes   preimage metadata
+    /// bytes   sealed terms
+    /// ```
     pub fn message(&self) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update([1u8]);
-        hasher.update((self.preimage_metadata.as_bytes().len() as u64).to_be_bytes());
-        hasher.update(self.preimage_metadata.as_bytes());
-        hasher.update(&self.sealed);
-        let mut message = GATEWAY_METADATA_DOMAIN.to_vec();
-        message.extend_from_slice(&hasher.finalize());
+        let mut message = SigningMessage::new(GATEWAY_METADATA_DOMAIN);
         message
+            .bytes(self.preimage_metadata.as_bytes())
+            .bytes(&self.sealed);
+        message.into_bytes()
     }
 
     /// Check that `gateway` signed this.
@@ -622,45 +718,79 @@ mod tests {
     }
 
     fn authorization(kind: AuthorizationKind) -> ReceiveAuthorization {
+        signed(kind, None)
+    }
+
+    fn signed(kind: AuthorizationKind, description: Option<&str>) -> ReceiveAuthorization {
         ReceiveAuthorization::sign(
             &[1; 32],
             kind,
             key(2),
             key(3),
             Some("https://relay.example".into()),
+            description.map(Into::into),
             1000,
             2000,
             1,
             50_000,
             DEFAULT_MIN_FINAL_TIMEOUT_SECS,
-            vec![Destination {
+            vec![GatewayDestination::Cashu {
                 network: NetworkId("cashu::localhost".into()),
-                target: HtlcTarget::XOnlyPubKey(
-                    ritualistic::SecretKey::from_bytes([4; 32])
-                        .unwrap()
-                        .pubkey(),
-                ),
+                target: ritualistic::SecretKey::from_bytes([4; 32])
+                    .unwrap()
+                    .pubkey(),
             }],
         )
         .unwrap()
     }
 
     #[test]
-    fn authorization_message_is_fixed_text() {
+    fn authorization_message_is_canonical() {
         let authorization = authorization(AuthorizationKind::Standing);
-        let message = authorization.message().unwrap();
-        let lines: Vec<&str> = message.lines().collect();
-        assert_eq!(lines[0], "Cassis receive authorization v1");
-        assert_eq!(lines[1], "kind: standing");
-        assert_eq!(lines[2], format!("payee: {}", key(1)));
-        assert_eq!(
-            lines[5],
-            "preimage server relay: some https://relay.example"
+        let mut expected = Vec::new();
+        expected.extend(31u32.to_be_bytes());
+        expected.extend(b"cassis/receive-authorization/v2");
+        expected.push(1);
+        expected.extend(key(1).as_bytes());
+        expected.extend(key(2).as_bytes());
+        expected.extend(key(3).as_bytes());
+        expected.push(1);
+        expected.extend(21u32.to_be_bytes());
+        expected.extend(b"https://relay.example");
+        expected.push(0);
+        for value in [1000u64, 2000, 1, 50_000, DEFAULT_MIN_FINAL_TIMEOUT_SECS] {
+            expected.extend(value.to_be_bytes());
+        }
+        expected.extend(1u32.to_be_bytes());
+        expected.extend(16u32.to_be_bytes());
+        expected.extend(b"cashu::localhost");
+        expected.push(0);
+        expected.extend(
+            ritualistic::SecretKey::from_bytes([4; 32])
+                .unwrap()
+                .pubkey()
+                .0,
         );
-        assert_eq!(lines[10], "min final timeout secs: 604800");
-        assert!(lines[11].starts_with("destination: cashu::localhost xonly:"));
-        assert!(message.ends_with('\n'));
+        assert_eq!(authorization.message().unwrap(), expected);
         authorization.verify().unwrap();
+    }
+
+    #[test]
+    fn authorization_description_is_a_signed_term() {
+        let authorization = signed(
+            AuthorizationKind::Standing,
+            Some("a \"quoted\"\ndescription"),
+        );
+        authorization.verify().unwrap();
+        assert!(authorization.allows_description(Some("a \"quoted\"\ndescription")));
+        assert!(!authorization.allows_description(None));
+        assert!(!authorization.allows_description(Some("coffee")));
+        let mut tampered = authorization.clone();
+        tampered.description = Some("coffee".into());
+        assert!(tampered.verify().is_err());
+        // Without one, any description does.
+        assert!(signed(AuthorizationKind::Single, None).allows_description(None));
+        assert!(signed(AuthorizationKind::Single, None).allows_description(Some("coffee")));
     }
 
     #[test]
@@ -679,7 +809,11 @@ mod tests {
         tampered.preimage_server_relay = None;
         assert!(tampered.verify().is_err());
         let mut tampered = authorization;
-        tampered.destinations[0].network = NetworkId("cashu::elsewhere".into());
+        tampered.destinations[0] = GatewayDestination::new(
+            NetworkId("cashu::elsewhere".into()),
+            tampered.destinations[0].target(),
+        )
+        .unwrap();
         assert!(tampered.verify().is_err());
     }
 
@@ -688,12 +822,30 @@ mod tests {
         let mut same = authorization(AuthorizationKind::Standing);
         same.gateway = same.preimage_server;
         assert!(same.message().is_err());
-        let mut spaced = authorization(AuthorizationKind::Standing);
-        spaced.destinations[0].network = NetworkId("cashu::a b".into());
-        assert!(spaced.message().is_err());
-        let mut lightning = authorization(AuthorizationKind::Standing);
-        lightning.destinations[0].target = HtlcTarget::LightningInvoice("lnbc".into());
-        assert!(lightning.message().is_err());
+        let mut nowhere = authorization(AuthorizationKind::Standing);
+        nowhere.destinations.clear();
+        assert!(nowhere.message().is_err());
+    }
+
+    #[test]
+    fn destinations_fit_their_network() {
+        let key = ritualistic::SecretKey::from_bytes([4; 32])
+            .unwrap()
+            .pubkey();
+        let lightning = HtlcTarget::LightningInvoice("lnbc".into());
+        assert!(GatewayDestination::new(NetworkId("lightning".into()), lightning).is_err());
+        let liquid = NetworkId("liquid".into());
+        assert!(GatewayDestination::new(liquid.clone(), HtlcTarget::XOnlyPubKey(key)).is_err());
+        let full = HtlcTarget::PubKey(PubKey::from_x_only(&key).unwrap());
+        let destination = GatewayDestination::new(liquid, full.clone()).unwrap();
+        let json = serde_json::to_string(&destination).unwrap();
+        assert_eq!(
+            serde_json::from_str::<GatewayDestination>(&json).unwrap(),
+            destination
+        );
+        let mismatched = json.replace("\"liquid\"", "\"bitcoin\"");
+        assert!(serde_json::from_str::<GatewayDestination>(&mismatched).is_err());
+        assert_eq!(destination.target(), full);
     }
 
     #[test]

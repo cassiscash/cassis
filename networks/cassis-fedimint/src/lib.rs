@@ -334,14 +334,10 @@ impl FedimintAdapter {
             funding_txid,
             funding_out_idx,
             contract,
+            target: claim,
         } = &htlc.descriptor
         else {
             return Err(NetworkError::invalid("not a fedimint HTLC"));
-        };
-        let HtlcTarget::XOnlyPubKey(claim) = &htlc.target else {
-            return Err(NetworkError::invalid(
-                "fedimint HTLCs are locked to an x-only key",
-            ));
         };
         let contract: OutgoingContract =
             serde_json::from_str(contract).map_err(NetworkError::invalid)?;
@@ -404,7 +400,7 @@ impl Network for FedimintAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.target != self.claim_target() {
+        if htlc.descriptor.target() != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -501,6 +497,7 @@ impl Network for FedimintAdapter {
             funding_txid: outpoint.txid.to_string(),
             funding_out_idx: outpoint.out_idx,
             contract: serde_json::to_string(&contract).map_err(NetworkError::invalid)?,
+            target: *receiver,
         })
     }
 

@@ -37,12 +37,12 @@ use crate::db::{
 };
 use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId, OutgoingState};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, Destination, GatewayMetadata, GatewayTerms,
+    endpoint_public_key, AuthorizationKind, GatewayDestination, GatewayMetadata, GatewayTerms,
     ReceiveAuthorization,
 };
 use cassis_core::protocol::{
     Commit, GatewayInvoiceFor, GatewayInvoiceRequest, Invoice, InvoiceBody, InvoiceNetwork,
-    Metadata, PreimageRelease, PreparePayee, Request, Response,
+    InvoiceTarget, Metadata, PreimageRelease, PreparePayee, Request, Response,
 };
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
@@ -353,7 +353,7 @@ impl Gateway {
         if !authorization
             .destinations
             .iter()
-            .any(|destination| self.network(&destination.network).is_ok())
+            .any(|destination| self.network(destination.network()).is_ok())
         {
             return Err("this gateway pays on none of the payee's networks".into());
         }
@@ -372,6 +372,9 @@ impl Gateway {
             metadata,
         } = request;
         self.check_authorization(&authorization, AuthorizationKind::Single)?;
+        if !authorization.allows_description(description.as_deref()) {
+            return Err("the invoice must say what the payee authorized".into());
+        }
         if peer
             .trim()
             .parse::<PublicKey>()
@@ -431,7 +434,8 @@ impl Gateway {
     }
 
     /// An invoice in the name of an offline payee, under its standing
-    /// authorization that runs longest among those allowing the amount.
+    /// authorization that runs longest among those allowing the amount;
+    /// its description is the one that authorization pins, if any.
     async fn invoice_for(&self, request: GatewayInvoiceFor) -> Result<Invoice, String> {
         let now = unix_now();
         let mut candidates = Vec::new();
@@ -442,7 +446,10 @@ impl Gateway {
             .map_err(db_error)?
         {
             let authorization = ReceiveAuthorization::try_from(&delegation.authorization)?;
-            if authorization.is_valid_at(now) && authorization.allows_amount(request.amount_msat) {
+            if authorization.is_valid_at(now)
+                && authorization.allows_amount(request.amount_msat)
+                && authorization.allows_description(request.description.as_deref())
+            {
                 candidates.push(authorization);
             }
         }
@@ -450,6 +457,11 @@ impl Gateway {
             .into_iter()
             .max_by_key(|authorization| authorization.valid_until)
             .ok_or("this payee authorized no invoice like this one")?;
+        // The payee may pin what its invoices say: then they say that.
+        let description = authorization
+            .description
+            .clone()
+            .or_else(|| request.description.clone());
         let expires_at = request
             .expires_at
             .unwrap_or(now + self.policy().default_invoice_expiry_secs)
@@ -491,7 +503,7 @@ impl Gateway {
             issuance.to_metadata()?,
             terms.clone(),
         )?;
-        let body = self.build(&carried, &terms, request.description).await?;
+        let body = self.build(&carried, &terms, description).await?;
         let invoice = Invoice::delegated(
             body,
             authorization.payee,
@@ -527,9 +539,10 @@ impl Gateway {
             match network
                 .receive_target(payment_hash, amount_msat, expires_at)
                 .await
+                .map_err(|e| e.to_string())
+                .and_then(|target| InvoiceTarget::new(network.id(), target))
             {
                 Ok(target) => targets.push(InvoiceNetwork {
-                    network: network.id(),
                     target,
                     incoming_delta_secs: Some(
                         network
@@ -611,15 +624,15 @@ impl Gateway {
         &self,
         authorization: &ReceiveAuthorization,
         amount_msat: u64,
-    ) -> Result<(Destination, Arc<dyn Network>), String> {
+    ) -> Result<(GatewayDestination, Arc<dyn Network>), String> {
         let mut reasons = Vec::new();
         for destination in &authorization.destinations {
-            let Ok(network) = self.network(&destination.network) else {
+            let Ok(network) = self.network(destination.network()) else {
                 continue;
             };
             match network.can_send(amount_msat).await {
                 Ok(()) => return Ok((destination.clone(), network)),
-                Err(error) => reasons.push(format!("{}: {error}", destination.network)),
+                Err(error) => reasons.push(format!("{}: {error}", destination.network())),
             }
         }
         Err(if reasons.is_empty() {
@@ -726,6 +739,9 @@ impl Gateway {
         let (target, _, claim_by) = self
             .payable_on(&terms, &commit.network, commit.expiry)
             .await?;
+        if commit.descriptor.target() != target {
+            return Err("the HTLC does not pay this invoice".into());
+        }
         let Some(busy) = self.busy(hash) else {
             return Ok(());
         };
@@ -735,7 +751,6 @@ impl Gateway {
                 payment_hash: hash,
                 amount_msat: terms.amount_msat,
                 expiry: commit.expiry,
-                target,
                 descriptor: commit.descriptor,
             },
             preimage_metadata: carried.preimage_metadata,
@@ -825,7 +840,7 @@ impl Gateway {
             claim_by: forward.claim_by,
             authorization: authorization.into(),
             payee_metadata: stored_metadata(&forward.terms.payee_metadata),
-            network: destination.network.clone(),
+            network: destination.network().clone(),
             htlc: None,
             outcome: None,
             preimage: None,
@@ -835,7 +850,7 @@ impl Gateway {
         };
         self.db().payee_htlcs().insert(&htlc).map_err(db_error)?;
         let funded = outgoing
-            .create_outgoing_htlc(hash, amount_msat, expiry, &destination.target)
+            .create_outgoing_htlc(hash, amount_msat, expiry, &destination.target())
             .await;
         let descriptor = match funded {
             Ok(descriptor) => descriptor,
@@ -846,7 +861,7 @@ impl Gateway {
                 }
                 return Err(format!(
                     "cannot pay the payee on {}: {error}",
-                    destination.network
+                    destination.network()
                 ));
             }
         };
@@ -855,7 +870,6 @@ impl Gateway {
                 payment_hash: hash,
                 amount_msat,
                 expiry,
-                target: destination.target,
                 descriptor,
             })
                 .into(),
@@ -865,7 +879,7 @@ impl Gateway {
             "COMMIT {}: locked {amount_msat} msat to payee {} on {} until {expiry}",
             hash.short(),
             authorization.payee,
-            destination.network
+            destination.network()
         );
         Ok(htlc)
     }

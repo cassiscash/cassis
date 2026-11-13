@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::offline::endpoint_public_key;
-use cassis_core::protocol::{InvoiceReceiver, Metadata};
+use cassis_core::protocol::{InvoiceReceiver, InvoiceTarget, Metadata};
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
@@ -65,7 +65,7 @@ impl MockNetwork {
 
     fn lock_id(htlc: &Htlc) -> Result<String, NetworkError> {
         match &htlc.descriptor {
-            HtlcDescriptor::Cashu { proofs_b64 } if proofs_b64.len() == 1 => {
+            HtlcDescriptor::Cashu { proofs_b64, .. } if proofs_b64.len() == 1 => {
                 Ok(proofs_b64[0].clone())
             }
             _ => Err(NetworkError::invalid("not a mock HTLC")),
@@ -96,8 +96,8 @@ impl Network for MockNetwork {
         let lock = ledger
             .get(&Self::lock_id(htlc)?)
             .ok_or_else(|| NetworkError::invalid("no such lock"))?;
-        let ok = htlc.target == HtlcTarget::XOnlyPubKey(self.key)
-            && lock.target == htlc.target
+        let ok = htlc.descriptor.target() == HtlcTarget::XOnlyPubKey(self.key)
+            && lock.target == htlc.descriptor.target()
             && lock.payment_hash == htlc.payment_hash
             && lock.amount_msat >= htlc.amount_msat
             && lock.expiry >= htlc.expiry
@@ -126,6 +126,11 @@ impl Network for MockNetwork {
         expiry: u64,
         target: &HtlcTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
+        let HtlcTarget::XOnlyPubKey(key) = target else {
+            return Err(NetworkError::invalid(
+                "mock HTLCs are locked to an x-only key",
+            ));
+        };
         let id = Bytes32::random().to_string();
         self.ledger.0.lock().unwrap().insert(
             id.clone(),
@@ -139,6 +144,7 @@ impl Network for MockNetwork {
         );
         Ok(HtlcDescriptor::Cashu {
             proofs_b64: vec![id],
+            target: *key,
         })
     }
 
@@ -351,11 +357,15 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
         .await
         .unwrap();
-    unreachable.body.networks[0].target = HtlcTarget::XOnlyPubKey(
-        ritualistic::SecretKey::from_bytes([9; 32])
-            .unwrap()
-            .pubkey(),
-    );
+    unreachable.body.networks[0].target = InvoiceTarget::new(
+        NetworkId(b.into()),
+        HtlcTarget::XOnlyPubKey(
+            ritualistic::SecretKey::from_bytes([9; 32])
+                .unwrap()
+                .pubkey(),
+        ),
+    )
+    .unwrap();
     unreachable.sign_as_payee(&payee_keys.iroh).unwrap();
     let error = payer
         .pay(&unreachable, &NetworkId(a.into()), &[RELAY.into()])

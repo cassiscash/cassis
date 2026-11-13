@@ -186,10 +186,10 @@ impl HtlcSpec {
             .ok_or_else(|| NetworkError::Invalid("cannot derive lockup address".into()))
     }
 
-    /// Build the wire descriptor: the pinned lockup outpoint plus the
-    /// refund parameters the receiver cannot derive itself (the claim
-    /// side it rebuilds from its own claim key and the payment hash).
-    fn to_descriptor(&self, lockup: OutPoint) -> HtlcDescriptor {
+    /// Build the wire descriptor: the pinned lockup outpoint, the
+    /// refund parameters and the `target` claim key the spec was built
+    /// with.
+    fn to_descriptor(&self, lockup: OutPoint, target: PubKey) -> HtlcDescriptor {
         HtlcDescriptor::Liquid {
             lockup_txid: lockup.txid.to_string(),
             lockup_vout: lockup.vout,
@@ -201,6 +201,7 @@ impl HtlcSpec {
             )
             .expect("wallet refund key is valid"),
             refund_locktime: self.refund_locktime,
+            target,
         }
     }
 }
@@ -343,21 +344,17 @@ impl LiquidAdapter {
     }
 
     /// Lockup outpoint and the HTLC script of `htlc`, whose claim key
-    /// is the target's and whose refund terms are the descriptor's.
+    /// and refund terms are the descriptor's.
     fn htlc_spec(htlc: &Htlc) -> Result<(HtlcSpec, OutPoint), NetworkError> {
         let HtlcDescriptor::Liquid {
             lockup_txid,
             lockup_vout,
             refund_pubkey,
             refund_locktime,
+            target: claim,
         } = &htlc.descriptor
         else {
             return Err(NetworkError::invalid("not a liquid HTLC"));
-        };
-        let HtlcTarget::PubKey(claim) = &htlc.target else {
-            return Err(NetworkError::invalid(
-                "liquid HTLCs are locked to a full key",
-            ));
         };
         let txid = Txid::from_str(lockup_txid).map_err(NetworkError::invalid)?;
         let spec = HtlcSpec::build(
@@ -875,7 +872,7 @@ impl Network for LiquidAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.target != self.claim_target() {
+        if htlc.descriptor.target() != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -994,7 +991,7 @@ impl Network for LiquidAdapter {
             payment_hash.short()
         );
         self.wait_lockup_propagation(txid).await;
-        Ok(spec.to_descriptor(OutPoint::new(txid, vout)))
+        Ok(spec.to_descriptor(OutPoint::new(txid, vout), *claim))
     }
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
@@ -1101,10 +1098,10 @@ mod tests {
             payment_hash,
             amount_msat: 1_000_000,
             expiry: 0,
-            target: HtlcTarget::PubKey(
+            descriptor: spec.to_descriptor(
+                OutPoint::new(txid, 3),
                 PubKey::from_bytes(claim.to_bytes().try_into().unwrap()).unwrap(),
             ),
-            descriptor: spec.to_descriptor(OutPoint::new(txid, 3)),
         };
         let (rebuilt, outpoint) = LiquidAdapter::htlc_spec(&htlc).unwrap();
         assert_eq!(rebuilt.lockup_script_pubkey, spec.lockup_script_pubkey);

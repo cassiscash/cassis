@@ -377,8 +377,8 @@ impl ArkadeAdapter {
         HtlcTarget::XOnlyPubKey(XOnlyPubKey::from_bytes(self.xonly.serialize()).expect("valid key"))
     }
 
-    /// VHTLC options of `htlc`: receiver from the target, sender and
-    /// timelocks from the descriptor, server is our operator.
+    /// VHTLC options of `htlc`: receiver, sender and timelocks from the
+    /// descriptor, server is our operator.
     fn vhtlc_options(&self, htlc: &Htlc) -> Result<VhtlcOptions, NetworkError> {
         let HtlcDescriptor::Arkade {
             sender,
@@ -386,14 +386,10 @@ impl ArkadeAdapter {
             unilateral_claim_delay,
             unilateral_refund_delay,
             unilateral_refund_without_receiver_delay,
+            target: receiver,
         } = &htlc.descriptor
         else {
             return Err(NetworkError::invalid("not an arkade HTLC"));
-        };
-        let HtlcTarget::XOnlyPubKey(receiver) = &htlc.target else {
-            return Err(NetworkError::invalid(
-                "arkade HTLCs are locked to an x-only key",
-            ));
         };
         let xonly = |key: &XOnlyPubKey| {
             XOnlyPublicKey::from_slice(key.as_bytes()).map_err(NetworkError::invalid)
@@ -433,6 +429,7 @@ impl ArkadeAdapter {
             unilateral_refund_without_receiver_delay: options
                 .unilateral_refund_without_receiver_delay
                 .to_consensus_u32(),
+            target: XOnlyPubKey::from_bytes(options.receiver.serialize()).expect("valid key"),
         }
     }
 
@@ -1019,7 +1016,7 @@ impl Network for ArkadeAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.target != self.claim_target() {
+        if htlc.descriptor.target() != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await

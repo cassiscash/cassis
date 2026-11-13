@@ -91,7 +91,7 @@ impl MockNetwork {
 
     fn lock_id(htlc: &Htlc) -> Result<String, NetworkError> {
         match &htlc.descriptor {
-            HtlcDescriptor::Cashu { proofs_b64 } if proofs_b64.len() == 1 => {
+            HtlcDescriptor::Cashu { proofs_b64, .. } if proofs_b64.len() == 1 => {
                 Ok(proofs_b64[0].clone())
             }
             _ => Err(NetworkError::invalid("not a mock HTLC")),
@@ -118,7 +118,7 @@ impl Network for MockNetwork {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.target != HtlcTarget::XOnlyPubKey(self.key) {
+        if htlc.descriptor.target() != HtlcTarget::XOnlyPubKey(self.key) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -129,7 +129,7 @@ impl Network for MockNetwork {
         let lock = ledger
             .get(&Self::lock_id(htlc)?)
             .ok_or_else(|| NetworkError::invalid("no such lock"))?;
-        let ok = lock.target == htlc.target
+        let ok = lock.target == htlc.descriptor.target()
             && lock.payment_hash == htlc.payment_hash
             && lock.amount_msat >= htlc.amount_msat
             && lock.expiry >= htlc.expiry
@@ -158,6 +158,11 @@ impl Network for MockNetwork {
         expiry: u64,
         target: &HtlcTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
+        let HtlcTarget::XOnlyPubKey(key) = target else {
+            return Err(NetworkError::invalid(
+                "mock HTLCs are locked to an x-only key",
+            ));
+        };
         let id = Bytes32::random().to_string();
         self.ledger.0.lock().unwrap().insert(
             id.clone(),
@@ -171,6 +176,7 @@ impl Network for MockNetwork {
         );
         Ok(HtlcDescriptor::Cashu {
             proofs_b64: vec![id],
+            target: *key,
         })
     }
 
@@ -527,9 +533,12 @@ async fn payee_offline_behind_a_gateway() {
             payment_hash: invoice.body.payment_hash,
             amount_msat: to_payee.amount_msat,
             expiry: to_payee.expiry,
-            target: to_payee.target.clone(),
             descriptor: HtlcDescriptor::Cashu {
                 proofs_b64: vec!["none".into()],
+                target: match &to_payee.target {
+                    HtlcTarget::XOnlyPubKey(key) => *key,
+                    other => panic!("mock target {other:?}"),
+                },
             },
         },
     });
@@ -584,6 +593,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
         1_000,
         100_000,
         DEFAULT_MIN_FINAL_TIMEOUT_SECS,
+        Some("tip".into()),
     )
     .await
     .unwrap();
@@ -607,6 +617,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     invoice.verify().unwrap();
     assert!(matches!(invoice.receiver, InvoiceReceiver::Delegated(_)));
     assert_eq!(*invoice.payee(), payee.key());
+    assert_eq!(invoice.body.description.as_deref(), Some("tip"));
 
     // Outside the authorized amounts, or for a payee that authorized
     // nothing, there is none.
@@ -620,6 +631,16 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     }
     assert!(matches!(
         request(&asker, &setup.endpoints.gateway, stranger).await,
+        Response::GatewayInvoice(Err(_))
+    ));
+    // The payee pinned what its invoices say: another description is
+    // refused.
+    let mut misdescribed = ask(20_000);
+    if let Request::GatewayInvoiceFor(ref mut ask) = misdescribed {
+        ask.description = Some("tea".into());
+    }
+    assert!(matches!(
+        request(&asker, &setup.endpoints.gateway, misdescribed).await,
         Response::GatewayInvoice(Err(_))
     ));
 

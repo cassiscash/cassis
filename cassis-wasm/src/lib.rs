@@ -55,6 +55,7 @@ export type HtlcDescriptor =
         unilateral_claim_delay: number;
         unilateral_refund_delay: number;
         unilateral_refund_without_receiver_delay: number;
+        target: string;
       };
     }
   | { [kind: string]: unknown };
@@ -143,7 +144,7 @@ pub fn parse_invoice(json: &str) -> Result<String, JsValue> {
         serde_json::from_str(json).map_err(|e| js_error(format!("invalid invoice: {e}")))?;
     invoice.verify().map_err(js_error)?;
     for entry in &invoice.body.networks {
-        NetworkId::parse(&entry.network.0).map_err(js_error)?;
+        NetworkId::parse(&entry.target.network().0).map_err(js_error)?;
     }
     if invoice.body.amount_msat == 0 {
         return Err(js_error("invoice amount is zero"));

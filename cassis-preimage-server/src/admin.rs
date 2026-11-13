@@ -6,7 +6,7 @@
 //! has: `network.*`, see [`cassis_admin::networks`].
 
 use crate::config::Config;
-use crate::db::{Payee, Payment};
+use crate::db::Payment;
 use crate::PreimageServer;
 use cassis_admin::networks::{
     config_cards, config_drafts, new_network, new_network_draft, Daemon, NetworkConfig, Networks,
@@ -15,7 +15,8 @@ use cassis_admin::networks::{
 use cassis_admin::view::{ago, fact, sat, stat, until};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity, Refresh};
 use cassis_core::routing::{autohue, autoname};
-use cassis_core::{unix_now, Network, NetworkId, XOnlyPubKey};
+use cassis_core::{unix_now, Bytes32, Network, NetworkId, XOnlyPubKey};
+use cassis_wallet::stored;
 use futures::future::BoxFuture;
 use hypereffect::vtree::{badge, card, column, list, notice, row, tab, text, Node};
 use hypereffect::{Map, Value};
@@ -105,7 +106,7 @@ impl PreimageAdmin {
         XOnlyPubKey(*self.server.key().as_bytes())
     }
 
-    fn overview(&self, payments: &[Payment], payees: &[Payee], now: u64) -> Node {
+    fn overview(&self, payments: &[Payment], payees: usize, now: u64) -> Node {
         let identity = card("identity").title("Identity").children([
             fact(
                 "identity/key",
@@ -126,7 +127,7 @@ impl PreimageAdmin {
                     sat(payments.iter().map(|payment| payment.amount_msat).sum()),
                 ),
                 stat("released/payments", "Payments", payments.len().to_string()),
-                stat("released/payees", "Payees", payees.len().to_string()),
+                stat("released/payees", "Payees", payees.to_string()),
             ]),
             text("released/open").variant("caption").text(format!(
                 "{} of their HTLCs have not reached their expiry yet.",
@@ -220,14 +221,9 @@ impl App for PreimageAdmin {
             .inspect_err(|error| listed("payments", error.clone()))
             .unwrap_or_default();
         payments.sort_by_key(|payment| std::cmp::Reverse(payment.released_at));
-        let mut payees = self
-            .server
-            .all_payees()
-            .inspect_err(|error| listed("payees", error.clone()))
-            .unwrap_or_default();
-        payees.sort_by_key(|payee| std::cmp::Reverse(payee.first_paid_at));
+        let payees = payees(&payments);
         vec![
-            self.overview(&payments, &payees, now),
+            self.overview(&payments, payees.len(), now),
             payments_tab(&payments, now),
             payees_tab(&payees, &payments, now),
             self.networks(now),
@@ -259,7 +255,8 @@ fn payments_tab(payments: &[Payment], now: u64) -> Node {
         .visible(payments.len() > LISTED)
         .text(format!("The latest {LISTED} of {}.", payments.len()));
     let rows = payments.iter().take(LISTED).map(|payment| {
-        let hash = &payment.payment_hash.0;
+        let hash = Bytes32(payment.payment_hash.0);
+        let hash = &hash;
         let el = |part: &str| format!("payment/{hash}/{part}");
         let expiry = if payment.expiry > now {
             badge(el("expiry"))
@@ -280,10 +277,10 @@ fn payments_tab(payments: &[Payment], now: u64) -> Node {
             ]))
             .child(text(el("payee")).variant("caption").text(format!(
                 "payee {} · released {}",
-                payment.payee.0,
+                payee_key(&payment.payee),
                 ago(now, payment.released_at)
             )))
-            .child(text(el("hash")).variant("caption").text(hash.as_str()))
+            .child(text(el("hash")).variant("caption").text(hash.to_string()))
     });
     tab("tab/payments")
         .label("Payments")
@@ -299,23 +296,45 @@ fn payments_tab(payments: &[Payment], now: u64) -> Node {
         )
 }
 
-fn payees_tab(payees: &[Payee], payments: &[Payment], now: u64) -> Node {
-    let mut totals: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+/// The iroh key of `payee`, as it prints.
+fn payee_key(payee: &[u8; 32]) -> String {
+    stored::endpoint_key(payee)
+        .map(|key| key.to_string())
+        .unwrap_or_else(|_| Bytes32(*payee).to_string())
+}
+
+/// The payees payments were released to, and when each was first paid:
+/// what the payments say, newest first.
+fn payees(payments: &[Payment]) -> Vec<([u8; 32], u64)> {
+    let mut first: BTreeMap<[u8; 32], u64> = BTreeMap::new();
     for payment in payments {
-        let total = totals.entry(payment.payee.0.as_str()).or_default();
+        first
+            .entry(payment.payee)
+            .and_modify(|at| *at = (*at).min(payment.released_at))
+            .or_insert(payment.released_at);
+    }
+    let mut payees: Vec<_> = first.into_iter().collect();
+    payees.sort_by_key(|(_, first_paid_at)| std::cmp::Reverse(*first_paid_at));
+    payees
+}
+
+fn payees_tab(payees: &[([u8; 32], u64)], payments: &[Payment], now: u64) -> Node {
+    let mut totals: BTreeMap<[u8; 32], (u64, usize)> = BTreeMap::new();
+    for payment in payments {
+        let total = totals.entry(payment.payee).or_default();
         total.0 += payment.amount_msat;
         total.1 += 1;
     }
-    let rows = payees.iter().map(|payee| {
-        let key = &payee.key.0;
+    let rows = payees.iter().map(|(payee, first_paid_at)| {
+        let key = payee_key(payee);
         let el = |part: &str| format!("payee/{key}/{part}");
-        let (amount, count) = totals.get(key.as_str()).copied().unwrap_or_default();
+        let (amount, count) = totals.get(payee).copied().unwrap_or_default();
         column(format!("payee/{key}")).gap("small").children([
             text(el("key")).variant("code").text(key.as_str()),
             text(el("totals")).variant("caption").text(format!(
                 "{} over {count} payment(s) · first paid {}",
                 sat(amount),
-                ago(now, payee.first_paid_at)
+                ago(now, *first_paid_at)
             )),
         ])
     });

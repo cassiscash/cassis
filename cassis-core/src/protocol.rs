@@ -25,16 +25,18 @@
 
 use crate::network::{Htlc, HtlcDescriptor, HtlcTarget, NetworkId};
 use crate::offline::{
-    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
+    endpoint_public_key, AuthorizationKind, GatewayDestination, PreimageIssuance,
+    ReceiveAuthorization, Signature,
 };
 use crate::primitives::{Bytes32, OperationId};
+use crate::signing::SigningMessage;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// Protocol identifier negotiated on every connection.
-pub const ALPN: &[u8] = b"cassis-hop/7";
+pub const ALPN: &[u8] = b"cassis-hop/8";
 
 /// Most bytes [`Metadata`] may hold.
 pub const MAX_METADATA_BYTES: usize = 128 * 1024;
@@ -89,12 +91,12 @@ impl<'de> Deserialize<'de> for Metadata {
     }
 }
 
-/// Prefix of the message a payee signs an invoice with (see
+/// Domain of the message a payee signs an invoice with (see
 /// [`Invoice::sign_as_payee`]), so it cannot be mistaken for a
 /// signature over anything else.
-const PAYEE_SIGNATURE_DOMAIN: &[u8] = b"cassis-invoice/v2/payee\0";
+const PAYEE_SIGNATURE_DOMAIN: &str = "cassis/invoice/payee/v3";
 /// Same for a gateway (see [`Invoice::sign_as_gateway`]).
-const GATEWAY_SIGNATURE_DOMAIN: &[u8] = b"cassis-invoice/v2/gateway\0";
+const GATEWAY_SIGNATURE_DOMAIN: &str = "cassis/invoice/gateway/v3";
 
 /// A payment request: the payment terms every invoice carries, plus the
 /// [`InvoiceReceiver`] that issued it and carries its signatures.
@@ -215,15 +217,85 @@ impl InvoiceReceiver {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One network an invoice can be paid on.
+///
+/// Crosses the wire as `{network, target, incoming_delta_secs?}`, read
+/// through [`InvoiceTarget::new`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "WireInvoiceNetwork", into = "WireInvoiceNetwork")]
 pub struct InvoiceNetwork {
-    pub network: NetworkId,
-    pub target: HtlcTarget,
+    pub target: InvoiceTarget,
     /// The receiver's safety margin on this network (see
     /// [`crate::Network::incoming_delta_secs`]): its HTLC must expire at
     /// least this long after COMMIT. The network's default when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_delta_secs: Option<u64>,
+}
+
+/// What a payer locks to on one network of an invoice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvoiceTarget {
+    /// A claim key on a network that locks HTLCs to keys.
+    Key(GatewayDestination),
+    /// A BOLT11 hold invoice on `network`.
+    Lightning { network: NetworkId, invoice: String },
+}
+
+impl InvoiceTarget {
+    /// The target paying `target` on `network`, if `target` is what
+    /// `network` locks HTLCs to.
+    pub fn new(network: NetworkId, target: HtlcTarget) -> Result<Self, String> {
+        match (network.kind(), target) {
+            ("lightning", HtlcTarget::LightningInvoice(invoice)) => {
+                Ok(Self::Lightning { network, invoice })
+            }
+            ("lightning", _) => Err(format!("{network} pays to a BOLT11 invoice")),
+            (_, target) => GatewayDestination::new(network, target).map(Self::Key),
+        }
+    }
+
+    pub fn network(&self) -> &NetworkId {
+        match self {
+            Self::Key(destination) => destination.network(),
+            Self::Lightning { network, .. } => network,
+        }
+    }
+
+    pub fn target(&self) -> HtlcTarget {
+        match self {
+            Self::Key(destination) => destination.target(),
+            Self::Lightning { invoice, .. } => HtlcTarget::LightningInvoice(invoice.clone()),
+        }
+    }
+}
+
+/// An [`InvoiceNetwork`] on the wire.
+#[derive(Serialize, Deserialize)]
+struct WireInvoiceNetwork {
+    network: NetworkId,
+    target: HtlcTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incoming_delta_secs: Option<u64>,
+}
+
+impl TryFrom<WireInvoiceNetwork> for InvoiceNetwork {
+    type Error = String;
+
+    fn try_from(entry: WireInvoiceNetwork) -> Result<Self, String> {
+        Ok(Self {
+            target: InvoiceTarget::new(entry.network, entry.target)?,
+            incoming_delta_secs: entry.incoming_delta_secs,
+        })
+    }
+}
+
+impl From<InvoiceNetwork> for WireInvoiceNetwork {
+    fn from(entry: InvoiceNetwork) -> Self {
+        Self {
+            network: entry.target.network().clone(),
+            target: entry.target.target(),
+            incoming_delta_secs: entry.incoming_delta_secs,
+        }
+    }
 }
 
 impl Invoice {
@@ -371,8 +443,9 @@ impl Invoice {
     ///   meets, and the preimage server vouches for its hash, amount
     ///   and metadata.
     ///
-    /// Decoding drops unknown fields, so an invoice carrying fields this
-    /// version does not know fails to verify.
+    /// Decoding drops unknown fields, and the signatures cover every
+    /// field of a version that knew them, so an invoice carrying fields
+    /// this version does not know fails to verify.
     pub fn verify(&self) -> Result<(), String> {
         match &self.receiver {
             InvoiceReceiver::Direct(receiver) => {
@@ -429,6 +502,11 @@ impl Invoice {
                 if !authorization.allows_amount(self.body.amount_msat) {
                     return Err("the payee did not authorize this amount".into());
                 }
+                if !authorization.allows_description(self.body.description.as_deref()) {
+                    return Err(
+                        "the invoice does not carry the description the payee authorized".into(),
+                    );
+                }
                 if self.body.expires_at > authorization.valid_until
                     || self.body.expires_at <= authorization.valid_from
                 {
@@ -448,28 +526,104 @@ impl Invoice {
         }
     }
 
-    /// What the payee signs: the invoice without its payee signature, as
-    /// JSON.
+    /// What the payee signs: the invoice's terms and, on a gateway
+    /// invoice, the gateway's signature (as an option: the payee signs
+    /// after the gateway). See [`Invoice::write_terms`].
     fn payee_message(&self) -> Vec<u8> {
-        let mut wire = self.to_wire();
-        wire.payee_signature = None;
-        let mut message = PAYEE_SIGNATURE_DOMAIN.to_vec();
-        message.extend(serde_json::to_vec(&wire).expect("invoices serialize"));
-        message
+        let mut message = SigningMessage::new(PAYEE_SIGNATURE_DOMAIN);
+        self.write_terms(&mut message);
+        if let InvoiceReceiver::Gateway(receiver) = &self.receiver {
+            message.option(receiver.gateway_signature.as_ref(), |message, signature| {
+                message.raw(&signature.0)
+            });
+        }
+        message.into_bytes()
     }
 
-    /// What the gateway signs: the invoice without the signatures, as
-    /// JSON. The payee signs after the gateway, if at all.
+    /// What the gateway signs: the invoice's terms. See
+    /// [`Invoice::write_terms`].
     fn gateway_message(&self) -> Vec<u8> {
-        let mut wire = self.to_wire();
-        wire.payee_signature = None;
-        wire.gateway_signature = None;
-        let mut message = GATEWAY_SIGNATURE_DOMAIN.to_vec();
-        message.extend(serde_json::to_vec(&wire).expect("invoices serialize"));
-        message
+        let mut message = SigningMessage::new(GATEWAY_SIGNATURE_DOMAIN);
+        self.write_terms(&mut message);
+        message.into_bytes()
     }
 
-    /// The flat wire form: what is serialized and signed.
+    /// Every field but the signatures, in [`crate::signing`]'s encoding:
+    ///
+    /// ```text
+    /// bytes32 payment hash
+    /// u64     amount msat
+    /// u64     expires at (unix seconds)
+    /// count   networks, each:
+    ///   str     network id
+    ///   target  what the payer locks to there
+    ///   option  u64  incoming delta secs
+    /// option  str    description
+    /// option  bytes  metadata
+    /// option  str    iroh relay
+    /// u8      receiver: 0 direct, 1 gateway, 2 delegated
+    /// key     payee
+    /// -- gateway and delegated:
+    /// key     gateway
+    /// -- delegated:
+    /// key     preimage server
+    /// bytes32 payee authorization id
+    /// sig     payee authorization signature
+    /// bytes32 issuance payment hash
+    /// u64     issuance amount msat
+    /// option  bytes32  issuance metadata hash
+    /// bytes32 issuance authorization id
+    /// bytes32 issuance nonce
+    /// sig     issuance signature
+    /// ```
+    fn write_terms(&self, message: &mut SigningMessage) {
+        let body = &self.body;
+        message
+            .bytes32(&body.payment_hash)
+            .u64(body.amount_msat)
+            .u64(body.expires_at)
+            .count(body.networks.len());
+        for entry in &body.networks {
+            message
+                .str(&entry.target.network().0)
+                .htlc_target(&entry.target.target())
+                .option(entry.incoming_delta_secs, SigningMessage::u64);
+        }
+        message
+            .option(body.description.as_deref(), SigningMessage::str)
+            .option(
+                body.metadata.as_ref().map(Metadata::as_bytes),
+                SigningMessage::bytes,
+            )
+            .option(body.iroh_relay.as_deref(), SigningMessage::str);
+        match &self.receiver {
+            InvoiceReceiver::Direct(receiver) => {
+                message.u8(0).key(&receiver.payee);
+            }
+            InvoiceReceiver::Gateway(receiver) => {
+                message.u8(1).key(&receiver.payee).key(&receiver.gateway);
+            }
+            InvoiceReceiver::Delegated(receiver) => {
+                let authorization = &receiver.payee_authorization;
+                let issuance = &receiver.preimage_server_issuance;
+                message
+                    .u8(2)
+                    .key(&receiver.payee)
+                    .key(&receiver.gateway)
+                    .key(&receiver.preimage_server)
+                    .bytes32(&authorization.digest())
+                    .raw(&authorization.signature.0)
+                    .bytes32(&issuance.payment_hash)
+                    .u64(issuance.amount_msat)
+                    .option(issuance.metadata_hash.as_ref(), SigningMessage::bytes32)
+                    .bytes32(&issuance.authorization)
+                    .bytes32(&issuance.nonce)
+                    .raw(&issuance.signature.0);
+            }
+        }
+    }
+
+    /// The flat wire form: what is serialized.
     fn to_wire(&self) -> InvoiceWire {
         let (
             payee,
@@ -609,12 +763,12 @@ impl Invoice {
     }
 
     /// Target the payer must lock to when paying on `network`.
-    pub fn target_for(&self, network: &NetworkId) -> Option<&HtlcTarget> {
+    pub fn target_for(&self, network: &NetworkId) -> Option<HtlcTarget> {
         self.body
             .networks
             .iter()
-            .find(|entry| entry.network == *network)
-            .map(|entry| &entry.target)
+            .find(|entry| entry.target.network() == network)
+            .map(|entry| entry.target.target())
     }
 
     /// The receiver's safety margin when paid on `network`.
@@ -622,14 +776,14 @@ impl Invoice {
         self.body
             .networks
             .iter()
-            .find(|entry| entry.network == *network)
+            .find(|entry| entry.target.network() == network)
             .and_then(|entry| entry.incoming_delta_secs)
             .unwrap_or_else(|| network.default_incoming_delta())
     }
 }
 
-/// The flat JSON form of an [`Invoice`], kept so its bytes (and so its
-/// signatures) do not depend on how the Rust model is nested.
+/// The flat JSON form of an [`Invoice`], kept so its bytes do not
+/// depend on how the Rust model is nested.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct InvoiceWire {
     payment_hash: Bytes32,
@@ -781,6 +935,8 @@ pub struct GatewayInvoiceFor {
     /// The gateway's default, capped by the authorization, when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// Unless the payee's authorization pins a description: then the
+    /// invoice says that, and this asks for it or names none.
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
@@ -792,13 +948,12 @@ pub enum ReceivedPayment {
     /// An HTLC a gateway funded to the payee and the server verified
     /// before releasing its preimage: still to be claimed by the payee
     /// with `preimage`. `descriptor` is the network-specific part
-    /// (cashu proofs, a lockup output, ...).
+    /// (its target, cashu proofs, a lockup output, ...).
     Received {
         payment_hash: Bytes32,
         network: NetworkId,
         amount_msat: u64,
         expiry: u64,
-        target: HtlcTarget,
         descriptor: HtlcDescriptor,
         preimage: Bytes32,
         /// The paid invoice's metadata.
@@ -885,6 +1040,9 @@ mod tests {
             operation_id: OperationId::random(),
             incoming_descriptor: HtlcDescriptor::Cashu {
                 proofs_b64: vec!["eyJhbW91bnQiOjF9".into()],
+                target: ritualistic::SecretKey::from_bytes([3; 32])
+                    .unwrap()
+                    .pubkey(),
             },
             outgoing_target: HtlcTarget::LightningInvoice("lnbc...".into()),
         });
@@ -902,6 +1060,46 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap(),
             Response::Prepared(Err(reason)) if reason == "no liquidity"
         ));
+    }
+
+    #[test]
+    fn invoice_networks_keep_their_wire_bytes() {
+        let mut entry = body().networks.remove(0);
+        let key = ritualistic::SecretKey::from_bytes([3; 32])
+            .unwrap()
+            .pubkey();
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            format!(
+                r#"{{"network":"cashu::localhost","target":{{"XOnlyPubKey":"{}"}}}}"#,
+                key.to_hex()
+            )
+        );
+        entry.incoming_delta_secs = Some(60);
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            format!(
+                r#"{{"network":"cashu::localhost","target":{{"XOnlyPubKey":"{}"}},"incoming_delta_secs":60}}"#,
+                key.to_hex()
+            )
+        );
+        let lightning = r#"{"network":"lightning","target":{"LightningInvoice":"lnbc1"}}"#;
+        let decoded: InvoiceNetwork = serde_json::from_str(lightning).unwrap();
+        assert_eq!(
+            decoded.target,
+            InvoiceTarget::Lightning {
+                network: NetworkId("lightning".into()),
+                invoice: "lnbc1".into(),
+            }
+        );
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), lightning);
+        let mismatched = r#"{"network":"cashu::localhost","target":{"LightningInvoice":"lnbc1"}}"#;
+        assert!(serde_json::from_str::<InvoiceNetwork>(mismatched).is_err());
+        let mismatched = format!(
+            r#"{{"network":"lightning","target":{{"XOnlyPubKey":"{}"}}}}"#,
+            key.to_hex()
+        );
+        assert!(serde_json::from_str::<InvoiceNetwork>(&mismatched).is_err());
     }
 
     #[test]
@@ -935,12 +1133,12 @@ mod tests {
             amount_msat: 1000,
             expires_at: 3000,
             networks: vec![InvoiceNetwork {
-                network: NetworkId("cashu::localhost".into()),
-                target: HtlcTarget::XOnlyPubKey(
-                    ritualistic::SecretKey::from_bytes([3; 32])
+                target: InvoiceTarget::Key(GatewayDestination::Cashu {
+                    network: NetworkId("cashu::localhost".into()),
+                    target: ritualistic::SecretKey::from_bytes([3; 32])
                         .unwrap()
                         .pubkey(),
-                ),
+                }),
                 incoming_delta_secs: None,
             }],
             description: Some("coffee".into()),
@@ -964,18 +1162,17 @@ mod tests {
             endpoint_public_key(&GATEWAY),
             endpoint_public_key(&PREIMAGE_SERVER),
             None,
+            None,
             1000,
             5000,
             1000,
             1000,
             crate::offline::DEFAULT_MIN_FINAL_TIMEOUT_SECS,
-            vec![crate::offline::Destination {
+            vec![crate::offline::GatewayDestination::Cashu {
                 network: NetworkId("cashu::localhost".into()),
-                target: HtlcTarget::XOnlyPubKey(
-                    ritualistic::SecretKey::from_bytes([4; 32])
-                        .unwrap()
-                        .pubkey(),
-                ),
+                target: ritualistic::SecretKey::from_bytes([4; 32])
+                    .unwrap()
+                    .pubkey(),
             }],
         )
         .unwrap()
@@ -1004,7 +1201,20 @@ mod tests {
 
     /// Issued by the gateway alone.
     fn delegated_invoice() -> Invoice {
-        let authorization = authorization(AuthorizationKind::Standing);
+        delegated_with(authorization(AuthorizationKind::Standing))
+    }
+
+    /// A standing authorization the payee pinned a description on,
+    /// signed again over the changed terms.
+    fn described_authorization(description: &str) -> ReceiveAuthorization {
+        let mut authorization = authorization(AuthorizationKind::Standing);
+        authorization.description = Some(description.into());
+        let message = authorization.message().unwrap();
+        authorization.signature = Signature::sign(&PAYEE, &message);
+        authorization
+    }
+
+    fn delegated_with(authorization: ReceiveAuthorization) -> Invoice {
         let mut body = body();
         let preimage_issuance = issuance(&authorization);
         let carried = GatewayMetadata::sign(
@@ -1139,6 +1349,12 @@ mod tests {
         later.body.expires_at = 6000;
         later.sign_as_gateway(&GATEWAY).unwrap();
         assert!(later.verify().unwrap_err().contains("outside"));
+        // A description the payee pinned, which the invoice must say.
+        delegated_with(described_authorization("coffee"))
+            .verify()
+            .unwrap();
+        let misdescribed = delegated_with(described_authorization("tea"));
+        assert!(misdescribed.verify().unwrap_err().contains("description"));
         // Another payee's name.
         let mut renamed = invoice.clone();
         if let InvoiceReceiver::Delegated(receiver) = &mut renamed.receiver {

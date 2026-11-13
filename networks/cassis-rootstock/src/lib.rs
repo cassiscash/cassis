@@ -142,14 +142,10 @@ impl Swap {
             amount_wei,
             refund_address,
             timelock,
+            target: claim,
         } = &htlc.descriptor
         else {
             return Err(NetworkError::invalid("not a rootstock HTLC"));
-        };
-        let HtlcTarget::PubKey(claim) = &htlc.target else {
-            return Err(NetworkError::invalid(
-                "rootstock HTLCs are locked to a full key",
-            ));
         };
         Ok(Self {
             amount_wei: U256::from(*amount_wei),
@@ -159,11 +155,14 @@ impl Swap {
         })
     }
 
-    fn descriptor(&self) -> Result<HtlcDescriptor, NetworkError> {
+    /// The descriptor of this swap, claimable by `target` (whose EVM
+    /// address is the swap's claim address).
+    fn descriptor(&self, target: PubKey) -> Result<HtlcDescriptor, NetworkError> {
         Ok(HtlcDescriptor::Rootstock {
             amount_wei: self.amount_wei.try_into().map_err(NetworkError::invalid)?,
             refund_address: format!("{:#x}", self.refund_address),
             timelock: self.timelock,
+            target,
         })
     }
 }
@@ -403,7 +402,7 @@ impl Network for RootstockAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.target != self.claim_target() {
+        if htlc.descriptor.target() != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -472,7 +471,7 @@ impl Network for RootstockAdapter {
             refund_address: self.address,
             timelock: self.block_number().await? + blocks,
         };
-        let descriptor = swap.descriptor()?;
+        let descriptor = swap.descriptor(*claim)?;
         let request = TransactionRequest::default()
             .value(swap.amount_wei)
             .gas_price(self.gas_price().await?)

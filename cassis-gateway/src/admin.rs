@@ -523,7 +523,7 @@ fn authorization_row(record: &HandledDelegation, now: u64) -> Option<Node> {
     let destinations = authorization
         .destinations
         .iter()
-        .map(|destination| destination.network.to_string())
+        .map(|destination| destination.network().to_string())
         .collect::<Vec<_>>()
         .join(", ");
     Some(
@@ -556,6 +556,11 @@ fn authorization_row(record: &HandledDelegation, now: u64) -> Option<Node> {
                 span(authorization.min_final_timeout_secs),
                 ago(now, record.registered_at)
             )))
+            .children(authorization.description.as_ref().map(|description| {
+                text(el("description"))
+                    .variant("caption")
+                    .text(format!("invoices must say {description:?}"))
+            }))
             .child(
                 act(
                     el("forget"),

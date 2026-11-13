@@ -491,6 +491,9 @@ impl Router {
         if prepare.outgoing_expiry <= unix_now() {
             return Err("outgoing expiry passed before EXECUTE".into());
         }
+        if execute.incoming_descriptor.target() != reservation.target {
+            return Err("the incoming HTLC does not pay the PREPARE answer".into());
+        }
         let incoming = Incoming {
             operation_id: HopId(execute.operation_id.as_str().to_string()),
             owner: peer,
@@ -500,7 +503,6 @@ impl Router {
                 payment_hash: prepare.payment_hash,
                 amount_msat: prepare.amount_msat,
                 expiry: prepare.incoming_expiry,
-                target: reservation.target,
                 descriptor: execute.incoming_descriptor,
             })
                 .into(),
@@ -591,7 +593,6 @@ impl Router {
                     payment_hash: htlc.payment_hash,
                     amount_msat: hop.outgoing_amount_msat,
                     expiry: hop.outgoing_expiry,
-                    target,
                     descriptor,
                 };
                 let forwarded = Incoming {

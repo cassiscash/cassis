@@ -4,8 +4,10 @@
 //! wallet, the router and the gateway.
 
 use cassis_core::network::{Htlc, HtlcDescriptor, HtlcTarget};
-use cassis_core::offline::{AuthorizationKind, Destination, ReceiveAuthorization, Signature};
-use cassis_core::protocol::{InvoiceNetwork, Metadata};
+use cassis_core::offline::{
+    AuthorizationKind, GatewayDestination, ReceiveAuthorization, Signature,
+};
+use cassis_core::protocol::{InvoiceNetwork, InvoiceTarget, Metadata};
 use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
 use iroh_base::PublicKey;
 
@@ -55,12 +57,14 @@ pub enum StoredTarget {
 pub enum StoredDescriptor {
     Cashu {
         proofs_b64: Vec<String>,
+        target: [u8; 32],
     },
     Liquid {
         lockup_txid: String,
         lockup_vout: u32,
         refund_pubkey: StoredPubKey,
         refund_locktime: u32,
+        target: StoredPubKey,
     },
     Arkade {
         sender: [u8; 32],
@@ -68,24 +72,30 @@ pub enum StoredDescriptor {
         unilateral_claim_delay: u32,
         unilateral_refund_delay: u32,
         unilateral_refund_without_receiver_delay: u32,
+        target: [u8; 32],
     },
     Bitcoin {
         lockup_txid: String,
         lockup_vout: u32,
         refund_pubkey: [u8; 32],
         refund_locktime: u32,
+        target: [u8; 32],
     },
     Rootstock {
         amount_wei: u128,
         refund_address: String,
         timelock: u64,
+        target: StoredPubKey,
     },
     Fedimint {
         funding_txid: String,
         funding_out_idx: u64,
         contract: String,
+        target: [u8; 32],
     },
-    Lightning,
+    Lightning {
+        target: String,
+    },
 }
 
 /// An [`Htlc`].
@@ -95,7 +105,6 @@ pub struct StoredHtlc {
     pub payment_hash: [u8; 32],
     pub amount_msat: u64,
     pub expiry: u64,
-    pub target: StoredTarget,
     pub descriptor: StoredDescriptor,
 }
 
@@ -103,9 +112,16 @@ pub struct StoredHtlc {
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredInvoiceNetwork {
-    pub network: String,
-    pub target: StoredTarget,
+    pub target: StoredInvoiceTarget,
     pub incoming_delta_secs: Option<u64>,
+}
+
+/// An [`InvoiceTarget`].
+#[orangedb::embed]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredInvoiceTarget {
+    Key(StoredGatewayDestination),
+    Lightning { network: String, invoice: String },
 }
 
 /// An [`AuthorizationKind`].
@@ -116,12 +132,34 @@ pub enum StoredAuthorizationKind {
     Standing,
 }
 
-/// A [`Destination`].
+/// A [`GatewayDestination`].
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredDestination {
-    pub network: String,
-    pub target: StoredTarget,
+pub enum StoredGatewayDestination {
+    Cashu {
+        network: String,
+        target: [u8; 32],
+    },
+    Fedimint {
+        network: String,
+        target: [u8; 32],
+    },
+    Arkade {
+        network: String,
+        target: [u8; 32],
+    },
+    Bitcoin {
+        network: String,
+        target: [u8; 32],
+    },
+    Liquid {
+        network: String,
+        target: StoredPubKey,
+    },
+    Rootstock {
+        network: String,
+        target: StoredPubKey,
+    },
 }
 
 /// A [`ReceiveAuthorization`].
@@ -133,12 +171,13 @@ pub struct StoredAuthorization {
     pub gateway: [u8; 32],
     pub preimage_server: [u8; 32],
     pub preimage_server_relay: Option<String>,
+    pub description: Option<String>,
     pub valid_from: u64,
     pub valid_until: u64,
     pub min_amount_msat: u64,
     pub max_amount_msat: u64,
     pub min_final_timeout_secs: u64,
-    pub destinations: Vec<StoredDestination>,
+    pub destinations: Vec<StoredGatewayDestination>,
     /// 64 bytes.
     pub signature: Vec<u8>,
 }
@@ -178,20 +217,89 @@ impl TryFrom<&StoredTarget> for HtlcTarget {
     }
 }
 
+impl From<&GatewayDestination> for StoredGatewayDestination {
+    fn from(destination: &GatewayDestination) -> Self {
+        match destination.clone() {
+            GatewayDestination::Cashu { network, target } => Self::Cashu {
+                network: network.0,
+                target: target.0,
+            },
+            GatewayDestination::Fedimint { network, target } => Self::Fedimint {
+                network: network.0,
+                target: target.0,
+            },
+            GatewayDestination::Arkade { network, target } => Self::Arkade {
+                network: network.0,
+                target: target.0,
+            },
+            GatewayDestination::Bitcoin { network, target } => Self::Bitcoin {
+                network: network.0,
+                target: target.0,
+            },
+            GatewayDestination::Liquid { network, target } => Self::Liquid {
+                network: network.0,
+                target: (&target).into(),
+            },
+            GatewayDestination::Rootstock { network, target } => Self::Rootstock {
+                network: network.0,
+                target: (&target).into(),
+            },
+        }
+    }
+}
+
+impl TryFrom<&StoredGatewayDestination> for GatewayDestination {
+    type Error = String;
+
+    fn try_from(destination: &StoredGatewayDestination) -> Result<Self, String> {
+        Ok(match destination.clone() {
+            StoredGatewayDestination::Cashu { network, target } => Self::Cashu {
+                network: NetworkId(network),
+                target: x_only(target)?,
+            },
+            StoredGatewayDestination::Fedimint { network, target } => Self::Fedimint {
+                network: NetworkId(network),
+                target: x_only(target)?,
+            },
+            StoredGatewayDestination::Arkade { network, target } => Self::Arkade {
+                network: NetworkId(network),
+                target: x_only(target)?,
+            },
+            StoredGatewayDestination::Bitcoin { network, target } => Self::Bitcoin {
+                network: NetworkId(network),
+                target: x_only(target)?,
+            },
+            StoredGatewayDestination::Liquid { network, target } => Self::Liquid {
+                network: NetworkId(network),
+                target: (&target).try_into()?,
+            },
+            StoredGatewayDestination::Rootstock { network, target } => Self::Rootstock {
+                network: NetworkId(network),
+                target: (&target).try_into()?,
+            },
+        })
+    }
+}
+
 impl From<&HtlcDescriptor> for StoredDescriptor {
     fn from(descriptor: &HtlcDescriptor) -> Self {
         match descriptor.clone() {
-            HtlcDescriptor::Cashu { proofs_b64 } => Self::Cashu { proofs_b64 },
+            HtlcDescriptor::Cashu { proofs_b64, target } => Self::Cashu {
+                proofs_b64,
+                target: target.0,
+            },
             HtlcDescriptor::Liquid {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey,
                 refund_locktime,
+                target,
             } => Self::Liquid {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey: (&refund_pubkey).into(),
                 refund_locktime,
+                target: (&target).into(),
             },
             HtlcDescriptor::Arkade {
                 sender,
@@ -199,43 +307,51 @@ impl From<&HtlcDescriptor> for StoredDescriptor {
                 unilateral_claim_delay,
                 unilateral_refund_delay,
                 unilateral_refund_without_receiver_delay,
+                target,
             } => Self::Arkade {
                 sender: sender.0,
                 refund_locktime,
                 unilateral_claim_delay,
                 unilateral_refund_delay,
                 unilateral_refund_without_receiver_delay,
+                target: target.0,
             },
             HtlcDescriptor::Bitcoin {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey,
                 refund_locktime,
+                target,
             } => Self::Bitcoin {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey: refund_pubkey.0,
                 refund_locktime,
+                target: target.0,
             },
             HtlcDescriptor::Rootstock {
                 amount_wei,
                 refund_address,
                 timelock,
+                target,
             } => Self::Rootstock {
                 amount_wei,
                 refund_address,
                 timelock,
+                target: (&target).into(),
             },
             HtlcDescriptor::Fedimint {
                 funding_txid,
                 funding_out_idx,
                 contract,
+                target,
             } => Self::Fedimint {
                 funding_txid,
                 funding_out_idx,
                 contract,
+                target: target.0,
             },
-            HtlcDescriptor::Lightning => Self::Lightning,
+            HtlcDescriptor::Lightning { target } => Self::Lightning { target },
         }
     }
 }
@@ -245,17 +361,22 @@ impl TryFrom<&StoredDescriptor> for HtlcDescriptor {
 
     fn try_from(descriptor: &StoredDescriptor) -> Result<Self, String> {
         Ok(match descriptor.clone() {
-            StoredDescriptor::Cashu { proofs_b64 } => Self::Cashu { proofs_b64 },
+            StoredDescriptor::Cashu { proofs_b64, target } => Self::Cashu {
+                proofs_b64,
+                target: x_only(target)?,
+            },
             StoredDescriptor::Liquid {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey,
                 refund_locktime,
+                target,
             } => Self::Liquid {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey: (&refund_pubkey).try_into()?,
                 refund_locktime,
+                target: (&target).try_into()?,
             },
             StoredDescriptor::Arkade {
                 sender,
@@ -263,43 +384,51 @@ impl TryFrom<&StoredDescriptor> for HtlcDescriptor {
                 unilateral_claim_delay,
                 unilateral_refund_delay,
                 unilateral_refund_without_receiver_delay,
+                target,
             } => Self::Arkade {
                 sender: x_only(sender)?,
                 refund_locktime,
                 unilateral_claim_delay,
                 unilateral_refund_delay,
                 unilateral_refund_without_receiver_delay,
+                target: x_only(target)?,
             },
             StoredDescriptor::Bitcoin {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey,
                 refund_locktime,
+                target,
             } => Self::Bitcoin {
                 lockup_txid,
                 lockup_vout,
                 refund_pubkey: x_only(refund_pubkey)?,
                 refund_locktime,
+                target: x_only(target)?,
             },
             StoredDescriptor::Rootstock {
                 amount_wei,
                 refund_address,
                 timelock,
+                target,
             } => Self::Rootstock {
                 amount_wei,
                 refund_address,
                 timelock,
+                target: (&target).try_into()?,
             },
             StoredDescriptor::Fedimint {
                 funding_txid,
                 funding_out_idx,
                 contract,
+                target,
             } => Self::Fedimint {
                 funding_txid,
                 funding_out_idx,
                 contract,
+                target: x_only(target)?,
             },
-            StoredDescriptor::Lightning => Self::Lightning,
+            StoredDescriptor::Lightning { target } => Self::Lightning { target },
         })
     }
 }
@@ -310,7 +439,6 @@ impl From<&Htlc> for StoredHtlc {
             payment_hash: htlc.payment_hash.0,
             amount_msat: htlc.amount_msat,
             expiry: htlc.expiry,
-            target: (&htlc.target).into(),
             descriptor: (&htlc.descriptor).into(),
         }
     }
@@ -324,7 +452,6 @@ impl TryFrom<&StoredHtlc> for Htlc {
             payment_hash: Bytes32(htlc.payment_hash),
             amount_msat: htlc.amount_msat,
             expiry: htlc.expiry,
-            target: (&htlc.target).try_into()?,
             descriptor: (&htlc.descriptor).try_into()?,
         })
     }
@@ -333,8 +460,13 @@ impl TryFrom<&StoredHtlc> for Htlc {
 impl From<&InvoiceNetwork> for StoredInvoiceNetwork {
     fn from(entry: &InvoiceNetwork) -> Self {
         Self {
-            network: entry.network.0.clone(),
-            target: (&entry.target).into(),
+            target: match &entry.target {
+                InvoiceTarget::Key(destination) => StoredInvoiceTarget::Key(destination.into()),
+                InvoiceTarget::Lightning { network, invoice } => StoredInvoiceTarget::Lightning {
+                    network: network.0.clone(),
+                    invoice: invoice.clone(),
+                },
+            },
             incoming_delta_secs: entry.incoming_delta_secs,
         }
     }
@@ -345,10 +477,39 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
 
     fn try_from(entry: &StoredInvoiceNetwork) -> Result<Self, String> {
         Ok(Self {
-            network: NetworkId(entry.network.clone()),
-            target: (&entry.target).try_into()?,
+            target: match &entry.target {
+                StoredInvoiceTarget::Key(destination) => {
+                    InvoiceTarget::Key(destination.try_into()?)
+                }
+                StoredInvoiceTarget::Lightning { network, invoice } => InvoiceTarget::Lightning {
+                    network: NetworkId(network.clone()),
+                    invoice: invoice.clone(),
+                },
+            },
             incoming_delta_secs: entry.incoming_delta_secs,
         })
+    }
+}
+
+impl StoredInvoiceNetwork {
+    pub fn network(&self) -> &str {
+        match &self.target {
+            StoredInvoiceTarget::Key(destination) => destination.network(),
+            StoredInvoiceTarget::Lightning { network, .. } => network,
+        }
+    }
+}
+
+impl StoredGatewayDestination {
+    pub fn network(&self) -> &str {
+        match self {
+            Self::Cashu { network, .. }
+            | Self::Fedimint { network, .. }
+            | Self::Arkade { network, .. }
+            | Self::Bitcoin { network, .. }
+            | Self::Liquid { network, .. }
+            | Self::Rootstock { network, .. } => network,
+        }
     }
 }
 
@@ -363,6 +524,7 @@ impl From<&ReceiveAuthorization> for StoredAuthorization {
             gateway: *authorization.gateway.as_bytes(),
             preimage_server: *authorization.preimage_server.as_bytes(),
             preimage_server_relay: authorization.preimage_server_relay.clone(),
+            description: authorization.description.clone(),
             valid_from: authorization.valid_from,
             valid_until: authorization.valid_until,
             min_amount_msat: authorization.min_amount_msat,
@@ -371,10 +533,7 @@ impl From<&ReceiveAuthorization> for StoredAuthorization {
             destinations: authorization
                 .destinations
                 .iter()
-                .map(|destination| StoredDestination {
-                    network: destination.network.0.clone(),
-                    target: (&destination.target).into(),
-                })
+                .map(StoredGatewayDestination::from)
                 .collect(),
             signature: authorization.signature.0.to_vec(),
         }
@@ -394,6 +553,7 @@ impl TryFrom<&StoredAuthorization> for ReceiveAuthorization {
             gateway: endpoint_key(&authorization.gateway)?,
             preimage_server: endpoint_key(&authorization.preimage_server)?,
             preimage_server_relay: authorization.preimage_server_relay.clone(),
+            description: authorization.description.clone(),
             valid_from: authorization.valid_from,
             valid_until: authorization.valid_until,
             min_amount_msat: authorization.min_amount_msat,
@@ -402,12 +562,7 @@ impl TryFrom<&StoredAuthorization> for ReceiveAuthorization {
             destinations: authorization
                 .destinations
                 .iter()
-                .map(|destination| {
-                    Ok(Destination {
-                        network: NetworkId(destination.network.clone()),
-                        target: (&destination.target).try_into()?,
-                    })
-                })
+                .map(GatewayDestination::try_from)
                 .collect::<Result<_, String>>()?,
             signature: signature(&authorization.signature)?,
         })
@@ -445,13 +600,12 @@ mod tests {
             payment_hash: Bytes32([1; 32]),
             amount_msat: 1000,
             expiry: 2000,
-            target: HtlcTarget::PubKey(PubKey::from_x_only(&key).unwrap()),
-            descriptor: HtlcDescriptor::Arkade {
-                sender: key,
-                refund_locktime: 1,
-                unilateral_claim_delay: 2,
-                unilateral_refund_delay: 3,
-                unilateral_refund_without_receiver_delay: 4,
+            descriptor: HtlcDescriptor::Liquid {
+                lockup_txid: "txid".into(),
+                lockup_vout: 1,
+                refund_pubkey: PubKey::from_x_only(&key).unwrap(),
+                refund_locktime: 2,
+                target: PubKey::from_x_only(&key).unwrap(),
             },
         };
         assert_eq!(Htlc::try_from(&StoredHtlc::from(&htlc)).unwrap(), htlc);
@@ -462,15 +616,22 @@ mod tests {
             endpoint_public_key(&[2; 32]),
             endpoint_public_key(&[3; 32]),
             Some("https://relay.example".into()),
+            Some("coffee".into()),
             1000,
             2000,
             1,
             50_000,
             3600,
-            vec![Destination {
-                network: NetworkId("cashu::localhost".into()),
-                target: HtlcTarget::XOnlyPubKey(key),
-            }],
+            vec![
+                GatewayDestination::Cashu {
+                    network: NetworkId("cashu::localhost".into()),
+                    target: key,
+                },
+                GatewayDestination::Liquid {
+                    network: NetworkId("liquid".into()),
+                    target: PubKey::from_x_only(&key).unwrap(),
+                },
+            ],
         )
         .unwrap();
         let stored = StoredAuthorization::from(&authorization);

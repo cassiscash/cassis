@@ -317,11 +317,8 @@ impl Network for BarkLightningAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor != HtlcDescriptor::Lightning {
+        let HtlcDescriptor::Lightning { target: request } = &htlc.descriptor else {
             return Err(NetworkError::invalid("not a lightning HTLC"));
-        }
-        let HtlcTarget::LightningInvoice(request) = &htlc.target else {
-            return Err(NetworkError::invalid("lightning HTLCs pay an invoice"));
         };
         let invoice = parse_invoice(request, htlc.payment_hash)?;
         if invoice.amount_milli_satoshis().unwrap_or(0) < htlc.amount_msat {
@@ -399,7 +396,9 @@ impl Network for BarkLightningAdapter {
             .await
             .map_err(wallet_error)?;
         info!(parent: &self.span, "paying {invoice_msat} msat for {}", payment_hash.short());
-        Ok(HtlcDescriptor::Lightning)
+        Ok(HtlcDescriptor::Lightning {
+            target: payment_request.clone(),
+        })
     }
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {

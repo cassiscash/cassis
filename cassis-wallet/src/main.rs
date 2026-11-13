@@ -154,6 +154,9 @@ enum Command {
         min_amount_msat: u64,
         #[arg(long)]
         max_amount_msat: u64,
+        /// If given, every invoice the gateway issues must say this.
+        #[arg(long)]
+        description: Option<String>,
         /// How long the gateway's HTLC to this node must stay
         /// unrefundable after the preimage is released.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_MIN_FINAL_TIMEOUT_SECS)]
@@ -423,6 +426,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             valid_for,
             min_amount_msat,
             max_amount_msat,
+            description,
             min_final_timeout,
         } => {
             let endpoints = offline
@@ -443,6 +447,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 min_amount_msat,
                 max_amount_msat,
                 min_final_timeout,
+                description,
             )
             .await;
             transport.close().await;
@@ -685,8 +690,8 @@ async fn redeem(
             }
         };
         for destination in authorization.destinations {
-            if !servers[index].1.contains(&destination.network) {
-                servers[index].1.push(destination.network);
+            if !servers[index].1.contains(destination.network()) {
+                servers[index].1.push(destination.network().clone());
             }
         }
     };

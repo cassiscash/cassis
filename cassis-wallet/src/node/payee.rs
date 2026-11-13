@@ -9,7 +9,7 @@ use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
 use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId};
 use cassis_core::protocol::{
-    Commit, Invoice, InvoiceBody, InvoiceNetwork, Metadata, PreparePayee, Response,
+    Commit, Invoice, InvoiceBody, InvoiceNetwork, InvoiceTarget, Metadata, PreparePayee, Response,
 };
 use cassis_core::{unix_now, Bytes32};
 use std::sync::Arc;
@@ -57,8 +57,7 @@ pub async fn create_invoice(
             .await
             .map_err(|e| format!("cannot receive on {}: {e}", network.id()))?;
         targets.push(InvoiceNetwork {
-            network: network.id(),
-            target,
+            target: InvoiceTarget::new(network.id(), target)?,
             incoming_delta_secs: Some(network.incoming_delta_secs()),
         });
     }
@@ -162,9 +161,9 @@ impl Node {
         let entry = record
             .networks
             .iter()
-            .find(|entry| entry.network == network.0)
+            .find(|entry| entry.network() == network.0)
             .ok_or_else(|| format!("invoice is not payable on {network}"))?;
-        let target = HtlcTarget::try_from(&entry.target)?;
+        let target = InvoiceNetwork::try_from(entry)?.target.target();
         let network = self.network(network)?;
         // The claim itself must land before the HTLC expires.
         let claim_by = expiry.saturating_sub(network.incoming_delta_secs());
@@ -253,11 +252,13 @@ impl Node {
         );
         let (target, network, claim_by) =
             self.payable_on(&record, &commit.network, commit.expiry)?;
+        if commit.descriptor.target() != target {
+            return Err("the HTLC does not pay this invoice".into());
+        }
         let htlc = Htlc {
             payment_hash: commit.payment_hash,
             amount_msat: record.amount_msat,
             expiry: commit.expiry,
-            target,
             descriptor: commit.descriptor,
         };
         let mut waiting = false;
@@ -321,7 +322,7 @@ impl Node {
             return;
         };
         for entry in &record.networks {
-            let id = NetworkId(entry.network.clone());
+            let id = NetworkId(entry.network().to_string());
             if Some(&id) == claimed_on {
                 continue;
             }

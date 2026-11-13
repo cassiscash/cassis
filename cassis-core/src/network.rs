@@ -179,16 +179,20 @@ pub enum HtlcTarget {
     LightningInvoice(String),
 }
 
-/// Network-specific handle to a funded HTLC: what the receiver needs,
-/// on top of the common [`Htlc`] fields, to find, verify and claim it,
-/// and what the sender needs to watch and refund it. Anything derivable
-/// from the common fields (payment hash, amount, target) is left out so
-/// it cannot disagree with them.
+/// Network-specific handle to a funded HTLC: who can claim it, in this
+/// network's kind of [`HtlcTarget`], and what the receiver needs, on
+/// top of the common [`Htlc`] fields, to find, verify and claim it, and
+/// what the sender needs to watch and refund it. Anything derivable
+/// from the common fields (payment hash, amount) is left out so it
+/// cannot disagree with them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HtlcDescriptor {
     /// NUT-14 HTLC-locked ecash proofs, one base64-encoded JSON proof
     /// per element.
-    Cashu { proofs_b64: Vec<String> },
+    Cashu {
+        proofs_b64: Vec<String>,
+        target: XOnlyPubKey,
+    },
     /// P2WSH lockup output on Liquid (see `cassis-liquid`). Refund opens
     /// at an absolute block height.
     Liquid {
@@ -196,6 +200,7 @@ pub enum HtlcDescriptor {
         lockup_vout: u32,
         refund_pubkey: PubKey,
         refund_locktime: u32,
+        target: PubKey,
     },
     /// Arkade VHTLC (see `cassis-arkade`). The receiver is the target,
     /// the server is the operator both parties use.
@@ -205,6 +210,7 @@ pub enum HtlcDescriptor {
         unilateral_claim_delay: u32,
         unilateral_refund_delay: u32,
         unilateral_refund_without_receiver_delay: u32,
+        target: XOnlyPubKey,
     },
     /// P2TR lockup output on Bitcoin (see `cassis-bitcoin`). Refund
     /// opens at an absolute unix timestamp.
@@ -213,6 +219,7 @@ pub enum HtlcDescriptor {
         lockup_vout: u32,
         refund_pubkey: XOnlyPubKey,
         refund_locktime: u32,
+        target: XOnlyPubKey,
     },
     /// EtherSwap lock on Rootstock (see `cassis-rootstock`). Refund opens
     /// at a block height.
@@ -220,6 +227,7 @@ pub enum HtlcDescriptor {
         amount_wei: u128,
         refund_address: String,
         timelock: u64,
+        target: PubKey,
     },
     /// Fedimint LNv2 direct HTLC: the funded `OutgoingContract`
     /// (consensus JSON) and where it was funded.
@@ -227,9 +235,27 @@ pub enum HtlcDescriptor {
         funding_txid: String,
         funding_out_idx: u64,
         contract: String,
+        target: XOnlyPubKey,
     },
-    /// A payment of the target hold invoice; LND tracks it by hash.
-    Lightning,
+    /// A payment of the `target` BOLT11 hold invoice; LND tracks it by
+    /// hash.
+    Lightning { target: String },
+}
+
+impl HtlcDescriptor {
+    /// Who can claim it.
+    pub fn target(&self) -> HtlcTarget {
+        match self {
+            Self::Cashu { target, .. }
+            | Self::Arkade { target, .. }
+            | Self::Bitcoin { target, .. }
+            | Self::Fedimint { target, .. } => HtlcTarget::XOnlyPubKey(*target),
+            Self::Liquid { target, .. } | Self::Rootstock { target, .. } => {
+                HtlcTarget::PubKey(*target)
+            }
+            Self::Lightning { target } => HtlcTarget::LightningInvoice(target.clone()),
+        }
+    }
 }
 
 /// One HTLC on one network, as both parties see it.
@@ -241,8 +267,6 @@ pub struct Htlc {
     pub amount_msat: u64,
     /// Unix seconds before which the sender cannot refund.
     pub expiry: u64,
-    /// Who can claim it.
-    pub target: HtlcTarget,
     pub descriptor: HtlcDescriptor,
 }
 
@@ -325,7 +349,8 @@ pub trait Network: Send + Sync {
     /// Check that `htlc` is a real HTLC this node can claim. Every
     /// adapter checks, in this order:
     /// 1. the descriptor is this network's kind and well formed;
-    /// 2. the HTLC pays `htlc.target`, and that target is this node's;
+    /// 2. the HTLC pays the descriptor's target, and that target is this
+    ///    node's;
     /// 3. it is locked to `htlc.payment_hash`;
     /// 4. it locks at least `htlc.amount_msat`;
     /// 5. its refund cannot happen before `htlc.expiry`;
@@ -336,7 +361,7 @@ pub trait Network: Send + Sync {
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError>;
 
     /// [`Network::verify_incoming_htlc`] for an HTLC paying any
-    /// `htlc.target`, not only this node's: every check but whose
+    /// target, not only this node's: every check but whose
     /// target it is. A preimage server runs it before revealing the
     /// preimage of an HTLC its payee will claim later.
     async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {

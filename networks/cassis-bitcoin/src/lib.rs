@@ -201,22 +201,18 @@ impl HtlcOptions {
         ScriptBuf::new_p2tr_tweaked(info.output_key())
     }
 
-    /// The HTLC of `htlc`: claim key from the target, refund terms and
-    /// lockup from the descriptor.
+    /// The HTLC of `htlc`: claim key, refund terms and lockup from the
+    /// descriptor.
     fn of(htlc: &Htlc) -> Result<Self, NetworkError> {
         let HtlcDescriptor::Bitcoin {
             lockup_txid,
             lockup_vout,
             refund_pubkey,
             refund_locktime,
+            target: claim,
         } = &htlc.descriptor
         else {
             return Err(NetworkError::invalid("not a bitcoin HTLC"));
-        };
-        let HtlcTarget::XOnlyPubKey(claim) = &htlc.target else {
-            return Err(NetworkError::invalid(
-                "bitcoin HTLCs are locked to an x-only key",
-            ));
         };
         if *refund_locktime < MIN_TIMESTAMP_LOCKTIME {
             return Err(NetworkError::invalid(
@@ -240,6 +236,8 @@ impl HtlcOptions {
             refund_pubkey: XOnlyPubKey::from_bytes(self.refund_pubkey.serialize())
                 .expect("valid x-only key"),
             refund_locktime: self.refund_locktime,
+            target: XOnlyPubKey::from_bytes(self.claim_pubkey.serialize())
+                .expect("valid x-only key"),
         }
     }
 }
@@ -872,7 +870,7 @@ impl Network for BitcoinAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.target != self.claim_target() {
+        if htlc.descriptor.target() != self.claim_target() {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -1056,9 +1054,6 @@ mod tests {
             payment_hash,
             amount_msat: 1_000_000,
             expiry: 700_000_000,
-            target: HtlcTarget::XOnlyPubKey(
-                XOnlyPubKey::from_bytes(xonly_of(2).serialize()).unwrap(),
-            ),
             descriptor: options.descriptor(),
         };
         let parsed = HtlcOptions::of(&htlc).unwrap();

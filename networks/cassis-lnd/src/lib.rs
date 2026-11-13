@@ -470,11 +470,8 @@ impl Network for LndAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor != HtlcDescriptor::Lightning {
+        let HtlcDescriptor::Lightning { target: request } = &htlc.descriptor else {
             return Err(NetworkError::invalid("not a lightning HTLC"));
-        }
-        let HtlcTarget::LightningInvoice(request) = &htlc.target else {
-            return Err(NetworkError::invalid("lightning HTLCs pay an invoice"));
         };
         parse_invoice(request, htlc.payment_hash)?;
         let invoice = self
@@ -560,7 +557,9 @@ impl Network for LndAdapter {
             }
         });
         info!(parent: &self.span, "paying {amount_msat} msat for {}", payment_hash.short());
-        Ok(HtlcDescriptor::Lightning)
+        Ok(HtlcDescriptor::Lightning {
+            target: payment_request.clone(),
+        })
     }
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {

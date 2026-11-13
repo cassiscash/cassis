@@ -423,7 +423,7 @@ impl Flow {
             .body
             .networks
             .iter()
-            .map(|entry| entry.network.clone())
+            .map(|entry| entry.target.network().clone())
             .find(|network| ours.contains(network))
             .ok_or("the refund invoice is on none of this node's networks")?;
         info!("paying refund for order {} on {from}", self.id);

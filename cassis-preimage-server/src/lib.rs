@@ -37,7 +37,6 @@ use hmac::{Hmac, Mac};
 use iroh_base::PublicKey;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{info, warn, Instrument, Span};
@@ -46,30 +45,21 @@ pub use db::Db;
 
 #[orangedb::schema]
 pub mod db {
-    use cassis_wallet::stored::{StoredDescriptor, StoredTarget};
-    /// A payee whose payment the server let through, by its key.
-    #[entity]
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Payee {
-        #[id(String)]
-        pub key: PayeeKey,
-        pub first_paid_at: u64,
-    }
-
+    use cassis_wallet::stored::StoredDescriptor;
     /// An HTLC a gateway funded to a payee, which the server verified
     /// before releasing its preimage: what the payee needs to claim it.
     #[entity]
     #[derive(Debug, Clone, PartialEq)]
     pub struct Payment {
-        /// Hex.
-        #[id(String)]
+        /// The payment hash.
+        #[id([u8; 32])]
         pub payment_hash: PaymentHash,
-        #[references(Payee, on_delete = cascade)]
-        pub payee: PayeeKey,
+        /// The payee's iroh key.
+        #[index]
+        pub payee: [u8; 32],
         pub network: String,
         pub amount_msat: u64,
         pub expiry: u64,
-        pub target: StoredTarget,
         pub descriptor: StoredDescriptor,
         pub preimage: [u8; 32],
         /// The invoice's metadata, if any.
@@ -79,7 +69,7 @@ pub mod db {
 }
 
 use cassis_wallet::stored::{self, stored_metadata};
-use db::{Payee, PayeeKey, Payment, PaymentHash};
+use db::{Payment, PaymentHash};
 
 pub struct ServerConfig {
     /// Secret of the server's iroh endpoint, which signs its issuances.
@@ -214,15 +204,6 @@ impl PreimageServer {
             .map_err(|e| format!("read payments: {e}"))
     }
 
-    /// Everyone paid through this server.
-    pub fn all_payees(&self) -> Result<Vec<Payee>, String> {
-        self.0
-            .db
-            .payees()
-            .all()
-            .map_err(|e| format!("read payees: {e}"))
-    }
-
     async fn handle(&self, request: Request, peer: String) -> Response {
         match request {
             Request::PreimageIssue {
@@ -264,7 +245,7 @@ impl PreimageServer {
             return Err("the authorization names another preimage server".into());
         }
         for destination in &authorization.destinations {
-            self.network(&destination.network)?;
+            self.network(destination.network())?;
         }
         authorization.id()
     }
@@ -396,7 +377,7 @@ impl PreimageServer {
         let destination = authorization
             .destination(&network)
             .ok_or_else(|| format!("the payee does not receive on {network}"))?;
-        if htlc.target != destination.target {
+        if htlc.descriptor.target() != destination.target() {
             return Err("the HTLC does not pay the payee's destination".into());
         }
         if htlc.amount_msat < issuance.amount_msat {
@@ -425,26 +406,17 @@ impl PreimageServer {
             Err(error) => return Err(format!("HTLC rejected: {error}")),
         }
         let payment = Payment {
-            payment_hash: PaymentHash(hash.to_string()),
-            payee: PayeeKey(authorization.payee.to_string()),
+            payment_hash: PaymentHash(hash.0),
+            payee: *authorization.payee.as_bytes(),
             network: network.0.clone(),
             amount_msat: htlc.amount_msat,
             expiry: htlc.expiry,
-            target: (&htlc.target).into(),
             descriptor: (&htlc.descriptor).into(),
             preimage: preimage.0,
             metadata: stored_metadata(&metadata),
             released_at: unix_now(),
         };
-        let written = self.0.db.write(|tx| {
-            if tx.payees().get(payment.payee.clone())?.is_none() {
-                tx.payees().insert(&Payee {
-                    key: payment.payee.clone(),
-                    first_paid_at: payment.released_at,
-                })?;
-            }
-            tx.payments().insert(&payment)
-        });
+        let written = self.0.db.write(|tx| tx.payments().insert(&payment));
         match written {
             Ok(_) => {
                 self.0.counters.released.fetch_add(1, Ordering::Relaxed);
@@ -466,13 +438,13 @@ impl PreimageServer {
         self.0
             .db
             .payments()
-            .get(PaymentHash(hash.to_string()))
+            .get(PaymentHash(hash.0))
             .map_err(|e| format!("read payment: {e}"))
     }
 
     /// The HTLCs released to `peer`, as payee, since `since`.
     fn payments(&self, peer: &str, since: u64) -> Result<Vec<ReceivedPayment>, String> {
-        let payee = PayeeKey(peer_key(peer)?.to_string());
+        let payee = *peer_key(peer)?.as_bytes();
         let mut payments = self
             .0
             .db
@@ -485,11 +457,10 @@ impl PreimageServer {
             .into_iter()
             .map(|payment| {
                 Ok(ReceivedPayment::Received {
-                    payment_hash: Bytes32::from_str(&payment.payment_hash.0)?,
+                    payment_hash: Bytes32(payment.payment_hash.0),
                     network: NetworkId(payment.network),
                     amount_msat: payment.amount_msat,
                     expiry: payment.expiry,
-                    target: (&payment.target).try_into()?,
                     descriptor: (&payment.descriptor).try_into()?,
                     preimage: Bytes32(payment.preimage),
                     metadata: stored::metadata(&payment.metadata)?,

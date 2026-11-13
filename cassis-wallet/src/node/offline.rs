@@ -19,7 +19,8 @@ use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
 use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, Destination, PreimageIssuance, ReceiveAuthorization,
+    endpoint_public_key, AuthorizationKind, GatewayDestination, PreimageIssuance,
+    ReceiveAuthorization,
 };
 use cassis_core::protocol::{
     GatewayInvoiceRequest, Invoice, InvoiceReceiver, Metadata, ReceivedPayment, Request, Response,
@@ -41,7 +42,7 @@ pub struct OfflineEndpoints {
 /// Where the gateway may pay this node: its claim key on each of
 /// `networks`. Lightning is refused: its hold invoices need this node
 /// online.
-async fn destinations(networks: &[Arc<dyn Network>]) -> Result<Vec<Destination>, String> {
+async fn destinations(networks: &[Arc<dyn Network>]) -> Result<Vec<GatewayDestination>, String> {
     if networks.is_empty() {
         return Err("receiving offline needs at least one network".into());
     }
@@ -58,10 +59,7 @@ async fn destinations(networks: &[Arc<dyn Network>]) -> Result<Vec<Destination>,
             .receive_target(Bytes32([0; 32]), 0, 0)
             .await
             .map_err(|e| format!("cannot receive on {id}: {e}"))?;
-        destinations.push(Destination {
-            network: id,
-            target,
-        });
+        destinations.push(GatewayDestination::new(id, target)?);
     }
     Ok(destinations)
 }
@@ -119,6 +117,7 @@ pub async fn create_gateway_invoice(
         endpoint_key(&endpoints.gateway)?,
         endpoint_key(&endpoints.preimage_server)?,
         endpoints.preimage_server.relay.clone(),
+        description.clone(),
         now,
         expires_at,
         amount_msat,
@@ -237,7 +236,8 @@ async fn issue(
 /// Let `endpoints.gateway` issue invoices in this node's name while it
 /// is offline: between `valid_from` and `valid_until`, for amounts
 /// between `min_amount_msat` and `max_amount_msat`, paid on to this
-/// node on one of `networks` as for [`create_gateway_invoice`]. The
+/// node on one of `networks` as for [`create_gateway_invoice`]. With a
+/// `description`, every invoice it issues must say exactly that. The
 /// gateway may refuse the terms. Records the authorization, so
 /// [`redeem_offline_payments`] knows where to look.
 #[allow(clippy::too_many_arguments)]
@@ -252,6 +252,7 @@ pub async fn authorize_gateway(
     min_amount_msat: u64,
     max_amount_msat: u64,
     min_final_timeout_secs: u64,
+    description: Option<String>,
 ) -> Result<ReceiveAuthorization, String> {
     if valid_until <= unix_now() {
         return Err("the authorization must end in the future".into());
@@ -263,6 +264,7 @@ pub async fn authorize_gateway(
         endpoint_key(&endpoints.gateway)?,
         endpoint_key(&endpoints.preimage_server)?,
         endpoints.preimage_server.relay.clone(),
+        description,
         valid_from,
         valid_until,
         min_amount_msat,
@@ -352,7 +354,6 @@ pub async fn redeem_offline_payments(
                 network,
                 amount_msat,
                 expiry,
-                target,
                 descriptor,
                 preimage,
                 metadata,
@@ -364,7 +365,6 @@ pub async fn redeem_offline_payments(
                     payment_hash,
                     amount_msat,
                     expiry,
-                    target,
                     descriptor,
                 },
                 preimage,

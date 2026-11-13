@@ -74,7 +74,6 @@ impl Node {
         let (route, payee_network) = self.choose_route(invoice, from, relays).await?;
         let payee_target = invoice
             .target_for(&payee_network)
-            .cloned()
             .ok_or("invoice has no target for the chosen network")?;
         // PREPARE and COMMIT go to the gateway when there is one: it is
         // paid in the payee's place.
@@ -167,7 +166,6 @@ impl Node {
                 payment_hash: hash,
                 amount_msat: plan.amounts[0],
                 expiry: plan.expiries[0],
-                target: targets[0].clone(),
                 descriptor,
             },
             Err(error) => {
@@ -312,7 +310,7 @@ impl Node {
                 let route = routing::find_route(
                     &announcements,
                     from,
-                    &entry.network,
+                    entry.target.network(),
                     invoice.body.amount_msat,
                     &HashSet::new(),
                 )
@@ -321,12 +319,14 @@ impl Node {
                 let plan = routing::plan_route(
                     &route,
                     invoice.body.amount_msat,
-                    invoice.incoming_delta_for(&entry.network),
+                    invoice.incoming_delta_for(entry.target.network()),
                     unix_now(),
                 )
-                .map_err(|error| unplannable = Some(format!("route to {}: {error}", entry.network)))
+                .map_err(|error| {
+                    unplannable = Some(format!("route to {}: {error}", entry.target.network()))
+                })
                 .ok()?;
-                Some((plan.amounts[0], route, entry.network.clone()))
+                Some((plan.amounts[0], route, entry.target.network().clone()))
             })
             .min_by_key(|(cost, _, _)| *cost)
             .map(|(_, route, network)| (route, network))
