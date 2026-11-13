@@ -9,13 +9,43 @@ use cassis_core::protocol::{InvoiceNetwork, Metadata};
 use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
 use iroh_base::PublicKey;
 
+/// A compressed secp256k1 public key: its parity byte and X coordinate.
+/// Stored as exactly 33 bytes, since serde and orangedb know arrays only
+/// up to 32.
+#[orangedb::embed]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredPubKey {
+    pub parity: u8,
+    pub x: [u8; 32],
+}
+
+impl From<&PubKey> for StoredPubKey {
+    fn from(key: &PubKey) -> Self {
+        let bytes = key.as_bytes();
+        Self {
+            parity: bytes[0],
+            x: bytes[1..].try_into().expect("a key after its parity byte"),
+        }
+    }
+}
+
+impl TryFrom<&StoredPubKey> for PubKey {
+    type Error = String;
+
+    fn try_from(key: &StoredPubKey) -> Result<Self, String> {
+        let mut bytes = [0u8; 33];
+        bytes[0] = key.parity;
+        bytes[1..].copy_from_slice(&key.x);
+        PubKey::from_bytes(bytes).map_err(|_| corrupt("public key"))
+    }
+}
+
 /// An [`HtlcTarget`].
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredTarget {
     XOnlyPubKey([u8; 32]),
-    /// 33 bytes.
-    PubKey(Vec<u8>),
+    PubKey(StoredPubKey),
     LightningInvoice(String),
 }
 
@@ -29,8 +59,7 @@ pub enum StoredDescriptor {
     Liquid {
         lockup_txid: String,
         lockup_vout: u32,
-        /// 33 bytes.
-        refund_pubkey: Vec<u8>,
+        refund_pubkey: StoredPubKey,
         refund_locktime: u32,
     },
     Arkade {
@@ -123,11 +152,6 @@ fn x_only(bytes: [u8; 32]) -> Result<XOnlyPubKey, String> {
     XOnlyPubKey::from_bytes(bytes).map_err(|_| corrupt("x-only key"))
 }
 
-fn pubkey(bytes: &[u8]) -> Result<PubKey, String> {
-    let bytes: [u8; 33] = bytes.try_into().map_err(|_| corrupt("public key"))?;
-    PubKey::from_bytes(bytes).map_err(|_| corrupt("public key"))
-}
-
 pub fn endpoint_key(bytes: &[u8; 32]) -> Result<PublicKey, String> {
     PublicKey::from_bytes(bytes).map_err(|_| corrupt("endpoint key"))
 }
@@ -136,7 +160,7 @@ impl From<&HtlcTarget> for StoredTarget {
     fn from(target: &HtlcTarget) -> Self {
         match target {
             HtlcTarget::XOnlyPubKey(key) => Self::XOnlyPubKey(key.0),
-            HtlcTarget::PubKey(key) => Self::PubKey(key.as_bytes().to_vec()),
+            HtlcTarget::PubKey(key) => Self::PubKey(key.into()),
             HtlcTarget::LightningInvoice(invoice) => Self::LightningInvoice(invoice.clone()),
         }
     }
@@ -148,7 +172,7 @@ impl TryFrom<&StoredTarget> for HtlcTarget {
     fn try_from(target: &StoredTarget) -> Result<Self, String> {
         Ok(match target {
             StoredTarget::XOnlyPubKey(key) => Self::XOnlyPubKey(x_only(*key)?),
-            StoredTarget::PubKey(key) => Self::PubKey(pubkey(key)?),
+            StoredTarget::PubKey(key) => Self::PubKey(key.try_into()?),
             StoredTarget::LightningInvoice(invoice) => Self::LightningInvoice(invoice.clone()),
         })
     }
@@ -166,7 +190,7 @@ impl From<&HtlcDescriptor> for StoredDescriptor {
             } => Self::Liquid {
                 lockup_txid,
                 lockup_vout,
-                refund_pubkey: refund_pubkey.as_bytes().to_vec(),
+                refund_pubkey: (&refund_pubkey).into(),
                 refund_locktime,
             },
             HtlcDescriptor::Arkade {
@@ -230,7 +254,7 @@ impl TryFrom<&StoredDescriptor> for HtlcDescriptor {
             } => Self::Liquid {
                 lockup_txid,
                 lockup_vout,
-                refund_pubkey: pubkey(&refund_pubkey)?,
+                refund_pubkey: (&refund_pubkey).try_into()?,
                 refund_locktime,
             },
             StoredDescriptor::Arkade {
