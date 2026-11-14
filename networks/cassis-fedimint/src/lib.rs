@@ -23,7 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
@@ -321,11 +321,13 @@ impl FedimintAdapter {
         Self::ln_module(&self.client).map_err(NetworkError::network)
     }
 
-    fn claim_target(&self) -> HtlcTarget {
+    fn claim_target(&self) -> InvoiceTarget {
         let x = self.claim_keypair.public_key().serialize();
-        HtlcTarget::XOnlyPubKey(
-            XOnlyPubKey::from_bytes(x[1..].try_into().expect("32 bytes")).expect("valid key"),
-        )
+        InvoiceTarget::Fedimint {
+            network: self.id.clone(),
+            target: XOnlyPubKey::from_bytes(x[1..].try_into().expect("32 bytes"))
+                .expect("valid key"),
+        }
     }
 
     /// Funding outpoint and contract of `htlc`.
@@ -391,7 +393,7 @@ impl Network for FedimintAdapter {
         _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         Ok(self.claim_target())
     }
 
@@ -400,7 +402,7 @@ impl Network for FedimintAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor.target() != self.claim_target() {
+        if !htlc.descriptor.pays(&self.claim_target()) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -466,9 +468,12 @@ impl Network for FedimintAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::XOnlyPubKey(receiver) = target else {
+        let InvoiceTarget::Fedimint {
+            target: receiver, ..
+        } = target
+        else {
             return Err(NetworkError::invalid(
                 "fedimint HTLCs are locked to an x-only key",
             ));

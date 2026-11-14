@@ -7,9 +7,9 @@
 use async_trait::async_trait;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::offline::endpoint_public_key;
-use cassis_core::protocol::{InvoiceReceiver, InvoiceTarget, Metadata};
+use cassis_core::protocol::{InvoiceReceiver, Metadata};
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
 use cassis_routerd::db::{Db as RouterDb, IncomingState};
@@ -38,7 +38,7 @@ struct Lock {
     payment_hash: Bytes32,
     amount_msat: u64,
     expiry: u64,
-    target: HtlcTarget,
+    target: XOnlyPubKey,
     state: LockState,
 }
 
@@ -83,8 +83,16 @@ impl Network for MockNetwork {
         5
     }
 
-    async fn receive_target(&self, _: Bytes32, _: u64, _: u64) -> Result<HtlcTarget, NetworkError> {
-        Ok(HtlcTarget::XOnlyPubKey(self.key))
+    async fn receive_target(
+        &self,
+        _: Bytes32,
+        _: u64,
+        _: u64,
+    ) -> Result<InvoiceTarget, NetworkError> {
+        Ok(InvoiceTarget::Cashu {
+            network: self.id(),
+            target: self.key,
+        })
     }
 
     async fn cancel_receive(&self, _: Bytes32) -> Result<(), NetworkError> {
@@ -96,8 +104,14 @@ impl Network for MockNetwork {
         let lock = ledger
             .get(&Self::lock_id(htlc)?)
             .ok_or_else(|| NetworkError::invalid("no such lock"))?;
-        let ok = htlc.descriptor.target() == HtlcTarget::XOnlyPubKey(self.key)
-            && lock.target == htlc.descriptor.target()
+        let paid = |target| -> InvoiceTarget {
+            InvoiceTarget::Cashu {
+                network: self.id(),
+                target,
+            }
+        };
+        let ok = htlc.descriptor.pays(&paid(self.key))
+            && htlc.descriptor.pays(&paid(lock.target))
             && lock.payment_hash == htlc.payment_hash
             && lock.amount_msat >= htlc.amount_msat
             && lock.expiry >= htlc.expiry
@@ -114,7 +128,7 @@ impl Network for MockNetwork {
         let mut ledger = self.ledger.0.lock().unwrap();
         let lock = ledger.get_mut(&Self::lock_id(htlc)?).unwrap();
         assert!(lock.payment_hash.matches_preimage(&preimage));
-        assert_eq!(lock.target, HtlcTarget::XOnlyPubKey(self.key));
+        assert_eq!(lock.target, self.key);
         lock.state = LockState::Claimed(preimage);
         Ok(())
     }
@@ -124,9 +138,9 @@ impl Network for MockNetwork {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::XOnlyPubKey(key) = target else {
+        let InvoiceTarget::Cashu { target: key, .. } = target else {
             return Err(NetworkError::invalid(
                 "mock HTLCs are locked to an x-only key",
             ));
@@ -138,7 +152,7 @@ impl Network for MockNetwork {
                 payment_hash,
                 amount_msat,
                 expiry,
-                target: target.clone(),
+                target: *key,
                 state: LockState::Locked,
             },
         );
@@ -357,15 +371,12 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .create_invoice(&[NetworkId(b.into())], 50_000, unix_now() + 600, None, None)
         .await
         .unwrap();
-    unreachable.body.networks[0].target = InvoiceTarget::new(
-        NetworkId(b.into()),
-        HtlcTarget::XOnlyPubKey(
-            ritualistic::SecretKey::from_bytes([9; 32])
-                .unwrap()
-                .pubkey(),
-        ),
-    )
-    .unwrap();
+    unreachable.body.networks[0].target = InvoiceTarget::Cashu {
+        network: NetworkId(b.into()),
+        target: ritualistic::SecretKey::from_bytes([9; 32])
+            .unwrap()
+            .pubkey(),
+    };
     unreachable.sign_as_payee(&payee_keys.iroh).unwrap();
     let error = payer
         .pay(&unreachable, &NetworkId(a.into()), &[RELAY.into()])

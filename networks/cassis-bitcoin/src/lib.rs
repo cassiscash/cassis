@@ -64,7 +64,7 @@ use bitcoin::taproot::{LeafVersion, TapLeafHash, TaprootBuilder};
 use bitcoin::transaction::Version;
 use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use cassis_core::{
-    sats_for_msat, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    sats_for_msat, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
 };
 use std::str::FromStr;
@@ -308,10 +308,11 @@ impl BitcoinAdapter {
         })
     }
 
-    fn claim_target(&self) -> HtlcTarget {
-        HtlcTarget::XOnlyPubKey(
-            XOnlyPubKey::from_bytes(self.key_xonly.serialize()).expect("valid x-only key"),
-        )
+    fn claim_target(&self) -> InvoiceTarget {
+        InvoiceTarget::Bitcoin {
+            network: self.id.clone(),
+            target: XOnlyPubKey::from_bytes(self.key_xonly.serialize()).expect("valid x-only key"),
+        }
     }
 
     /// Value of the HTLC output if it is still unspent, and whether it
@@ -861,7 +862,7 @@ impl Network for BitcoinAdapter {
         _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         Ok(self.claim_target())
     }
 
@@ -870,7 +871,7 @@ impl Network for BitcoinAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor.target() != self.claim_target() {
+        if !htlc.descriptor.pays(&self.claim_target()) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -911,9 +912,9 @@ impl Network for BitcoinAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::XOnlyPubKey(claim) = target else {
+        let InvoiceTarget::Bitcoin { target: claim, .. } = target else {
             return Err(NetworkError::invalid(
                 "bitcoin HTLCs are locked to an x-only key",
             ));

@@ -74,6 +74,7 @@ impl Node {
         let (route, payee_network) = self.choose_route(invoice, from, relays).await?;
         let payee_target = invoice
             .target_for(&payee_network)
+            .cloned()
             .ok_or("invoice has no target for the chosen network")?;
         // PREPARE and COMMIT go to the gateway when there is one: it is
         // paid in the payee's place.

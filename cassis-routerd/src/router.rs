@@ -11,7 +11,7 @@ use crate::db::{
     Db, Fail, FailId, FailReason, Forward, ForwardId, HopId, Incoming, IncomingState, Outgoing,
     OutgoingId,
 };
-use cassis_core::network::{Htlc, HtlcTarget, NetworkError, NetworkId};
+use cassis_core::network::{Htlc, InvoiceTarget, NetworkError, NetworkId};
 use cassis_core::protocol::{Discard, Execute, Prepare, Request, Response, Settle};
 use cassis_core::routing::{self, RouteAnnouncement, DEFAULT_TRANSIT_SLACK_SECS};
 use cassis_core::transport::Handler;
@@ -102,7 +102,7 @@ impl RoutingPolicy {
 struct Reservation {
     prepare: Prepare,
     owner: String,
-    target: HtlcTarget,
+    target: InvoiceTarget,
     expires_at: u64,
 }
 
@@ -277,7 +277,7 @@ impl Router {
         }
     }
 
-    async fn prepare(&self, prepare: Prepare, peer: String) -> Result<HtlcTarget, String> {
+    async fn prepare(&self, prepare: Prepare, peer: String) -> Result<InvoiceTarget, String> {
         let result = self.reserve(&prepare, peer).await;
         match &result {
             Ok(_) => info!(
@@ -296,7 +296,7 @@ impl Router {
         result
     }
 
-    async fn reserve(&self, prepare: &Prepare, peer: String) -> Result<HtlcTarget, String> {
+    async fn reserve(&self, prepare: &Prepare, peer: String) -> Result<InvoiceTarget, String> {
         let policy = self.routing().ok_or("this node does not route")?;
         let incoming = self.node().network(&prepare.incoming_network)?;
         let outgoing = self.node().network(&prepare.outgoing_network)?;
@@ -491,8 +491,11 @@ impl Router {
         if prepare.outgoing_expiry <= unix_now() {
             return Err("outgoing expiry passed before EXECUTE".into());
         }
-        if execute.incoming_descriptor.target() != reservation.target {
+        if !execute.incoming_descriptor.pays(&reservation.target) {
             return Err("the incoming HTLC does not pay the PREPARE answer".into());
+        }
+        if *execute.outgoing_target.network() != prepare.outgoing_network {
+            return Err("EXECUTE pays on another network than its PREPARE".into());
         }
         let incoming = Incoming {
             operation_id: HopId(execute.operation_id.as_str().to_string()),
@@ -572,7 +575,7 @@ impl Router {
             warn!("EXECUTE {hash} failed: journaling: {error}");
             return self.fail(&hop, FailReason::FundingFailed, true).await;
         }
-        let (target, network) = match HtlcTarget::try_from(&hop.outgoing_target) {
+        let (target, network) = match hop.outgoing_target.on(outgoing.id()) {
             Ok(target) => (target, outgoing.id()),
             Err(error) => {
                 error!("hop {}: {error}", hop.operation_id.0);

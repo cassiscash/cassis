@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    sats_for_msat, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    sats_for_msat, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
 use cdk::amount::{FeeAndAmounts, SplitTarget};
@@ -93,6 +93,13 @@ impl CashuAdapter {
             wallet: Wallet::open(data_dir)?,
             id,
         })
+    }
+
+    fn claim_target(&self) -> InvoiceTarget {
+        InvoiceTarget::Cashu {
+            network: self.id.clone(),
+            target: self.claim_pubkey,
+        }
     }
 
     /// Put already-owned proofs in the wallet (e.g. migrated from an
@@ -307,8 +314,8 @@ impl Network for CashuAdapter {
         _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
-        Ok(HtlcTarget::XOnlyPubKey(self.claim_pubkey))
+    ) -> Result<InvoiceTarget, NetworkError> {
+        Ok(self.claim_target())
     }
 
     async fn cancel_receive(&self, _payment_hash: Bytes32) -> Result<(), NetworkError> {
@@ -316,7 +323,7 @@ impl Network for CashuAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor.target() != HtlcTarget::XOnlyPubKey(self.claim_pubkey) {
+        if !htlc.descriptor.pays(&self.claim_target()) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -391,9 +398,12 @@ impl Network for CashuAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::XOnlyPubKey(receiver) = target else {
+        let InvoiceTarget::Cashu {
+            target: receiver, ..
+        } = target
+        else {
             return Err(NetworkError::invalid(
                 "cashu HTLCs are locked to an x-only key",
             ));

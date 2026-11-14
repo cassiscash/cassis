@@ -8,10 +8,15 @@
 //! reservations, journaling, retries, timeouts, polling — lives in the
 //! node (see `cassis-wallet`).
 
+use crate::offline::GatewayDestination;
 use crate::primitives::{Bytes32, PubKey, XOnlyPubKey};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,22 +170,280 @@ impl fmt::Display for NetworkId {
     }
 }
 
-/// What a payer locks an HTLC to on a given network.
+/// What a payer locks an HTLC to on one network: who can claim it, with
+/// one variant per network kind.
 ///
-/// Crosses the wire inside protocol messages, so it stays externally
-/// tagged JSON.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HtlcTarget {
-    /// X-only claim key (Cashu, Arkade, Bitcoin, Fedimint).
-    XOnlyPubKey(XOnlyPubKey),
-    /// Full compressed claim key (Liquid, Rootstock).
-    PubKey(PubKey),
-    /// BOLT11 hold invoice the payer must pay (Lightning).
-    LightningInvoice(String),
+/// `L` is what a Lightning target carries: a BOLT11 hold invoice, or
+/// [`Infallible`] where Lightning cannot be paid (see
+/// [`crate::offline::GatewayDestination`]).
+///
+/// Crosses the wire as `{"network": <id>, "target": {<kind of key>: <key>}}`:
+/// `{"XOnlyPubKey": <hex>}`, `{"PubKey": <hex>}` or
+/// `{"LightningInvoice": <BOLT11>}`, which must be the network's kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvoiceTarget<L = String> {
+    Cashu {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Fedimint {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Arkade {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Bitcoin {
+        network: NetworkId,
+        target: XOnlyPubKey,
+    },
+    Liquid {
+        network: NetworkId,
+        target: PubKey,
+    },
+    Rootstock {
+        network: NetworkId,
+        target: PubKey,
+    },
+    Lightning {
+        network: NetworkId,
+        invoice: L,
+    },
+}
+
+/// What an [`InvoiceTarget::Lightning`] carries.
+pub trait LightningTarget: Sized {
+    /// The target paying `invoice` on `network`.
+    fn from_invoice(network: &NetworkId, invoice: String) -> Result<Self, String>;
+
+    fn invoice(&self) -> &str;
+}
+
+impl LightningTarget for String {
+    fn from_invoice(_: &NetworkId, invoice: String) -> Result<Self, String> {
+        Ok(invoice)
+    }
+
+    fn invoice(&self) -> &str {
+        self
+    }
+}
+
+/// No Lightning target at all: hold invoices need the payee online.
+impl LightningTarget for Infallible {
+    fn from_invoice(network: &NetworkId, _: String) -> Result<Self, String> {
+        Err(format!(
+            "{network} cannot be paid to an offline payee: its hold invoices need it online"
+        ))
+    }
+
+    fn invoice(&self) -> &str {
+        match *self {}
+    }
+}
+
+impl<L: LightningTarget> InvoiceTarget<L> {
+    /// The target on `network` that `target` names: a claim key in hex,
+    /// or a BOLT11 invoice, as the network's kind says.
+    pub fn parse(network: NetworkId, target: &str) -> Result<Self, String> {
+        let x_only = || {
+            target
+                .parse::<XOnlyPubKey>()
+                .map_err(|_| format!("{network} pays to an x-only key"))
+        };
+        let full = || {
+            target
+                .parse::<PubKey>()
+                .map_err(|_| format!("{network} pays to a full public key"))
+        };
+        Ok(match network.kind() {
+            "cashu" => Self::Cashu {
+                target: x_only()?,
+                network,
+            },
+            "fedimint" => Self::Fedimint {
+                target: x_only()?,
+                network,
+            },
+            "arkade" => Self::Arkade {
+                target: x_only()?,
+                network,
+            },
+            "bitcoin" => Self::Bitcoin {
+                target: x_only()?,
+                network,
+            },
+            "liquid" => Self::Liquid {
+                target: full()?,
+                network,
+            },
+            "rootstock" => Self::Rootstock {
+                target: full()?,
+                network,
+            },
+            "lightning" => Self::Lightning {
+                invoice: L::from_invoice(&network, target.to_string())?,
+                network,
+            },
+            _ => return Err(format!("{network} is not a network kind Cassis supports")),
+        })
+    }
+
+    /// The kind of key the target is, as it is tagged on the wire.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Cashu { .. }
+            | Self::Fedimint { .. }
+            | Self::Arkade { .. }
+            | Self::Bitcoin { .. } => "XOnlyPubKey",
+            Self::Liquid { .. } | Self::Rootstock { .. } => "PubKey",
+            Self::Lightning { .. } => "LightningInvoice",
+        }
+    }
+
+    /// The target [`InvoiceTarget::parse`] reads back.
+    pub fn target_string(&self) -> String {
+        match self {
+            Self::Cashu { target, .. }
+            | Self::Fedimint { target, .. }
+            | Self::Arkade { target, .. }
+            | Self::Bitcoin { target, .. } => target.to_hex(),
+            Self::Liquid { target, .. } | Self::Rootstock { target, .. } => target.to_hex(),
+            Self::Lightning { invoice, .. } => invoice.invoice().to_string(),
+        }
+    }
+}
+
+impl<L> InvoiceTarget<L> {
+    pub fn network(&self) -> &NetworkId {
+        match self {
+            Self::Cashu { network, .. }
+            | Self::Fedimint { network, .. }
+            | Self::Arkade { network, .. }
+            | Self::Bitcoin { network, .. }
+            | Self::Liquid { network, .. }
+            | Self::Rootstock { network, .. }
+            | Self::Lightning { network, .. } => network,
+        }
+    }
+
+    /// This target, a Lightning one replaced by `lightning`.
+    fn map_lightning<M, E>(
+        self,
+        lightning: impl FnOnce(NetworkId, L) -> Result<InvoiceTarget<M>, E>,
+    ) -> Result<InvoiceTarget<M>, E> {
+        Ok(match self {
+            Self::Cashu { network, target } => InvoiceTarget::Cashu { network, target },
+            Self::Fedimint { network, target } => InvoiceTarget::Fedimint { network, target },
+            Self::Arkade { network, target } => InvoiceTarget::Arkade { network, target },
+            Self::Bitcoin { network, target } => InvoiceTarget::Bitcoin { network, target },
+            Self::Liquid { network, target } => InvoiceTarget::Liquid { network, target },
+            Self::Rootstock { network, target } => InvoiceTarget::Rootstock { network, target },
+            Self::Lightning { network, invoice } => lightning(network, invoice)?,
+        })
+    }
+
+    /// The destination this target is, or the network and invoice of a
+    /// Lightning one.
+    pub fn destination(self) -> Result<GatewayDestination, (NetworkId, L)> {
+        self.map_lightning(|network, invoice| Err((network, invoice)))
+    }
+}
+
+impl From<GatewayDestination> for InvoiceTarget {
+    fn from(destination: GatewayDestination) -> Self {
+        let Ok(target) = destination.map_lightning::<String, Infallible>(|_, never| match never {});
+        target
+    }
+}
+
+impl<L: LightningTarget> InvoiceTarget<L> {
+    /// The wire `target`: a one-entry map from [`InvoiceTarget::tag`] to
+    /// [`InvoiceTarget::target_string`].
+    pub(crate) fn tagged_target(&self) -> [(&'static str, String); 1] {
+        [(self.tag(), self.target_string())]
+    }
+
+    /// Read back what [`InvoiceTarget::tagged_target`] wrote.
+    pub(crate) fn from_tagged(
+        network: NetworkId,
+        target: BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut entries = target.into_iter();
+        let (Some((tag, target)), None) = (entries.next(), entries.next()) else {
+            return Err("a target names exactly one kind of key".into());
+        };
+        let parsed = Self::parse(network, &target)?;
+        if parsed.tag() != tag {
+            return Err(format!(
+                "{} pays to a {}, not a {tag}",
+                parsed.network(),
+                parsed.tag()
+            ));
+        }
+        Ok(parsed)
+    }
+}
+
+impl<L: LightningTarget> Serialize for InvoiceTarget<L> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut target = serializer.serialize_struct("InvoiceTarget", 2)?;
+        target.serialize_field("network", self.network())?;
+        target.serialize_field("target", &BTreeMap::from(self.tagged_target()))?;
+        target.end()
+    }
+}
+
+impl<'de, L: LightningTarget> Deserialize<'de> for InvoiceTarget<L> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<L>(PhantomData<L>);
+
+        impl<'de, L: LightningTarget> de::Visitor<'de> for Visitor<L> {
+            type Value = InvoiceTarget<L>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a network and its target")
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let network = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let target = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                InvoiceTarget::from_tagged(network, target).map_err(de::Error::custom)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut network = None;
+                let mut target = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "network" => network = Some(map.next_value()?),
+                        "target" => target = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let network = network.ok_or_else(|| de::Error::missing_field("network"))?;
+                let target = target.ok_or_else(|| de::Error::missing_field("target"))?;
+                InvoiceTarget::from_tagged(network, target).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "InvoiceTarget",
+            &["network", "target"],
+            Visitor(PhantomData),
+        )
+    }
 }
 
 /// Network-specific handle to a funded HTLC: who can claim it, in this
-/// network's kind of [`HtlcTarget`], and what the receiver needs, on
+/// network's kind of [`InvoiceTarget`], and what the receiver needs, on
 /// top of the common [`Htlc`] fields, to find, verify and claim it, and
 /// what the sender needs to watch and refund it. Anything derivable
 /// from the common fields (payment hash, amount) is left out so it
@@ -243,17 +506,23 @@ pub enum HtlcDescriptor {
 }
 
 impl HtlcDescriptor {
-    /// Who can claim it.
-    pub fn target(&self) -> HtlcTarget {
-        match self {
-            Self::Cashu { target, .. }
-            | Self::Arkade { target, .. }
-            | Self::Bitcoin { target, .. }
-            | Self::Fedimint { target, .. } => HtlcTarget::XOnlyPubKey(*target),
-            Self::Liquid { target, .. } | Self::Rootstock { target, .. } => {
-                HtlcTarget::PubKey(*target)
+    /// Whether `target` can claim it, on whichever network.
+    pub fn pays<L: LightningTarget>(&self, target: &InvoiceTarget<L>) -> bool {
+        match (self, target) {
+            (Self::Cashu { target, .. }, InvoiceTarget::Cashu { target: claim, .. })
+            | (Self::Fedimint { target, .. }, InvoiceTarget::Fedimint { target: claim, .. })
+            | (Self::Arkade { target, .. }, InvoiceTarget::Arkade { target: claim, .. })
+            | (Self::Bitcoin { target, .. }, InvoiceTarget::Bitcoin { target: claim, .. }) => {
+                target == claim
             }
-            Self::Lightning { target } => HtlcTarget::LightningInvoice(target.clone()),
+            (Self::Liquid { target, .. }, InvoiceTarget::Liquid { target: claim, .. })
+            | (Self::Rootstock { target, .. }, InvoiceTarget::Rootstock { target: claim, .. }) => {
+                target == claim
+            }
+            (Self::Lightning { target }, InvoiceTarget::Lightning { invoice, .. }) => {
+                target == invoice.invoice()
+            }
+            _ => false,
         }
     }
 }
@@ -340,7 +609,7 @@ pub trait Network: Send + Sync {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError>;
+    ) -> Result<InvoiceTarget, NetworkError>;
 
     /// Release whatever [`Network::receive_target`] set up for a payment
     /// that will not be funded. No-op for claim-key networks.
@@ -384,7 +653,7 @@ pub trait Network: Send + Sync {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError>;
 
     /// One-shot look at an outgoing HTLC: still pending, claimed (with
@@ -448,7 +717,7 @@ impl Network for Overridden {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         self.network
             .receive_target(payment_hash, amount_msat, expiry)
             .await
@@ -479,7 +748,7 @@ impl Network for Overridden {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
         self.network
             .create_outgoing_htlc(payment_hash, amount_msat, expiry, target)

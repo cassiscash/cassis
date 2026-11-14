@@ -3,11 +3,11 @@
 //! these change only with a migration. Shared by the schemas of the
 //! wallet, the router and the gateway.
 
-use cassis_core::network::{Htlc, HtlcDescriptor, HtlcTarget};
+use cassis_core::network::{Htlc, HtlcDescriptor, InvoiceTarget};
 use cassis_core::offline::{
     AuthorizationKind, GatewayDestination, ReceiveAuthorization, Signature,
 };
-use cassis_core::protocol::{InvoiceNetwork, InvoiceTarget, Metadata};
+use cassis_core::protocol::{InvoiceNetwork, Metadata};
 use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
 use iroh_base::PublicKey;
 
@@ -42,7 +42,7 @@ impl TryFrom<&StoredPubKey> for PubKey {
     }
 }
 
-/// An [`HtlcTarget`].
+/// The key of an [`InvoiceTarget`], its network stored next to it.
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredTarget {
@@ -195,25 +195,34 @@ pub fn endpoint_key(bytes: &[u8; 32]) -> Result<PublicKey, String> {
     PublicKey::from_bytes(bytes).map_err(|_| corrupt("endpoint key"))
 }
 
-impl From<&HtlcTarget> for StoredTarget {
-    fn from(target: &HtlcTarget) -> Self {
+impl From<&InvoiceTarget> for StoredTarget {
+    fn from(target: &InvoiceTarget) -> Self {
         match target {
-            HtlcTarget::XOnlyPubKey(key) => Self::XOnlyPubKey(key.0),
-            HtlcTarget::PubKey(key) => Self::PubKey(key.into()),
-            HtlcTarget::LightningInvoice(invoice) => Self::LightningInvoice(invoice.clone()),
+            InvoiceTarget::Cashu { target, .. }
+            | InvoiceTarget::Fedimint { target, .. }
+            | InvoiceTarget::Arkade { target, .. }
+            | InvoiceTarget::Bitcoin { target, .. } => Self::XOnlyPubKey(target.0),
+            InvoiceTarget::Liquid { target, .. } | InvoiceTarget::Rootstock { target, .. } => {
+                Self::PubKey(target.into())
+            }
+            InvoiceTarget::Lightning { invoice, .. } => Self::LightningInvoice(invoice.clone()),
         }
     }
 }
 
-impl TryFrom<&StoredTarget> for HtlcTarget {
-    type Error = String;
-
-    fn try_from(target: &StoredTarget) -> Result<Self, String> {
-        Ok(match target {
-            StoredTarget::XOnlyPubKey(key) => Self::XOnlyPubKey(x_only(*key)?),
-            StoredTarget::PubKey(key) => Self::PubKey(key.try_into()?),
-            StoredTarget::LightningInvoice(invoice) => Self::LightningInvoice(invoice.clone()),
-        })
+impl StoredTarget {
+    /// The target this is on `network`.
+    pub fn on(&self, network: NetworkId) -> Result<InvoiceTarget, String> {
+        let target = match self {
+            Self::XOnlyPubKey(key) => x_only(*key)?.to_hex(),
+            Self::PubKey(key) => PubKey::try_from(key)?.to_hex(),
+            Self::LightningInvoice(invoice) => invoice.clone(),
+        };
+        let target = InvoiceTarget::parse(network, &target).map_err(|_| corrupt("target"))?;
+        if Self::from(&target) != *self {
+            return Err(corrupt("target"));
+        }
+        Ok(target)
     }
 }
 
@@ -460,11 +469,11 @@ impl TryFrom<&StoredHtlc> for Htlc {
 impl From<&InvoiceNetwork> for StoredInvoiceNetwork {
     fn from(entry: &InvoiceNetwork) -> Self {
         Self {
-            target: match &entry.target {
-                InvoiceTarget::Key(destination) => StoredInvoiceTarget::Key(destination.into()),
-                InvoiceTarget::Lightning { network, invoice } => StoredInvoiceTarget::Lightning {
-                    network: network.0.clone(),
-                    invoice: invoice.clone(),
+            target: match entry.target.clone().destination() {
+                Ok(destination) => StoredInvoiceTarget::Key((&destination).into()),
+                Err((network, invoice)) => StoredInvoiceTarget::Lightning {
+                    network: network.0,
+                    invoice,
                 },
             },
             incoming_delta_secs: entry.incoming_delta_secs,
@@ -479,7 +488,7 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
         Ok(Self {
             target: match &entry.target {
                 StoredInvoiceTarget::Key(destination) => {
-                    InvoiceTarget::Key(destination.try_into()?)
+                    GatewayDestination::try_from(destination)?.into()
                 }
                 StoredInvoiceTarget::Lightning { network, invoice } => InvoiceTarget::Lightning {
                     network: NetworkId(network.clone()),

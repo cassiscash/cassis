@@ -14,7 +14,7 @@
 //! * optional values are a byte `0` when absent, or `1` and the value;
 //! * enumerations are one tag byte, then the variant's fields.
 
-use crate::network::HtlcTarget;
+use crate::network::{InvoiceTarget, LightningTarget};
 use crate::primitives::Bytes32;
 use iroh_base::PublicKey;
 
@@ -87,13 +87,20 @@ impl SigningMessage {
         }
     }
 
-    /// What an HTLC is locked to: tag `0` and a 32-byte x-only key, tag
-    /// `1` and a 33-byte compressed key, or tag `2` and a BOLT11 string.
-    pub fn htlc_target(&mut self, target: &HtlcTarget) -> &mut Self {
+    /// What an HTLC is locked to: the network, then tag `0` and a
+    /// 32-byte x-only key, tag `1` and a 33-byte compressed key, or tag
+    /// `2` and a BOLT11 string.
+    pub fn invoice_target<L: LightningTarget>(&mut self, target: &InvoiceTarget<L>) -> &mut Self {
+        self.str(&target.network().0);
         match target {
-            HtlcTarget::XOnlyPubKey(key) => self.u8(0).raw(&key.0),
-            HtlcTarget::PubKey(key) => self.u8(1).raw(key.as_bytes()),
-            HtlcTarget::LightningInvoice(invoice) => self.u8(2).str(invoice),
+            InvoiceTarget::Cashu { target, .. }
+            | InvoiceTarget::Fedimint { target, .. }
+            | InvoiceTarget::Arkade { target, .. }
+            | InvoiceTarget::Bitcoin { target, .. } => self.u8(0).raw(&target.0),
+            InvoiceTarget::Liquid { target, .. } | InvoiceTarget::Rootstock { target, .. } => {
+                self.u8(1).raw(target.as_bytes())
+            }
+            InvoiceTarget::Lightning { invoice, .. } => self.u8(2).str(invoice.invoice()),
         }
     }
 

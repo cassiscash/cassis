@@ -1,16 +1,12 @@
-//! Every key a node uses, derived from one 12-word BIP39 mnemonic.
+//! Every key a node uses, derived from one 12-word BIP39 mnemonic: each is
+//! `HMAC-SHA512(seed, "cassis/<label>")`, truncated to 32 bytes.
 
 use crate::network::NetworkId;
 use hmac::{Hmac, Mac};
 use ritualistic::SecretKey;
 use sha2::Sha512;
-use std::str::FromStr;
 
 pub const SEED_WORD_COUNT: usize = 12;
-
-/// NIP-06 path of the node key (account 0): the same key a Nostr client
-/// derives from this mnemonic. Pinned so a node's identity never drifts.
-const NODE_DERIVATION_PATH: &str = "m/44'/1237'/0'/0/0";
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -20,8 +16,6 @@ pub enum SeedError {
     InvalidMnemonic(#[from] bip39::Error),
     #[error("expected a {SEED_WORD_COUNT}-word mnemonic, got {0} words")]
     WrongWordCount(usize),
-    #[error("BIP32 derivation failed: {0}")]
-    Derivation(String),
 }
 
 #[derive(Clone)]
@@ -44,13 +38,8 @@ impl NodeKeys {
             return Err(SeedError::WrongWordCount(words));
         }
         let seed = bip39::Mnemonic::parse(mnemonic)?.to_seed("");
-        let path = bip32::DerivationPath::from_str(NODE_DERIVATION_PATH)
-            .map_err(|e| SeedError::Derivation(e.to_string()))?;
-        let node = bip32::XPrv::derive_from_path(seed, &path)
-            .map_err(|e| SeedError::Derivation(e.to_string()))?
-            .to_bytes();
-        let node =
-            SecretKey::from_bytes(node).map_err(|e| SeedError::Derivation(format!("{e:?}")))?;
+        let node = SecretKey::from_bytes(scalar(&seed, b"cassis/node"))
+            .expect("scalar() yields a valid secp256k1 secret");
         let iroh = hmac(&seed, b"cassis/iroh", None);
         Ok(Self { seed, node, iroh })
     }
@@ -75,16 +64,19 @@ impl NodeKeys {
         hmac(&self.seed, b"cassis/preimage-server", None)
     }
 
-    /// Signing key of this node on `network`: the first 32 bytes of
-    /// `HMAC-SHA512(seed, "cassis/network/<id>" || counter)` that form a
-    /// valid secp256k1 scalar.
+    /// Signing key of this node on `network`.
     pub fn network_secret(&self, network: &NetworkId) -> [u8; 32] {
-        let label = format!("cassis/network/{network}");
-        (0u32..)
-            .map(|counter| hmac(&self.seed, label.as_bytes(), Some(counter)))
-            .find(|candidate| secp256k1::SecretKey::from_byte_array(*candidate).is_ok())
-            .expect("a valid scalar turns up with overwhelming probability")
+        scalar(&self.seed, format!("cassis/network/{network}").as_bytes())
     }
+}
+
+/// The first `HMAC-SHA512(seed, label || counter)` whose leading 32 bytes
+/// form a valid secp256k1 scalar.
+fn scalar(seed: &[u8; 64], label: &[u8]) -> [u8; 32] {
+    (0u32..)
+        .map(|counter| hmac(seed, label, Some(counter)))
+        .find(|candidate| secp256k1::SecretKey::from_byte_array(*candidate).is_ok())
+        .expect("a valid scalar turns up with overwhelming probability")
 }
 
 fn hmac(seed: &[u8; 64], label: &[u8], counter: Option<u32>) -> [u8; 32] {
@@ -139,19 +131,23 @@ mod tests {
     }
 
     #[test]
-    fn node_key_matches_nip6_test_vector() {
-        let keys = NodeKeys::from_mnemonic(
-            "leader monkey parrot ring guide accident before fence cannon height naive bean",
-        )
-        .unwrap();
-        assert_eq!(
-            keys.node.to_hex(),
-            "7f7ff03d123792d6ac594bfa67bf6d0c0ab55b6b1fdb6249303fe861f1ccba9a"
-        );
-        assert_eq!(
-            keys.node.pubkey().to_hex(),
-            "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
-        );
+    fn keys_are_deterministic_and_distinct() {
+        let keys = NodeKeys::from_mnemonic(MNEMONIC).unwrap();
+        let again = NodeKeys::from_mnemonic(MNEMONIC).unwrap();
+        assert_eq!(keys.node.as_bytes(), again.node.as_bytes());
+        assert_eq!(keys.iroh, again.iroh);
+        let secrets = [
+            *keys.node.as_bytes(),
+            keys.iroh,
+            keys.order_endpoint_secret(),
+            keys.admin_endpoint_secret(),
+            keys.preimage_server_secret(),
+        ];
+        for (i, a) in secrets.iter().enumerate() {
+            for b in &secrets[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]

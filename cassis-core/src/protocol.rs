@@ -3,7 +3,7 @@
 //! A payment over a route of `n` routers runs:
 //!
 //! 1. **PREPARE** every router concurrently. Each checks the terms and
-//!    its liquidity, and answers with the [`HtlcTarget`] its incoming
+//!    its liquidity, and answers with the [`InvoiceTarget`] its incoming
 //!    HTLC must be locked to. The payee gets a [`PreparePayee`] at the
 //!    same time, announcing the HTLC it will be COMMITted, and may
 //!    refuse the payment before anything is funded.
@@ -23,20 +23,22 @@
 //! answer [`Response::Pending`] and keep working, and the payer repeats
 //! the same request until it gets the outcome.
 
-use crate::network::{Htlc, HtlcDescriptor, HtlcTarget, NetworkId};
+use crate::network::{Htlc, HtlcDescriptor, InvoiceTarget, NetworkId};
 use crate::offline::{
-    endpoint_public_key, AuthorizationKind, GatewayDestination, PreimageIssuance,
-    ReceiveAuthorization, Signature,
+    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
 };
 use crate::primitives::{Bytes32, OperationId};
 use crate::signing::SigningMessage;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use iroh_base::PublicKey;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
+use std::fmt;
 
 /// Protocol identifier negotiated on every connection.
-pub const ALPN: &[u8] = b"cassis-hop/8";
+pub const ALPN: &[u8] = b"cassis-hop/9";
 
 /// Most bytes [`Metadata`] may hold.
 pub const MAX_METADATA_BYTES: usize = 128 * 1024;
@@ -219,10 +221,9 @@ impl InvoiceReceiver {
 
 /// One network an invoice can be paid on.
 ///
-/// Crosses the wire as `{network, target, incoming_delta_secs?}`, read
-/// through [`InvoiceTarget::new`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "WireInvoiceNetwork", into = "WireInvoiceNetwork")]
+/// Crosses the wire as its [`InvoiceTarget`], plus
+/// `incoming_delta_secs` when set.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceNetwork {
     pub target: InvoiceTarget,
     /// The receiver's safety margin on this network (see
@@ -231,70 +232,68 @@ pub struct InvoiceNetwork {
     pub incoming_delta_secs: Option<u64>,
 }
 
-/// What a payer locks to on one network of an invoice.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InvoiceTarget {
-    /// A claim key on a network that locks HTLCs to keys.
-    Key(GatewayDestination),
-    /// A BOLT11 hold invoice on `network`.
-    Lightning { network: NetworkId, invoice: String },
+impl Serialize for InvoiceNetwork {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut entry = serializer.serialize_struct("InvoiceNetwork", 3)?;
+        entry.serialize_field("network", self.target.network())?;
+        entry.serialize_field("target", &BTreeMap::from(self.target.tagged_target()))?;
+        optional_field(&mut entry, "incoming_delta_secs", &self.incoming_delta_secs)?;
+        entry.end()
+    }
 }
 
-impl InvoiceTarget {
-    /// The target paying `target` on `network`, if `target` is what
-    /// `network` locks HTLCs to.
-    pub fn new(network: NetworkId, target: HtlcTarget) -> Result<Self, String> {
-        match (network.kind(), target) {
-            ("lightning", HtlcTarget::LightningInvoice(invoice)) => {
-                Ok(Self::Lightning { network, invoice })
+impl<'de> Deserialize<'de> for InvoiceNetwork {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = InvoiceNetwork;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a network an invoice can be paid on")
             }
-            ("lightning", _) => Err(format!("{network} pays to a BOLT11 invoice")),
-            (_, target) => GatewayDestination::new(network, target).map(Self::Key),
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut network = None;
+                let mut target = None;
+                let mut incoming_delta_secs = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "network" => network = Some(map.next_value()?),
+                        "target" => target = Some(map.next_value()?),
+                        "incoming_delta_secs" => incoming_delta_secs = map.next_value()?,
+                        _ => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let network = network.ok_or_else(|| de::Error::missing_field("network"))?;
+                let target = target.ok_or_else(|| de::Error::missing_field("target"))?;
+                Ok(InvoiceNetwork {
+                    target: InvoiceTarget::from_tagged(network, target)
+                        .map_err(de::Error::custom)?,
+                    incoming_delta_secs,
+                })
+            }
         }
-    }
 
-    pub fn network(&self) -> &NetworkId {
-        match self {
-            Self::Key(destination) => destination.network(),
-            Self::Lightning { network, .. } => network,
-        }
-    }
-
-    pub fn target(&self) -> HtlcTarget {
-        match self {
-            Self::Key(destination) => destination.target(),
-            Self::Lightning { invoice, .. } => HtlcTarget::LightningInvoice(invoice.clone()),
-        }
-    }
-}
-
-/// An [`InvoiceNetwork`] on the wire.
-#[derive(Serialize, Deserialize)]
-struct WireInvoiceNetwork {
-    network: NetworkId,
-    target: HtlcTarget,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    incoming_delta_secs: Option<u64>,
-}
-
-impl TryFrom<WireInvoiceNetwork> for InvoiceNetwork {
-    type Error = String;
-
-    fn try_from(entry: WireInvoiceNetwork) -> Result<Self, String> {
-        Ok(Self {
-            target: InvoiceTarget::new(entry.network, entry.target)?,
-            incoming_delta_secs: entry.incoming_delta_secs,
-        })
+        deserializer.deserialize_struct(
+            "InvoiceNetwork",
+            &["network", "target", "incoming_delta_secs"],
+            Visitor,
+        )
     }
 }
 
-impl From<InvoiceNetwork> for WireInvoiceNetwork {
-    fn from(entry: InvoiceNetwork) -> Self {
-        Self {
-            network: entry.target.network().clone(),
-            target: entry.target.target(),
-            incoming_delta_secs: entry.incoming_delta_secs,
-        }
+/// Serialize `value` as field `key` of a struct, or skip it when absent.
+fn optional_field<S: SerializeStruct, T: Serialize>(
+    serializer: &mut S,
+    key: &'static str,
+    value: &Option<T>,
+) -> Result<(), S::Error> {
+    match value {
+        Some(value) => serializer.serialize_field(key, value),
+        None => serializer.skip_field(key),
     }
 }
 
@@ -585,8 +584,7 @@ impl Invoice {
             .count(body.networks.len());
         for entry in &body.networks {
             message
-                .str(&entry.target.network().0)
-                .htlc_target(&entry.target.target())
+                .invoice_target(&entry.target)
                 .option(entry.incoming_delta_secs, SigningMessage::u64);
         }
         message
@@ -623,152 +621,13 @@ impl Invoice {
         }
     }
 
-    /// The flat wire form: what is serialized.
-    fn to_wire(&self) -> InvoiceWire {
-        let (
-            payee,
-            payee_signature,
-            gateway,
-            gateway_signature,
-            preimage_server,
-            preimage_server_issuance,
-            payee_authorization,
-        ) = match &self.receiver {
-            InvoiceReceiver::Direct(receiver) => (
-                receiver.payee,
-                receiver.payee_signature,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            InvoiceReceiver::Gateway(receiver) => (
-                receiver.payee,
-                receiver.payee_signature,
-                Some(receiver.gateway),
-                receiver.gateway_signature,
-                None,
-                None,
-                None,
-            ),
-            InvoiceReceiver::Delegated(receiver) => (
-                receiver.payee,
-                None,
-                Some(receiver.gateway),
-                receiver.gateway_signature,
-                Some(receiver.preimage_server),
-                Some(receiver.preimage_server_issuance.clone()),
-                Some(receiver.payee_authorization.clone()),
-            ),
-        };
-        InvoiceWire {
-            payment_hash: self.body.payment_hash,
-            amount_msat: self.body.amount_msat,
-            expires_at: self.body.expires_at,
-            networks: self.body.networks.clone(),
-            description: self.body.description.clone(),
-            metadata: self.body.metadata.clone(),
-            iroh_peer_id: Some(self.iroh_peer_id().to_string()),
-            iroh_relay: self.body.iroh_relay.clone(),
-            payee: Some(payee),
-            payee_signature,
-            gateway,
-            gateway_signature,
-            preimage_server,
-            preimage_server_issuance,
-            payee_authorization,
-        }
-    }
-
-    /// Classify a flat wire invoice into its receiver.
-    fn from_wire(wire: InvoiceWire) -> Result<Self, String> {
-        let payee = wire.payee.ok_or("invoice names no payee")?;
-        let body = InvoiceBody {
-            payment_hash: wire.payment_hash,
-            amount_msat: wire.amount_msat,
-            expires_at: wire.expires_at,
-            networks: wire.networks,
-            description: wire.description,
-            metadata: wire.metadata,
-            iroh_relay: wire.iroh_relay,
-        };
-        let receiver = if let Some(gateway) = wire.gateway {
-            if gateway == payee {
-                return Err("the payee cannot be its own gateway".into());
-            }
-            if let Some(named) = wire.iroh_peer_id.as_deref() {
-                let named: PublicKey = named
-                    .parse()
-                    .map_err(|e| format!("invoice endpoint: {e}"))?;
-                if named != gateway {
-                    return Err("invoice names another endpoint than its gateway".into());
-                }
-            }
-            if let Some(authorization) = wire.payee_authorization {
-                if wire.payee_signature.is_some() {
-                    return Err(
-                        "an invoice under a payee authorization carries a payee signature".into(),
-                    );
-                }
-                let preimage_server = wire
-                    .preimage_server
-                    .ok_or("invoice names no preimage server")?;
-                let issuance = wire
-                    .preimage_server_issuance
-                    .ok_or("invoice carries no issuance of its payment hash")?;
-                InvoiceReceiver::Delegated(DelegatedReceiver {
-                    payee,
-                    gateway,
-                    gateway_signature: wire.gateway_signature,
-                    preimage_server,
-                    preimage_server_issuance: issuance,
-                    payee_authorization: authorization,
-                })
-            } else {
-                if wire.preimage_server.is_some() || wire.preimage_server_issuance.is_some() {
-                    return Err(
-                        "a payee-signed gateway invoice carries preimage server fields".into(),
-                    );
-                }
-                InvoiceReceiver::Gateway(GatewayReceiver {
-                    payee,
-                    gateway,
-                    gateway_signature: wire.gateway_signature,
-                    payee_signature: wire.payee_signature,
-                })
-            }
-        } else {
-            if wire.gateway_signature.is_some()
-                || wire.preimage_server.is_some()
-                || wire.preimage_server_issuance.is_some()
-                || wire.payee_authorization.is_some()
-            {
-                return Err("an invoice without a gateway carries gateway fields".into());
-            }
-            if let Some(named) = wire.iroh_peer_id.as_deref() {
-                let named: PublicKey = named
-                    .parse()
-                    .map_err(|e| format!("invoice endpoint: {e}"))?;
-                if named != payee {
-                    return Err("invoice names another endpoint than its payee".into());
-                }
-            }
-            InvoiceReceiver::Direct(DirectReceiver {
-                payee,
-                payee_signature: wire.payee_signature,
-            })
-        };
-        Ok(Self { body, receiver })
-    }
-
     /// Target the payer must lock to when paying on `network`.
-    pub fn target_for(&self, network: &NetworkId) -> Option<HtlcTarget> {
+    pub fn target_for(&self, network: &NetworkId) -> Option<&InvoiceTarget> {
         self.body
             .networks
             .iter()
             .find(|entry| entry.target.network() == network)
-            .map(|entry| entry.target.target())
+            .map(|entry| &entry.target)
     }
 
     /// The receiver's safety margin when paid on `network`.
@@ -782,48 +641,225 @@ impl Invoice {
     }
 }
 
-/// The flat JSON form of an [`Invoice`], kept so its bytes do not
-/// depend on how the Rust model is nested.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct InvoiceWire {
-    payment_hash: Bytes32,
-    amount_msat: u64,
-    expires_at: u64,
-    networks: Vec<InvoiceNetwork>,
-    description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    metadata: Option<Metadata>,
-    /// Derived from the receiver; serialized for compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    iroh_peer_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    iroh_relay: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    payee: Option<PublicKey>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    payee_signature: Option<Signature>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gateway: Option<PublicKey>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gateway_signature: Option<Signature>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    preimage_server: Option<PublicKey>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    preimage_server_issuance: Option<PreimageIssuance>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    payee_authorization: Option<ReceiveAuthorization>,
-}
-
+/// An [`Invoice`] crosses the wire as flat JSON, so its bytes do not
+/// depend on how the Rust model is nested: the body's fields, then
+/// `iroh_peer_id` (derived from the receiver, kept for compatibility)
+/// and the receiver's fields, each present only when its kind has it.
 impl Serialize for Invoice {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_wire().serialize(serializer)
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let body = &self.body;
+        let (
+            payee,
+            payee_signature,
+            gateway,
+            gateway_signature,
+            preimage_server,
+            preimage_server_issuance,
+            payee_authorization,
+        ) = match &self.receiver {
+            InvoiceReceiver::Direct(receiver) => (
+                &receiver.payee,
+                &receiver.payee_signature,
+                None,
+                &None,
+                None,
+                None,
+                None,
+            ),
+            InvoiceReceiver::Gateway(receiver) => (
+                &receiver.payee,
+                &receiver.payee_signature,
+                Some(&receiver.gateway),
+                &receiver.gateway_signature,
+                None,
+                None,
+                None,
+            ),
+            InvoiceReceiver::Delegated(receiver) => (
+                &receiver.payee,
+                &None,
+                Some(&receiver.gateway),
+                &receiver.gateway_signature,
+                Some(&receiver.preimage_server),
+                Some(&receiver.preimage_server_issuance),
+                Some(&receiver.payee_authorization),
+            ),
+        };
+        let mut invoice = serializer.serialize_struct("Invoice", 15)?;
+        invoice.serialize_field("payment_hash", &body.payment_hash)?;
+        invoice.serialize_field("amount_msat", &body.amount_msat)?;
+        invoice.serialize_field("expires_at", &body.expires_at)?;
+        invoice.serialize_field("networks", &body.networks)?;
+        invoice.serialize_field("description", &body.description)?;
+        optional_field(&mut invoice, "metadata", &body.metadata)?;
+        invoice.serialize_field("iroh_peer_id", &self.iroh_peer_id().to_string())?;
+        optional_field(&mut invoice, "iroh_relay", &body.iroh_relay)?;
+        invoice.serialize_field("payee", payee)?;
+        optional_field(&mut invoice, "payee_signature", payee_signature)?;
+        optional_field(&mut invoice, "gateway", &gateway)?;
+        optional_field(&mut invoice, "gateway_signature", gateway_signature)?;
+        optional_field(&mut invoice, "preimage_server", &preimage_server)?;
+        optional_field(
+            &mut invoice,
+            "preimage_server_issuance",
+            &preimage_server_issuance,
+        )?;
+        optional_field(&mut invoice, "payee_authorization", &payee_authorization)?;
+        invoice.end()
     }
 }
 
+/// Reads what [`Invoice`]'s `Serialize` writes, classifying the receiver
+/// by the fields present.
 impl<'de> Deserialize<'de> for Invoice {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = InvoiceWire::deserialize(deserializer)?;
-        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &[
+            "payment_hash",
+            "amount_msat",
+            "expires_at",
+            "networks",
+            "description",
+            "metadata",
+            "iroh_peer_id",
+            "iroh_relay",
+            "payee",
+            "payee_signature",
+            "gateway",
+            "gateway_signature",
+            "preimage_server",
+            "preimage_server_issuance",
+            "payee_authorization",
+        ];
+
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = Invoice;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an invoice")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Invoice, A::Error> {
+                let mut payment_hash = None;
+                let mut amount_msat = None;
+                let mut expires_at = None;
+                let mut networks = None;
+                let mut description = None;
+                let mut metadata = None;
+                let mut iroh_peer_id: Option<String> = None;
+                let mut iroh_relay = None;
+                let mut payee: Option<PublicKey> = None;
+                let mut payee_signature = None;
+                let mut gateway: Option<PublicKey> = None;
+                let mut gateway_signature = None;
+                let mut preimage_server = None;
+                let mut preimage_server_issuance = None;
+                let mut payee_authorization = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "payment_hash" => payment_hash = Some(map.next_value()?),
+                        "amount_msat" => amount_msat = Some(map.next_value()?),
+                        "expires_at" => expires_at = Some(map.next_value()?),
+                        "networks" => networks = Some(map.next_value()?),
+                        "description" => description = map.next_value()?,
+                        "metadata" => metadata = map.next_value()?,
+                        "iroh_peer_id" => iroh_peer_id = map.next_value()?,
+                        "iroh_relay" => iroh_relay = map.next_value()?,
+                        "payee" => payee = map.next_value()?,
+                        "payee_signature" => payee_signature = map.next_value()?,
+                        "gateway" => gateway = map.next_value()?,
+                        "gateway_signature" => gateway_signature = map.next_value()?,
+                        "preimage_server" => preimage_server = map.next_value()?,
+                        "preimage_server_issuance" => {
+                            preimage_server_issuance = map.next_value()?
+                        }
+                        "payee_authorization" => payee_authorization = map.next_value()?,
+                        _ => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let invalid = |reason: &str| de::Error::custom(reason);
+                let body = InvoiceBody {
+                    payment_hash: payment_hash
+                        .ok_or_else(|| de::Error::missing_field("payment_hash"))?,
+                    amount_msat: amount_msat
+                        .ok_or_else(|| de::Error::missing_field("amount_msat"))?,
+                    expires_at: expires_at.ok_or_else(|| de::Error::missing_field("expires_at"))?,
+                    networks: networks.ok_or_else(|| de::Error::missing_field("networks"))?,
+                    description,
+                    metadata,
+                    iroh_relay,
+                };
+                let payee = payee.ok_or_else(|| invalid("invoice names no payee"))?;
+                let named = iroh_peer_id
+                    .map(|named| {
+                        named
+                            .parse::<PublicKey>()
+                            .map_err(|e| de::Error::custom(format!("invoice endpoint: {e}")))
+                    })
+                    .transpose()?;
+                let receiver = if let Some(gateway) = gateway {
+                    if gateway == payee {
+                        return Err(invalid("the payee cannot be its own gateway"));
+                    }
+                    if named.is_some_and(|named| named != gateway) {
+                        return Err(invalid("invoice names another endpoint than its gateway"));
+                    }
+                    if let Some(authorization) = payee_authorization {
+                        if payee_signature.is_some() {
+                            return Err(invalid(
+                                "an invoice under a payee authorization carries a payee signature",
+                            ));
+                        }
+                        InvoiceReceiver::Delegated(DelegatedReceiver {
+                            payee,
+                            gateway,
+                            gateway_signature,
+                            preimage_server: preimage_server
+                                .ok_or_else(|| invalid("invoice names no preimage server"))?,
+                            preimage_server_issuance: preimage_server_issuance.ok_or_else(
+                                || invalid("invoice carries no issuance of its payment hash"),
+                            )?,
+                            payee_authorization: authorization,
+                        })
+                    } else {
+                        if preimage_server.is_some() || preimage_server_issuance.is_some() {
+                            return Err(invalid(
+                                "a payee-signed gateway invoice carries preimage server fields",
+                            ));
+                        }
+                        InvoiceReceiver::Gateway(GatewayReceiver {
+                            payee,
+                            gateway,
+                            gateway_signature,
+                            payee_signature,
+                        })
+                    }
+                } else {
+                    if gateway_signature.is_some()
+                        || preimage_server.is_some()
+                        || preimage_server_issuance.is_some()
+                        || payee_authorization.is_some()
+                    {
+                        return Err(invalid(
+                            "an invoice without a gateway carries gateway fields",
+                        ));
+                    }
+                    if named.is_some_and(|named| named != payee) {
+                        return Err(invalid("invoice names another endpoint than its payee"));
+                    }
+                    InvoiceReceiver::Direct(DirectReceiver {
+                        payee,
+                        payee_signature,
+                    })
+                };
+                Ok(Invoice { body, receiver })
+            }
+        }
+
+        deserializer.deserialize_struct("Invoice", FIELDS, Visitor)
     }
 }
 
@@ -851,7 +887,7 @@ pub struct Execute {
     pub payment_hash: Bytes32,
     pub operation_id: OperationId,
     pub incoming_descriptor: HtlcDescriptor,
-    pub outgoing_target: HtlcTarget,
+    pub outgoing_target: InvoiceTarget,
 }
 
 /// Release the reservation of a PREPARE that will not be executed.
@@ -1007,7 +1043,7 @@ pub enum Request {
 pub enum Response {
     /// Target to lock the hop's incoming HTLC to, or why the hop
     /// refuses.
-    Prepared(Result<HtlcTarget, String>),
+    Prepared(Result<InvoiceTarget, String>),
     /// The payee expects the announced HTLC, or why it refuses.
     PayeePrepared(Result<(), String>),
     /// Descriptor of the hop's freshly funded outgoing HTLC.
@@ -1044,7 +1080,10 @@ mod tests {
                     .unwrap()
                     .pubkey(),
             },
-            outgoing_target: HtlcTarget::LightningInvoice("lnbc...".into()),
+            outgoing_target: InvoiceTarget::Lightning {
+                network: NetworkId("lightning".into()),
+                invoice: "lnbc...".into(),
+            },
         });
         let bytes = serde_json::to_vec(&request).unwrap();
         let Request::Execute(decoded) = serde_json::from_slice(&bytes).unwrap() else {
@@ -1052,7 +1091,10 @@ mod tests {
         };
         assert_eq!(
             decoded.outgoing_target,
-            HtlcTarget::LightningInvoice("lnbc...".into())
+            InvoiceTarget::Lightning {
+                network: NetworkId("lightning".into()),
+                invoice: "lnbc...".into(),
+            }
         );
         let response = Response::Prepared(Err("no liquidity".into()));
         let bytes = serde_json::to_vec(&response).unwrap();
@@ -1133,12 +1175,12 @@ mod tests {
             amount_msat: 1000,
             expires_at: 3000,
             networks: vec![InvoiceNetwork {
-                target: InvoiceTarget::Key(GatewayDestination::Cashu {
+                target: InvoiceTarget::Cashu {
                     network: NetworkId("cashu::localhost".into()),
                     target: ritualistic::SecretKey::from_bytes([3; 32])
                         .unwrap()
                         .pubkey(),
-                }),
+                },
                 incoming_delta_secs: None,
             }],
             description: Some("coffee".into()),

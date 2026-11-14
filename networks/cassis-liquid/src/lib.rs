@@ -32,7 +32,7 @@ mod zeroconf;
 
 use async_trait::async_trait;
 use cassis_core::{
-    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError,
+    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
     NetworkId, OutgoingState, PubKey, MSAT_PER_SAT,
 };
 use hmac::Mac;
@@ -336,11 +336,12 @@ impl LiquidAdapter {
         })
     }
 
-    fn claim_target(&self) -> HtlcTarget {
-        HtlcTarget::PubKey(
-            PubKey::from_bytes(self.claim_pk_full.to_bytes().try_into().expect("33 bytes"))
+    fn claim_target(&self) -> InvoiceTarget {
+        InvoiceTarget::Liquid {
+            network: self.id.clone(),
+            target: PubKey::from_bytes(self.claim_pk_full.to_bytes().try_into().expect("33 bytes"))
                 .expect("valid claim key"),
-        )
+        }
     }
 
     /// Lockup outpoint and the HTLC script of `htlc`, whose claim key
@@ -863,7 +864,7 @@ impl Network for LiquidAdapter {
         _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         Ok(self.claim_target())
     }
 
@@ -872,7 +873,7 @@ impl Network for LiquidAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor.target() != self.claim_target() {
+        if !htlc.descriptor.pays(&self.claim_target()) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -927,9 +928,9 @@ impl Network for LiquidAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::PubKey(claim) = target else {
+        let InvoiceTarget::Liquid { target: claim, .. } = target else {
             return Err(NetworkError::invalid(
                 "liquid HTLCs are locked to a full key",
             ));

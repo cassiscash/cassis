@@ -72,7 +72,7 @@ use bitcoin::TxOut;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
 use cassis_core::{
-    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError,
+    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
     NetworkId, OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
 };
 use std::path::Path;
@@ -373,8 +373,11 @@ impl ArkadeAdapter {
         Ok(())
     }
 
-    fn claim_target(&self) -> HtlcTarget {
-        HtlcTarget::XOnlyPubKey(XOnlyPubKey::from_bytes(self.xonly.serialize()).expect("valid key"))
+    fn claim_target(&self) -> InvoiceTarget {
+        InvoiceTarget::Arkade {
+            network: self.id.clone(),
+            target: XOnlyPubKey::from_bytes(self.xonly.serialize()).expect("valid key"),
+        }
     }
 
     /// VHTLC options of `htlc`: receiver, sender and timelocks from the
@@ -1007,7 +1010,7 @@ impl Network for ArkadeAdapter {
         _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         Ok(self.claim_target())
     }
 
@@ -1016,7 +1019,7 @@ impl Network for ArkadeAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor.target() != self.claim_target() {
+        if !htlc.descriptor.pays(&self.claim_target()) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -1059,9 +1062,12 @@ impl Network for ArkadeAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::XOnlyPubKey(receiver) = target else {
+        let InvoiceTarget::Arkade {
+            target: receiver, ..
+        } = target
+        else {
             return Err(NetworkError::invalid(
                 "arkade HTLCs are locked to an x-only key",
             ));

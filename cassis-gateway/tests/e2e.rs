@@ -22,7 +22,7 @@ use cassis_core::protocol::{
 };
 use cassis_core::transport::{PeerAddr, Transport};
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
 use cassis_gateway::admin::GatewayAdmin;
@@ -60,7 +60,7 @@ struct Lock {
     payment_hash: Bytes32,
     amount_msat: u64,
     expiry: u64,
-    target: HtlcTarget,
+    target: XOnlyPubKey,
     state: LockState,
 }
 
@@ -109,8 +109,16 @@ impl Network for MockNetwork {
         5
     }
 
-    async fn receive_target(&self, _: Bytes32, _: u64, _: u64) -> Result<HtlcTarget, NetworkError> {
-        Ok(HtlcTarget::XOnlyPubKey(self.key))
+    async fn receive_target(
+        &self,
+        _: Bytes32,
+        _: u64,
+        _: u64,
+    ) -> Result<InvoiceTarget, NetworkError> {
+        Ok(InvoiceTarget::Cashu {
+            network: self.id(),
+            target: self.key,
+        })
     }
 
     async fn cancel_receive(&self, _: Bytes32) -> Result<(), NetworkError> {
@@ -118,7 +126,10 @@ impl Network for MockNetwork {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor.target() != HtlcTarget::XOnlyPubKey(self.key) {
+        if !htlc
+            .descriptor
+            .pays(&self.receive_target(htlc.payment_hash, 0, 0).await?)
+        {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -129,7 +140,11 @@ impl Network for MockNetwork {
         let lock = ledger
             .get(&Self::lock_id(htlc)?)
             .ok_or_else(|| NetworkError::invalid("no such lock"))?;
-        let ok = lock.target == htlc.descriptor.target()
+        let paid: InvoiceTarget = InvoiceTarget::Cashu {
+            network: self.id(),
+            target: lock.target,
+        };
+        let ok = htlc.descriptor.pays(&paid)
             && lock.payment_hash == htlc.payment_hash
             && lock.amount_msat >= htlc.amount_msat
             && lock.expiry >= htlc.expiry
@@ -146,7 +161,7 @@ impl Network for MockNetwork {
         let mut ledger = self.ledger.0.lock().unwrap();
         let lock = ledger.get_mut(&Self::lock_id(htlc)?).unwrap();
         assert!(lock.payment_hash.matches_preimage(&preimage));
-        assert_eq!(lock.target, HtlcTarget::XOnlyPubKey(self.key));
+        assert_eq!(lock.target, self.key);
         lock.state = LockState::Claimed(preimage);
         Ok(())
     }
@@ -156,9 +171,9 @@ impl Network for MockNetwork {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::XOnlyPubKey(key) = target else {
+        let InvoiceTarget::Cashu { target: key, .. } = target else {
             return Err(NetworkError::invalid(
                 "mock HTLCs are locked to an x-only key",
             ));
@@ -170,7 +185,7 @@ impl Network for MockNetwork {
                 payment_hash,
                 amount_msat,
                 expiry,
-                target: target.clone(),
+                target: *key,
                 state: LockState::Locked,
             },
         );
@@ -428,7 +443,7 @@ impl Setup {
     /// The locks paying `hash`: the payer's to the gateway, and the
     /// gateway's to `payee`.
     fn locks(&self, hash: Bytes32, payee: u8) -> (Lock, Lock) {
-        let payee = HtlcTarget::XOnlyPubKey(MockNetwork::new(payee, &self.ledger).key);
+        let payee = MockNetwork::new(payee, &self.ledger).key;
         let locks: Vec<Lock> = self
             .ledger
             .locks()
@@ -535,10 +550,7 @@ async fn payee_offline_behind_a_gateway() {
             expiry: to_payee.expiry,
             descriptor: HtlcDescriptor::Cashu {
                 proofs_b64: vec!["none".into()],
-                target: match &to_payee.target {
-                    HtlcTarget::XOnlyPubKey(key) => *key,
-                    other => panic!("mock target {other:?}"),
-                },
+                target: to_payee.target,
             },
         },
     });

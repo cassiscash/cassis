@@ -29,7 +29,6 @@ async-trait = "0.1.91"
 base64 = "0.22.1"
 bitcoin = "0.32.102"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
-bip32 = { version = "0.5.3", default-features = false, features = ["secp256k1", "std"] }
 bip39 = "2.2.2"
 chacha20 = "0.9.1"
 cdk = { version = "0.17.3", features = ["wallet"] }

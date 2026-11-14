@@ -59,7 +59,9 @@ async fn destinations(networks: &[Arc<dyn Network>]) -> Result<Vec<GatewayDestin
             .receive_target(Bytes32([0; 32]), 0, 0)
             .await
             .map_err(|e| format!("cannot receive on {id}: {e}"))?;
-        destinations.push(GatewayDestination::new(id, target)?);
+        destinations.push(target.destination().map_err(|(id, _)| {
+            format!("{id} cannot be paid to an offline payee: its hold invoices need it online")
+        })?);
     }
     Ok(destinations)
 }

@@ -7,9 +7,9 @@ use crate::db::{
 };
 use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
-use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId};
+use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkError, NetworkId};
 use cassis_core::protocol::{
-    Commit, Invoice, InvoiceBody, InvoiceNetwork, InvoiceTarget, Metadata, PreparePayee, Response,
+    Commit, Invoice, InvoiceBody, InvoiceNetwork, Metadata, PreparePayee, Response,
 };
 use cassis_core::{unix_now, Bytes32};
 use std::sync::Arc;
@@ -57,7 +57,7 @@ pub async fn create_invoice(
             .await
             .map_err(|e| format!("cannot receive on {}: {e}", network.id()))?;
         targets.push(InvoiceNetwork {
-            target: InvoiceTarget::new(network.id(), target)?,
+            target,
             incoming_delta_secs: Some(network.incoming_delta_secs()),
         });
     }
@@ -154,7 +154,7 @@ impl Node {
         record: &StoredInvoice,
         network: &NetworkId,
         expiry: u64,
-    ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
+    ) -> Result<(InvoiceTarget, Arc<dyn Network>, u64), String> {
         if record.state == InvoiceState::Expired || record.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
@@ -163,7 +163,7 @@ impl Node {
             .iter()
             .find(|entry| entry.network() == network.0)
             .ok_or_else(|| format!("invoice is not payable on {network}"))?;
-        let target = InvoiceNetwork::try_from(entry)?.target.target();
+        let target = InvoiceNetwork::try_from(entry)?.target;
         let network = self.network(network)?;
         // The claim itself must land before the HTLC expires.
         let claim_by = expiry.saturating_sub(network.incoming_delta_secs());
@@ -252,7 +252,7 @@ impl Node {
         );
         let (target, network, claim_by) =
             self.payable_on(&record, &commit.network, commit.expiry)?;
-        if commit.descriptor.target() != target {
+        if !commit.descriptor.pays(&target) {
             return Err("the HTLC does not pay this invoice".into());
         }
         let htlc = Htlc {

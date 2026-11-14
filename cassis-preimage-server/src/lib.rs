@@ -377,7 +377,7 @@ impl PreimageServer {
         let destination = authorization
             .destination(&network)
             .ok_or_else(|| format!("the payee does not receive on {network}"))?;
-        if htlc.descriptor.target() != destination.target() {
+        if !htlc.descriptor.pays(destination) {
             return Err("the HTLC does not pay the payee's destination".into());
         }
         if htlc.amount_msat < issuance.amount_msat {

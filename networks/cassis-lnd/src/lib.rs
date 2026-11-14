@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, MSAT_PER_SAT,
 };
 use lightning_invoice::Bolt11Invoice;
@@ -451,10 +451,13 @@ impl Network for LndAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         self.hold_invoice(payment_hash, amount_msat, expiry)
             .await
-            .map(HtlcTarget::LightningInvoice)
+            .map(|invoice| InvoiceTarget::Lightning {
+                network: self.id.clone(),
+                invoice,
+            })
     }
 
     async fn cancel_receive(&self, payment_hash: Bytes32) -> Result<(), NetworkError> {
@@ -518,9 +521,13 @@ impl Network for LndAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::LightningInvoice(payment_request) = target else {
+        let InvoiceTarget::Lightning {
+            invoice: payment_request,
+            ..
+        } = target
+        else {
             return Err(NetworkError::invalid("lightning HTLCs pay an invoice"));
         };
         let invoice = parse_invoice(payment_request, payment_hash)?;

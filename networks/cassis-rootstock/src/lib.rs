@@ -30,7 +30,7 @@ use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, PubKey, XOnlyPubKey,
 };
 use std::str::FromStr;
@@ -241,8 +241,11 @@ impl RootstockAdapter {
         Ok(*pending.tx_hash())
     }
 
-    fn claim_target(&self) -> HtlcTarget {
-        HtlcTarget::PubKey(PubKey::from_x_only(&self.claim_pubkey).expect("valid key"))
+    fn claim_target(&self) -> InvoiceTarget {
+        InvoiceTarget::Rootstock {
+            network: self.id.clone(),
+            target: PubKey::from_x_only(&self.claim_pubkey).expect("valid key"),
+        }
     }
 
     async fn block_number(&self) -> Result<u64, NetworkError> {
@@ -393,7 +396,7 @@ impl Network for RootstockAdapter {
         _payment_hash: Bytes32,
         _amount_msat: u64,
         _expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         Ok(self.claim_target())
     }
 
@@ -402,7 +405,7 @@ impl Network for RootstockAdapter {
     }
 
     async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        if htlc.descriptor.target() != self.claim_target() {
+        if !htlc.descriptor.pays(&self.claim_target()) {
             return Err(NetworkError::invalid("HTLC is not addressed to this node"));
         }
         self.verify_htlc(htlc).await
@@ -454,9 +457,9 @@ impl Network for RootstockAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::PubKey(claim) = target else {
+        let InvoiceTarget::Rootstock { target: claim, .. } = target else {
             return Err(NetworkError::invalid(
                 "rootstock HTLCs are locked to a full key",
             ));

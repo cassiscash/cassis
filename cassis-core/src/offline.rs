@@ -31,8 +31,9 @@
 //! with their own signature rules (see
 //! [`Invoice::verify`](crate::protocol::Invoice::verify)).
 
-use crate::network::{HtlcTarget, NetworkId};
-use crate::primitives::{Bytes32, PubKey, XOnlyPubKey};
+use crate::network::InvoiceTarget;
+use crate::network::NetworkId;
+use crate::primitives::Bytes32;
 use crate::protocol::Metadata;
 use crate::signing::SigningMessage;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
@@ -41,6 +42,7 @@ use hmac::{Hmac, Mac};
 use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::convert::Infallible;
 use std::fmt;
 
 /// Default of [`ReceiveAuthorization::min_final_timeout_secs`]: how
@@ -125,117 +127,9 @@ impl AuthorizationKind {
     }
 }
 
-/// Where the gateway pays the payee: an HTLC on `network` locked to
-/// `target`, with one variant per network kind an offline payee can
-/// receive on. Lightning has none: its hold invoices need the payee
-/// online.
-///
-/// Crosses the wire as `{network, target}`, read through
-/// [`GatewayDestination::new`] so the variant always is the network's kind.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "WireGatewayDestination", into = "WireGatewayDestination")]
-pub enum GatewayDestination {
-    Cashu {
-        network: NetworkId,
-        target: XOnlyPubKey,
-    },
-    Fedimint {
-        network: NetworkId,
-        target: XOnlyPubKey,
-    },
-    Arkade {
-        network: NetworkId,
-        target: XOnlyPubKey,
-    },
-    Bitcoin {
-        network: NetworkId,
-        target: XOnlyPubKey,
-    },
-    Liquid {
-        network: NetworkId,
-        target: PubKey,
-    },
-    Rootstock {
-        network: NetworkId,
-        target: PubKey,
-    },
-}
-
-impl GatewayDestination {
-    /// The destination paying `target` on `network`, if `target` is the
-    /// kind of claim key `network` locks HTLCs to.
-    pub fn new(network: NetworkId, target: HtlcTarget) -> Result<Self, String> {
-        let kind = network.kind().to_string();
-        Ok(match (kind.as_str(), target) {
-            ("cashu", HtlcTarget::XOnlyPubKey(target)) => Self::Cashu { network, target },
-            ("fedimint", HtlcTarget::XOnlyPubKey(target)) => Self::Fedimint { network, target },
-            ("arkade", HtlcTarget::XOnlyPubKey(target)) => Self::Arkade { network, target },
-            ("bitcoin", HtlcTarget::XOnlyPubKey(target)) => Self::Bitcoin { network, target },
-            ("liquid", HtlcTarget::PubKey(target)) => Self::Liquid { network, target },
-            ("rootstock", HtlcTarget::PubKey(target)) => Self::Rootstock { network, target },
-            ("cashu" | "fedimint" | "arkade" | "bitcoin", _) => {
-                return Err(format!("{network} pays to an x-only key"));
-            }
-            ("liquid" | "rootstock", _) => {
-                return Err(format!("{network} pays to a full public key"));
-            }
-            ("lightning", _) => {
-                return Err(format!(
-                    "{network} cannot be paid to an offline payee: its hold invoices need it \
-                     online"
-                ));
-            }
-            _ => return Err(format!("{network} is not a network kind Cassis supports")),
-        })
-    }
-
-    pub fn network(&self) -> &NetworkId {
-        match self {
-            Self::Cashu { network, .. }
-            | Self::Fedimint { network, .. }
-            | Self::Arkade { network, .. }
-            | Self::Bitcoin { network, .. }
-            | Self::Liquid { network, .. }
-            | Self::Rootstock { network, .. } => network,
-        }
-    }
-
-    pub fn target(&self) -> HtlcTarget {
-        match self {
-            Self::Cashu { target, .. }
-            | Self::Fedimint { target, .. }
-            | Self::Arkade { target, .. }
-            | Self::Bitcoin { target, .. } => HtlcTarget::XOnlyPubKey(*target),
-            Self::Liquid { target, .. } | Self::Rootstock { target, .. } => {
-                HtlcTarget::PubKey(*target)
-            }
-        }
-    }
-}
-
-/// A [`GatewayDestination`] on the wire.
-#[derive(Serialize, Deserialize)]
-struct WireGatewayDestination {
-    network: NetworkId,
-    target: HtlcTarget,
-}
-
-impl TryFrom<WireGatewayDestination> for GatewayDestination {
-    type Error = String;
-
-    fn try_from(destination: WireGatewayDestination) -> Result<Self, String> {
-        Self::new(destination.network, destination.target)
-    }
-}
-
-impl From<GatewayDestination> for WireGatewayDestination {
-    fn from(destination: GatewayDestination) -> Self {
-        Self {
-            target: destination.target(),
-            network: destination.network().clone(),
-        }
-    }
-}
+/// Where the gateway pays the payee: an [`InvoiceTarget`] without a
+/// Lightning one, whose hold invoices need the payee online.
+pub type GatewayDestination = InvoiceTarget<Infallible>;
 
 /// The payee's signed statement: "I, `payee`, authorize `gateway` and
 /// `preimage_server` to create invoices in my name, valid between
@@ -351,9 +245,7 @@ impl ReceiveAuthorization {
             .u64(self.min_final_timeout_secs)
             .count(self.destinations.len());
         for destination in &self.destinations {
-            message
-                .str(&destination.network().0)
-                .htlc_target(&destination.target());
+            message.invoice_target(destination);
         }
         message.into_bytes()
     }
@@ -502,54 +394,39 @@ impl PreimageIssuance {
             .map_err(|_| "invalid preimage server signature on the payment hash".to_string())
     }
 
-    /// As opaque metadata a gateway can carry for this server: Postcard,
-    /// with the signature raw.
+    /// As opaque metadata a gateway can carry for this server: Postcard
+    /// of the tuple of its fields, with the signature raw.
     pub fn to_metadata(&self) -> Result<Metadata, String> {
-        #[derive(Serialize, Deserialize)]
-        struct Wire {
-            payment_hash: [u8; 32],
-            amount_msat: u64,
-            metadata_hash: Option<[u8; 32]>,
-            authorization: [u8; 32],
-            nonce: [u8; 32],
-            signature: Vec<u8>,
-        }
-        let wire = Wire {
-            payment_hash: self.payment_hash.0,
-            amount_msat: self.amount_msat,
-            metadata_hash: self.metadata_hash.map(|hash| hash.0),
-            authorization: self.authorization.0,
-            nonce: self.nonce.0,
-            signature: self.signature.0.to_vec(),
-        };
-        let bytes = postcard::to_allocvec(&wire).map_err(|e| format!("encoding issuance: {e}"))?;
+        let fields = (
+            self.payment_hash.0,
+            self.amount_msat,
+            self.metadata_hash.map(|hash| hash.0),
+            self.authorization.0,
+            self.nonce.0,
+            self.signature.0.as_slice(),
+        );
+        let bytes =
+            postcard::to_allocvec(&fields).map_err(|e| format!("encoding issuance: {e}"))?;
         Metadata::new(bytes)
     }
 
     /// Read what [`PreimageIssuance::to_metadata`] wrote.
     pub fn from_metadata(metadata: &Metadata) -> Result<Self, String> {
-        #[derive(Serialize, Deserialize)]
-        struct Wire {
-            payment_hash: [u8; 32],
-            amount_msat: u64,
-            metadata_hash: Option<[u8; 32]>,
-            authorization: [u8; 32],
-            nonce: [u8; 32],
-            signature: Vec<u8>,
-        }
-        let (wire, rest) = postcard::take_from_bytes::<Wire>(metadata.as_bytes())
-            .map_err(|e| format!("not a preimage server's issuance: {e}"))?;
+        type Fields = ([u8; 32], u64, Option<[u8; 32]>, [u8; 32], [u8; 32], Vec<u8>);
+        let ((payment_hash, amount_msat, metadata_hash, authorization, nonce, signature), rest) =
+            postcard::take_from_bytes::<Fields>(metadata.as_bytes())
+                .map_err(|e| format!("not a preimage server's issuance: {e}"))?;
         if !rest.is_empty() {
             return Err("not a preimage server's issuance: trailing bytes".into());
         }
         Ok(Self {
-            payment_hash: Bytes32(wire.payment_hash),
-            amount_msat: wire.amount_msat,
-            metadata_hash: wire.metadata_hash.map(Bytes32),
-            authorization: Bytes32(wire.authorization),
-            nonce: Bytes32(wire.nonce),
+            payment_hash: Bytes32(payment_hash),
+            amount_msat,
+            metadata_hash: metadata_hash.map(Bytes32),
+            authorization: Bytes32(authorization),
+            nonce: Bytes32(nonce),
             signature: Signature(
-                wire.signature
+                signature
                     .try_into()
                     .map_err(|_| "not a preimage server's issuance: bad signature".to_string())?,
             ),
@@ -581,15 +458,6 @@ pub struct GatewayTerms {
     pub expires_at: u64,
     /// The payee's metadata, which the issuance commits to.
     pub payee_metadata: Option<Metadata>,
-}
-
-/// How [`GatewayMetadata`] is encoded as [`Metadata`]: Postcard, with
-/// the preimage metadata, the sealed terms and the signature raw.
-#[derive(Serialize, Deserialize)]
-struct GatewayMetadataWire {
-    preimage_metadata: Vec<u8>,
-    sealed: Vec<u8>,
-    gateway_signature: Vec<u8>,
 }
 
 /// The key a gateway seals its terms with, derived from its signing
@@ -678,30 +546,32 @@ impl GatewayMetadata {
         Ok(terms)
     }
 
-    /// As invoice metadata, with the preimage metadata, the sealed terms
-    /// and the signature as raw bytes.
+    /// As invoice metadata: Postcard of the preimage metadata, the
+    /// sealed terms and the signature, as raw bytes.
     pub fn to_metadata(&self) -> Result<Metadata, String> {
-        let wire = GatewayMetadataWire {
-            preimage_metadata: self.preimage_metadata.as_bytes().to_vec(),
-            sealed: self.sealed.clone(),
-            gateway_signature: self.gateway_signature.0.to_vec(),
-        };
-        let bytes = postcard::to_allocvec(&wire).map_err(|e| format!("encoding metadata: {e}"))?;
+        let fields = (
+            self.preimage_metadata.as_bytes(),
+            self.sealed.as_slice(),
+            self.gateway_signature.0.as_slice(),
+        );
+        let bytes =
+            postcard::to_allocvec(&fields).map_err(|e| format!("encoding metadata: {e}"))?;
         Metadata::new(bytes)
     }
 
     /// Read it from the metadata of a gateway's invoice.
     pub fn from_metadata(metadata: &Metadata) -> Result<Self, String> {
-        let (wire, rest) = postcard::take_from_bytes::<GatewayMetadataWire>(metadata.as_bytes())
-            .map_err(|e| format!("not a gateway's invoice metadata: {e}"))?;
+        let ((preimage_metadata, sealed, gateway_signature), rest) =
+            postcard::take_from_bytes::<(Vec<u8>, Vec<u8>, Vec<u8>)>(metadata.as_bytes())
+                .map_err(|e| format!("not a gateway's invoice metadata: {e}"))?;
         if !rest.is_empty() {
             return Err("not a gateway's invoice metadata: trailing bytes".into());
         }
         Ok(Self {
-            preimage_metadata: Metadata::new(wire.preimage_metadata)?,
-            sealed: wire.sealed,
+            preimage_metadata: Metadata::new(preimage_metadata)?,
+            sealed,
             gateway_signature: Signature(
-                wire.gateway_signature
+                gateway_signature
                     .try_into()
                     .map_err(|_| "not a gateway's invoice metadata: bad signature".to_string())?,
             ),
@@ -809,9 +679,9 @@ mod tests {
         tampered.preimage_server_relay = None;
         assert!(tampered.verify().is_err());
         let mut tampered = authorization;
-        tampered.destinations[0] = GatewayDestination::new(
+        tampered.destinations[0] = GatewayDestination::parse(
             NetworkId("cashu::elsewhere".into()),
-            tampered.destinations[0].target(),
+            &tampered.destinations[0].target_string(),
         )
         .unwrap();
         assert!(tampered.verify().is_err());
@@ -832,12 +702,18 @@ mod tests {
         let key = ritualistic::SecretKey::from_bytes([4; 32])
             .unwrap()
             .pubkey();
-        let lightning = HtlcTarget::LightningInvoice("lnbc".into());
-        assert!(GatewayDestination::new(NetworkId("lightning".into()), lightning).is_err());
+        assert!(GatewayDestination::parse(NetworkId("lightning".into()), "lnbc").is_err());
         let liquid = NetworkId("liquid".into());
-        assert!(GatewayDestination::new(liquid.clone(), HtlcTarget::XOnlyPubKey(key)).is_err());
-        let full = HtlcTarget::PubKey(PubKey::from_x_only(&key).unwrap());
-        let destination = GatewayDestination::new(liquid, full.clone()).unwrap();
+        assert!(GatewayDestination::parse(liquid.clone(), &key.to_hex()).is_err());
+        let full = crate::PubKey::from_x_only(&key).unwrap();
+        let destination = GatewayDestination::parse(liquid.clone(), &full.to_hex()).unwrap();
+        assert_eq!(
+            destination,
+            GatewayDestination::Liquid {
+                network: liquid,
+                target: full
+            }
+        );
         let json = serde_json::to_string(&destination).unwrap();
         assert_eq!(
             serde_json::from_str::<GatewayDestination>(&json).unwrap(),
@@ -845,7 +721,8 @@ mod tests {
         );
         let mismatched = json.replace("\"liquid\"", "\"bitcoin\"");
         assert!(serde_json::from_str::<GatewayDestination>(&mismatched).is_err());
-        assert_eq!(destination.target(), full);
+        let mistagged = json.replace("\"PubKey\"", "\"XOnlyPubKey\"");
+        assert!(serde_json::from_str::<GatewayDestination>(&mistagged).is_err());
     }
 
     #[test]

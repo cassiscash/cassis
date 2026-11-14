@@ -33,7 +33,7 @@ use bark::lightning_invoice::Bolt11Invoice;
 use bark::{Config, OpenWalletArgs, Wallet, WalletSeed};
 use bitcoin_ext::BlockDelta;
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, HtlcTarget, Network, NetworkError, NetworkId,
+    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, MSAT_PER_SAT,
 };
 use serde::{Deserialize, Serialize};
@@ -269,7 +269,7 @@ impl Network for BarkLightningAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         expiry: u64,
-    ) -> Result<HtlcTarget, NetworkError> {
+    ) -> Result<InvoiceTarget, NetworkError> {
         let hash = PaymentHash::from(payment_hash.0);
         let sats = amount_msat.div_ceil(MSAT_PER_SAT);
         if let Some(receive) = self
@@ -283,7 +283,10 @@ impl Network for BarkLightningAdapter {
                     "an invoice for this hash has another amount",
                 ));
             }
-            return Ok(HtlcTarget::LightningInvoice(receive.invoice.to_string()));
+            return Ok(InvoiceTarget::Lightning {
+                network: self.id.clone(),
+                invoice: receive.invoice.to_string(),
+            });
         }
         // The invoice's whole CLTV, the server's delta included, fits in
         // the time until `expiry`, within what the server accepts. Payers
@@ -302,7 +305,10 @@ impl Network for BarkLightningAdapter {
             .build()
             .await
             .map_err(wallet_error)?;
-        Ok(HtlcTarget::LightningInvoice(invoice.to_string()))
+        Ok(InvoiceTarget::Lightning {
+            network: self.id.clone(),
+            invoice: invoice.to_string(),
+        })
     }
 
     /// Cancels the hold invoice while it is unpaid. Once the server holds
@@ -376,9 +382,13 @@ impl Network for BarkLightningAdapter {
         payment_hash: Bytes32,
         amount_msat: u64,
         _expiry: u64,
-        target: &HtlcTarget,
+        target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let HtlcTarget::LightningInvoice(payment_request) = target else {
+        let InvoiceTarget::Lightning {
+            invoice: payment_request,
+            ..
+        } = target
+        else {
             return Err(NetworkError::invalid("lightning HTLCs pay an invoice"));
         };
         let invoice = parse_invoice(payment_request, payment_hash)?;

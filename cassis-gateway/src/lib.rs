@@ -35,14 +35,14 @@ pub mod db;
 use crate::db::{
     Db, HandledDelegation, HandledDelegationId, PayeeHtlc, PayeeHtlcHash, PayeeOutcome,
 };
-use cassis_core::network::{Htlc, HtlcTarget, Network, NetworkError, NetworkId, OutgoingState};
+use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkError, NetworkId, OutgoingState};
 use cassis_core::offline::{
     endpoint_public_key, AuthorizationKind, GatewayDestination, GatewayMetadata, GatewayTerms,
     ReceiveAuthorization,
 };
 use cassis_core::protocol::{
     Commit, GatewayInvoiceFor, GatewayInvoiceRequest, Invoice, InvoiceBody, InvoiceNetwork,
-    InvoiceTarget, Metadata, PreimageRelease, PreparePayee, Request, Response,
+    Metadata, PreimageRelease, PreparePayee, Request, Response,
 };
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
@@ -540,7 +540,6 @@ impl Gateway {
                 .receive_target(payment_hash, amount_msat, expires_at)
                 .await
                 .map_err(|e| e.to_string())
-                .and_then(|target| InvoiceTarget::new(network.id(), target))
             {
                 Ok(target) => targets.push(InvoiceNetwork {
                     target,
@@ -601,7 +600,7 @@ impl Gateway {
         terms: &GatewayTerms,
         network: &NetworkId,
         expiry: u64,
-    ) -> Result<(HtlcTarget, Arc<dyn Network>, u64), String> {
+    ) -> Result<(InvoiceTarget, Arc<dyn Network>, u64), String> {
         if terms.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
@@ -739,7 +738,7 @@ impl Gateway {
         let (target, _, claim_by) = self
             .payable_on(&terms, &commit.network, commit.expiry)
             .await?;
-        if commit.descriptor.target() != target {
+        if !commit.descriptor.pays(&target) {
             return Err("the HTLC does not pay this invoice".into());
         }
         let Some(busy) = self.busy(hash) else {
@@ -850,7 +849,7 @@ impl Gateway {
         };
         self.db().payee_htlcs().insert(&htlc).map_err(db_error)?;
         let funded = outgoing
-            .create_outgoing_htlc(hash, amount_msat, expiry, &destination.target())
+            .create_outgoing_htlc(hash, amount_msat, expiry, &destination.clone().into())
             .await;
         let descriptor = match funded {
             Ok(descriptor) => descriptor,
