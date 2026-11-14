@@ -8,7 +8,7 @@ async-trait = { workspace = true }
 cassis-core = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 # Arkade Rust SDK (`ark-rs`). `ark-client` is the high-level wallet
 # (coin selection, offchain send/claim flows, VTXO listings); it

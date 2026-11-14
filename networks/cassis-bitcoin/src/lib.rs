@@ -75,6 +75,8 @@ pub const MAINNET_ESPLORA_URL: &str = "https://mempool.space/api";
 pub const MUTINYNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
 
 const RPC_TIMEOUT_SECS: u64 = 30;
+/// Confirmed transactions in one page of an Esplora script history.
+const ESPLORA_PAGE: usize = 25;
 /// `nLockTime` values below this threshold are block heights; HTLCs
 /// here always use unix timestamps.
 const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
@@ -256,6 +258,9 @@ pub struct BitcoinAdapter {
     /// Incoming lockups must be confirmed before they are relied on.
     require_confirmation: bool,
     client: esplora_client::AsyncClient,
+    /// Held while wallet coins are picked and spent, so that two spends
+    /// never pick the same ones.
+    funding: tokio::sync::Mutex<()>,
     span: Span,
 }
 
@@ -304,6 +309,7 @@ impl BitcoinAdapter {
             funding_address,
             require_confirmation: network != bitcoin::Network::Signet,
             client,
+            funding: tokio::sync::Mutex::new(()),
             span,
         })
     }
@@ -320,13 +326,19 @@ impl BitcoinAdapter {
     async fn unspent_lockup(&self, options: &HtlcOptions) -> Result<(Amount, bool), NetworkError> {
         let outpoint = OutPoint::new(options.lockup_txid, options.lockup_vout);
         let spk = options.taproot_spk(&Secp256k1::verification_only());
-        let value = self
+        let unspent = self
             .scan_unspent(&spk)
             .await?
             .into_iter()
             .find(|(candidate, _)| *candidate == outpoint)
-            .map(|(_, value)| value)
-            .ok_or_else(|| NetworkError::invalid("HTLC output is missing or spent"))?;
+            .map(|(_, value)| value);
+        let Some(value) = unspent else {
+            // An explorer behind the sender's may not have the lockup yet.
+            return Err(match self.get_tx(options.lockup_txid).await? {
+                None => NetworkError::not_yet("lockup is not seen yet"),
+                Some(_) => NetworkError::invalid("HTLC output is missing or spent"),
+            });
+        };
         let status = self
             .client
             .get_tx_status(&options.lockup_txid)
@@ -378,6 +390,7 @@ impl BitcoinAdapter {
             .map_err(|e| NetworkError::Invalid(format!("wrong network for destination: {e}")))?;
 
         let funding_spk = self.funding_address.script_pubkey();
+        let _funding = self.funding.lock().await;
         let mut utxos = self.scan_unspent(&funding_spk).await?;
         utxos.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
         let mut selected: Vec<(OutPoint, Amount)> = Vec::new();
@@ -474,13 +487,7 @@ impl BitcoinAdapter {
         &self,
         script: &ScriptBuf,
     ) -> Result<Vec<(OutPoint, Amount)>, NetworkError> {
-        let txs = tokio::time::timeout(
-            Duration::from_secs(RPC_TIMEOUT_SECS),
-            self.client.scripthash_txs(script, None),
-        )
-        .await
-        .map_err(|_| NetworkError::Network("scripthash_txs timed out".into()))?
-        .map_err(|e| NetworkError::Network(format!("scripthash_txs: {e}")))?;
+        let txs = self.script_txs(script).await?;
         let spent: std::collections::HashSet<OutPoint> = txs
             .iter()
             .flat_map(|tx| {
@@ -511,6 +518,34 @@ impl BitcoinAdapter {
             })
             .filter(|(outpoint, _)| !spent.contains(outpoint))
             .collect())
+    }
+
+    /// The whole history of `script`: its unconfirmed transactions and
+    /// every page of the confirmed ones.
+    async fn script_txs(
+        &self,
+        script: &ScriptBuf,
+    ) -> Result<Vec<esplora_client::Tx>, NetworkError> {
+        let page = |last_seen| async move {
+            tokio::time::timeout(
+                Duration::from_secs(RPC_TIMEOUT_SECS),
+                self.client.scripthash_txs(script, last_seen),
+            )
+            .await
+            .map_err(|_| NetworkError::network("scripthash_txs timed out"))?
+            .map_err(|e| NetworkError::network(format!("scripthash_txs: {e}")))
+        };
+        let mut txs = page(None).await?;
+        let mut confirmed = txs.iter().filter(|tx| tx.status.confirmed).count();
+        while confirmed == ESPLORA_PAGE {
+            let Some(last) = txs.last().map(|tx| tx.txid) else {
+                break;
+            };
+            let more = page(Some(last)).await?;
+            confirmed = more.len();
+            txs.extend(more);
+        }
+        Ok(txs)
     }
 
     async fn tip_time(&self) -> Result<u64, NetworkError> {
@@ -577,32 +612,8 @@ impl BitcoinAdapter {
     ) -> Result<bitcoin::Txid, NetworkError> {
         let funding_spk = self.funding_address.script_pubkey();
         let refund_locktime = options.refund_locktime;
-        let mut utxos = self.scan_unspent(&funding_spk).await?;
-        utxos.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
-        let mut selected: Vec<(OutPoint, Amount)> = Vec::new();
-        let mut gathered = 0u64;
-        let mut change_expected = false;
-        let mut fee = self.fee_for(Self::vsize_for(0, 0, 1, 1)).to_sat();
-        for utxo in &utxos {
-            if gathered >= amount_sat + fee + DUST_SATS {
-                break;
-            }
-            gathered += utxo.1.to_sat();
-            selected.push(*utxo);
-            fee = self
-                .fee_for(Self::vsize_for(selected.len() as u64, 0, 2, 1))
-                .to_sat();
-            change_expected = gathered >= amount_sat + fee + DUST_SATS;
-        }
-        if gathered < amount_sat + fee {
-            return Err(NetworkError::Invalid(format!(
-                "insufficient bitcoin balance on {}: HTLC needs {} sats (with fee), \
-                 wallet holds {gathered} sats",
-                self.id,
-                amount_sat + fee,
-            )));
-        }
-        let change = gathered - (amount_sat + fee);
+        let _funding = self.funding.lock().await;
+        let (selected, change_expected, change) = self.select_for_lock(amount_sat).await?;
 
         let mut outputs = vec![TxOut {
             value: Amount::from_sat(amount_sat),
@@ -674,6 +685,47 @@ impl BitcoinAdapter {
             );
         });
         Ok(txid)
+    }
+
+    /// Wallet UTXOs funding a lockup of `amount_sat` and its fee, largest
+    /// first, whether they leave change, and how much is left over.
+    async fn select_for_lock(
+        &self,
+        amount_sat: u64,
+    ) -> Result<(Vec<(OutPoint, Amount)>, bool, u64), NetworkError> {
+        if amount_sat < DUST_SATS {
+            return Err(NetworkError::invalid(format!(
+                "{amount_sat} sats is below the dust limit"
+            )));
+        }
+        let mut utxos = self
+            .scan_unspent(&self.funding_address.script_pubkey())
+            .await?;
+        utxos.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        let mut selected: Vec<(OutPoint, Amount)> = Vec::new();
+        let mut gathered = 0u64;
+        let mut change_expected = false;
+        let mut fee = self.fee_for(Self::vsize_for(0, 0, 1, 1)).to_sat();
+        for utxo in &utxos {
+            if gathered >= amount_sat + fee + DUST_SATS {
+                break;
+            }
+            gathered += utxo.1.to_sat();
+            selected.push(*utxo);
+            fee = self
+                .fee_for(Self::vsize_for(selected.len() as u64, 0, 2, 1))
+                .to_sat();
+            change_expected = gathered >= amount_sat + fee + DUST_SATS;
+        }
+        if gathered < amount_sat + fee {
+            return Err(NetworkError::Invalid(format!(
+                "insufficient bitcoin balance on {}: HTLC needs {} sats (with fee), \
+                 wallet holds {gathered} sats",
+                self.id,
+                amount_sat + fee,
+            )));
+        }
+        Ok((selected, change_expected, gathered - (amount_sat + fee)))
     }
 
     /// Claim (preimage path) or refund (CLTV path) of an HTLC input.
@@ -807,13 +859,7 @@ impl BitcoinAdapter {
     /// The transaction spending the HTLC output, if any.
     async fn scan_spend(&self, options: &HtlcOptions) -> Result<Option<Transaction>, NetworkError> {
         let spk = options.taproot_spk(&Secp256k1::verification_only());
-        let txs = tokio::time::timeout(
-            Duration::from_secs(RPC_TIMEOUT_SECS),
-            self.client.scripthash_txs(&spk, None),
-        )
-        .await
-        .map_err(|_| NetworkError::network("scripthash_txs timed out"))?
-        .map_err(|e| NetworkError::network(format!("scripthash_txs: {e}")))?;
+        let txs = self.script_txs(&spk).await?;
         let Some(spend) = txs.iter().find(|tx| {
             tx.vin
                 .iter()
@@ -900,6 +946,9 @@ impl Network for BitcoinAdapter {
         preimage: Bytes32,
     ) -> Result<(), NetworkError> {
         let options = HtlcOptions::of(htlc)?;
+        // TODO: a broadcast claim counts as settled, but at the fixed
+        // feerate it may not confirm before the sender can refund. Watch
+        // it until it confirms, bumping its fee as the expiry nears.
         let txid = self
             .spend_htlc(&options, Some(preimage), self.funding_address.clone())
             .await?;
@@ -920,11 +969,6 @@ impl Network for BitcoinAdapter {
             ));
         };
         let amount_sat = sats_for_msat(amount_msat);
-        if amount_sat < DUST_SATS {
-            return Err(NetworkError::invalid(format!(
-                "{amount_sat} sats is below the dust limit"
-            )));
-        }
         let mut options = HtlcOptions {
             payment_hash160: HtlcOptions::payment_hash160(&payment_hash),
             lockup_txid: bitcoin::Txid::all_zeros(),
@@ -956,18 +1000,22 @@ impl Network for BitcoinAdapter {
         Ok(())
     }
 
+    /// The wallet funds the lockup and its fee.
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        let available = self.balance_msat().await?;
-        if available < amount_msat {
-            return Err(NetworkError::invalid(format!(
-                "need {amount_msat} msat plus fees, wallet has {available} msat"
-            )));
-        }
-        Ok(())
+        self.select_for_lock(sats_for_msat(amount_msat))
+            .await
+            .map(|_| ())
     }
 
-    /// Claim fees come out of the HTLC.
-    async fn can_receive(&self, _amount_msat: u64) -> Result<(), NetworkError> {
+    /// Claim fees come out of the HTLC, which must be worth claiming.
+    async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        let needed = self.fee_for(Self::vsize_for(0, 1, 1, 0)).to_sat() + DUST_SATS;
+        let amount_sat = sats_for_msat(amount_msat);
+        if amount_sat <= needed {
+            return Err(NetworkError::invalid(format!(
+                "{amount_sat} sats do not cover a claim: it takes more than {needed} sats"
+            )));
+        }
         Ok(())
     }
 }

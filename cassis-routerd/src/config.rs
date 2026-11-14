@@ -20,7 +20,7 @@
 //! [[routes]]
 //! from = "cashu::mint.example"
 //! to = "lightning"
-//! fee_base_msat = 1000
+//! fee_base_msat = 1000             # on top of what claiming on `from` costs
 //! fee_ppm = 500
 //! # transit_slack_secs = 60
 //! # test_money = true
@@ -62,6 +62,9 @@ pub struct Config {
     pub nostr_relays: Vec<String>,
     #[serde(default = "default_max_reservations")]
     pub max_reservations: usize,
+    /// Longest an incoming HTLC may run from its PREPARE.
+    #[serde(default = "default_max_htlc_secs")]
+    pub max_htlc_secs: u64,
     #[serde(default)]
     pub networks: BTreeMap<String, NetworkConfig>,
     #[serde(default)]
@@ -86,6 +89,10 @@ pub struct RouteConfig {
 
 fn default_max_reservations() -> usize {
     RoutingPolicy::default().max_reservations
+}
+
+fn default_max_htlc_secs() -> u64 {
+    RoutingPolicy::default().max_htlc_secs
 }
 
 fn default_transit_slack() -> u64 {
@@ -207,6 +214,7 @@ impl Config {
             routes,
             cleanup_relays: self.nostr_relays.clone(),
             max_reservations: self.max_reservations,
+            max_htlc_secs: self.max_htlc_secs,
             ..RoutingPolicy::default()
         })
     }

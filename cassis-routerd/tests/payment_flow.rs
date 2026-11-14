@@ -12,7 +12,7 @@ use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
 };
-use cassis_routerd::db::{Db as RouterDb, IncomingState};
+use cassis_routerd::db::{Db as RouterDb, HopState};
 use cassis_routerd::router::{RouteOffer, Router, RoutingPolicy};
 use cassis_wallet::db::{PendingPaymentHash, TransactionHash};
 use cassis_wallet::{open_db, Node, NodeConfig};
@@ -304,13 +304,14 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .unwrap();
     assert!(invoice.body.payment_hash.matches_preimage(&preimage));
     // The SETTLE fanout claimed the router's incoming HTLC: the hop is
-    // a forward, no longer in flight.
-    let forwards = router.db().forwards().all().unwrap();
-    assert_eq!(forwards.len(), 1);
-    // Fee: 1000 base + 500 ppm of 100_000.
-    assert_eq!(forwards[0].incoming_amount_msat, 101_050);
-    assert_eq!(forwards[0].fee_msat(), 1_050);
-    assert!(router.db().incomings().is_empty().unwrap());
+    // settled, no longer in flight.
+    let settled = router.db().hops().by_in_flight(false).unwrap();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].state, HopState::Settled);
+    // Fee: 1000 base + 2000 of cashu claim cost + 500 ppm of 100_000.
+    assert_eq!(settled[0].incoming.amount_msat, 103_050);
+    assert_eq!(settled[0].fee_msat(), 3_050);
+    assert!(router.db().hops().by_in_flight(true).unwrap().is_empty());
     // The payer and the payee each have their transaction.
     let key = TransactionHash(invoice.body.payment_hash.to_string());
     assert!(payer.db().transactions().contains(key.clone()).unwrap());
@@ -392,13 +393,13 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .unwrap());
     let forwarded = router
         .db()
-        .incomings()
+        .hops()
         .by_payment_hash(unreachable.body.payment_hash.to_string())
         .unwrap();
     assert!(forwarded
         .iter()
-        .any(|hop| hop.state == IncomingState::Forwarded));
-    assert_eq!(router.db().outgoings().len().unwrap(), 1);
+        .any(|hop| hop.state == HopState::Forwarded && hop.outgoing.is_some()));
+    assert_eq!(router.db().hops().by_in_flight(true).unwrap().len(), 1);
     // Nothing is refunded before the expiry.
     router.settle_once().await;
     payer.settle_once().await;

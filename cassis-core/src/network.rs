@@ -17,7 +17,6 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Canonical network identifier: `<kind>` or `<kind>::<param>`.
@@ -148,6 +147,63 @@ impl NetworkId {
             "lightning" => 60 * MINUTE,
             // Unknown kinds: the most cautious of the above.
             _ => 60 * MINUTE,
+        }
+    }
+
+    /// How long after its expiry an HTLC sent on this network can still
+    /// be claimed: the refund opens by the network's own clock (blocks,
+    /// a chain's median time), which runs behind the wall clock, and
+    /// then has to get through. A router adds it to the margin of the
+    /// hop's incoming network (see [`NetworkId::default_incoming_delta`])
+    /// in what it requires and announces, since a preimage revealed
+    /// this late must still claim its incoming HTLC.
+    pub fn outgoing_lag_secs(&self) -> u64 {
+        const MINUTE: u64 = 60;
+        match self.kind() {
+            // The mint's clock decides, and the refund is one request.
+            "cashu" => MINUTE,
+            // The expiry is rounded up to bitcoin blocks, which can come
+            // late.
+            "fedimint" => 60 * MINUTE,
+            // The operator holds the refund against the chain tip's
+            // time, which waits for the next block.
+            "arkade" => 60 * MINUTE,
+            // The locktime is held against the median time of the last
+            // 11 blocks, about an hour behind, and the refund must then
+            // confirm.
+            "bitcoin" => 120 * MINUTE,
+            // The expiry is rounded up to one-minute blocks.
+            "liquid" => 10 * MINUTE,
+            // Timelocks assume the fastest block cadence, so the refund
+            // of an HTLC lasting two hours opens up to an hour late.
+            "rootstock" => 60 * MINUTE,
+            // The payment's CLTV counts bitcoin blocks, which can come
+            // late.
+            "lightning" => 60 * MINUTE,
+            // Unknown kinds: the most cautious of the above.
+            _ => 120 * MINUTE,
+        }
+    }
+
+    /// What claiming an HTLC received on this network costs its
+    /// receiver, roughly. A router adds it to the base fee of the hops
+    /// it receives on this network, in what it requires and announces.
+    pub fn claim_cost_msat(&self) -> u64 {
+        const SAT: u64 = 1000;
+        match self.kind() {
+            // The mint's input fee on the claimed proofs.
+            "cashu" => 2 * SAT,
+            // The federation's fee on the contract input.
+            "fedimint" => 5 * SAT,
+            // An on-chain claim of ~122 vB at 1 sat/vB.
+            "bitcoin" => 122 * SAT,
+            // A claim at 0.2 sat/vB.
+            "liquid" => 50 * SAT,
+            // The gas of an `EtherSwap.claim()`.
+            "rootstock" => 20 * SAT,
+            // The operator co-signs for free; settling a hold invoice
+            // costs nothing.
+            _ => 0,
         }
     }
 }
@@ -593,9 +649,9 @@ pub trait Network: Send + Sync {
     /// Seconds this network needs to get a claim through once the
     /// preimage is known. A router requires at least this much between
     /// the expiry of its outgoing HTLC and the expiry of the incoming
-    /// one it claims on this network. Defaults to
-    /// [`NetworkId::default_incoming_delta`]; see
-    /// [`with_incoming_delta`] to change it.
+    /// one it claims on this network, on top of the outgoing network's
+    /// [`NetworkId::outgoing_lag_secs`]. Defaults to
+    /// [`NetworkId::default_incoming_delta`].
     fn incoming_delta_secs(&self) -> u64 {
         self.id().default_incoming_delta()
     }
@@ -656,6 +712,23 @@ pub trait Network: Send + Sync {
         target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError>;
 
+    /// The descriptor [`Network::create_outgoing_htlc`] would return
+    /// for the same arguments, on networks where it is known before
+    /// anything is funded. A node journals it first, so an HTLC whose
+    /// funding a restart interrupted can still be watched and refunded.
+    /// A descriptor of an HTLC that was never funded must check as
+    /// pending and refund without error once expired.
+    fn outgoing_descriptor(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+        target: &InvoiceTarget,
+    ) -> Option<HtlcDescriptor> {
+        let _ = (payment_hash, amount_msat, expiry, target);
+        None
+    }
+
     /// One-shot look at an outgoing HTLC: still pending, claimed (with
     /// the revealed preimage) or refunded.
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError>;
@@ -683,100 +756,6 @@ pub trait Network: Send + Sync {
     /// of any payment (e.g. refreshing coins before they expire).
     async fn maintain(&self) -> Result<(), NetworkError> {
         Ok(())
-    }
-}
-
-/// `network` with a safety margin of `secs` instead of its own (see
-/// [`Network::incoming_delta_secs`]), e.g. to test expiries without
-/// waiting for the real margins.
-pub fn with_incoming_delta(network: Arc<dyn Network>, secs: u64) -> Arc<dyn Network> {
-    Arc::new(Overridden {
-        network,
-        incoming_delta_secs: secs,
-    })
-}
-
-/// A network with its safety margin replaced.
-struct Overridden {
-    network: Arc<dyn Network>,
-    incoming_delta_secs: u64,
-}
-
-#[async_trait]
-impl Network for Overridden {
-    fn id(&self) -> NetworkId {
-        self.network.id()
-    }
-
-    fn incoming_delta_secs(&self) -> u64 {
-        self.incoming_delta_secs
-    }
-
-    async fn receive_target(
-        &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-    ) -> Result<InvoiceTarget, NetworkError> {
-        self.network
-            .receive_target(payment_hash, amount_msat, expiry)
-            .await
-    }
-
-    async fn cancel_receive(&self, payment_hash: Bytes32) -> Result<(), NetworkError> {
-        self.network.cancel_receive(payment_hash).await
-    }
-
-    async fn verify_incoming_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        self.network.verify_incoming_htlc(htlc).await
-    }
-
-    async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        self.network.verify_htlc(htlc).await
-    }
-
-    async fn claim_incoming_htlc(
-        &self,
-        htlc: &Htlc,
-        preimage: Bytes32,
-    ) -> Result<(), NetworkError> {
-        self.network.claim_incoming_htlc(htlc, preimage).await
-    }
-
-    async fn create_outgoing_htlc(
-        &self,
-        payment_hash: Bytes32,
-        amount_msat: u64,
-        expiry: u64,
-        target: &InvoiceTarget,
-    ) -> Result<HtlcDescriptor, NetworkError> {
-        self.network
-            .create_outgoing_htlc(payment_hash, amount_msat, expiry, target)
-            .await
-    }
-
-    async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
-        self.network.check_outgoing_htlc(htlc).await
-    }
-
-    async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        self.network.refund_outgoing_htlc(htlc).await
-    }
-
-    async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        self.network.can_send(amount_msat).await
-    }
-
-    async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        self.network.can_receive(amount_msat).await
-    }
-
-    fn maintenance_interval(&self) -> Option<Duration> {
-        self.network.maintenance_interval()
-    }
-
-    async fn maintain(&self) -> Result<(), NetworkError> {
-        self.network.maintain().await
     }
 }
 

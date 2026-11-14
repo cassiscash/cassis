@@ -15,7 +15,9 @@
 //! the wallet must be able to exit on-chain on its own. A receive's
 //! invoice therefore asks for a CLTV delta covering the whole HTLC
 //! expiry, and the time bark needs to exit is this network's incoming
-//! delta: on mainnet defaults over 180 blocks, about 31 hours. Sends
+//! delta: on mainnet defaults over 180 blocks, about 31 hours. A send
+//! only pays invoices whose final CLTV delta fits in the time until the
+//! HTLC's expiry, so the payee cannot hold it longer. Past that, sends
 //! trust the server, as any bark user does: it could hold a send's VTXOs
 //! for its `htlc_send_expiry_delta` (256 blocks on signet) before
 //! revealing the preimage or letting them be revoked, but a cooperating
@@ -89,7 +91,6 @@ pub struct BarkLightningAdapter {
     /// The server's blocks between a lightning HTLC and the Ark HTLC
     /// behind it.
     htlc_expiry_delta: u64,
-    /// Blocks an HTLC-send VTXO can stay locked.
     /// Smallest CLTV delta a receive may ask for.
     min_cltv_delta: u64,
     /// Largest CLTV delta the server grants a receive.
@@ -294,7 +295,14 @@ impl Network for BarkLightningAdapter {
         let lifetime = expiry.saturating_sub(unix_now());
         let cltv_delta = (lifetime / self.block_secs)
             .saturating_sub(self.htlc_expiry_delta)
-            .clamp(self.min_cltv_delta, self.max_cltv_delta);
+            .max(self.min_cltv_delta);
+        // A shorter CLTV would let the HTLC expire before `expiry`.
+        if cltv_delta > self.max_cltv_delta {
+            return Err(NetworkError::invalid(format!(
+                "the server grants receives {} blocks, {expiry} is {cltv_delta} away",
+                self.max_cltv_delta
+            )));
+        }
         let invoice = self
             .wallet
             .bolt11_invoice_builder()
@@ -381,7 +389,7 @@ impl Network for BarkLightningAdapter {
         &self,
         payment_hash: Bytes32,
         amount_msat: u64,
-        _expiry: u64,
+        expiry: u64,
         target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
         let InvoiceTarget::Lightning {
@@ -392,6 +400,16 @@ impl Network for BarkLightningAdapter {
             return Err(NetworkError::invalid("lightning HTLCs pay an invoice"));
         };
         let invoice = parse_invoice(payment_request, payment_hash)?;
+        // The payee can hold the payment for the invoice's final CLTV
+        // delta: it must be over by `expiry`.
+        let held_secs = invoice
+            .min_final_cltv_expiry_delta()
+            .saturating_mul(self.block_secs);
+        if held_secs > expiry.saturating_sub(unix_now()) {
+            return Err(NetworkError::invalid(format!(
+                "the invoice can be held for {held_secs}s, past the HTLC's expiry"
+            )));
+        }
         // Receivers in whole sats round the amount up.
         let invoice_msat = invoice.amount_milli_satoshis().unwrap_or(0);
         if invoice_msat < amount_msat || invoice_msat > amount_msat.next_multiple_of(MSAT_PER_SAT) {
@@ -409,6 +427,22 @@ impl Network for BarkLightningAdapter {
         Ok(HtlcDescriptor::Lightning {
             target: payment_request.clone(),
         })
+    }
+
+    /// The send is tracked by the invoice's payment hash alone.
+    fn outgoing_descriptor(
+        &self,
+        _payment_hash: Bytes32,
+        _amount_msat: u64,
+        _expiry: u64,
+        target: &InvoiceTarget,
+    ) -> Option<HtlcDescriptor> {
+        match target {
+            InvoiceTarget::Lightning { invoice, .. } => Some(HtlcDescriptor::Lightning {
+                target: invoice.clone(),
+            }),
+            _ => None,
+        }
     }
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {

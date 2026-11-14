@@ -7,11 +7,8 @@
 //! the preimage shows up downstream, refund the outgoing one once it
 //! expires.
 
-use crate::db::{
-    Db, Fail, FailId, FailReason, Forward, ForwardId, HopId, Incoming, IncomingState, Outgoing,
-    OutgoingId,
-};
-use cassis_core::network::{Htlc, InvoiceTarget, NetworkError, NetworkId};
+use crate::db::{Db, FailReason, Hop, HopId, HopState};
+use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkError, NetworkId};
 use cassis_core::protocol::{Discard, Execute, Prepare, Request, Response, Settle};
 use cassis_core::routing::{self, RouteAnnouncement, DEFAULT_TRANSIT_SLACK_SECS};
 use cassis_core::transport::Handler;
@@ -48,6 +45,13 @@ pub struct RouteOffer {
 }
 
 impl RouteOffer {
+    /// The base fee the hop asks: its own, and what claiming on `from`
+    /// costs (see [`NetworkId::claim_cost_msat`]).
+    fn base_fee_msat(&self) -> u64 {
+        self.fee_base_msat
+            .saturating_add(self.from.claim_cost_msat())
+    }
+
     /// `from -> to` at the default fees, on the default relays.
     pub fn new(from: NetworkId, to: NetworkId) -> Self {
         Self {
@@ -75,6 +79,9 @@ pub struct RoutingPolicy {
     pub cleanup_relays: Vec<String>,
     /// Most PREPARE reservations held at once.
     pub max_reservations: usize,
+    /// Longest an incoming HTLC may run from its PREPARE: how long a
+    /// hop that never settles can keep this node's funds locked.
+    pub max_htlc_secs: u64,
     /// Runs after the built-in checks, before anything is reserved.
     pub prepare_veto: Option<PrepareVeto>,
 }
@@ -85,6 +92,7 @@ impl Default for RoutingPolicy {
             routes: Vec::new(),
             cleanup_relays: Vec::new(),
             max_reservations: 100,
+            max_htlc_secs: 3 * 24 * 60 * 60,
             prepare_veto: None,
         }
     }
@@ -98,11 +106,22 @@ impl RoutingPolicy {
     }
 }
 
+/// Seconds a hop needs between its outgoing and its incoming expiry: the
+/// outgoing HTLC can still be claimed for a while after its expiry (see
+/// [`NetworkId::outgoing_lag_secs`]), and the incoming one must then
+/// still take the claim. Announced as the hop's one incoming delta.
+fn hop_delta_secs(incoming: &dyn Network, outgoing: &NetworkId) -> u64 {
+    incoming
+        .incoming_delta_secs()
+        .saturating_add(outgoing.outgoing_lag_secs())
+}
+
 /// A PREPARE waiting for its EXECUTE.
 struct Reservation {
     prepare: Prepare,
     owner: String,
-    target: InvoiceTarget,
+    /// What the payer locks to; `None` while the networks are asked.
+    target: Option<InvoiceTarget>,
     expires_at: u64,
 }
 
@@ -232,9 +251,9 @@ impl Router {
                 iroh_relay: relay.clone(),
                 from: route.from.clone(),
                 to: route.to.clone(),
-                fee_base_msat: route.fee_base_msat,
+                fee_base_msat: route.base_fee_msat(),
                 fee_ppm: route.fee_ppm,
-                incoming_delta_secs: incoming.incoming_delta_secs(),
+                incoming_delta_secs: hop_delta_secs(incoming.as_ref(), &route.to),
                 transit_slack_secs: route.transit_slack_secs,
                 test_money: route.test_money,
             };
@@ -322,7 +341,7 @@ impl Router {
                 )
             })?;
         let fee = routing::fee_msat(
-            route.fee_base_msat,
+            route.base_fee_msat(),
             route.fee_ppm,
             prepare.outgoing_amount_msat,
         );
@@ -332,67 +351,119 @@ impl Router {
         if prepare.outgoing_expiry <= now {
             return Err("outgoing expiry is in the past".into());
         }
-        // Worst case the downstream claims at the outgoing expiry; the
-        // incoming network must still have time to take our claim.
-        let delta = incoming.incoming_delta_secs();
+        // Worst case the downstream claims as late as the outgoing
+        // network lets it; the incoming network must still have time to
+        // take our claim.
+        let delta = hop_delta_secs(incoming.as_ref(), &prepare.outgoing_network);
         if prepare.incoming_expiry < prepare.outgoing_expiry.saturating_add(delta) {
             return Err(format!(
                 "incoming expiry must be at least {delta}s after the outgoing expiry"
+            ));
+        }
+        if prepare.incoming_expiry > now.saturating_add(policy.max_htlc_secs) {
+            return Err(format!(
+                "incoming expiry must be within {}s",
+                policy.max_htlc_secs
             ));
         }
         if let Some(reason) = policy.prepare_veto.as_ref().and_then(|veto| veto(prepare)) {
             return Err(reason);
         }
 
+        // Reserve first, then ask the networks without holding up the
+        // other hops.
+        let promised = {
+            let mut reservations = self.0.reservations.lock().await;
+            if let Some(existing) = reservations.get(&prepare.operation_id) {
+                return match &existing.target {
+                    Some(target) if existing.owner == peer && existing.prepare == *prepare => {
+                        Ok(target.clone())
+                    }
+                    None if existing.owner == peer && existing.prepare == *prepare => {
+                        Err("still preparing: ask again".into())
+                    }
+                    _ => Err("operation id already in use".into()),
+                };
+            }
+            if reservations.len() >= policy.max_reservations {
+                return Err("too many pending reservations".into());
+            }
+            let in_flight = self.db().hops().by_in_flight(true).map_err(db_error)?;
+            let hash = prepare.payment_hash.to_string();
+            let hash_in_use = reservations
+                .values()
+                .any(|reservation| reservation.prepare.payment_hash == prepare.payment_hash)
+                || in_flight.iter().any(|hop| hop.payment_hash == hash);
+            if hash_in_use {
+                return Err("payment hash already has an active attempt here".into());
+            }
+            // What other hops are about to send on the outgoing network.
+            let promised: u64 = reservations
+                .values()
+                .filter(|reservation| {
+                    reservation.prepare.outgoing_network == prepare.outgoing_network
+                })
+                .map(|reservation| reservation.prepare.outgoing_amount_msat)
+                .chain(
+                    in_flight
+                        .iter()
+                        .filter(|hop| {
+                            matches!(hop.state, HopState::Verifying | HopState::Funding)
+                                && hop.outgoing_network == prepare.outgoing_network.0
+                        })
+                        .map(|hop| hop.outgoing_amount_msat),
+                )
+                .fold(0, u64::saturating_add);
+            reservations.insert(
+                prepare.operation_id.clone(),
+                Reservation {
+                    prepare: prepare.clone(),
+                    owner: peer,
+                    target: None,
+                    expires_at: now + RESERVATION_TTL_SECS,
+                },
+            );
+            promised
+        };
+        let asked = async {
+            outgoing
+                .can_send(prepare.outgoing_amount_msat.saturating_add(promised))
+                .await
+                .map_err(|e| format!("cannot send on {}: {e}", prepare.outgoing_network))?;
+            incoming
+                .can_receive(prepare.amount_msat)
+                .await
+                .map_err(|e| format!("cannot receive on {}: {e}", prepare.incoming_network))?;
+            incoming
+                .receive_target(
+                    prepare.payment_hash,
+                    prepare.amount_msat,
+                    prepare.incoming_expiry,
+                )
+                .await
+                .map_err(|e| format!("cannot receive on {}: {e}", prepare.incoming_network))
+        }
+        .await;
         let mut reservations = self.0.reservations.lock().await;
-        if let Some(existing) = reservations.get(&prepare.operation_id) {
-            return if existing.owner == peer && existing.prepare == *prepare {
-                Ok(existing.target.clone())
-            } else {
-                Err("operation id already in use".into())
-            };
-        }
-        if reservations.len() >= policy.max_reservations {
-            return Err("too many pending reservations".into());
-        }
-        let hash_in_use = reservations
-            .values()
-            .any(|reservation| reservation.prepare.payment_hash == prepare.payment_hash)
-            || !self
-                .db()
-                .incomings()
-                .ids_by_payment_hash(prepare.payment_hash.to_string())
-                .map_err(db_error)?
-                .is_empty();
-        if hash_in_use {
-            return Err("payment hash already has an active attempt here".into());
-        }
-        outgoing
-            .can_send(prepare.outgoing_amount_msat)
-            .await
-            .map_err(|e| format!("cannot send on {}: {e}", prepare.outgoing_network))?;
-        incoming
-            .can_receive(prepare.amount_msat)
-            .await
-            .map_err(|e| format!("cannot receive on {}: {e}", prepare.incoming_network))?;
-        let target = incoming
-            .receive_target(
-                prepare.payment_hash,
-                prepare.amount_msat,
-                prepare.incoming_expiry,
-            )
-            .await
-            .map_err(|e| format!("cannot receive on {}: {e}", prepare.incoming_network))?;
-        reservations.insert(
-            prepare.operation_id.clone(),
-            Reservation {
-                prepare: prepare.clone(),
-                owner: peer,
-                target: target.clone(),
-                expires_at: now + RESERVATION_TTL_SECS,
+        match asked {
+            Ok(target) => match reservations.get_mut(&prepare.operation_id) {
+                Some(reservation) => {
+                    reservation.target = Some(target.clone());
+                    Ok(target)
+                }
+                // Discarded meanwhile.
+                None => {
+                    drop(reservations);
+                    self.release(&prepare.incoming_network, prepare.payment_hash)
+                        .await;
+                    Err("discarded while preparing".into())
+                }
             },
-        );
-        Ok(target)
+            Err(error) => {
+                reservations.remove(&prepare.operation_id);
+                Err(error)
+            }
+        }
     }
 
     /// Start forwarding a prepared hop, or report on one already
@@ -412,10 +483,13 @@ impl Router {
         let deadline = tokio::time::Instant::now() + INLINE_WAIT;
         loop {
             let response = match self.hop(&execute.operation_id) {
-                Ok(Some(hop)) if hop.owner != peer || hop.payment_hash != execute.payment_hash => {
+                Ok(Some(hop))
+                    if hop.owner != peer
+                        || hop.payment_hash != execute.payment_hash.to_string() =>
+                {
                     Response::Error("operation belongs to another payment".into())
                 }
-                Ok(Some(hop)) => hop.response,
+                Ok(Some(hop)) => report(&hop),
                 Ok(None) => Response::Error("no matching PREPARE".into()),
                 Err(error) => Response::Error(error),
             };
@@ -426,83 +500,53 @@ impl Router {
         }
     }
 
-    /// What EXECUTE answers about the hop `operation_id`, wherever it is.
-    fn hop(&self, operation_id: &OperationId) -> Result<Option<HopReport>, String> {
-        let id = operation_id.as_str().to_string();
-        let found = self
-            .db()
-            .read(|tx| {
-                if let Some(incoming) = tx.incomings().get(HopId(id.clone()))? {
-                    let outgoing = tx.outgoings().get(OutgoingId(id.clone()))?;
-                    return Ok(Some((
-                        incoming.owner,
-                        incoming.payment_hash,
-                        Found::InFlight(outgoing.map(|outgoing| outgoing.htlc)),
-                    )));
-                }
-                if let Some(forward) = tx.forwards().get(ForwardId(id.clone()))? {
-                    return Ok(Some((
-                        forward.owner,
-                        forward.payment_hash,
-                        Found::Forwarded(forward.outgoing),
-                    )));
-                }
-                let fail = tx.fails().get(FailId(id.clone()))?;
-                Ok::<_, orangedb::Error>(
-                    fail.map(|fail| (fail.owner, fail.payment_hash, Found::Failed(fail.reason))),
-                )
-            })
-            .map_err(db_error)?;
-        let Some((owner, payment_hash, found)) = found else {
-            return Ok(None);
-        };
-        let response = match found {
-            Found::InFlight(None) => Response::Pending,
-            Found::InFlight(Some(htlc)) | Found::Forwarded(htlc) => Htlc::try_from(&htlc)
-                .map(|htlc| Response::Executed(htlc.descriptor))
-                .unwrap_or_else(Response::Error),
-            Found::Failed(reason) => Response::Error(reason.describe().into()),
-        };
-        Ok(Some(HopReport {
-            owner,
-            payment_hash: payment_hash
-                .parse()
-                .map_err(|_| "stored payment hash is invalid".to_string())?,
-            response,
-        }))
+    fn hop(&self, operation_id: &OperationId) -> Result<Option<Hop>, String> {
+        self.db()
+            .hops()
+            .get(HopId(operation_id.as_str().to_string()))
+            .map_err(db_error)
     }
 
     /// Turn the reservation of `execute` into a journaled hop and
     /// forward it in the background.
     async fn start_hop(&self, execute: Execute, peer: String) -> Result<(), String> {
-        let reservation = {
+        let (prepare, target) = {
             let mut reservations = self.0.reservations.lock().await;
             match reservations.get(&execute.operation_id) {
                 Some(reservation)
                     if reservation.owner == peer
-                        && reservation.prepare.payment_hash == execute.payment_hash => {}
+                        && reservation.prepare.payment_hash == execute.payment_hash
+                        && reservation.target.is_some() => {}
                 _ => return Err("no matching PREPARE".into()),
             }
-            reservations
+            let reservation = reservations
                 .remove(&execute.operation_id)
-                .expect("checked above")
+                .expect("checked above");
+            (
+                reservation.prepare,
+                reservation.target.expect("checked above"),
+            )
         };
-        let prepare = reservation.prepare;
-        if prepare.outgoing_expiry <= unix_now() {
-            return Err("outgoing expiry passed before EXECUTE".into());
+        let checked = if prepare.outgoing_expiry <= unix_now() {
+            Err("outgoing expiry passed before EXECUTE")
+        } else if !execute.incoming_descriptor.pays(&target) {
+            Err("the incoming HTLC does not pay the PREPARE answer")
+        } else if *execute.outgoing_target.network() != prepare.outgoing_network {
+            Err("EXECUTE pays on another network than its PREPARE")
+        } else {
+            Ok(())
+        };
+        if let Err(error) = checked {
+            self.release(&prepare.incoming_network, prepare.payment_hash)
+                .await;
+            return Err(error.into());
         }
-        if !execute.incoming_descriptor.pays(&reservation.target) {
-            return Err("the incoming HTLC does not pay the PREPARE answer".into());
-        }
-        if *execute.outgoing_target.network() != prepare.outgoing_network {
-            return Err("EXECUTE pays on another network than its PREPARE".into());
-        }
-        let incoming = Incoming {
+        let hop = Hop {
             operation_id: HopId(execute.operation_id.as_str().to_string()),
             owner: peer,
             payment_hash: prepare.payment_hash.to_string(),
-            network: prepare.incoming_network.0.clone(),
-            htlc: (&Htlc {
+            incoming_network: prepare.incoming_network.0.clone(),
+            incoming: (&Htlc {
                 payment_hash: prepare.payment_hash,
                 amount_msat: prepare.amount_msat,
                 expiry: prepare.incoming_expiry,
@@ -513,23 +557,27 @@ impl Router {
             outgoing_amount_msat: prepare.outgoing_amount_msat,
             outgoing_expiry: prepare.outgoing_expiry,
             outgoing_target: (&execute.outgoing_target).into(),
-            state: IncomingState::Verifying,
+            outgoing: None,
+            preimage: None,
+            state: HopState::Verifying,
             created_at: unix_now(),
+            ended_at: None,
         };
-        self.db().incomings().insert(&incoming).map_err(db_error)?;
-        self.node().spawn(self.clone().forward(incoming));
+        self.db().hops().insert(&hop).map_err(db_error)?;
+        self.node().spawn(self.clone().forward(hop));
         Ok(())
     }
 
     /// Wait for the incoming HTLC of a hop to verify, then fund its
     /// outgoing HTLC.
-    async fn forward(self, mut hop: Incoming) {
+    async fn forward(self, mut hop: Hop) {
         let Some(_busy) = self.node().busy(format!("hop:{}", hop.operation_id.0)) else {
             return;
         };
         let hash = short(&hop.payment_hash);
         let (incoming, outgoing) = match (
-            self.node().network(&NetworkId(hop.network.clone())),
+            self.node()
+                .network(&NetworkId(hop.incoming_network.clone())),
             self.node()
                 .network(&NetworkId(hop.outgoing_network.clone())),
         ) {
@@ -539,7 +587,7 @@ impl Router {
                 return self.fail(&hop, FailReason::NetworkUnavailable, true).await;
             }
         };
-        let htlc = match Htlc::try_from(&hop.htlc) {
+        let htlc = match Htlc::try_from(&hop.incoming) {
             Ok(htlc) => htlc,
             Err(error) => {
                 error!("hop {}: {error}", hop.operation_id.0);
@@ -550,16 +598,24 @@ impl Router {
         loop {
             match incoming.verify_incoming_htlc(&htlc).await {
                 Ok(()) => break,
-                Err(NetworkError::NotYet(reason)) if unix_now() < hop.outgoing_expiry => {
+                Err(NetworkError::Invalid(reason)) => {
+                    warn!("EXECUTE {hash} failed: incoming HTLC rejected: {reason}");
+                    return self.fail(&hop, FailReason::IncomingRejected, true).await;
+                }
+                // Not final yet, or the network could not tell: nothing
+                // is funded, so waiting costs nothing.
+                Err(error) if unix_now() < hop.outgoing_expiry => {
                     if !waiting {
-                        info!("EXECUTE {hash}: waiting for the incoming HTLC: {reason}");
+                        info!("EXECUTE {hash}: waiting for the incoming HTLC: {error}");
                         waiting = true;
                     }
                     tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
                 }
                 Err(error) => {
-                    warn!("EXECUTE {hash} failed: incoming HTLC rejected: {error}");
-                    return self.fail(&hop, FailReason::IncomingRejected, true).await;
+                    warn!("EXECUTE {hash} failed: outgoing expiry passed while verifying: {error}");
+                    return self
+                        .fail(&hop, FailReason::ExpiredWhileVerifying, true)
+                        .await;
                 }
             }
         }
@@ -570,11 +626,6 @@ impl Router {
                 .await;
         }
 
-        hop.state = IncomingState::Funding;
-        if let Err(error) = self.db().incomings().update(&hop) {
-            warn!("EXECUTE {hash} failed: journaling: {error}");
-            return self.fail(&hop, FailReason::FundingFailed, true).await;
-        }
         let network = outgoing.id();
         let target = match InvoiceTarget::try_from(&hop.outgoing_target) {
             Ok(target) => target,
@@ -583,6 +634,27 @@ impl Router {
                 return self.fail(&hop, FailReason::FundingFailed, true).await;
             }
         };
+        let sent = |descriptor| Htlc {
+            payment_hash: htlc.payment_hash,
+            amount_msat: hop.outgoing_amount_msat,
+            expiry: hop.outgoing_expiry,
+            descriptor,
+        };
+        // Where the network can tell the HTLC before funding it, it is
+        // journaled first: a restart then finds it (see `resume`).
+        hop.outgoing = outgoing
+            .outgoing_descriptor(
+                htlc.payment_hash,
+                hop.outgoing_amount_msat,
+                hop.outgoing_expiry,
+                &target,
+            )
+            .map(|descriptor| (&sent(descriptor)).into());
+        hop.state = HopState::Funding;
+        if let Err(error) = self.db().hops().update(&hop) {
+            warn!("EXECUTE {hash} failed: journaling: {error}");
+            return self.fail(&hop, FailReason::FundingFailed, true).await;
+        }
         let funded = outgoing
             .create_outgoing_htlc(
                 htlc.payment_hash,
@@ -593,28 +665,10 @@ impl Router {
             .await;
         match funded {
             Ok(descriptor) => {
-                let sent = Htlc {
-                    payment_hash: htlc.payment_hash,
-                    amount_msat: hop.outgoing_amount_msat,
-                    expiry: hop.outgoing_expiry,
-                    descriptor,
-                };
-                let forwarded = Incoming {
-                    state: IncomingState::Forwarded,
-                    ..hop.clone()
-                };
-                let journaled = self.db().write(|tx| {
-                    tx.incomings().update(&forwarded)?;
-                    tx.outgoings().insert(&Outgoing {
-                        operation_id: OutgoingId(hop.operation_id.0.clone()),
-                        incoming: hop.operation_id.clone(),
-                        network: network.0.clone(),
-                        htlc: (&sent).into(),
-                        preimage: None,
-                        funded_at: unix_now(),
-                    })
-                });
-                if let Err(error) = journaled {
+                let sent = sent(descriptor);
+                hop.outgoing = Some((&sent).into());
+                hop.state = HopState::Forwarded;
+                if let Err(error) = self.db().hops().update(&hop) {
                     error!(
                         "journaling forwarded hop {}: {error}; check {network} for a lock to \
                          {sent:?}",
@@ -623,7 +677,7 @@ impl Router {
                 }
                 info!(
                     "EXECUTE {hash}: forwarded {} msat {} -> {network}",
-                    hop.outgoing_amount_msat, hop.network
+                    hop.outgoing_amount_msat, hop.incoming_network
                 );
             }
             Err(error) => {
@@ -635,27 +689,25 @@ impl Router {
 
     /// End `hop` with `reason`, releasing what its incoming network set
     /// up to receive it if `release`.
-    async fn fail(&self, hop: &Incoming, reason: FailReason, release: bool) {
+    async fn fail(&self, hop: &Hop, reason: FailReason, release: bool) {
         if release {
             if let Ok(hash) = hop.payment_hash.parse() {
-                self.release(&NetworkId(hop.network.clone()), hash).await;
+                self.release(&NetworkId(hop.incoming_network.clone()), hash)
+                    .await;
             }
         }
-        let ended = self.db().write(|tx| {
-            tx.incomings().delete(hop.operation_id.clone())?;
-            tx.fails().insert(&Fail {
-                operation_id: FailId(hop.operation_id.0.clone()),
-                owner: hop.owner.clone(),
-                payment_hash: hop.payment_hash.clone(),
-                incoming_network: hop.network.clone(),
-                amount_msat: hop.htlc.amount_msat,
-                outgoing_network: hop.outgoing_network.clone(),
-                reason,
-                at: unix_now(),
-            })
-        });
-        if let Err(error) = ended {
-            error!("journaling failed hop {}: {error}", hop.operation_id.0);
+        self.end(hop, HopState::Failed { reason });
+    }
+
+    /// Journal `hop` as over, in `state`.
+    fn end(&self, hop: &Hop, state: HopState) {
+        let ended = Hop {
+            state,
+            ended_at: Some(unix_now()),
+            ..hop.clone()
+        };
+        if let Err(error) = self.db().hops().update(&ended) {
+            error!("journaling ended hop {}: {error}", hop.operation_id.0);
         }
     }
 
@@ -685,29 +737,21 @@ impl Router {
         let Some(_busy) = self.node().busy(format!("hop:{id}")) else {
             return;
         };
-        let Ok((Some(incoming), Some(outgoing))) = self.db().read(|tx| {
-            Ok::<_, orangedb::Error>((
-                tx.incomings().get(HopId(id.clone()))?,
-                tx.outgoings().get(OutgoingId(id.clone()))?,
-            ))
-        }) else {
+        let Ok(Some(mut hop)) = self.hop(&settle.operation_id) else {
             return;
         };
-        let matches = incoming
+        let matches = hop
             .payment_hash
             .parse::<Bytes32>()
             .is_ok_and(|hash| hash.matches_preimage(&settle.preimage));
-        if incoming.owner != peer || !matches {
+        if hop.state != HopState::Forwarded || hop.owner != peer || !matches {
             return;
         }
-        let outgoing = Outgoing {
-            preimage: Some(settle.preimage.0),
-            ..outgoing
-        };
-        if let Err(error) = self.db().outgoings().update(&outgoing) {
+        hop.preimage = Some(settle.preimage.0);
+        if let Err(error) = self.db().hops().update(&hop) {
             warn!("saving hop {id}: {error}");
         }
-        self.claim(&incoming, &outgoing).await;
+        self.claim(&hop).await;
     }
 
     /// Drop reservations whose EXECUTE never came.
@@ -745,10 +789,10 @@ impl Router {
 
     /// The hops in flight through `id`, which need it to settle.
     pub fn in_flight(&self, id: &NetworkId) -> usize {
-        match self.db().incomings().all() {
+        match self.db().hops().by_in_flight(true) {
             Ok(hops) => hops
                 .iter()
-                .filter(|hop| hop.network == id.0 || hop.outgoing_network == id.0)
+                .filter(|hop| hop.incoming_network == id.0 || hop.outgoing_network == id.0)
                 .count(),
             // Unable to tell: do not let go of the network.
             Err(_) => 1,
@@ -756,14 +800,25 @@ impl Router {
     }
 
     /// After a restart: go on waiting for hops still verifying, and
-    /// fail hops left mid-funding, which cannot be resumed: whether
-    /// their outgoing HTLC exists is unknown, and funding it again could
-    /// pay twice.
+    /// settle those interrupted while funding an outgoing HTLC that was
+    /// journaled first, as if it was funded: it refunds like one that
+    /// was. The others left mid-funding cannot be resumed, and fail:
+    /// whether their outgoing HTLC exists is unknown, and funding it
+    /// again could pay twice.
     fn resume(&self) -> Result<(), String> {
-        for hop in self.db().incomings().all().map_err(db_error)? {
+        for mut hop in self.db().hops().by_in_flight(true).map_err(db_error)? {
             match hop.state {
-                IncomingState::Verifying => self.node().spawn(self.clone().forward(hop)),
-                IncomingState::Funding => {
+                HopState::Verifying => self.node().spawn(self.clone().forward(hop)),
+                HopState::Funding if hop.outgoing.is_some() => {
+                    warn!(
+                        "hop {} was interrupted while funding its outgoing HTLC on {}: \
+                         settling it as funded",
+                        hop.operation_id.0, hop.outgoing_network,
+                    );
+                    hop.state = HopState::Forwarded;
+                    self.db().hops().update(&hop).map_err(db_error)?;
+                }
+                HopState::Funding => {
                     error!(
                         "hop {} was interrupted while funding its outgoing HTLC on {}; check \
                          that wallet for a lock of {} msat for {} until {}",
@@ -773,25 +828,32 @@ impl Router {
                         hop.payment_hash,
                         hop.outgoing_expiry,
                     );
-                    let router = self.clone();
-                    self.node().spawn(async move {
-                        router
-                            .fail(&hop, FailReason::InterruptedWhileFunding, false)
-                            .await
-                    });
+                    self.end(
+                        &hop,
+                        HopState::Failed {
+                            reason: FailReason::InterruptedWhileFunding,
+                        },
+                    );
                 }
-                IncomingState::Forwarded => {}
+                _ => {}
             }
         }
         Ok(())
     }
 
+    /// Every tick, each forwarded hop advances in a task of its own: one
+    /// stuck on its network does not hold up the others, and is skipped
+    /// while it is.
     async fn settle_loop(self) {
         let mut ticker = tokio::time::interval(SETTLE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            self.settle_once().await;
+            self.expire_reservations().await;
+            for id in self.forwarded() {
+                let router = self.clone();
+                self.node().spawn(async move { router.advance(id).await });
+            }
         }
     }
 
@@ -799,124 +861,109 @@ impl Router {
     /// forwarded hops whose outgoing HTLC may be claimed or refundable.
     pub async fn settle_once(&self) {
         self.expire_reservations().await;
-        match self.db().outgoings().all() {
-            Ok(outgoings) => {
-                for outgoing in outgoings {
-                    self.advance(outgoing).await;
-                }
+        futures::future::join_all(self.forwarded().into_iter().map(|id| self.advance(id))).await;
+    }
+
+    /// The hops whose outgoing HTLC is funded.
+    fn forwarded(&self) -> Vec<HopId> {
+        match self.db().hops().by_in_flight(true) {
+            Ok(hops) => hops
+                .into_iter()
+                .filter(|hop| hop.state == HopState::Forwarded)
+                .map(|hop| hop.operation_id)
+                .collect(),
+            Err(error) => {
+                warn!("listing hops: {error}");
+                Vec::new()
             }
-            Err(error) => warn!("listing hops: {error}"),
         }
     }
 
-    async fn advance(&self, outgoing: Outgoing) {
-        let id = outgoing.operation_id.0.clone();
-        let Some(_busy) = self.node().busy(format!("hop:{id}")) else {
+    async fn advance(&self, id: HopId) {
+        let Some(_busy) = self.node().busy(format!("hop:{}", id.0)) else {
             return;
         };
         // The listing may be stale: a SETTLE could have ended it since.
-        let Ok((Some(incoming), Some(mut outgoing))) = self.db().read(|tx| {
-            Ok::<_, orangedb::Error>((
-                tx.incomings().get(HopId(id.clone()))?,
-                tx.outgoings().get(OutgoingId(id.clone()))?,
-            ))
-        }) else {
+        let Ok(Some(mut hop)) = self.db().hops().get(id.clone()) else {
             return;
         };
-        let (Ok(network), Ok(htlc)) = (
-            self.node().network(&NetworkId(outgoing.network.clone())),
-            Htlc::try_from(&outgoing.htlc),
+        if hop.state != HopState::Forwarded {
+            return;
+        }
+        let (Ok(network), Some(Ok(htlc))) = (
+            self.node()
+                .network(&NetworkId(hop.outgoing_network.clone())),
+            hop.outgoing.as_ref().map(Htlc::try_from),
         ) else {
             return;
         };
-        if outgoing.preimage.is_none() {
+        if hop.preimage.is_none() {
             match settle_outgoing(network.as_ref(), &htlc).await {
                 Outcome::Pending => return,
                 Outcome::Claimed(preimage) => {
                     info!(
                         "{} claimed downstream on {}",
-                        short(&incoming.payment_hash),
-                        outgoing.network
+                        short(&hop.payment_hash),
+                        hop.outgoing_network
                     );
-                    outgoing.preimage = Some(preimage.0);
-                    if let Err(error) = self.db().outgoings().update(&outgoing) {
-                        warn!("saving hop {id}: {error}");
+                    hop.preimage = Some(preimage.0);
+                    if let Err(error) = self.db().hops().update(&hop) {
+                        warn!("saving hop {}: {error}", id.0);
                     }
                 }
                 Outcome::Refunded => {
-                    return self
-                        .fail(&incoming, FailReason::PreimageNotReceived, true)
-                        .await
+                    return self.fail(&hop, FailReason::PreimageNotReceived, true).await
                 }
             }
         }
-        self.claim(&incoming, &outgoing).await;
+        self.claim(&hop).await;
     }
 
     /// Claim the incoming HTLC of a hop whose preimage is known.
-    async fn claim(&self, incoming: &Incoming, outgoing: &Outgoing) {
-        let Some(preimage) = outgoing.preimage.map(Bytes32) else {
+    async fn claim(&self, hop: &Hop) {
+        let Some(preimage) = hop.preimage.map(Bytes32) else {
             return;
         };
-        let hash = short(&incoming.payment_hash);
+        let hash = short(&hop.payment_hash);
         let (Ok(network), Ok(htlc)) = (
-            self.node().network(&NetworkId(incoming.network.clone())),
-            Htlc::try_from(&incoming.htlc),
+            self.node()
+                .network(&NetworkId(hop.incoming_network.clone())),
+            Htlc::try_from(&hop.incoming),
         ) else {
             return;
         };
         match network.claim_incoming_htlc(&htlc, preimage).await {
             Ok(()) => {
-                let forward = Forward {
-                    operation_id: ForwardId(incoming.operation_id.0.clone()),
-                    owner: incoming.owner.clone(),
-                    payment_hash: incoming.payment_hash.clone(),
-                    incoming_network: incoming.network.clone(),
-                    incoming_amount_msat: htlc.amount_msat,
-                    outgoing_network: outgoing.network.clone(),
-                    outgoing: outgoing.htlc.clone(),
-                    settled_at: unix_now(),
-                };
-                info!("{hash} settled: earned {} msat", forward.fee_msat());
-                let ended = self.db().write(|tx| {
-                    tx.incomings().delete(incoming.operation_id.clone())?;
-                    tx.forwards().insert(&forward)
-                });
-                if let Err(error) = ended {
-                    error!(
-                        "journaling settled hop {}: {error}",
-                        incoming.operation_id.0
-                    );
-                }
+                info!("{hash} settled: earned {} msat", hop.fee_msat());
+                self.end(hop, HopState::Settled);
             }
             Err(claim_error) if unix_now() >= htlc.expiry => {
                 error!(
                     "{hash} could not be claimed on {} before it expired: {claim_error}",
-                    incoming.network
+                    hop.incoming_network
                 );
-                self.fail(incoming, FailReason::ClaimFailed, false).await;
+                self.fail(hop, FailReason::ClaimFailed, false).await;
             }
             Err(claim_error) => warn!(
                 "claiming {hash} on {}: {claim_error}; retrying",
-                incoming.network
+                hop.incoming_network
             ),
         }
     }
 }
 
-/// Where a hop is.
-enum Found {
-    /// In flight, with its outgoing HTLC once funded.
-    InFlight(Option<cassis_wallet::stored::StoredHtlc>),
-    Forwarded(cassis_wallet::stored::StoredHtlc),
-    Failed(FailReason),
-}
-
-/// What EXECUTE answers about a hop, and who it belongs to.
-struct HopReport {
-    owner: String,
-    payment_hash: Bytes32,
-    response: Response,
+/// What EXECUTE answers about `hop`.
+fn report(hop: &Hop) -> Response {
+    match hop.state {
+        HopState::Verifying | HopState::Funding => Response::Pending,
+        HopState::Forwarded | HopState::Settled => match &hop.outgoing {
+            Some(outgoing) => Htlc::try_from(outgoing)
+                .map(|htlc| Response::Executed(htlc.descriptor))
+                .unwrap_or_else(Response::Error),
+            None => Response::Error("the forwarded HTLC is missing".into()),
+        },
+        HopState::Failed { reason } => Response::Error(reason.describe().into()),
+    }
 }
 
 fn short(hash: &str) -> String {

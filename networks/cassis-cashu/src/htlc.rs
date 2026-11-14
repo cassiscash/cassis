@@ -8,7 +8,7 @@ use cdk::nuts::nut01::SecretKey;
 use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::nut10::{Secret as Nut10Secret, SpendingConditions};
 use cdk::nuts::nut14::HTLCWitness;
-use cdk::nuts::{Conditions, Witness};
+use cdk::nuts::{Conditions, SigFlag, Witness};
 use cdk::secp256k1::hashes::Hash as _;
 use cdk::secret::Secret;
 use cdk::Amount;
@@ -46,6 +46,16 @@ impl HtlcTerms {
                 "HTLC proof must name exactly one refund key",
             ));
         };
+        // Claims are witnessed with one signature over the inputs:
+        // anything else would verify here and never claim.
+        if conditions.num_sigs.is_some_and(|sigs| sigs != 1) {
+            return Err(NetworkError::invalid(
+                "HTLC proof must ask for exactly one signature",
+            ));
+        }
+        if conditions.sig_flag != SigFlag::SigInputs {
+            return Err(NetworkError::invalid("HTLC proof must be SIG_INPUTS"));
+        }
         Ok(Self {
             payment_hash: Bytes32(data.to_byte_array()),
             receiver: *receiver,
@@ -108,7 +118,6 @@ pub fn htlc_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdk::nuts::SigFlag;
 
     fn terms() -> HtlcTerms {
         HtlcTerms {

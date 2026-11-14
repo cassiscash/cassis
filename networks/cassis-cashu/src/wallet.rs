@@ -1,9 +1,33 @@
 //! The ecash wallet: unrestricted proofs kept in one JSON file.
 
-use crate::{KeysetId, Proof};
+use crate::{Amount, KeysetId, Proof, Secret};
+use cdk::nuts::nut01::SecretKey;
 use fs2::FileExt;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+
+/// File of the swaps asked of the mint whose outputs are not held yet.
+const PENDING: &str = "pending.json";
+
+/// One output of a [`PendingSwap`]: what unblinds the mint's signature.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingOutput {
+    pub secret: Secret,
+    pub r: SecretKey,
+    pub amount: Amount,
+}
+
+/// A swap asked of the mint: if its answer is lost, the mint can still
+/// be asked for the signatures of these outputs (NUT-09).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingSwap {
+    pub id: u64,
+    pub created_at: u64,
+    pub keyset: KeysetId,
+    pub outputs: Vec<PendingOutput>,
+}
 
 pub struct Wallet {
     dir: PathBuf,
@@ -21,11 +45,47 @@ impl Wallet {
         self.update(|proofs| Ok(proofs.clone()))
     }
 
+    /// Add `new` proofs, except those the wallet already has.
     pub fn add(&self, new: &[Proof]) -> Result<(), String> {
         self.update(|proofs| {
-            proofs.extend_from_slice(new);
+            for proof in new {
+                if !proofs.iter().any(|held| held.secret == proof.secret) {
+                    proofs.push(proof.clone());
+                }
+            }
             Ok(())
         })
+    }
+
+    /// Journal the outputs of a swap about to be asked of the mint, so
+    /// they can be restored if its answer is lost.
+    pub fn begin_swap(&self, swap: &PendingSwap) -> Result<(), String> {
+        self.update_file(PENDING, |swaps: &mut Vec<PendingSwap>| {
+            swaps.push(swap.clone());
+            Ok(())
+        })
+    }
+
+    /// Forget the swap `id`: its outputs are held, or will never exist.
+    pub fn end_swap(&self, id: u64) -> Result<(), String> {
+        self.update_file(PENDING, |swaps: &mut Vec<PendingSwap>| {
+            swaps.retain(|swap| swap.id != id);
+            Ok(())
+        })
+    }
+
+    /// Replace the journaled swap `swap.id` by `swap`.
+    pub fn replace_swap(&self, swap: &PendingSwap) -> Result<(), String> {
+        self.update_file(PENDING, |swaps: &mut Vec<PendingSwap>| {
+            for held in swaps.iter_mut().filter(|held| held.id == swap.id) {
+                *held = swap.clone();
+            }
+            Ok(())
+        })
+    }
+
+    pub fn pending_swaps(&self) -> Result<Vec<PendingSwap>, String> {
+        self.update_file(PENDING, |swaps: &mut Vec<PendingSwap>| Ok(swaps.clone()))
     }
 
     /// Remove and return proofs of `keyset` covering `amount_sat` plus
@@ -56,20 +116,32 @@ impl Wallet {
     /// Read-modify-write under an exclusive file lock, so concurrent
     /// processes on the same wallet never lose proofs.
     fn update<T>(&self, f: impl FnOnce(&mut Vec<Proof>) -> Result<T, String>) -> Result<T, String> {
+        self.update_file("proofs.json", f)
+    }
+
+    /// [`Wallet::update`] of the list kept in the file `name`.
+    fn update_file<I, T>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut Vec<I>) -> Result<T, String>,
+    ) -> Result<T, String>
+    where
+        I: Serialize + DeserializeOwned + Clone + PartialEq,
+    {
         let lock = File::create(self.dir.join("proofs.lock")).map_err(|e| e.to_string())?;
         lock.lock_exclusive()
             .map_err(|e| format!("lock wallet: {e}"))?;
-        let path = self.dir.join("proofs.json");
-        let mut proofs: Vec<Proof> = match std::fs::read(&path) {
+        let path = self.dir.join(name);
+        let mut items: Vec<I> = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("read wallet: {e}"))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(format!("read wallet: {error}")),
         };
-        let before = proofs.clone();
-        let result = f(&mut proofs)?;
-        if proofs != before {
-            let temporary = self.dir.join("proofs.json.tmp");
-            let bytes = serde_json::to_vec(&proofs).map_err(|e| e.to_string())?;
+        let before = items.clone();
+        let result = f(&mut items)?;
+        if items != before {
+            let temporary = self.dir.join(format!("{name}.tmp"));
+            let bytes = serde_json::to_vec(&items).map_err(|e| e.to_string())?;
             std::fs::write(&temporary, bytes).map_err(|e| format!("write wallet: {e}"))?;
             std::fs::rename(&temporary, &path).map_err(|e| format!("write wallet: {e}"))?;
         }

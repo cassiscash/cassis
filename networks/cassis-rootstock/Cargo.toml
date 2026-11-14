@@ -11,3 +11,4 @@ cassis-core = { workspace = true }
 # one EVM address (see `normalized_key`).
 secp256k1 = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }

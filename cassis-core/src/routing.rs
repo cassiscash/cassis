@@ -70,7 +70,8 @@ pub struct RouteAnnouncement {
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
     /// Seconds the router needs between its outgoing and incoming
-    /// expiry (see `Network::incoming_delta_secs`).
+    /// expiry: its incoming network's `Network::incoming_delta_secs`
+    /// and its outgoing network's `NetworkId::outgoing_lag_secs`.
     pub incoming_delta_secs: u64,
     /// Seconds of slack the router asks payers to add per leg.
     pub transit_slack_secs: u64,

@@ -40,6 +40,7 @@ use cassis_admin::networks::{new_network_id, ALL_KINDS};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, Identity, Refresh};
 use cassis_core::routing::{autohue, autoname, fetch_published, Published};
 use cassis_core::{unix_now, NetworkId};
+use cassis_routerd::db::HopState;
 use cassis_routerd::router::Router;
 use hypereffect::vtree;
 use hypereffect::{Map, Value};
@@ -347,14 +348,20 @@ impl Admin {
         let db = self.router.db();
         let read = || -> orangedb::Result<view::Hops> {
             let mut failed = BTreeMap::new();
-            for fail in db.fails().all()? {
-                *failed
-                    .entry(view::fail_kind(fail.reason).to_string())
-                    .or_default() += 1;
+            let mut settled = 0;
+            for hop in db.hops().by_in_flight(false)? {
+                match hop.state {
+                    HopState::Failed { reason } => {
+                        *failed
+                            .entry(view::fail_kind(reason).to_string())
+                            .or_default() += 1;
+                    }
+                    _ => settled += 1,
+                }
             }
             Ok(view::Hops {
-                in_flight: db.incomings().all()?,
-                settled: db.forwards().len()? as usize,
+                in_flight: db.hops().by_in_flight(true)?,
+                settled,
                 failed,
             })
         };

@@ -216,6 +216,9 @@ pub struct LiquidAdapter {
     /// Full 33-byte claim pubkey (always `02 || X`).
     claim_pk_full: BtcPublicKey,
     wollet: Mutex<Wollet>,
+    /// Held while a lockup picks wallet coins and spends them, so that
+    /// two never pick the same ones.
+    funding: Mutex<()>,
     esplora: Mutex<EsploraClient>,
     waterfalls: Mutex<EsploraClient>,
     http: reqwest::Client,
@@ -327,6 +330,7 @@ impl LiquidAdapter {
             claim_path,
             claim_pk_full,
             wollet: Mutex::new(wollet),
+            funding: Mutex::new(()),
             esplora: Mutex::new(EsploraClient::new(network, esplora_url)),
             waterfalls: Mutex::new(waterfalls),
             http,
@@ -895,7 +899,7 @@ impl Network for LiquidAdapter {
         if self.network.is_mainnet() && !self.tx_confirmed(&outpoint.txid).await? {
             zeroconf::check_coverage(&self.http, &outpoint.txid.to_string())
                 .await
-                .map_err(NetworkError::Network)?;
+                .map_err(NetworkError::NotYet)?;
         }
         let address = spec.lockup_address(self.network.address_params())?;
         if self
@@ -916,6 +920,9 @@ impl Network for LiquidAdapter {
     ) -> Result<(), NetworkError> {
         let (spec, outpoint) = Self::htlc_spec(htlc)?;
         let value_sat = self.lockup_value(&spec, outpoint).await?;
+        // TODO: a broadcast claim counts as settled, but nothing checks
+        // that it confirms before the sender can refund. Watch it until
+        // it does, broadcasting it again if it was dropped.
         let txid = self
             .spend_htlc_input(&spec, outpoint, value_sat, Some(preimage.0), None)
             .await?;
@@ -951,6 +958,7 @@ impl Network for LiquidAdapter {
             refund_locktime,
         );
         let lockup_address = spec.lockup_address(self.network.address_params())?;
+        let funding = self.funding.lock().await;
         self.sync_wallet().await?;
         let mut pset = {
             let wollet = self.wollet.lock().await;
@@ -986,6 +994,7 @@ impl Network for LiquidAdapter {
                 .position(|output| output.script_pubkey == spec.lockup_script_pubkey)
                 .ok_or_else(|| NetworkError::network("lockup output missing"))? as u32;
         let txid = self.broadcast(&tx).await?;
+        drop(funding);
         info!(
             parent: &self.span,
             "locked {sats} sats for {} until block {refund_locktime}: tx {txid}",
@@ -1027,19 +1036,36 @@ impl Network for LiquidAdapter {
         Ok(())
     }
 
+    /// The wallet can build the lockup, fee included.
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
         let needed = sats_for_msat(amount_msat);
-        let available = self.lbtc_balance_sat().await?;
-        if needed > available {
+        if needed < MIN_LOCK_SATS {
             return Err(NetworkError::invalid(format!(
-                "need {needed} sats, wallet has {available}"
+                "liquid HTLCs lock at least {MIN_LOCK_SATS} sats"
             )));
         }
+        let available = self.lbtc_balance_sat().await?;
+        let address = self.next_wallet_address().await?;
+        let wollet = self.wollet.lock().await;
+        wollet
+            .tx_builder()
+            .add_explicit_recipient(&address, needed, *self.network.policy_asset())
+            .and_then(|builder| builder.fee_rate(Some(FEE_RATE_SATS_KVB)).finish())
+            .map_err(|e| {
+                NetworkError::invalid(format!(
+                    "cannot lock {needed} sats with fees, wallet has {available}: {e}"
+                ))
+            })?;
         Ok(())
     }
 
-    /// Claim fees come out of the HTLC.
-    async fn can_receive(&self, _amount_msat: u64) -> Result<(), NetworkError> {
+    /// Claim fees come out of the HTLC, which must be worth claiming.
+    async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        if sats_for_msat(amount_msat) < MIN_LOCK_SATS {
+            return Err(NetworkError::invalid(format!(
+                "liquid HTLCs lock at least {MIN_LOCK_SATS} sats"
+            )));
+        }
         Ok(())
     }
 }

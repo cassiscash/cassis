@@ -1,6 +1,6 @@
 //! Arkade network adapter for cassis.
 //!
-//! Implements [`NetworkAdapter`] on top of an Arkade operator
+//! Implements [`Network`] on top of an Arkade operator
 //! (arkd) using the Arkade Rust SDK. HTLCs are Arkade
 //! VHTLCs (`ark_core::vhtlc::VhtlcScript`, a taproot tree with six
 //! spending paths):
@@ -206,6 +206,9 @@ pub struct ArkadeAdapter {
     /// How long the operator's batches last, at least (see
     /// [`Self::learn_batch_lifetime`]); `None` until a VTXO is seen.
     batch_lifetime_secs: Mutex<Option<u64>>,
+    /// Held while coins are picked and spent, by a lock or by upkeep, so
+    /// that two spends never pick the same ones.
+    spending: tokio::sync::Mutex<()>,
 }
 
 impl ArkadeAdapter {
@@ -299,6 +302,7 @@ impl ArkadeAdapter {
             client: Arc::new(client),
             chain,
             batch_lifetime_secs: Mutex::new(None),
+            spending: tokio::sync::Mutex::new(()),
         };
         adapter.learn_batch_lifetime().await;
         Ok(adapter)
@@ -552,13 +556,16 @@ impl ArkadeAdapter {
             .map_err(|e| NetworkError::network(format!("get_virtual_tx_outpoints: {e}")))
     }
 
-    /// The single unspent VTXO at the VHTLC address.
-    async fn unspent_vtxo_at(&self, options: &VhtlcOptions) -> Result<UnspentVtxo, NetworkError> {
+    /// The unspent VTXOs at the VHTLC address, largest first. Anyone can
+    /// send more there, so there may be several.
+    async fn unspent_vtxos_at(
+        &self,
+        options: &VhtlcOptions,
+    ) -> Result<Vec<UnspentVtxo>, NetworkError> {
         let vhtlc = self.script_for(options)?;
         let mut unspent: Vec<UnspentVtxo> = self
             .outpoints_at_address(&vhtlc)
-            .await
-            .map_err(htlc)?
+            .await?
             .into_iter()
             .filter(|o| !o.is_spent && !o.is_swept && o.amount > bitcoin::Amount::ZERO)
             .map(|o| UnspentVtxo {
@@ -568,15 +575,8 @@ impl ArkadeAdapter {
                 expires_at: expiry_secs(o.expires_at),
             })
             .collect();
-        match unspent.len() {
-            1 => Ok(unspent.remove(0)),
-            0 => Err(NetworkError::Network(
-                "no unspent VTXO found at the VHTLC address".into(),
-            )),
-            n => Err(NetworkError::Network(format!(
-                "expected one VTXO at the VHTLC address, found {n}"
-            ))),
-        }
+        unspent.sort_by_key(|vtxo| std::cmp::Reverse(vtxo.amount));
+        Ok(unspent)
     }
 
     async fn our_offchain_address(&self) -> Result<ArkAddress, NetworkError> {
@@ -692,17 +692,25 @@ impl ArkadeAdapter {
         Ok(ark_txid)
     }
 
-    /// Spend the single VTXO at the VHTLC address back to our own
-    /// offchain address, through the claim leaf (with `preimage`) or the
-    /// sender-only refund leaf.
+    /// Spend the largest VTXO at the VHTLC address, worth at least
+    /// `amount`, back to our own offchain address, through the claim
+    /// leaf (with `preimage`) or the sender-only refund leaf.
     async fn spend_vhtlc(
         &self,
         options: &VhtlcOptions,
+        amount: bitcoin::Amount,
         claim: bool,
         preimage: Option<&[u8; 32]>,
     ) -> Result<bitcoin::Txid, NetworkError> {
         let vhtlc = self.script_for(options)?;
-        let vtxo = self.unspent_vtxo_at(options).await?;
+        let vtxo = self
+            .unspent_vtxos_at(options)
+            .await?
+            .into_iter()
+            .find(|vtxo| vtxo.amount >= amount)
+            .ok_or_else(|| {
+                NetworkError::network("no unspent VTXO of the HTLC at the VHTLC address")
+            })?;
         let our_address = self.our_offchain_address().await?;
         let (script, locktime) = if claim {
             (vhtlc.claim_script(), None)
@@ -1033,7 +1041,13 @@ impl Network for ArkadeAdapter {
         if u64::from(options.refund_locktime) < htlc.expiry {
             return Err(NetworkError::invalid("refund opens before the expiry"));
         }
-        let vtxo = self.unspent_vtxo_at(&options).await?;
+        // The one the claim will pick: the largest.
+        let vtxo = self
+            .unspent_vtxos_at(&options)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NetworkError::not_yet("no unspent VTXO at the VHTLC address"))?;
         if vtxo.amount < sat_amount(htlc.amount_msat) {
             return Err(NetworkError::invalid("VHTLC is worth less than the HTLC"));
         }
@@ -1052,7 +1066,14 @@ impl Network for ArkadeAdapter {
         preimage: Bytes32,
     ) -> Result<(), NetworkError> {
         let options = self.vhtlc_options(htlc)?;
-        let txid = self.spend_vhtlc(&options, true, Some(&preimage.0)).await?;
+        let txid = self
+            .spend_vhtlc(
+                &options,
+                sat_amount(htlc.amount_msat),
+                true,
+                Some(&preimage.0),
+            )
+            .await?;
         info!(parent: &self.span, "claimed {}: tx {txid}", htlc.payment_hash.short());
         Ok(())
     }
@@ -1081,6 +1102,7 @@ impl Network for ArkadeAdapter {
             )));
         }
         let options = self.build_options_for_outgoing(&payment_hash, receiver, expiry)?;
+        let _spending = self.spending.lock().await;
         self.refresh_vtxos_expiring_before(expiry.saturating_add(SWEEP_MARGIN_SECS))
             .await?;
         let address = self.script_for(&options)?.address();
@@ -1098,25 +1120,50 @@ impl Network for ArkadeAdapter {
         Ok(Self::descriptor(&options))
     }
 
+    /// The VHTLC is all in its options, which the arguments decide.
+    fn outgoing_descriptor(
+        &self,
+        payment_hash: Bytes32,
+        _amount_msat: u64,
+        expiry: u64,
+        target: &InvoiceTarget,
+    ) -> Option<HtlcDescriptor> {
+        let InvoiceTarget::Arkade {
+            target: receiver, ..
+        } = target
+        else {
+            return None;
+        };
+        self.build_options_for_outgoing(&payment_hash, receiver, expiry)
+            .ok()
+            .as_ref()
+            .map(Self::descriptor)
+    }
+
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
         let options = self.vhtlc_options(htlc)?;
         let vhtlc = self.script_for(&options)?;
-        let spent = self
-            .outpoints_at_address(&vhtlc)
-            .await?
-            .into_iter()
-            .find_map(|outpoint| outpoint.is_spent.then_some(outpoint.ark_txid).flatten());
-        let Some(txid) = spent else {
-            return Ok(OutgoingState::Pending);
-        };
-        let psbt = self
-            .virtual_tx_psbt(txid)
-            .await
-            .map_err(NetworkError::network)?
-            .ok_or_else(|| NetworkError::network("spending transaction not found"))?;
-        match Self::extract_preimage_from_psbt(&psbt).map_err(NetworkError::network)? {
-            Some(preimage) => Ok(OutgoingState::Claimed(Bytes32(preimage))),
-            None => Ok(OutgoingState::Refunded),
+        // Only our lock can be spent without the preimage, by our
+        // refund: any spend showing it is a claim.
+        let mut refunded = false;
+        for outpoint in self.outpoints_at_address(&vhtlc).await? {
+            let Some(txid) = outpoint.is_spent.then_some(outpoint.ark_txid).flatten() else {
+                continue;
+            };
+            let psbt = self
+                .virtual_tx_psbt(txid)
+                .await
+                .map_err(NetworkError::network)?
+                .ok_or_else(|| NetworkError::network("spending transaction not found"))?;
+            match Self::extract_preimage_from_psbt(&psbt).map_err(NetworkError::network)? {
+                Some(preimage) => return Ok(OutgoingState::Claimed(Bytes32(preimage))),
+                None => refunded = true,
+            }
+        }
+        if refunded {
+            Ok(OutgoingState::Refunded)
+        } else {
+            Ok(OutgoingState::Pending)
         }
     }
 
@@ -1129,7 +1176,15 @@ impl Network for ArkadeAdapter {
                 options.refund_locktime
             )));
         }
-        let txid = self.spend_vhtlc(&options, false, None).await?;
+        // Never funded (see [`Network::outgoing_descriptor`]): nothing to
+        // take back.
+        let vhtlc = self.script_for(&options)?;
+        if self.outpoints_at_address(&vhtlc).await?.is_empty() {
+            return Ok(());
+        }
+        let txid = self
+            .spend_vhtlc(&options, bitcoin::Amount::ZERO, false, None)
+            .await?;
         info!(parent: &self.span, "refunded {}: tx {txid}", htlc.payment_hash.short());
         Ok(())
     }
@@ -1178,6 +1233,7 @@ impl Network for ArkadeAdapter {
     /// refresh VTXOs past half their batch lifetime, so the wallet never
     /// holds coins the operator may sweep.
     async fn maintain(&self) -> Result<(), NetworkError> {
+        let _spending = self.spending.lock().await;
         if let Some(txid) = self.onboard().await? {
             info!(parent: &self.span, "settled boarding outputs in {txid}");
         }

@@ -66,8 +66,13 @@ fn secs_per_block(network: bitcoin::Network) -> u64 {
     }
 }
 
-/// How long verification waits for an incoming contract to be funded.
-const FUNDING_WAIT: Duration = Duration::from_secs(30);
+/// How long one verification waits for an incoming contract to be
+/// funded, before answering [`NetworkError::NotYet`].
+const FUNDING_WAIT: Duration = Duration::from_secs(5);
+/// How long a claim or refund waits for the federation to settle it. One
+/// that takes longer is reported as failed, and picked up again by the
+/// next attempt.
+const SETTLE_WAIT: Duration = Duration::from_secs(60);
 /// How long a check waits for the federation to report a resolution.
 const RESOLUTION_WAIT: Duration = Duration::from_secs(2);
 
@@ -195,8 +200,6 @@ impl FedimintAdapter {
         }
     }
 
-    /// Wallet balance in msat, bitcoin-denominated (same bucket the
-    /// outgoing contracts are funded from).
     /// The federation's agreed bitcoin block count (tip height + 1),
     /// which contract expirations count against.
     pub async fn consensus_block_count(&self) -> Result<u64, String> {
@@ -207,6 +210,8 @@ impl FedimintAdapter {
             .map_err(|e| e.to_string())
     }
 
+    /// Wallet balance in msat, bitcoin-denominated (same bucket the
+    /// outgoing contracts are funded from).
     pub async fn balance_msat(&self) -> Result<u64, String> {
         let balance = self
             .client
@@ -420,7 +425,7 @@ impl Network for FedimintAdapter {
             self.ln()?.await_htlc_funded(outpoint, &contract),
         )
         .await
-        .map_err(|_| NetworkError::network("contract is not funded"))?
+        .map_err(|_| NetworkError::not_yet("contract is not funded"))?
         .map_err(ln_err)?;
         // Rounded up, as when locking: the contract must last at least
         // as many blocks as the expiry is expected to take.
@@ -456,8 +461,9 @@ impl Network for FedimintAdapter {
             Err(LnHtlcError::ContractNotFound) => Self::claim_operation(outpoint),
             Err(error) => return Err(ln_err(error)),
         };
-        ln.await_htlc_operation_settled(operation)
+        tokio::time::timeout(SETTLE_WAIT, ln.await_htlc_operation_settled(operation))
             .await
+            .map_err(|_| NetworkError::network("the federation has not settled it yet"))?
             .map_err(ln_err)?;
         info!(parent: &self.span, "claimed {}", htlc.payment_hash.short());
         Ok(())
@@ -538,8 +544,9 @@ impl Network for FedimintAdapter {
             Err(LnHtlcError::ContractNotFound) => Self::refund_operation(outpoint),
             Err(error) => return Err(ln_err(error)),
         };
-        ln.await_htlc_operation_settled(operation)
+        tokio::time::timeout(SETTLE_WAIT, ln.await_htlc_operation_settled(operation))
             .await
+            .map_err(|_| NetworkError::network("the federation has not settled it yet"))?
             .map_err(ln_err)?;
         info!(parent: &self.span, "refunded {}", htlc.payment_hash.short());
         Ok(())

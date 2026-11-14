@@ -20,7 +20,7 @@
 
 use alloy::consensus::Transaction as _;
 use alloy::eips::BlockNumberOrTag;
-use alloy::network::{Ethereum, EthereumWallet};
+use alloy::network::{Ethereum, EthereumWallet, TransactionResponse as _};
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::{Filter, TransactionRequest};
@@ -34,6 +34,8 @@ use cassis_core::{
     OutgoingState, PubKey, XOnlyPubKey,
 };
 use std::str::FromStr;
+use std::time::Duration;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn, Span};
 
 sol! {
@@ -105,6 +107,9 @@ const CLAIM_TX_GAS: u64 = 60_000;
 /// Headroom over a node's gas estimate, which is exact only for the
 /// state it was made on.
 const GAS_MARGIN_PERCENT: u64 = 25;
+/// How long a sent transaction is waited for. One that takes longer is
+/// reported as failed, and found (or sent again) by the next attempt.
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(180);
 /// JSON-RPC "method not found", what Rootstock's public nodes answer
 /// `eth_getLogs` with.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -176,6 +181,9 @@ pub struct RootstockAdapter {
     claim_pubkey: XOnlyPubKey,
     contract: Address,
     provider: Box<dyn Provider + Send + Sync>,
+    /// Held while a transaction is sent, so that two never take the
+    /// same nonce.
+    sending: Mutex<()>,
 }
 
 impl RootstockAdapter {
@@ -208,6 +216,7 @@ impl RootstockAdapter {
             claim_pubkey,
             contract: Address::from_str(contract).map_err(|e| e.to_string())?,
             provider,
+            sending: Mutex::new(()),
         })
     }
 
@@ -310,21 +319,23 @@ impl RootstockAdapter {
         what: &str,
     ) -> Result<B256, NetworkError> {
         let request = request.from(self.address).to(self.contract);
-        let estimate = self
-            .provider
-            .estimate_gas(request.clone())
-            .await
-            .map_err(rpc_error(what))?;
-        let request = request.gas_limit(estimate + estimate * GAS_MARGIN_PERCENT / 100);
-        let pending = self
-            .provider
-            .send_transaction(request)
-            .await
-            .map_err(rpc_error(what))?;
+        let pending = {
+            let _sending = self.sending.lock().await;
+            let estimate = self
+                .provider
+                .estimate_gas(request.clone())
+                .await
+                .map_err(rpc_error(what))?;
+            let request = request.gas_limit(estimate + estimate * GAS_MARGIN_PERCENT / 100);
+            self.provider
+                .send_transaction(request)
+                .await
+                .map_err(rpc_error(what))?
+        };
         let tx_hash = *pending.tx_hash();
-        let receipt = pending
-            .get_receipt()
+        let receipt = tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
             .await
+            .map_err(|_| NetworkError::network(format!("{what} {tx_hash}: no receipt yet")))?
             .map_err(|e| NetworkError::network(format!("{what} {tx_hash}: {e}")))?;
         if !receipt.status() {
             return Err(NetworkError::network(format!("{what} {tx_hash} reverted")));
@@ -332,20 +343,72 @@ impl RootstockAdapter {
         Ok(tx_hash)
     }
 
-    /// [`Network::check_outgoing_htlc`] without `eth_getLogs`: pending
-    /// while the contract still holds the lock, else settled by the
-    /// latest `claim` revealing the preimage or successful `refund` of
-    /// it, found scanning back from the tip.
-    async fn check_outgoing_without_logs(
+    /// What became of the lock of `htlc`: pending while the contract
+    /// holds it, else claimed or refunded.
+    ///
+    /// `Claim` and `Refund` events name only the payment hash, and
+    /// anyone can lock, claim and refund other swaps under the same
+    /// hash. So nothing is settled while the contract holds this swap,
+    /// whose hash commits to all of its terms; once it is gone, any
+    /// claim reveals the preimage, and only without one was it refunded.
+    async fn outcome(&self, htlc: &Htlc, swap: &Swap) -> Result<OutgoingState, NetworkError> {
+        if self.swap_exists(htlc.payment_hash, swap).await? {
+            return Ok(OutgoingState::Pending);
+        }
+        let filter = Filter::new()
+            .address(self.contract)
+            .topic1(B256::from(htlc.payment_hash.0))
+            .from_block(BlockNumberOrTag::Number(
+                swap.timelock.saturating_sub(MAX_LOCK_BLOCKS),
+            ));
+        let logs = match self.provider.get_logs(&filter).await {
+            Ok(logs) => logs,
+            Err(error)
+                if error
+                    .as_error_resp()
+                    .is_some_and(|response| response.code == METHOD_NOT_FOUND) =>
+            {
+                return self.outcome_without_logs(htlc, swap).await;
+            }
+            Err(error) => return Err(rpc_error("logs")(error)),
+        };
+        let mut refunded = false;
+        for log in logs {
+            match log.topic0() {
+                Some(topic) if *topic == IEtherSwap::Claim::SIGNATURE_HASH => {
+                    let claim = log
+                        .log_decode::<IEtherSwap::Claim>()
+                        .map_err(NetworkError::network)?;
+                    let preimage = Bytes32(claim.inner.data.preimage.0);
+                    if htlc.payment_hash.matches_preimage(&preimage) {
+                        return Ok(OutgoingState::Claimed(preimage));
+                    }
+                }
+                Some(topic) if *topic == IEtherSwap::Refund::SIGNATURE_HASH => refunded = true,
+                _ => {}
+            }
+        }
+        if refunded {
+            return Ok(OutgoingState::Refunded);
+        }
+        Err(NetworkError::network(format!(
+            "lock of {} is gone but the node shows no claim or refund of it",
+            htlc.payment_hash.short()
+        )))
+    }
+
+    /// [`RootstockAdapter::outcome`] of a lock the contract no longer
+    /// holds, on nodes without `eth_getLogs`: any `claim` revealing the
+    /// preimage, else our successful `refund` of this very swap, found
+    /// scanning back from the tip.
+    async fn outcome_without_logs(
         &self,
         htlc: &Htlc,
         swap: &Swap,
     ) -> Result<OutgoingState, NetworkError> {
-        if self.swap_exists(htlc.payment_hash, swap).await? {
-            return Ok(OutgoingState::Pending);
-        }
         let tip = self.block_number().await?;
         let oldest = swap.timelock.saturating_sub(MAX_LOCK_BLOCKS);
+        let mut refunded = false;
         for number in (oldest..=tip).rev() {
             let block = self
                 .provider
@@ -364,7 +427,15 @@ impl RootstockAdapter {
                         return Ok(OutgoingState::Claimed(preimage));
                     }
                 } else if let Ok(refund) = IEtherSwap::refundCall::abi_decode(tx.input()) {
-                    if refund.preimageHash.0 != htlc.payment_hash.0 {
+                    // The refund of another swap under the same hash is
+                    // not ours.
+                    if refunded
+                        || refund.preimageHash.0 != htlc.payment_hash.0
+                        || refund.amount != swap.amount_wei
+                        || refund.claimAddress != swap.claim_address
+                        || refund.timelock != U256::from(swap.timelock)
+                        || tx.from() != swap.refund_address
+                    {
                         continue;
                     }
                     let receipt = self
@@ -372,11 +443,12 @@ impl RootstockAdapter {
                         .get_transaction_receipt(*tx.inner.tx_hash())
                         .await
                         .map_err(rpc_error("receipt"))?;
-                    if receipt.is_some_and(|receipt| receipt.status()) {
-                        return Ok(OutgoingState::Refunded);
-                    }
+                    refunded = receipt.is_some_and(|receipt| receipt.status());
                 }
             }
+        }
+        if refunded {
+            return Ok(OutgoingState::Refunded);
         }
         Err(NetworkError::network(format!(
             "lock of {} is gone but no claim or refund of it since block {oldest}",
@@ -424,8 +496,9 @@ impl Network for RootstockAdapter {
             return Err(NetworkError::invalid("refund opens before the expiry"));
         }
         // The swap hash commits to the payment hash and every term above.
+        // A node behind the sender's may not have it yet.
         if !self.swap_exists(htlc.payment_hash, &swap).await? {
-            return Err(NetworkError::invalid("no such lock in the contract"));
+            return Err(NetworkError::not_yet("no such lock in the contract"));
         }
         Ok(())
     }
@@ -436,6 +509,15 @@ impl Network for RootstockAdapter {
         preimage: Bytes32,
     ) -> Result<(), NetworkError> {
         let swap = Swap::of(htlc)?;
+        // An earlier attempt may have gone through after it was given
+        // up on.
+        match self.outcome(htlc, &swap).await {
+            Ok(OutgoingState::Claimed(_)) => return Ok(()),
+            Ok(OutgoingState::Refunded) => {
+                return Err(NetworkError::invalid("the lock was refunded"))
+            }
+            Ok(OutgoingState::Pending) | Err(_) => {}
+        }
         let gas_price = self.gas_price().await?;
         let request = TransactionRequest::default().gas_price(gas_price).input(
             IEtherSwap::claimCall {
@@ -499,42 +581,18 @@ impl Network for RootstockAdapter {
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
         let swap = Swap::of(htlc)?;
-        let filter = Filter::new()
-            .address(self.contract)
-            .topic1(B256::from(htlc.payment_hash.0))
-            .from_block(BlockNumberOrTag::Number(
-                swap.timelock.saturating_sub(MAX_LOCK_BLOCKS),
-            ));
-        let logs = match self.provider.get_logs(&filter).await {
-            Ok(logs) => logs,
-            Err(error)
-                if error
-                    .as_error_resp()
-                    .is_some_and(|response| response.code == METHOD_NOT_FOUND) =>
-            {
-                return self.check_outgoing_without_logs(htlc, &swap).await;
-            }
-            Err(error) => return Err(rpc_error("logs")(error)),
-        };
-        for log in logs {
-            match log.topic0() {
-                Some(topic) if *topic == IEtherSwap::Claim::SIGNATURE_HASH => {
-                    let claim = log
-                        .log_decode::<IEtherSwap::Claim>()
-                        .map_err(NetworkError::network)?;
-                    return Ok(OutgoingState::Claimed(Bytes32(claim.inner.data.preimage.0)));
-                }
-                Some(topic) if *topic == IEtherSwap::Refund::SIGNATURE_HASH => {
-                    return Ok(OutgoingState::Refunded);
-                }
-                _ => {}
-            }
-        }
-        Ok(OutgoingState::Pending)
+        self.outcome(htlc, &swap).await
     }
 
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
         let swap = Swap::of(htlc)?;
+        match self.outcome(htlc, &swap).await {
+            Ok(OutgoingState::Refunded) => return Ok(()),
+            Ok(OutgoingState::Claimed(_)) => {
+                return Err(NetworkError::invalid("the lock was claimed"))
+            }
+            Ok(OutgoingState::Pending) | Err(_) => {}
+        }
         let height = self.block_number().await?;
         if height < swap.timelock {
             return Err(NetworkError::network(format!(
@@ -601,7 +659,7 @@ fn gas_cost(gas: u64, gas_price: u128) -> U256 {
 /// so showing the local address doesn't need an RPC
 /// connection.
 ///
-/// Normalizes the key exactly like [`RootstockAdapter::new`], so the
+/// Normalizes the key exactly like [`RootstockAdapter::open`], so the
 /// address shown here is always the address the adapter actually uses.
 pub fn address_from_sk(sk: [u8; 32]) -> Result<Address, String> {
     let (sk, _) = normalized_key(sk)?;
@@ -630,10 +688,9 @@ pub fn address_from_sk(sk: [u8; 32]) -> Result<Address, String> {
 /// even-Y twin with an identical X. The x-only pubkey is therefore
 /// unchanged, so nostr/npub and cashu (BIP340, x-only) identities are
 /// unaffected — only the EVM address becomes well defined.
-/// Normalize `sk` to its even-Y form and return it together with the
-/// x-only identity it maps to, sharing one secp context and one scalar
-/// multiplication (every caller needs both halves). Kept private:
-/// external callers want [`address_from_sk`] or the adapter itself.
+///
+/// Returns the normalized key together with the x-only identity it maps
+/// to (every caller needs both halves).
 fn normalized_key(sk: [u8; 32]) -> Result<([u8; 32], XOnlyPubKey), String> {
     let secp = secp256k1::Secp256k1::signing_only();
     let secret = secp256k1::SecretKey::from_byte_array(sk)

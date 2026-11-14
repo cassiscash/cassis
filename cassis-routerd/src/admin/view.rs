@@ -14,7 +14,7 @@ use cassis_admin::wallets::{self, Funds};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
 use cassis_networks::Can;
-use cassis_routerd::db::{FailReason, Incoming, IncomingState};
+use cassis_routerd::db::{FailReason, Hop, HopState};
 use hypereffect::vtree::{badge, card, checkbox, column, list, row, select, tab, text, Node};
 use hypereffect::{cel, json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,7 +50,7 @@ pub struct Network {
 /// The hops the router routed.
 #[derive(Default)]
 pub struct Hops {
-    pub in_flight: Vec<Incoming>,
+    pub in_flight: Vec<Hop>,
     pub settled: usize,
     /// Failed by reason.
     pub failed: BTreeMap<String, usize>,
@@ -182,10 +182,12 @@ fn overview(ctx: &Context) -> Node {
         ),
         fact("identity/iroh", "Iroh id (cassis-hop)", &ctx.iroh_peer_id),
     ]);
-    let state_name = |state: IncomingState| match state {
-        IncomingState::Verifying => "verifying",
-        IncomingState::Funding => "funding",
-        IncomingState::Forwarded => "forwarded",
+    let state_name = |state: HopState| match state {
+        HopState::Verifying => "verifying",
+        HopState::Funding => "funding",
+        HopState::Forwarded => "forwarded",
+        HopState::Settled => "settled",
+        HopState::Failed { .. } => "failed",
     };
     let in_flight = ["verifying", "funding", "forwarded"].map(|name| {
         let count = ctx
@@ -224,7 +226,7 @@ fn overview(ctx: &Context) -> Node {
     let active = ctx.hops.in_flight.iter().map(|hop| {
         text(format!("hop/{}", hop.operation_id.0)).text(format!(
             "{} → {} · {} msat · {}",
-            hop.network,
+            hop.incoming_network,
             hop.outgoing_network,
             hop.outgoing_amount_msat,
             state_name(hop.state)

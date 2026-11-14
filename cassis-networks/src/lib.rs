@@ -33,8 +33,6 @@ pub struct NetworkSettings {
     pub secret: [u8; 32],
     /// Private directory of the network's wallet (see [`network_dir`]).
     pub dir: PathBuf,
-    /// Longest an HTLC received on the network may run, instead of what
-    /// the network derives.
     /// Chain API instead of the public one, for `arkade` and `bitcoin`
     /// (regtest has none).
     pub esplora_url: Option<String>,

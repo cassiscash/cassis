@@ -8,5 +8,5 @@ async-trait = { workspace = true }
 bitcoin = { workspace = true }
 cassis-core = { workspace = true }
 esplora-client = { workspace = true, features = ["async-https"] }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }

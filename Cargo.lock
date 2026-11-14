@@ -2689,6 +2689,8 @@ dependencies = [
  "cdk",
  "fs2",
  "lowercase-hex",
+ "rand 0.8.7",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -2856,6 +2858,7 @@ dependencies = [
  "async-trait",
  "cassis-core",
  "secp256k1 0.31.1",
+ "tokio",
  "tracing",
 ]
 

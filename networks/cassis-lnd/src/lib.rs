@@ -39,8 +39,12 @@ fn secs_per_block(id: &NetworkId) -> u64 {
 }
 /// LND's minimum final CLTV delta.
 const MIN_FINAL_CLTV: u64 = 18;
-/// How long a check listens to LND's payment stream.
+/// How long a check waits for LND's payment stream to say where the
+/// payment is.
 const TRACK_WAIT: Duration = Duration::from_secs(3);
+/// How long a send waits for LND to take the payment or refuse it. A
+/// slower LND is not a failure: the payment is watched by hash.
+const SEND_START_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LndConfig {
@@ -398,7 +402,7 @@ impl LndAdapter {
 
     /// LND's view of the payment for `payment_hash`, as reported on its
     /// tracking stream within [`TRACK_WAIT`].
-    async fn payment(&self, payment_hash: Bytes32) -> Result<Option<Payment>, NetworkError> {
+    async fn payment(&self, payment_hash: Bytes32) -> Result<Tracked, NetworkError> {
         let mut response = self
             .client
             .get(self.endpoint(&format!("v2/router/track/{payment_hash}")))
@@ -406,10 +410,10 @@ impl LndAdapter {
             .await
             .map_err(api_error)?;
         if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
+            return Ok(Tracked::Unknown);
         }
         let mut body = Vec::new();
-        let mut last = None;
+        let mut tracked = Tracked::Silent;
         let _ = tokio::time::timeout(TRACK_WAIT, async {
             while let Ok(Some(chunk)) = response.chunk().await {
                 body.extend_from_slice(&chunk);
@@ -420,25 +424,40 @@ impl LndAdapter {
                         value = result.take();
                     }
                     if let Some(error) = value.get("error") {
-                        warn!("LND payment stream: {error}");
+                        if error.get("code").and_then(Value::as_u64) == Some(GRPC_NOT_FOUND) {
+                            tracked = Tracked::Unknown;
+                        } else {
+                            warn!("LND payment stream: {error}");
+                        }
                         continue;
                     }
                     if let Ok(payment) = serde_json::from_value::<Payment>(value) {
-                        last = Some(payment);
+                        tracked = Tracked::Found(payment);
                     }
                 }
-                if last
-                    .as_ref()
-                    .is_some_and(|payment: &Payment| status_name(&payment.status) != "IN_FLIGHT")
-                {
+                // The stream opens with where the payment is now, which
+                // is all a check needs.
+                if !matches!(tracked, Tracked::Silent) {
                     break;
                 }
             }
         })
         .await;
-        Ok(last)
+        Ok(tracked)
     }
 }
+
+/// What LND's tracking stream says of a payment.
+enum Tracked {
+    /// LND has no such payment.
+    Unknown,
+    /// Nothing in time: LND may or may not have it.
+    Silent,
+    Found(Payment),
+}
+
+/// gRPC's `NOT_FOUND` status code.
+const GRPC_NOT_FOUND: u64 = 5;
 
 #[async_trait]
 impl Network for LndAdapter {
@@ -462,7 +481,9 @@ impl Network for LndAdapter {
 
     async fn cancel_receive(&self, payment_hash: Bytes32) -> Result<(), NetworkError> {
         match self.lookup_invoice(payment_hash).await? {
-            Some(invoice) if invoice.state.as_deref() == Some("OPEN") => {
+            // Canceling an accepted invoice fails its HTLCs back to the
+            // payer right away, instead of at their expiry.
+            Some(invoice) if matches!(invoice.state.as_deref(), Some("OPEN" | "ACCEPTED")) => {
                 let request = HashRequest {
                     payment_hash: BASE64.encode(payment_hash.0),
                 };
@@ -487,7 +508,7 @@ impl Network for LndAdapter {
         // LND accepted the HTLC only if it locks the invoice amount and
         // stays locked for the invoice's final CLTV.
         if invoice.state.as_deref() != Some("ACCEPTED") {
-            return Err(NetworkError::network("hold invoice is not funded yet"));
+            return Err(NetworkError::not_yet("hold invoice is not funded yet"));
         }
         if invoice
             .value_msat
@@ -544,25 +565,51 @@ impl Network for LndAdapter {
             fee_limit_msat: (amount_msat / 100).max(1_000).to_string(),
             timeout_seconds: SEND_TIMEOUT_SECS,
             cltv_limit: i32::try_from(cltv_limit).map_err(NetworkError::invalid)?,
-            no_inflight_updates: true,
+            // The first update tells that LND took the payment.
+            no_inflight_updates: false,
             cancelable: false,
         };
         // The payment lives on in LND independently of this request:
-        // drive the stream in the background and watch it by hash.
+        // drive the stream in the background and watch it by hash, once
+        // LND has taken the payment or refused it.
         let call = self
             .client
             .post(self.endpoint("v2/router/send"))
             .json(&request)
             .send();
-        let span = self.span.clone();
+        let (started, starting) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            match call.await {
-                Ok(response) => {
-                    let _ = response.bytes().await;
+            let mut response = match call.await {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = started.send(Err(error.to_string()));
+                    return;
                 }
-                Err(error) => warn!(parent: &span, "LND send: {error}"),
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let _ = started.send(Err(format!("HTTP {status}: {body}")));
+                return;
+            }
+            let refusal = match response.chunk().await {
+                Ok(Some(chunk)) => serde_json::from_slice::<Value>(&chunk)
+                    .ok()
+                    .and_then(|update| update.get("error").map(Value::to_string)),
+                Ok(None) => Some("LND closed the payment stream".to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            let refused = refusal.is_some();
+            let _ = started.send(refusal.map_or(Ok(()), Err));
+            if !refused {
+                while let Ok(Some(_)) = response.chunk().await {}
             }
         });
+        match tokio::time::timeout(SEND_START_WAIT, starting).await {
+            Ok(Ok(Ok(()))) | Err(_) => {}
+            Ok(Ok(Err(refusal))) => return Err(api_error(refusal)),
+            Ok(Err(_)) => return Err(api_error("the send was interrupted")),
+        }
         info!(parent: &self.span, "paying {amount_msat} msat for {}", payment_hash.short());
         Ok(HtlcDescriptor::Lightning {
             target: payment_request.clone(),
@@ -570,7 +617,7 @@ impl Network for LndAdapter {
     }
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
-        let Some(payment) = self.payment(htlc.payment_hash).await? else {
+        let Tracked::Found(payment) = self.payment(htlc.payment_hash).await? else {
             return Ok(OutgoingState::Pending);
         };
         match status_name(&payment.status).as_str() {
@@ -587,9 +634,29 @@ impl Network for LndAdapter {
         }
     }
 
+    /// The send is tracked by the invoice's payment hash alone.
+    fn outgoing_descriptor(
+        &self,
+        _payment_hash: Bytes32,
+        _amount_msat: u64,
+        _expiry: u64,
+        target: &InvoiceTarget,
+    ) -> Option<HtlcDescriptor> {
+        match target {
+            InvoiceTarget::Lightning { invoice, .. } => Some(HtlcDescriptor::Lightning {
+                target: invoice.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     /// Lightning has no refund: a failed payment returns the funds by
-    /// itself, an in-flight one can only wait.
+    /// itself, an in-flight one can only wait. A payment LND does not
+    /// know by now was never sent.
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        if matches!(self.payment(htlc.payment_hash).await?, Tracked::Unknown) {
+            return Ok(());
+        }
         match self.check_outgoing_htlc(htlc).await? {
             OutgoingState::Refunded => Ok(()),
             _ => Err(NetworkError::network("payment is still in flight")),
