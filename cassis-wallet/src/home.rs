@@ -9,7 +9,7 @@
 //! A router (`cassis-routerd`) and a gateway (`cassis-gateway`) keep
 //! their wallet the same way, next to their own files.
 
-use crate::config::{self, NetworkConfig, WalletConfig};
+use crate::config::{self, WalletConfig};
 use crate::db::Db;
 use cassis_core::keys::NodeKeys;
 use cassis_core::{Network, NetworkId};
@@ -66,15 +66,6 @@ impl Home {
         })
     }
 
-    pub fn mnemonic(&self) -> &str {
-        &self.config.mnemonic
-    }
-
-    /// The networks in the config.
-    pub fn networks(&self) -> Result<Vec<NetworkId>, String> {
-        self.config.network_ids()
-    }
-
     /// Add `network` to the config with a fresh key, if it is not there
     /// yet, and apply `change` to its table.
     pub fn enable(
@@ -101,10 +92,6 @@ impl Home {
         Ok(())
     }
 
-    fn network_config(&self, network: &NetworkId) -> Result<&NetworkConfig, String> {
-        self.config.network(network)
-    }
-
     /// Private directory of `network`: `<home>/<kind>/<variant>`.
     pub fn network_dir(&self, network: &NetworkId) -> PathBuf {
         cassis_networks::network_dir(&self.dir, network)
@@ -112,14 +99,14 @@ impl Home {
 
     /// The wallet key on `network`, from the config.
     pub fn secret(&self, network: &NetworkId) -> Result<[u8; 32], String> {
-        self.network_config(network)?.secret(network)
+        self.config.network(network)?.secret(network)
     }
 
     /// What opening `network` takes, as configured. `$CASSIS_ESPLORA_URL`
     /// stands in for an `esplora_url` the config does not set, as
     /// operators on chains without a public one (regtest) need.
     pub fn settings(&self, network: &NetworkId) -> Result<NetworkSettings, String> {
-        let mut settings = self.network_config(network)?.settings(network, &self.dir)?;
+        let mut settings = self.config.network(network)?.settings(network, &self.dir)?;
         if settings.esplora_url.is_none() && matches!(network.kind(), "arkade" | "bitcoin") {
             settings.esplora_url = std::env::var("CASSIS_ESPLORA_URL").ok();
         }

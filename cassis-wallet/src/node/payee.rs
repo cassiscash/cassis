@@ -162,7 +162,7 @@ impl Node {
         let entry = record
             .networks
             .iter()
-            .find(|entry| entry.network() == network.0)
+            .find(|entry| entry.target.network() == network.0)
             .ok_or_else(|| format!("invoice is not payable on {network}"))?;
         let target = InvoiceNetwork::try_from(entry)?.target;
         let network = self.network(network)?;
@@ -323,7 +323,7 @@ impl Node {
             return;
         };
         for entry in &record.networks {
-            let id = NetworkId(entry.network().to_string());
+            let id = NetworkId(entry.target.network().to_string());
             if Some(&id) == claimed_on {
                 continue;
             }

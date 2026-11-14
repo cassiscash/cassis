@@ -78,7 +78,7 @@ impl Node {
             .ok_or("invoice has no target for the chosen network")?;
         // PREPARE and COMMIT go to the gateway when there is one: it is
         // paid in the payee's place.
-        let endpoint = invoice.iroh_peer_id();
+        let endpoint = invoice.receiver.iroh_peer_id();
         let payee = PeerAddr {
             id: endpoint.to_string(),
             relay: invoice.body.iroh_relay.clone(),

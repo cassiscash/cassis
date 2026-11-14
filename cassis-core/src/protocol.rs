@@ -361,22 +361,6 @@ impl Invoice {
         invoice
     }
 
-    /// The iroh endpoint PREPARE and COMMIT are sent to: the payee's, or
-    /// the gateway's when there is one.
-    pub fn iroh_peer_id(&self) -> &PublicKey {
-        self.receiver.iroh_peer_id()
-    }
-
-    /// Key of the final payee, whoever the payer talks to.
-    pub fn payee(&self) -> &PublicKey {
-        self.receiver.payee()
-    }
-
-    /// Key of the gateway paid in the payee's place, if any.
-    pub fn gateway(&self) -> Option<&PublicKey> {
-        self.receiver.gateway()
-    }
-
     /// Sign as the payee whose secret is `secret`. A direct invoice must
     /// name that same key as its payee; a gateway's invoice must already
     /// name it as its payee, and the signature covers the gateway's.
@@ -691,7 +675,7 @@ impl Serialize for Invoice {
         invoice.serialize_field("networks", &body.networks)?;
         invoice.serialize_field("description", &body.description)?;
         optional_field(&mut invoice, "metadata", &body.metadata)?;
-        invoice.serialize_field("iroh_peer_id", &self.iroh_peer_id().to_string())?;
+        invoice.serialize_field("iroh_peer_id", &self.receiver.iroh_peer_id().to_string())?;
         optional_field(&mut invoice, "iroh_relay", &body.iroh_relay)?;
         invoice.serialize_field("payee", payee)?;
         optional_field(&mut invoice, "payee_signature", payee_signature)?;

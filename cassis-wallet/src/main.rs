@@ -289,7 +289,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     let mut home = Home::open(cli.home)?;
     let span = info_span!("node", node = "wallet");
     match cli.command {
-        Command::Seed => println!("{}", home.mnemonic()),
+        Command::Seed => println!("{}", home.config.mnemonic),
         Command::Info => {
             println!("node pubkey: {}", home.keys.node.pubkey().to_hex());
             println!(
@@ -297,7 +297,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 endpoint_public_key(&home.keys.iroh)
             );
             println!("networks:");
-            for network in home.networks()? {
+            for network in home.config.network_ids()? {
                 println!("  {network}");
             }
         }
@@ -355,7 +355,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             home.disable(&remove)?;
         }
         Command::Sync => {
-            let networks = home.open_networks(&home.networks()?, &span).await?;
+            let networks = home
+                .open_networks(&home.config.network_ids()?, &span)
+                .await?;
             let node = Node::start(
                 NodeConfig {
                     keys: home.keys.clone(),
@@ -620,7 +622,9 @@ async fn run(cli: Cli) -> Result<(), String> {
 
 /// Start the node, serving under its identity, with all its networks.
 async fn serve(home: &Home, span: &Span) -> Result<Node, String> {
-    let networks = home.open_networks(&home.networks()?, span).await?;
+    let networks = home
+        .open_networks(&home.config.network_ids()?, span)
+        .await?;
     if networks.is_empty() {
         return Err("no networks enabled; see `cassis-wallet enable`".into());
     }
@@ -737,7 +741,7 @@ async fn redeem(
                     id,
                     relay: preimage_server_relay,
                 },
-                home.networks()?,
+                home.config.network_ids()?,
             )),
         }
     }
@@ -792,7 +796,7 @@ async fn redeem_from(
 /// `specs` parsed, or every network of the node when empty.
 fn parse_networks(home: &Home, specs: &[String]) -> Result<Vec<NetworkId>, String> {
     if specs.is_empty() {
-        return home.networks();
+        return home.config.network_ids();
     }
     specs.iter().map(|spec| NetworkId::parse(spec)).collect()
 }

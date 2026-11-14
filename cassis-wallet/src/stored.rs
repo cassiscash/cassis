@@ -483,12 +483,6 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
     }
 }
 
-impl StoredInvoiceNetwork {
-    pub fn network(&self) -> &str {
-        self.target.network()
-    }
-}
-
 impl StoredGatewayDestination {
     pub fn network(&self) -> &str {
         match self {

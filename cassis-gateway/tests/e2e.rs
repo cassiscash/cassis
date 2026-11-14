@@ -471,15 +471,21 @@ async fn payee_offline_behind_a_gateway() {
         .unwrap();
     invoice.verify().unwrap();
     assert!(matches!(invoice.receiver, InvoiceReceiver::Gateway(_)));
-    assert_eq!(*invoice.payee(), payee.key());
+    assert_eq!(*invoice.receiver.payee(), payee.key());
     // The gateway carries the invoice's terms in its metadata, signed,
     // around the payee's.
     let (carried, terms) = carried(&invoice, &setup.gateway_secret);
     carried.verify(&setup.gateway.key()).unwrap();
     assert_eq!(terms.payee_metadata, Some(metadata("order 42")));
     assert_eq!(terms.payment_hash, invoice.body.payment_hash);
-    assert_eq!(invoice.gateway().copied(), Some(setup.gateway.key()));
-    assert_eq!(invoice.iroh_peer_id().to_string(), setup.gateway.peer_id());
+    assert_eq!(
+        invoice.receiver.gateway().copied(),
+        Some(setup.gateway.key())
+    );
+    assert_eq!(
+        invoice.receiver.iroh_peer_id().to_string(),
+        setup.gateway.peer_id()
+    );
 
     let preimage = setup.payer.pay(&invoice, &network, &[]).await.unwrap();
     assert!(invoice.body.payment_hash.matches_preimage(&preimage));
@@ -628,7 +634,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     };
     invoice.verify().unwrap();
     assert!(matches!(invoice.receiver, InvoiceReceiver::Delegated(_)));
-    assert_eq!(*invoice.payee(), payee.key());
+    assert_eq!(*invoice.receiver.payee(), payee.key());
     assert_eq!(invoice.body.description.as_deref(), Some("tip"));
 
     // Outside the authorized amounts, or for a payee that authorized
