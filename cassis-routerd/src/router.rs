@@ -575,8 +575,9 @@ impl Router {
             warn!("EXECUTE {hash} failed: journaling: {error}");
             return self.fail(&hop, FailReason::FundingFailed, true).await;
         }
-        let (target, network) = match hop.outgoing_target.on(outgoing.id()) {
-            Ok(target) => (target, outgoing.id()),
+        let network = outgoing.id();
+        let target = match InvoiceTarget::try_from(&hop.outgoing_target) {
+            Ok(target) => target,
             Err(error) => {
                 error!("hop {}: {error}", hop.operation_id.0);
                 return self.fail(&hop, FailReason::FundingFailed, true).await;

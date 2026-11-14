@@ -42,15 +42,6 @@ impl TryFrom<&StoredPubKey> for PubKey {
     }
 }
 
-/// The key of an [`InvoiceTarget`], its network stored next to it.
-#[orangedb::embed]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StoredTarget {
-    XOnlyPubKey([u8; 32]),
-    PubKey(StoredPubKey),
-    LightningInvoice(String),
-}
-
 /// An [`HtlcDescriptor`].
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,34 +186,40 @@ pub fn endpoint_key(bytes: &[u8; 32]) -> Result<PublicKey, String> {
     PublicKey::from_bytes(bytes).map_err(|_| corrupt("endpoint key"))
 }
 
-impl From<&InvoiceTarget> for StoredTarget {
+impl From<&InvoiceTarget> for StoredInvoiceTarget {
     fn from(target: &InvoiceTarget) -> Self {
-        match target {
-            InvoiceTarget::Cashu { target, .. }
-            | InvoiceTarget::Fedimint { target, .. }
-            | InvoiceTarget::Arkade { target, .. }
-            | InvoiceTarget::Bitcoin { target, .. } => Self::XOnlyPubKey(target.0),
-            InvoiceTarget::Liquid { target, .. } | InvoiceTarget::Rootstock { target, .. } => {
-                Self::PubKey(target.into())
-            }
-            InvoiceTarget::Lightning { invoice, .. } => Self::LightningInvoice(invoice.clone()),
+        match target.clone().destination() {
+            Ok(destination) => Self::Key((&destination).into()),
+            Err((network, invoice)) => Self::Lightning {
+                network: network.0,
+                invoice,
+            },
         }
     }
 }
 
-impl StoredTarget {
-    /// The target this is on `network`.
-    pub fn on(&self, network: NetworkId) -> Result<InvoiceTarget, String> {
-        let target = match self {
-            Self::XOnlyPubKey(key) => x_only(*key)?.to_hex(),
-            Self::PubKey(key) => PubKey::try_from(key)?.to_hex(),
-            Self::LightningInvoice(invoice) => invoice.clone(),
-        };
-        let target = InvoiceTarget::parse(network, &target).map_err(|_| corrupt("target"))?;
-        if Self::from(&target) != *self {
-            return Err(corrupt("target"));
+impl TryFrom<&StoredInvoiceTarget> for InvoiceTarget {
+    type Error = String;
+
+    fn try_from(target: &StoredInvoiceTarget) -> Result<Self, String> {
+        Ok(match target {
+            StoredInvoiceTarget::Key(destination) => {
+                GatewayDestination::try_from(destination)?.into()
+            }
+            StoredInvoiceTarget::Lightning { network, invoice } => InvoiceTarget::Lightning {
+                network: NetworkId(network.clone()),
+                invoice: invoice.clone(),
+            },
+        })
+    }
+}
+
+impl StoredInvoiceTarget {
+    pub fn network(&self) -> &str {
+        match self {
+            Self::Key(destination) => destination.network(),
+            Self::Lightning { network, .. } => network,
         }
-        Ok(target)
     }
 }
 
@@ -469,13 +466,7 @@ impl TryFrom<&StoredHtlc> for Htlc {
 impl From<&InvoiceNetwork> for StoredInvoiceNetwork {
     fn from(entry: &InvoiceNetwork) -> Self {
         Self {
-            target: match entry.target.clone().destination() {
-                Ok(destination) => StoredInvoiceTarget::Key((&destination).into()),
-                Err((network, invoice)) => StoredInvoiceTarget::Lightning {
-                    network: network.0,
-                    invoice,
-                },
-            },
+            target: (&entry.target).into(),
             incoming_delta_secs: entry.incoming_delta_secs,
         }
     }
@@ -486,15 +477,7 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
 
     fn try_from(entry: &StoredInvoiceNetwork) -> Result<Self, String> {
         Ok(Self {
-            target: match &entry.target {
-                StoredInvoiceTarget::Key(destination) => {
-                    GatewayDestination::try_from(destination)?.into()
-                }
-                StoredInvoiceTarget::Lightning { network, invoice } => InvoiceTarget::Lightning {
-                    network: NetworkId(network.clone()),
-                    invoice: invoice.clone(),
-                },
-            },
+            target: (&entry.target).try_into()?,
             incoming_delta_secs: entry.incoming_delta_secs,
         })
     }
@@ -502,10 +485,7 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
 
 impl StoredInvoiceNetwork {
     pub fn network(&self) -> &str {
-        match &self.target {
-            StoredInvoiceTarget::Key(destination) => destination.network(),
-            StoredInvoiceTarget::Lightning { network, .. } => network,
-        }
+        self.target.network()
     }
 }
 

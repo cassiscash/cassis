@@ -9,7 +9,7 @@ pub use db_schema::*;
 
 #[orangedb::schema]
 pub mod db_schema {
-    use cassis_wallet::stored::{StoredHtlc, StoredTarget};
+    use cassis_wallet::stored::{StoredHtlc, StoredInvoiceTarget};
 
     /// Where an incoming HTLC is.
     #[embed]
@@ -41,7 +41,7 @@ pub mod db_schema {
         pub outgoing_network: String,
         pub outgoing_amount_msat: u64,
         pub outgoing_expiry: u64,
-        pub outgoing_target: StoredTarget,
+        pub outgoing_target: StoredInvoiceTarget,
         pub state: IncomingState,
         pub created_at: u64,
     }
