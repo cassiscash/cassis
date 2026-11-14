@@ -148,9 +148,7 @@ pub struct ReceiveAuthorization {
     /// Where the gateway reaches the preimage server.
     #[serde(default)]
     pub preimage_server_relay: Option<String>,
-    /// What every invoice issued under this authorization must say, if
-    /// set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// What every invoice issued under this authorization must say, if set.
     pub description: Option<String>,
     /// Unix seconds.
     pub valid_from: u64,
@@ -332,7 +330,6 @@ pub struct PreimageIssuance {
     pub amount_msat: u64,
     /// [`Metadata::hash`] of the metadata of the invoice the hash is
     /// for; `None` for an invoice without.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_hash: Option<Bytes32>,
     /// [`ReceiveAuthorization::id`].
     pub authorization: Bytes32,

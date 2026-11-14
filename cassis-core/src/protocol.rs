@@ -119,15 +119,14 @@ pub struct InvoiceBody {
     pub networks: Vec<InvoiceNetwork>,
     pub description: Option<String>,
     /// Handed back to the endpoint with PREPARE and COMMIT.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
     /// Relay the payer reaches the invoice's endpoint through, if known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iroh_relay: Option<String>,
 }
 
 /// The three kinds of invoices, by who issued them and how the payer
 /// reaches the payee.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum InvoiceReceiver {
     /// Issued and signed by the payee, which is paid directly at its
@@ -907,7 +906,6 @@ pub struct PreparePayee {
     pub network: NetworkId,
     pub expiry: u64,
     /// The invoice's [`InvoiceBody::metadata`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
 }
 
@@ -920,7 +918,6 @@ pub struct Commit {
     pub expiry: u64,
     pub descriptor: HtlcDescriptor,
     /// The invoice's [`InvoiceBody::metadata`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
 }
 
@@ -943,7 +940,6 @@ pub struct PreimageRelease {
     pub preimage_metadata: Metadata,
     /// The invoice's metadata, which the issuance commits to; logged
     /// for the payee.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
     pub network: NetworkId,
     pub htlc: Htlc,
@@ -958,7 +954,6 @@ pub struct GatewayInvoiceRequest {
     pub issuance: PreimageIssuance,
     pub expires_at: u64,
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
 }
 
@@ -969,12 +964,10 @@ pub struct GatewayInvoiceFor {
     pub payee: PublicKey,
     pub amount_msat: u64,
     /// The gateway's default, capped by the authorization, when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
     /// Unless the payee's authorization pins a description: then the
     /// invoice says that, and this asks for it or names none.
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
 }
 
@@ -993,7 +986,6 @@ pub enum ReceivedPayment {
         descriptor: HtlcDescriptor,
         preimage: Bytes32,
         /// The paid invoice's metadata.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Metadata>,
         at: u64,
     },
@@ -1020,7 +1012,6 @@ pub enum Request {
     PreimageIssue {
         authorization: ReceiveAuthorization,
         amount_msat: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Metadata>,
     },
     PreimageRelease(PreimageRelease),
