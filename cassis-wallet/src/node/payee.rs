@@ -1,13 +1,13 @@
 //! Payee role: issue invoices, vet PREPARE, claim on COMMIT.
 
-use super::{db_error, Node, INLINE_WAIT, VERIFY_RETRY_INTERVAL};
+use super::{db_error, verify_incoming, Node, INLINE_WAIT};
 use crate::db::{
     Db, Direction, Invoice as StoredInvoice, InvoiceHash, InvoiceState, Transaction,
     TransactionHash,
 };
 use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
-use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkError, NetworkId};
+use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId};
 use cassis_core::protocol::{
     Commit, Invoice, InvoiceBody, InvoiceNetwork, Metadata, PreparePayee, Response,
 };
@@ -262,23 +262,9 @@ impl Node {
             expiry: commit.expiry,
             descriptor: commit.descriptor,
         };
-        let mut waiting = false;
-        loop {
-            match network.verify_incoming_htlc(&htlc).await {
-                Ok(()) => break,
-                Err(NetworkError::NotYet(reason)) if unix_now() < claim_by => {
-                    if !waiting {
-                        info!(
-                            "COMMIT {}: waiting for the HTLC: {reason}",
-                            htlc.payment_hash.short()
-                        );
-                        waiting = true;
-                    }
-                    tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
-                }
-                Err(error) => return Err(format!("HTLC rejected: {error}")),
-            }
-        }
+        verify_incoming(network.as_ref(), &htlc, claim_by, "COMMIT")
+            .await
+            .map_err(|e| e.to_string())?;
         info!(
             "claiming {} msat for invoice {} on {}",
             htlc.amount_msat, key, commit.network

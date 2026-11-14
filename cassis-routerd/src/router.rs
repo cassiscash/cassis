@@ -8,12 +8,12 @@
 //! expires.
 
 use crate::db::{Db, FailReason, Hop, HopId, HopState};
-use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkError, NetworkId};
+use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId};
 use cassis_core::protocol::{Discard, Execute, Prepare, Request, Response, Settle};
 use cassis_core::routing::{self, RouteAnnouncement, DEFAULT_TRANSIT_SLACK_SECS};
 use cassis_core::transport::Handler;
 use cassis_core::{unix_now, Bytes32, OperationId};
-use cassis_wallet::node::{settle_outgoing, Outcome, INLINE_WAIT, VERIFY_RETRY_INTERVAL};
+use cassis_wallet::node::{settle_outgoing, verify_incoming, Outcome, Unverified, INLINE_WAIT};
 use cassis_wallet::Node;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -594,30 +594,15 @@ impl Router {
                 return;
             }
         };
-        let mut waiting = false;
-        loop {
-            match incoming.verify_incoming_htlc(&htlc).await {
-                Ok(()) => break,
-                Err(NetworkError::Invalid(reason)) => {
-                    warn!("EXECUTE {hash} failed: incoming HTLC rejected: {reason}");
-                    return self.fail(&hop, FailReason::IncomingRejected, true).await;
-                }
-                // Not final yet, or the network could not tell: nothing
-                // is funded, so waiting costs nothing.
-                Err(error) if unix_now() < hop.outgoing_expiry => {
-                    if !waiting {
-                        info!("EXECUTE {hash}: waiting for the incoming HTLC: {error}");
-                        waiting = true;
-                    }
-                    tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
-                }
-                Err(error) => {
-                    warn!("EXECUTE {hash} failed: outgoing expiry passed while verifying: {error}");
-                    return self
-                        .fail(&hop, FailReason::ExpiredWhileVerifying, true)
-                        .await;
-                }
-            }
+        if let Err(error) =
+            verify_incoming(incoming.as_ref(), &htlc, hop.outgoing_expiry, "EXECUTE").await
+        {
+            warn!("EXECUTE {hash} failed: {error}");
+            let reason = match error {
+                Unverified::Rejected(_) => FailReason::IncomingRejected,
+                Unverified::TimedOut(_) => FailReason::ExpiredWhileVerifying,
+            };
+            return self.fail(&hop, reason, true).await;
         }
         if hop.outgoing_expiry <= unix_now() {
             warn!("EXECUTE {hash} failed: outgoing expiry passed while verifying");

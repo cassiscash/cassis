@@ -20,6 +20,7 @@ mod offline;
 mod payee;
 mod payer;
 mod settle;
+mod verify;
 
 use crate::db::Db;
 use cassis_core::keys::NodeKeys;
@@ -38,11 +39,12 @@ pub use offline::{
 };
 pub use payee::create_invoice;
 pub use settle::{settle_outgoing, Outcome};
+pub use verify::{verify_incoming, Unverified};
 
 /// How long COMMIT works before answering [`Response::Pending`] instead
 /// of the outcome.
 pub const INLINE_WAIT: Duration = Duration::from_secs(5);
-/// How often an incoming HTLC that is not final yet is verified again.
+/// How often an incoming HTLC that does not verify yet is verified again.
 pub const VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct NodeConfig {

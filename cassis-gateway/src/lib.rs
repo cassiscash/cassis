@@ -35,7 +35,7 @@ pub mod db;
 use crate::db::{
     Db, HandledDelegation, HandledDelegationId, PayeeHtlc, PayeeHtlcHash, PayeeOutcome,
 };
-use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkError, NetworkId, OutgoingState};
+use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId, OutgoingState};
 use cassis_core::offline::{
     endpoint_public_key, AuthorizationKind, GatewayDestination, GatewayMetadata, GatewayTerms,
     ReceiveAuthorization,
@@ -46,6 +46,7 @@ use cassis_core::protocol::{
 };
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
+use cassis_wallet::node::verify_incoming;
 use cassis_wallet::stored::{metadata, stored_metadata};
 use iroh_base::PublicKey;
 use serde::Deserialize;
@@ -805,20 +806,14 @@ impl Gateway {
         let incoming = self
             .network_by(&forward.incoming_network, forward.claim_by)
             .await?;
-        let mut waiting = false;
-        loop {
-            match incoming.verify_incoming_htlc(&forward.incoming).await {
-                Ok(()) => break,
-                Err(NetworkError::NotYet(reason)) if unix_now() < forward.claim_by => {
-                    if !waiting {
-                        info!("COMMIT {}: waiting for the HTLC: {reason}", hash.short());
-                        waiting = true;
-                    }
-                    tokio::time::sleep(RETRY_INTERVAL).await;
-                }
-                Err(error) => return Err(format!("HTLC rejected: {error}")),
-            }
-        }
+        verify_incoming(
+            incoming.as_ref(),
+            &forward.incoming,
+            forward.claim_by,
+            "COMMIT",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let authorization = &forward.terms.authorization;
         let amount_msat = forward.terms.amount_msat;
         let (destination, outgoing) = self.destination(authorization, amount_msat).await?;
