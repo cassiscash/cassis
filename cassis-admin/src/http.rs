@@ -89,6 +89,7 @@ fn is_loopback_host(headers: &HeaderMap) -> bool {
 
 impl Http {
     /// The session a request is signed for.
+    #[allow(clippy::result_large_err)]
     fn authenticate(&self, headers: &HeaderMap) -> Result<(String, Arc<Session>), Response> {
         let unauthorized = |why| Err(refuse(StatusCode::UNAUTHORIZED, why));
         let (Some(id), Some(signature)) = (header(headers, SESSION), header(headers, SIGNATURE))

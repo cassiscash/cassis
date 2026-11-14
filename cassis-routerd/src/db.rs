@@ -5,10 +5,10 @@
 //! [`Outgoing`] one paid in exchange. When it ends both go, leaving a
 //! [`Forward`] if the incoming HTLC was claimed, or a [`Fail`].
 
-pub use db::*;
+pub use db_schema::*;
 
 #[orangedb::schema]
-pub mod db {
+pub mod db_schema {
     use cassis_wallet::stored::{StoredHtlc, StoredTarget};
 
     /// Where an incoming HTLC is.

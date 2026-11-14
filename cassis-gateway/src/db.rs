@@ -11,10 +11,10 @@
 //! [`GatewayMetadata`](cassis_core::offline::GatewayMetadata)), which
 //! payers hand back with PREPARE and COMMIT.
 
-pub use db::*;
+pub use db_schema::*;
 
 #[orangedb::schema]
-pub mod db {
+pub mod db_schema {
     use cassis_core::network::NetworkId;
     use cassis_wallet::stored::{StoredAuthorization, StoredHtlc};
 

@@ -29,6 +29,7 @@ pub(super) enum CommitState {
 /// Needs no running node: the payee endpoint is derived from `keys`, so
 /// an invoice can be issued while the node that will claim it is
 /// offline. `iroh_relay` is that node's home relay, if known.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_invoice(
     db: &Db,
     keys: &NodeKeys,

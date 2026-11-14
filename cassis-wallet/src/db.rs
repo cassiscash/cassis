@@ -9,10 +9,10 @@
 //! * [`FullDelegation`]s: the gateways it lets issue invoices in its
 //!   name, whose preimage servers it asks for payments to claim.
 
-pub use db::*;
+pub use db_schema::*;
 
 #[orangedb::schema]
-pub mod db {
+pub mod db_schema {
     use crate::stored::{StoredAuthorization, StoredHtlc, StoredInvoiceNetwork};
 
     /// Whether an invoice may still be paid.

@@ -65,6 +65,7 @@ pub fn network_dir(root: &Path, network: &NetworkId) -> PathBuf {
 
 /// Whether this build has the kind of network named `kind`: a network
 /// kind, or `lnd` or `bark` for the two ways of being on `lightning`.
+#[allow(clippy::match_like_matches_macro)]
 pub fn built(kind: &str) -> bool {
     match kind {
         "arkade" => cfg!(feature = "arkade"),
