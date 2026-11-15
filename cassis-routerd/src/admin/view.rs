@@ -125,7 +125,7 @@ fn network_values(network: &NetworkConfig) -> Value {
 
 fn route_values(route: &RouteConfig) -> Value {
     json!({
-        "fee_base_msat": route.fee_base_msat,
+        "fee_base_msat": route.base_fee_msat(),
         "fee_ppm": route.fee_ppm,
         "incoming_delta_secs": route.incoming_delta_secs,
         "test_money": route.test_money,
@@ -137,6 +137,7 @@ pub fn new_drafts(config: &Config) -> Map<String, Value> {
     let mut ids = config.networks.keys();
     let from = ids.next().cloned().unwrap_or_default();
     let to = ids.next().cloned().unwrap_or_default();
+    let base = NetworkId::parse(&from).map_or(0, |id| id.default_base_fee_msat());
     let mut drafts = Map::new();
     let (name, draft) = new_network_draft();
     drafts.insert(name, draft);
@@ -145,7 +146,7 @@ pub fn new_drafts(config: &Config) -> Map<String, Value> {
         json!({
             "from": from,
             "to": to,
-            "fee_base_msat": 1000,
+            "fee_base_msat": base,
             "fee_ppm": 500,
             "test_money": false,
         }),

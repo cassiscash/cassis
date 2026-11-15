@@ -308,9 +308,9 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     let settled = router.db().hops().by_in_flight(false).unwrap();
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0].state, HopState::Settled);
-    // Fee: 1000 base + 2000 of cashu claim cost + 500 ppm of 100_000.
-    assert_eq!(settled[0].incoming.amount_msat, 103_050);
-    assert_eq!(settled[0].fee_msat(), 3_050);
+    // Fee: cashu's default base fee of 0 + 500 ppm of 100_000.
+    assert_eq!(settled[0].incoming.amount_msat, 100_050);
+    assert_eq!(settled[0].fee_msat(), 50);
     assert!(router.db().hops().by_in_flight(true).unwrap().is_empty());
     // The payer and the payee each have their transaction.
     let key = TransactionHash(invoice.body.payment_hash.to_string());

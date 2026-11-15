@@ -48,13 +48,6 @@ pub struct RouteOffer {
 }
 
 impl RouteOffer {
-    /// The base fee the hop asks: its own, and what claiming on `from`
-    /// costs (see [`NetworkId::claim_cost_msat`]).
-    fn base_fee_msat(&self) -> u64 {
-        self.fee_base_msat
-            .saturating_add(self.from.claim_cost_msat())
-    }
-
     /// The incoming delta the hop requires and announces: the configured
     /// one, else what `incoming` and `to` need (see [`hop_delta_secs`]).
     fn incoming_delta_secs(&self, incoming: &dyn Network) -> u64 {
@@ -65,9 +58,9 @@ impl RouteOffer {
     /// `from -> to` at the default fees, on the default relays.
     pub fn new(from: NetworkId, to: NetworkId) -> Self {
         Self {
+            fee_base_msat: from.default_base_fee_msat(),
             from,
             to,
-            fee_base_msat: 1000,
             fee_ppm: 500,
             incoming_delta_secs: None,
             nostr_relays: routing::DEFAULT_NOSTR_RELAYS
@@ -261,7 +254,7 @@ impl Router {
                 iroh_relay: relay.clone(),
                 from: route.from.clone(),
                 to: route.to.clone(),
-                fee_base_msat: route.base_fee_msat(),
+                fee_base_msat: route.fee_base_msat,
                 fee_ppm: route.fee_ppm,
                 incoming_delta_secs: route.incoming_delta_secs(incoming.as_ref()),
                 test_money: route.test_money,
@@ -350,7 +343,7 @@ impl Router {
                 )
             })?;
         let fee = routing::fee_msat(
-            route.base_fee_msat(),
+            route.fee_base_msat,
             route.fee_ppm,
             prepare.outgoing_amount_msat,
         );

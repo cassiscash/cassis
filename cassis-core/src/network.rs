@@ -185,24 +185,16 @@ impl NetworkId {
         }
     }
 
-    /// What claiming an HTLC received on this network costs its
-    /// receiver, roughly. A router adds it to the base fee of the hops
-    /// it receives on this network, in what it requires and announces.
-    pub fn claim_cost_msat(&self) -> u64 {
+    /// The base fee a hop receiving on this network charges by default,
+    /// in msat. The router's operator can override it per route.
+    pub fn default_base_fee_msat(&self) -> u64 {
         const SAT: u64 = 1000;
         match self.kind() {
-            // The mint's input fee on the claimed proofs.
-            "cashu" => 2 * SAT,
-            // The federation's fee on the contract input.
-            "fedimint" => 5 * SAT,
-            // An on-chain claim of ~122 vB at 1 sat/vB.
-            "bitcoin" => 122 * SAT,
-            // A claim at 0.2 sat/vB.
-            "liquid" => 50 * SAT,
-            // The gas of an `EtherSwap.claim()`.
-            "rootstock" => 20 * SAT,
-            // The operator co-signs for free; settling a hold invoice
-            // costs nothing.
+            "bitcoin" => 500 * SAT,
+            "liquid" => 2 * SAT,
+            "rootstock" => 100 * SAT,
+            "lightning" => 2 * SAT,
+            "cashu" | "fedimint" | "arkade" => 0,
             _ => 0,
         }
     }
@@ -847,5 +839,17 @@ mod tests {
         assert_eq!(delta("liquid::testnet"), 10);
         assert_eq!(delta("rootstock"), 20);
         assert_eq!(delta("lightning"), 60);
+    }
+
+    #[test]
+    fn default_base_fee_uses_the_kind() {
+        let fee = |id: &str| NetworkId(id.into()).default_base_fee_msat();
+        assert_eq!(fee("bitcoin"), 500_000);
+        assert_eq!(fee("liquid::testnet"), 2_000);
+        assert_eq!(fee("rootstock"), 100_000);
+        assert_eq!(fee("cashu::localhost"), 0);
+        assert_eq!(fee("lightning"), 2_000);
+        assert_eq!(fee("fedimint::fed1q"), 0);
+        assert_eq!(fee("arkade::mutinynet"), 0);
     }
 }

@@ -20,7 +20,7 @@
 //! [[routes]]
 //! from = "cashu::mint.example"
 //! to = "lightning"
-//! fee_base_msat = 1000             # on top of what claiming on `from` costs
+//! fee_base_msat = 0                # else the default for `from`
 //! fee_ppm = 500
 //! # incoming_delta_secs = 3600     # else what the two networks need
 //! # test_money = true
@@ -78,7 +78,10 @@ pub struct Config {
 pub struct RouteConfig {
     pub from: String,
     pub to: String,
-    pub fee_base_msat: u64,
+    /// The base fee of the hop, in msat; else the default for `from`
+    /// (see [`NetworkId::default_base_fee_msat`]).
+    #[serde(default)]
+    pub fee_base_msat: Option<u64>,
     pub fee_ppm: u64,
     /// Seconds required and announced between the outgoing and the
     /// incoming expiry, instead of what the networks need.
@@ -86,6 +89,16 @@ pub struct RouteConfig {
     /// Mark the route's announcement as test money.
     #[serde(default)]
     pub test_money: bool,
+}
+
+impl RouteConfig {
+    /// The configured base fee, else the default for the route's `from`
+    /// network.
+    pub fn base_fee_msat(&self) -> u64 {
+        self.fee_base_msat.unwrap_or_else(|| {
+            NetworkId::parse(&self.from).map_or(0, |from| from.default_base_fee_msat())
+        })
+    }
 }
 
 fn default_max_reservations() -> usize {
@@ -204,7 +217,7 @@ impl Config {
                 Ok(RouteOffer {
                     from: NetworkId::parse(&route.from)?,
                     to: NetworkId::parse(&route.to)?,
-                    fee_base_msat: route.fee_base_msat,
+                    fee_base_msat: route.base_fee_msat(),
                     fee_ppm: route.fee_ppm,
                     incoming_delta_secs: route.incoming_delta_secs,
                     nostr_relays: self.nostr_relays.clone(),
@@ -279,7 +292,7 @@ fn write_new(path: &Path) -> Result<(), String> {
 # [[routes]]
 # from = "cashu::mint.example"
 # to = "arkade"
-# fee_base_msat = 1000
+# fee_base_msat = 0                # else the default for `from`
 # fee_ppm = 500
 # test_money = true
 #
