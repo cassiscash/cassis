@@ -31,6 +31,11 @@ pub const ROUTE_ANNOUNCEMENT_KIND: u16 = 35515;
 /// offline. Routers republish well within it.
 pub const ANNOUNCEMENT_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
+/// Extra seconds the payer adds to every delta, so each receiver still
+/// gets its full minimum after the time spent preparing, executing and
+/// committing, and with some clock slack.
+pub const DELTA_OVERSHOOT_SECS: u64 = 60;
+
 /// Relays route announcements are published to and fetched from.
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://nostr.wine"];
 
@@ -65,10 +70,11 @@ pub struct RouteAnnouncement {
     pub to: NetworkId,
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
-    /// Seconds the router needs between its outgoing and incoming
-    /// expiry, all the slack it wants included. By default its incoming
-    /// network's `Network::incoming_delta_secs` and its outgoing
-    /// network's `NetworkId::outgoing_lag_secs`.
+    /// Minimum seconds the router needs between its outgoing and
+    /// incoming expiry, all the slack it wants included. By default its
+    /// incoming network's `Network::incoming_delta_secs` and its
+    /// outgoing network's `NetworkId::outgoing_lag_secs`; payers add
+    /// [`DELTA_OVERSHOOT_SECS`] on top.
     pub incoming_delta_secs: u64,
     /// The router moves test money on this hop ([`TEST_MONEY_TAG`]).
     #[serde(default)]
@@ -477,7 +483,8 @@ pub struct RoutePlan {
 ///
 /// Expiries decrease from payer to payee: the payee leg gets the payee's
 /// delta, and each hop its announced delta between its outgoing and
-/// incoming leg, nothing more.
+/// incoming leg, each with [`DELTA_OVERSHOOT_SECS`] added so the
+/// receiver can still meet it after the attempt's own setup time.
 pub fn plan_route(
     route: &[RouteAnnouncement],
     amount_msat: u64,
@@ -492,9 +499,13 @@ pub fn plan_route(
             .ok_or("route fees overflow")?;
     }
     let mut expiries = vec![0; n + 1];
-    expiries[n] = now.saturating_add(payee_delta_secs);
+    expiries[n] = now
+        .saturating_add(payee_delta_secs)
+        .saturating_add(DELTA_OVERSHOOT_SECS);
     for i in (0..n).rev() {
-        expiries[i] = expiries[i + 1].saturating_add(route[i].incoming_delta_secs);
+        expiries[i] = expiries[i + 1]
+            .saturating_add(route[i].incoming_delta_secs)
+            .saturating_add(DELTA_OVERSHOOT_SECS);
     }
     Ok(RoutePlan { amounts, expiries })
 }
@@ -694,20 +705,29 @@ mod tests {
         let graph = [hop(1, "a", "b", 100, 10_000), hop(2, "b", "c", 100, 10_000)];
         let plan = plan_route(&graph, 1_000, 30, 1_000).unwrap();
         assert_eq!(plan.amounts, vec![1_221, 1_110, 1_000]);
-        // Payee leg: now + 30 delta; each hop adds its 90 delta.
-        assert_eq!(plan.expiries, vec![1_210, 1_120, 1_030]);
+        // Payee leg: now + 30 delta; each hop adds its 90 delta. Every
+        // leg also gets the payer's overshoot.
+        assert_eq!(
+            plan.expiries,
+            vec![
+                1_000 + 30 + 3 * DELTA_OVERSHOOT_SECS + 2 * 90,
+                1_000 + 30 + 2 * DELTA_OVERSHOOT_SECS + 90,
+                1_000 + 30 + DELTA_OVERSHOOT_SECS,
+            ]
+        );
     }
 
     #[test]
     fn plan_without_hops_only_has_the_payee_leg() {
         let plan = plan_route(&[], 5_000, 30, 1_000).unwrap();
         assert_eq!(plan.amounts, vec![5_000]);
-        assert_eq!(plan.expiries, vec![1_030]);
+        assert_eq!(plan.expiries, vec![1_000 + 30 + DELTA_OVERSHOOT_SECS]);
     }
 
     /// fedimint -> router -> cashu -> router -> arkade, with the default
     /// margins as deltas: each hop adds the margin of its incoming
-    /// network, so the payer's HTLC expires last.
+    /// network plus the payer's overshoot, so the payer's HTLC expires
+    /// last.
     #[test]
     fn expiries_grow_by_each_incoming_margin() {
         let id = |spec: &str| NetworkId(spec.into());
@@ -718,10 +738,14 @@ mod tests {
         };
         let route = [announce(&fedimint, &cashu), announce(&cashu, &arkade)];
         let plan = plan_route(&route, 1_000, arkade.default_incoming_delta(), 0).unwrap();
-        let payee = 20 * 60;
+        let payee = (20 * 60) + DELTA_OVERSHOOT_SECS;
         assert_eq!(
             plan.expiries,
-            vec![payee + (5 + 40) * 60, payee + 5 * 60, payee]
+            vec![
+                payee + (5 + 40) * 60 + 2 * DELTA_OVERSHOOT_SECS,
+                payee + 5 * 60 + DELTA_OVERSHOOT_SECS,
+                payee,
+            ]
         );
     }
 }

@@ -166,8 +166,14 @@ impl Node {
             .ok_or_else(|| format!("invoice is not payable on {network}"))?;
         let target = InvoiceNetwork::try_from(entry)?.target;
         let network = self.network(network)?;
-        // The claim itself must land before the HTLC expires.
-        let claim_by = expiry.saturating_sub(network.incoming_delta_secs());
+        // The invoice carries the minimum margin this payee needs; any
+        // later expiry is fine. The claim itself must still start before
+        // the HTLC expires.
+        let incoming_delta = entry
+            .incoming_delta_secs
+            .unwrap_or_else(|| network.incoming_delta_secs())
+            .max(network.incoming_delta_secs());
+        let claim_by = expiry.saturating_sub(incoming_delta);
         if claim_by <= unix_now() {
             return Err("HTLC expires too soon to claim it".into());
         }

@@ -166,7 +166,7 @@ u64     expires at
 count   networks, each:
   str     network id
   target  what the payer locks to on that network
-  option  u64  incoming delta secs
+  option  u64  minimum incoming delta secs
 option  str    description
 option  bytes  metadata
 option  str    iroh relay

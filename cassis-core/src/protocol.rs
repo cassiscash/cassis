@@ -225,9 +225,10 @@ impl InvoiceReceiver {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceNetwork {
     pub target: InvoiceTarget,
-    /// The receiver's safety margin on this network (see
+    /// The receiver's minimum safety margin on this network (see
     /// [`crate::Network::incoming_delta_secs`]): its HTLC must expire at
-    /// least this long after COMMIT. The network's default when absent.
+    /// least this long after COMMIT, and payers give a little more.
+    /// The network's default when absent.
     pub incoming_delta_secs: Option<u64>,
 }
 
@@ -613,7 +614,7 @@ impl Invoice {
             .map(|entry| &entry.target)
     }
 
-    /// The receiver's safety margin when paid on `network`.
+    /// The receiver's minimum safety margin when paid on `network`.
     pub fn incoming_delta_for(&self, network: &NetworkId) -> u64 {
         self.body
             .networks
