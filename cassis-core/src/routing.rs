@@ -31,10 +31,6 @@ pub const ROUTE_ANNOUNCEMENT_KIND: u16 = 35515;
 /// offline. Routers republish well within it.
 pub const ANNOUNCEMENT_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
-/// Extra seconds per leg added to every timelock to absorb message
-/// latency and clock skew, when a router does not announce its own.
-pub const DEFAULT_TRANSIT_SLACK_SECS: u64 = 60;
-
 /// Relays route announcements are published to and fetched from.
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://nostr.wine"];
 
@@ -70,11 +66,10 @@ pub struct RouteAnnouncement {
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
     /// Seconds the router needs between its outgoing and incoming
-    /// expiry: its incoming network's `Network::incoming_delta_secs`
-    /// and its outgoing network's `NetworkId::outgoing_lag_secs`.
+    /// expiry, all the slack it wants included. By default its incoming
+    /// network's `Network::incoming_delta_secs` and its outgoing
+    /// network's `NetworkId::outgoing_lag_secs`.
     pub incoming_delta_secs: u64,
-    /// Seconds of slack the router asks payers to add per leg.
-    pub transit_slack_secs: u64,
     /// The router moves test money on this hop ([`TEST_MONEY_TAG`]).
     #[serde(default)]
     pub test_money: bool,
@@ -84,13 +79,6 @@ impl RouteAnnouncement {
     /// Fee this hop charges for forwarding `amount_msat`.
     pub fn fee_msat(&self, amount_msat: u64) -> u64 {
         fee_msat(self.fee_base_msat, self.fee_ppm, amount_msat)
-    }
-
-    /// Seconds the payer must leave between this hop's outgoing and
-    /// incoming expiry.
-    pub fn timelock_delta(&self) -> u64 {
-        self.incoming_delta_secs
-            .saturating_add(self.transit_slack_secs)
     }
 
     /// The `name` in the node's kind-0 metadata, if it published one.
@@ -136,10 +124,6 @@ impl RouteAnnouncement {
                 "incoming_delta_secs".to_string(),
                 self.incoming_delta_secs.to_string(),
             ],
-            vec![
-                "transit_slack_secs".to_string(),
-                self.transit_slack_secs.to_string(),
-            ],
         ];
         if self.test_money {
             tags.push(vec![TEST_MONEY_TAG.to_string()]);
@@ -173,9 +157,6 @@ impl RouteAnnouncement {
             incoming_delta_secs: number("incoming_delta_secs")
                 .filter(|delta| *delta > 0)
                 .unwrap_or_else(|| from.default_incoming_delta()),
-            transit_slack_secs: number("transit_slack_secs")
-                .filter(|slack| *slack > 0)
-                .unwrap_or(DEFAULT_TRANSIT_SLACK_SECS),
             test_money: event
                 .tags
                 .iter()
@@ -494,10 +475,9 @@ pub struct RoutePlan {
 /// Plan `route` delivering `amount_msat` to a payee who needs
 /// `payee_delta_secs` to claim, starting at `now`.
 ///
-/// Expiries decrease from payer to payee: each hop gets its announced
-/// delta plus slack between its outgoing and incoming leg, and the
-/// payee leg starts after every hop has had one slack period to
-/// execute, so it is still claimable when the payee gets COMMIT.
+/// Expiries decrease from payer to payee: the payee leg gets the payee's
+/// delta, and each hop its announced delta between its outgoing and
+/// incoming leg, nothing more.
 pub fn plan_route(
     route: &[RouteAnnouncement],
     amount_msat: u64,
@@ -511,14 +491,10 @@ pub fn plan_route(
             .checked_add(route[i].fee_msat(amounts[i + 1]))
             .ok_or("route fees overflow")?;
     }
-    let setup: u64 = route.iter().map(|hop| hop.transit_slack_secs).sum();
     let mut expiries = vec![0; n + 1];
-    expiries[n] = now
-        .saturating_add(setup)
-        .saturating_add(payee_delta_secs)
-        .saturating_add(DEFAULT_TRANSIT_SLACK_SECS);
+    expiries[n] = now.saturating_add(payee_delta_secs);
     for i in (0..n).rev() {
-        expiries[i] = expiries[i + 1].saturating_add(route[i].timelock_delta());
+        expiries[i] = expiries[i + 1].saturating_add(route[i].incoming_delta_secs);
     }
     Ok(RoutePlan { amounts, expiries })
 }
@@ -608,8 +584,7 @@ mod tests {
             to: NetworkId(to.into()),
             fee_base_msat,
             fee_ppm,
-            incoming_delta_secs: 30,
-            transit_slack_secs: 60,
+            incoming_delta_secs: 90,
             test_money: false,
         }
     }
@@ -719,33 +694,31 @@ mod tests {
         let graph = [hop(1, "a", "b", 100, 10_000), hop(2, "b", "c", 100, 10_000)];
         let plan = plan_route(&graph, 1_000, 30, 1_000).unwrap();
         assert_eq!(plan.amounts, vec![1_221, 1_110, 1_000]);
-        // Payee leg: now + 2 * 60 setup + 30 delta + 60 slack.
-        assert_eq!(plan.expiries, vec![1_390, 1_300, 1_210]);
+        // Payee leg: now + 30 delta; each hop adds its 90 delta.
+        assert_eq!(plan.expiries, vec![1_210, 1_120, 1_030]);
     }
 
     #[test]
     fn plan_without_hops_only_has_the_payee_leg() {
         let plan = plan_route(&[], 5_000, 30, 1_000).unwrap();
         assert_eq!(plan.amounts, vec![5_000]);
-        assert_eq!(plan.expiries, vec![1_090]);
+        assert_eq!(plan.expiries, vec![1_030]);
     }
 
     /// fedimint -> router -> cashu -> router -> arkade, with the default
-    /// margins and no transit slack: each hop adds the margin of its
-    /// incoming network, so the payer's HTLC expires last.
+    /// margins as deltas: each hop adds the margin of its incoming
+    /// network, so the payer's HTLC expires last.
     #[test]
     fn expiries_grow_by_each_incoming_margin() {
         let id = |spec: &str| NetworkId(spec.into());
         let (fedimint, cashu, arkade) = (id("fedimint::fed1q"), id("cashu::mint"), id("arkade"));
         let announce = |from: &NetworkId, to: &NetworkId| RouteAnnouncement {
             incoming_delta_secs: from.default_incoming_delta(),
-            transit_slack_secs: 0,
             ..hop(1, &from.0, &to.0, 0, 0)
         };
         let route = [announce(&fedimint, &cashu), announce(&cashu, &arkade)];
         let plan = plan_route(&route, 1_000, arkade.default_incoming_delta(), 0).unwrap();
-        // The payee's leg also gets one default slack, for COMMIT.
-        let payee = 20 * 60 + DEFAULT_TRANSIT_SLACK_SECS;
+        let payee = 20 * 60;
         assert_eq!(
             plan.expiries,
             vec![payee + (5 + 40) * 60, payee + 5 * 60, payee]

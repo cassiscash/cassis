@@ -127,7 +127,7 @@ fn route_values(route: &RouteConfig) -> Value {
     json!({
         "fee_base_msat": route.fee_base_msat,
         "fee_ppm": route.fee_ppm,
-        "transit_slack_secs": route.transit_slack_secs,
+        "incoming_delta_secs": route.incoming_delta_secs,
         "test_money": route.test_money,
     })
 }
@@ -341,10 +341,11 @@ fn routes(ctx: &Context) -> Node {
                 status,
                 fees(&el(""), &d("")),
                 number(
-                    el("transit_slack_secs"),
-                    "Transit slack (seconds)",
-                    &d("transit_slack_secs"),
-                ),
+                    el("incoming_delta_secs"),
+                    "Incoming delta (seconds)",
+                    &d("incoming_delta_secs"),
+                )
+                .placeholder("what the networks need"),
                 test_money(&el(""), &d("")),
                 row(el("actions")).children([
                     submit(

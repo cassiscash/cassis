@@ -97,7 +97,7 @@ pub fn remove_network(doc: &mut DocumentMut, id: &NetworkId) -> Result<(), Strin
 }
 
 /// Adds `from -> to` if missing, at the default fees unless given.
-/// Fields: `fee_base_msat`, `fee_ppm`, `transit_slack_secs`,
+/// Fields: `fee_base_msat`, `fee_ppm`, `incoming_delta_secs`,
 /// `test_money`.
 pub fn route(
     doc: &mut DocumentMut,
@@ -131,8 +131,8 @@ pub fn route(
     }
     put_number(
         route,
-        "transit_slack_secs",
-        args.number("transit_slack_secs")?,
+        "incoming_delta_secs",
+        args.number("incoming_delta_secs")?,
     )?;
     if let Some(test_money) = args.flag("test_money")? {
         put(
@@ -230,24 +230,24 @@ mod tests {
             &mut doc,
             &from,
             &to,
-            &args(json!({"fee_base_msat": "7", "transit_slack_secs": 600, "test_money": true})),
+            &args(json!({"fee_base_msat": "7", "incoming_delta_secs": 600, "test_money": true})),
         )
         .unwrap();
         let text = doc.to_string();
         assert!(text.contains("# top\n"));
         assert!(text.contains("fee_base_msat = 7 # base\n"));
         assert!(text.contains("fee_ppm = 2\n"));
-        assert!(text.contains("transit_slack_secs = 600\n"));
+        assert!(text.contains("incoming_delta_secs = 600\n"));
         assert!(text.contains("test_money = true\n"));
         // Empty unsets what is optional, and is refused for what is not.
         route(
             &mut doc,
             &from,
             &to,
-            &args(json!({"transit_slack_secs": "", "test_money": false})),
+            &args(json!({"incoming_delta_secs": "", "test_money": false})),
         )
         .unwrap();
-        assert!(!doc.to_string().contains("transit_slack_secs"));
+        assert!(!doc.to_string().contains("incoming_delta_secs"));
         assert!(!doc.to_string().contains("test_money"));
         assert!(route(&mut doc, &from, &to, &args(json!({"fee_ppm": null}))).is_err());
         remove_route(&mut doc, &from, &to).unwrap();

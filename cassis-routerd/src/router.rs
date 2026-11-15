@@ -10,7 +10,7 @@
 use crate::db::{Db, FailReason, Hop, HopId, HopState};
 use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId};
 use cassis_core::protocol::{Discard, Execute, Prepare, Request, Response, Settle};
-use cassis_core::routing::{self, RouteAnnouncement, DEFAULT_TRANSIT_SLACK_SECS};
+use cassis_core::routing::{self, RouteAnnouncement};
 use cassis_core::transport::Handler;
 use cassis_core::{unix_now, Bytes32, OperationId};
 use cassis_wallet::node::{settle_outgoing, verify_incoming, Outcome, Unverified, INLINE_WAIT};
@@ -38,7 +38,10 @@ pub struct RouteOffer {
     pub to: NetworkId,
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
-    pub transit_slack_secs: u64,
+    /// Seconds the hop requires and announces between its outgoing and
+    /// its incoming expiry, instead of [`RouteOffer::incoming_delta_secs`]'s
+    /// default.
+    pub incoming_delta_secs: Option<u64>,
     pub nostr_relays: Vec<String>,
     /// Mark the announcement as test money ([`routing::TEST_MONEY_TAG`]).
     pub test_money: bool,
@@ -52,6 +55,13 @@ impl RouteOffer {
             .saturating_add(self.from.claim_cost_msat())
     }
 
+    /// The incoming delta the hop requires and announces: the configured
+    /// one, else what `incoming` and `to` need (see [`hop_delta_secs`]).
+    fn incoming_delta_secs(&self, incoming: &dyn Network) -> u64 {
+        self.incoming_delta_secs
+            .unwrap_or_else(|| hop_delta_secs(incoming, &self.to))
+    }
+
     /// `from -> to` at the default fees, on the default relays.
     pub fn new(from: NetworkId, to: NetworkId) -> Self {
         Self {
@@ -59,7 +69,7 @@ impl RouteOffer {
             to,
             fee_base_msat: 1000,
             fee_ppm: 500,
-            transit_slack_secs: DEFAULT_TRANSIT_SLACK_SECS,
+            incoming_delta_secs: None,
             nostr_relays: routing::DEFAULT_NOSTR_RELAYS
                 .iter()
                 .map(|relay| relay.to_string())
@@ -109,7 +119,7 @@ impl RoutingPolicy {
 /// Seconds a hop needs between its outgoing and its incoming expiry: the
 /// outgoing HTLC can still be claimed for a while after its expiry (see
 /// [`NetworkId::outgoing_lag_secs`]), and the incoming one must then
-/// still take the claim. Announced as the hop's one incoming delta.
+/// still take the claim.
 fn hop_delta_secs(incoming: &dyn Network, outgoing: &NetworkId) -> u64 {
     incoming
         .incoming_delta_secs()
@@ -253,8 +263,7 @@ impl Router {
                 to: route.to.clone(),
                 fee_base_msat: route.base_fee_msat(),
                 fee_ppm: route.fee_ppm,
-                incoming_delta_secs: hop_delta_secs(incoming.as_ref(), &route.to),
-                transit_slack_secs: route.transit_slack_secs,
+                incoming_delta_secs: route.incoming_delta_secs(incoming.as_ref()),
                 test_money: route.test_money,
             };
             for (d_tag, accepted) in routing::publish_announcements(
@@ -354,7 +363,7 @@ impl Router {
         // Worst case the downstream claims as late as the outgoing
         // network lets it; the incoming network must still have time to
         // take our claim.
-        let delta = hop_delta_secs(incoming.as_ref(), &prepare.outgoing_network);
+        let delta = route.incoming_delta_secs(incoming.as_ref());
         if prepare.incoming_expiry < prepare.outgoing_expiry.saturating_add(delta) {
             return Err(format!(
                 "incoming expiry must be at least {delta}s after the outgoing expiry"

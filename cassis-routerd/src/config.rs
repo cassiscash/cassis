@@ -22,7 +22,7 @@
 //! to = "lightning"
 //! fee_base_msat = 1000             # on top of what claiming on `from` costs
 //! fee_ppm = 500
-//! # transit_slack_secs = 60
+//! # incoming_delta_secs = 3600     # else what the two networks need
 //! # test_money = true
 //!
 //! [admin]
@@ -34,7 +34,7 @@
 use cassis_admin::config::write_private;
 pub use cassis_admin::AdminConfig;
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
-use cassis_core::routing::{DEFAULT_NOSTR_RELAYS, DEFAULT_TRANSIT_SLACK_SECS};
+use cassis_core::routing::DEFAULT_NOSTR_RELAYS;
 use cassis_core::NetworkId;
 use cassis_routerd::router::{RouteOffer, RoutingPolicy};
 use cassis_wallet::config::parse_secret;
@@ -80,8 +80,9 @@ pub struct RouteConfig {
     pub to: String,
     pub fee_base_msat: u64,
     pub fee_ppm: u64,
-    #[serde(default = "default_transit_slack")]
-    pub transit_slack_secs: u64,
+    /// Seconds required and announced between the outgoing and the
+    /// incoming expiry, instead of what the networks need.
+    pub incoming_delta_secs: Option<u64>,
     /// Mark the route's announcement as test money.
     #[serde(default)]
     pub test_money: bool,
@@ -93,10 +94,6 @@ fn default_max_reservations() -> usize {
 
 fn default_max_htlc_secs() -> u64 {
     RoutingPolicy::default().max_htlc_secs
-}
-
-fn default_transit_slack() -> u64 {
-    DEFAULT_TRANSIT_SLACK_SECS
 }
 
 fn default_relays() -> Vec<String> {
@@ -159,6 +156,11 @@ impl Config {
             if from == to {
                 return Err(format!("route {from} -> {to} goes nowhere"));
             }
+            if route.incoming_delta_secs == Some(0) {
+                return Err(format!(
+                    "route {from} -> {to}: incoming_delta_secs must be positive"
+                ));
+            }
             let same = self.routes.iter().filter(|other| {
                 (other.from.as_str(), other.to.as_str()) == (route.from.as_str(), route.to.as_str())
             });
@@ -204,7 +206,7 @@ impl Config {
                     to: NetworkId::parse(&route.to)?,
                     fee_base_msat: route.fee_base_msat,
                     fee_ppm: route.fee_ppm,
-                    transit_slack_secs: route.transit_slack_secs,
+                    incoming_delta_secs: route.incoming_delta_secs,
                     nostr_relays: self.nostr_relays.clone(),
                     test_money: route.test_money,
                 })

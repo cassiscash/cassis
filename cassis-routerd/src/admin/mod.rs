@@ -15,7 +15,7 @@
 //! | `network.remove`      | `id`                                                      |
 //! | `network.open`        | `id`                                                      |
 //! | `wallet.*`            | see [`cassis_admin::wallets`]                             |
-//! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `transit_slack_secs`, `test_money` |
+//! | `route.set`           | `from`, `to`, `fee_base_msat`, `fee_ppm`, `incoming_delta_secs`, `test_money` |
 //! | `route.remove`        | `from`, `to`                                              |
 //! | `routes.announce`     |                                                           |
 //! | `announcements.check` |                                                           |
