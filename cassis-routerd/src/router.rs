@@ -16,6 +16,7 @@ use cassis_core::{unix_now, Bytes32, OperationId};
 use cassis_wallet::node::{settle_outgoing, verify_incoming, Outcome, Unverified, INLINE_WAIT};
 use cassis_wallet::stored::StoredFailReason;
 use cassis_wallet::Node;
+use iroh_base::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -123,7 +124,7 @@ fn hop_delta_secs(incoming: &dyn Network, outgoing: &NetworkId) -> u64 {
 /// A PREPARE waiting for its EXECUTE.
 struct Reservation {
     prepare: Prepare,
-    owner: String,
+    owner: PublicKey,
     /// What the payer locks to; `None` while the networks are asked.
     target: Option<InvoiceTarget>,
     expires_at: u64,
@@ -169,7 +170,11 @@ impl Router {
         &self.0.db
     }
 
-    async fn handle(&self, request: Request, peer: String) -> Response {
+    async fn handle(&self, request: Request, peer: PublicKey) -> Response {
+        let peer = match peer.parse::<PublicKey>() {
+            Ok(peer) => peer,
+            Err(error) => return Response::Error(format!("peer id {peer}: {error}")),
+        };
         match request {
             Request::Prepare(prepare) => Response::Prepared(self.prepare(prepare, peer).await),
             Request::Execute(execute) => self.execute(execute, peer).await,
@@ -299,7 +304,7 @@ impl Router {
         }
     }
 
-    async fn prepare(&self, prepare: Prepare, peer: String) -> Result<InvoiceTarget, String> {
+    async fn prepare(&self, prepare: Prepare, peer: PublicKey) -> Result<InvoiceTarget, String> {
         let result = self.reserve(&prepare, peer).await;
         match &result {
             Ok(_) => info!(
@@ -318,14 +323,11 @@ impl Router {
         result
     }
 
-    async fn reserve(&self, prepare: &Prepare, peer: String) -> Result<InvoiceTarget, String> {
+    async fn reserve(&self, prepare: &Prepare, peer: PublicKey) -> Result<InvoiceTarget, String> {
         let policy = self.routing().ok_or("this node does not route")?;
         let incoming = self.node().network(&prepare.incoming_network)?;
         let outgoing = self.node().network(&prepare.outgoing_network)?;
         let now = unix_now();
-        if !prepare.operation_id.is_valid() {
-            return Err("operation id must be 32 hex characters".into());
-        }
         if prepare.payment_hash.0 == [0; 32] {
             return Err("zero payment hash".into());
         }
@@ -392,11 +394,12 @@ impl Router {
                 return Err("too many pending reservations".into());
             }
             let in_flight = self.db().hops().by_in_flight(true).map_err(db_error)?;
-            let hash = prepare.payment_hash.to_string();
             let hash_in_use = reservations
                 .values()
                 .any(|reservation| reservation.prepare.payment_hash == prepare.payment_hash)
-                || in_flight.iter().any(|hop| hop.payment_hash == hash);
+                || in_flight
+                    .iter()
+                    .any(|hop| hop.payment_hash == prepare.payment_hash.0);
             if hash_in_use {
                 return Err("payment hash already has an active attempt here".into());
             }
@@ -418,7 +421,7 @@ impl Router {
                 )
                 .fold(0, u64::saturating_add);
             reservations.insert(
-                prepare.operation_id.clone(),
+                prepare.operation_id,
                 Reservation {
                     prepare: prepare.clone(),
                     owner: peer,
@@ -472,13 +475,13 @@ impl Router {
     /// Start forwarding a prepared hop, or report on one already
     /// started: [`Response::Executed`] once the outgoing HTLC is funded,
     /// [`Response::Pending`] while the incoming one is not final yet.
-    async fn execute(&self, execute: Execute, peer: String) -> Response {
+    async fn execute(&self, execute: Execute, peer: PublicKey) -> Response {
         let known = match self.hop(&execute.operation_id) {
             Ok(hop) => hop.is_some(),
             Err(error) => return Response::Error(error),
         };
         if !known {
-            if let Err(error) = self.start_hop(execute.clone(), peer.clone()).await {
+            if let Err(error) = self.start_hop(execute.clone(), peer).await {
                 return Response::Error(error);
             }
         }
@@ -487,8 +490,8 @@ impl Router {
         loop {
             let response = match self.hop(&execute.operation_id) {
                 Ok(Some(hop))
-                    if hop.owner != peer
-                        || hop.payment_hash != execute.payment_hash.to_string() =>
+                    if hop.owner != *peer.as_bytes()
+                        || hop.payment_hash != execute.payment_hash.0 =>
                 {
                     Response::Error("operation belongs to another payment".into())
                 }
@@ -506,13 +509,13 @@ impl Router {
     fn hop(&self, operation_id: &OperationId) -> Result<Option<Hop>, String> {
         self.db()
             .hops()
-            .get(HopId(operation_id.as_str().to_string()))
+            .get(HopId(operation_id.0))
             .map_err(db_error)
     }
 
     /// Turn the reservation of `execute` into a journaled hop and
     /// forward it in the background.
-    async fn start_hop(&self, execute: Execute, peer: String) -> Result<(), String> {
+    async fn start_hop(&self, execute: Execute, peer: PublicKey) -> Result<(), String> {
         let (prepare, target) = {
             let mut reservations = self.0.reservations.lock().await;
             match reservations.get(&execute.operation_id) {
@@ -545,9 +548,9 @@ impl Router {
             return Err(error.into());
         }
         let hop = Hop {
-            operation_id: HopId(execute.operation_id.as_str().to_string()),
-            owner: peer,
-            payment_hash: prepare.payment_hash.to_string(),
+            operation_id: HopId(execute.operation_id.0),
+            owner: *peer.as_bytes(),
+            payment_hash: prepare.payment_hash.0,
             incoming_network: prepare.incoming_network.0.clone(),
             incoming: (&Htlc {
                 payment_hash: prepare.payment_hash,
@@ -574,7 +577,10 @@ impl Router {
     /// Wait for the incoming HTLC of a hop to verify, then fund its
     /// outgoing HTLC.
     async fn forward(self, mut hop: Hop) {
-        let Some(_busy) = self.node().busy(format!("hop:{}", hop.operation_id.0)) else {
+        let Some(_busy) = self
+            .node()
+            .busy(format!("hop:{}", OperationId(hop.operation_id.0)))
+        else {
             return;
         };
         let hash = short(&hop.payment_hash);
@@ -593,7 +599,7 @@ impl Router {
         let htlc = match Htlc::try_from(&hop.incoming) {
             Ok(htlc) => htlc,
             Err(error) => {
-                error!("hop {}: {error}", hop.operation_id.0);
+                error!("hop {}: {error}", OperationId(hop.operation_id.0));
                 return;
             }
         };
@@ -618,7 +624,7 @@ impl Router {
         let target = match InvoiceTarget::try_from(&hop.outgoing_target) {
             Ok(target) => target,
             Err(error) => {
-                error!("hop {}: {error}", hop.operation_id.0);
+                error!("hop {}: {error}", OperationId(hop.operation_id.0));
                 return self
                     .fail(&hop, FailReason::InvalidOutgoingTarget, true)
                     .await;
@@ -662,7 +668,7 @@ impl Router {
                     error!(
                         "journaling forwarded hop {}: {error}; check {network} for a lock to \
                          {sent:?}",
-                        hop.operation_id.0
+                        OperationId(hop.operation_id.0)
                     );
                 }
                 info!(
@@ -686,10 +692,11 @@ impl Router {
     /// up to receive it if `release`.
     async fn fail(&self, hop: &Hop, reason: FailReason, release: bool) {
         if release {
-            if let Ok(hash) = hop.payment_hash.parse() {
-                self.release(&NetworkId(hop.incoming_network.clone()), hash)
-                    .await;
-            }
+            self.release(
+                &NetworkId(hop.incoming_network.clone()),
+                Bytes32(hop.payment_hash),
+            )
+            .await;
         }
         self.end(
             hop,
@@ -707,11 +714,14 @@ impl Router {
             ..hop.clone()
         };
         if let Err(error) = self.db().hops().update(&ended) {
-            error!("journaling ended hop {}: {error}", hop.operation_id.0);
+            error!(
+                "journaling ended hop {}: {error}",
+                OperationId(hop.operation_id.0)
+            );
         }
     }
 
-    async fn discard(&self, discard: Discard, peer: String) {
+    async fn discard(&self, discard: Discard, peer: PublicKey) {
         let reservation = {
             let mut reservations = self.0.reservations.lock().await;
             match reservations.get(&discard.operation_id) {
@@ -732,19 +742,16 @@ impl Router {
     }
 
     /// The payer reveals the preimage of an executed hop.
-    async fn settle_hop(&self, settle: Settle, peer: String) {
-        let id = settle.operation_id.as_str().to_string();
+    async fn settle_hop(&self, settle: Settle, peer: PublicKey) {
+        let id = settle.operation_id;
         let Some(_busy) = self.node().busy(format!("hop:{id}")) else {
             return;
         };
         let Ok(Some(mut hop)) = self.hop(&settle.operation_id) else {
             return;
         };
-        let matches = hop
-            .payment_hash
-            .parse::<Bytes32>()
-            .is_ok_and(|hash| hash.matches_preimage(&settle.preimage));
-        if hop.state != HopState::Forwarded || hop.owner != peer || !matches {
+        let matches = Bytes32(hop.payment_hash).matches_preimage(&settle.preimage);
+        if hop.state != HopState::Forwarded || hop.owner != *peer.as_bytes() || !matches {
             return;
         }
         hop.preimage = Some(settle.preimage.0);
@@ -813,7 +820,8 @@ impl Router {
                     warn!(
                         "hop {} was interrupted while funding its outgoing HTLC on {}: \
                          settling it as funded",
-                        hop.operation_id.0, hop.outgoing_network,
+                        OperationId(hop.operation_id.0),
+                        hop.outgoing_network,
                     );
                     hop.state = HopState::Forwarded;
                     self.db().hops().update(&hop).map_err(db_error)?;
@@ -822,10 +830,10 @@ impl Router {
                     error!(
                         "hop {} was interrupted while funding its outgoing HTLC on {}; check \
                          that wallet for a lock of {} msat for {} until {}",
-                        hop.operation_id.0,
+                        OperationId(hop.operation_id.0),
                         hop.outgoing_network,
                         hop.outgoing_amount_msat,
-                        hop.payment_hash,
+                        Bytes32(hop.payment_hash),
                         hop.outgoing_expiry,
                     );
                     self.end(
@@ -880,7 +888,7 @@ impl Router {
     }
 
     async fn advance(&self, id: HopId) {
-        let Some(_busy) = self.node().busy(format!("hop:{}", id.0)) else {
+        let Some(_busy) = self.node().busy(format!("hop:{}", OperationId(id.0))) else {
             return;
         };
         // The listing may be stale: a SETTLE could have ended it since.
@@ -908,7 +916,7 @@ impl Router {
                     );
                     hop.preimage = Some(preimage.0);
                     if let Err(error) = self.db().hops().update(&hop) {
-                        warn!("saving hop {}: {error}", id.0);
+                        warn!("saving hop {}: {error}", OperationId(id.0));
                     }
                 }
                 Outcome::Refunded => {
@@ -966,10 +974,8 @@ fn report(hop: &Hop) -> Response {
     }
 }
 
-fn short(hash: &str) -> String {
-    hash.parse::<Bytes32>()
-        .map(|hash| hash.short())
-        .unwrap_or_else(|_| hash.to_string())
+fn short(hash: &[u8; 32]) -> String {
+    Bytes32(*hash).short()
 }
 
 fn db_error(error: orangedb::Error) -> String {

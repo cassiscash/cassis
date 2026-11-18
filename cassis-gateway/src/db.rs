@@ -22,8 +22,8 @@ pub mod db_schema {
     #[entity]
     #[derive(Clone, Debug, PartialEq)]
     pub struct HandledDelegation {
-        /// Hex [`ReceiveAuthorization::id`](cassis_core::offline::ReceiveAuthorization::id).
-        #[id(String)]
+        /// [`ReceiveAuthorization::id`](cassis_core::offline::ReceiveAuthorization::id).
+        #[id([u8; 32])]
         pub authorization_id: HandledDelegationId,
         /// The payee's iroh key.
         #[index]

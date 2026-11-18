@@ -19,6 +19,7 @@ cassis-admin = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
 cassis-wallet = { workspace = true }
+iroh-base = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
 hypereffect = { workspace = true }

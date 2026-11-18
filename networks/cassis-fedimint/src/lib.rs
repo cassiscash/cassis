@@ -356,7 +356,8 @@ impl FedimintAdapter {
         {
             return Err(NetworkError::invalid("contract is locked to another hash"));
         }
-        let txid = TransactionId::from_str(funding_txid).map_err(NetworkError::invalid)?;
+        let txid =
+            TransactionId::from_str(&funding_txid.to_string()).map_err(NetworkError::invalid)?;
         Ok((
             OutPoint {
                 txid,
@@ -505,7 +506,11 @@ impl Network for FedimintAdapter {
             payment_hash.short()
         );
         Ok(HtlcDescriptor::Fedimint {
-            funding_txid: outpoint.txid.to_string(),
+            funding_txid: outpoint
+                .txid
+                .to_string()
+                .parse()
+                .expect("a txid is 32 bytes of hex"),
             funding_out_idx: outpoint.out_idx,
             contract: serde_json::to_string(&contract).map_err(NetworkError::invalid)?,
             target: *receiver,

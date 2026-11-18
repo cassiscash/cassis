@@ -132,11 +132,10 @@ impl Node {
         if invoice.body.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
-        let key = hash.to_string();
         if let Some(previous) = self
             .db()
             .transactions()
-            .get(TransactionHash(key.clone()))
+            .get(TransactionHash(hash.0))
             .map_err(db_error)?
         {
             return match previous.direction {
@@ -147,7 +146,7 @@ impl Node {
         if let Some(previous) = self
             .db()
             .pending_payments()
-            .get(PendingPaymentHash(key.clone()))
+            .get(PendingPaymentHash(hash.0))
             .map_err(db_error)?
         {
             return Err(format!(
@@ -289,7 +288,7 @@ impl Node {
         self.db()
             .pending_payments()
             .insert(&PendingPayment {
-                payment_hash: PendingPaymentHash(key.clone()),
+                payment_hash: PendingPaymentHash(hash.0),
                 network: from.0.clone(),
                 htlc: (&first).into(),
                 created_at: unix_now(),
@@ -363,7 +362,7 @@ impl Node {
                 ))
             }
         };
-        self.complete_payment(&key, from, &first, preimage)?;
+        self.complete_payment(hash, from, &first, preimage)?;
         info!("paid {}: preimage {preimage}", hash.short());
 
         // Let every hop claim right away instead of waiting to observe
@@ -387,17 +386,16 @@ impl Node {
     /// transaction: the payee claimed it with `preimage`.
     pub(super) fn complete_payment(
         &self,
-        key: &str,
+        hash: Bytes32,
         network: &NetworkId,
         htlc: &Htlc,
         preimage: Bytes32,
     ) -> Result<(), String> {
         self.db()
             .write(|tx| {
-                tx.pending_payments()
-                    .delete(PendingPaymentHash(key.to_string()))?;
+                tx.pending_payments().delete(PendingPaymentHash(hash.0))?;
                 tx.transactions().insert(&Transaction {
-                    payment_hash: TransactionHash(key.to_string()),
+                    payment_hash: TransactionHash(hash.0),
                     direction: Direction::Outgoing,
                     amount_msat: htlc.amount_msat,
                     network: network.0.clone(),

@@ -225,7 +225,7 @@ impl Gateway {
     pub fn forget_delegation(&self, id: &Bytes32) -> Result<(), String> {
         self.db()
             .handled_delegations()
-            .delete(HandledDelegationId(id.to_string()))
+            .delete(HandledDelegationId(id.0))
             .map(|_| ())
             .map_err(db_error)
     }
@@ -426,7 +426,7 @@ impl Gateway {
         self.db()
             .handled_delegations()
             .upsert(&HandledDelegation {
-                authorization_id: HandledDelegationId(id.to_string()),
+                authorization_id: HandledDelegationId(id.0),
                 payee: *authorization.payee.as_bytes(),
                 authorization: (&authorization).into(),
                 registered_at: unix_now(),

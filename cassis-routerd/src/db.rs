@@ -41,13 +41,12 @@ pub mod db_schema {
         HopState::Verifying | HopState::Funding | HopState::Forwarded
     ))]
     pub struct Hop {
-        #[id(String)]
+        #[id([u8; 16])]
         pub operation_id: HopId,
-        /// Iroh id of the payer that prepared and executed the hop.
-        pub owner: String,
-        /// Hex.
+        /// Iroh key of the payer that prepared and executed the hop.
+        pub owner: [u8; 32],
         #[index]
-        pub payment_hash: String,
+        pub payment_hash: [u8; 32],
         pub incoming_network: String,
         pub incoming: StoredHtlc,
         /// What the PREPARE asked to forward, and EXECUTE where to.

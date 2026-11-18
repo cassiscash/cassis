@@ -319,7 +319,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     assert_eq!(settled[0].fee_msat(), 50);
     assert!(router.db().hops().by_in_flight(true).unwrap().is_empty());
     // The payer and the payee each have their transaction.
-    let key = TransactionHash(invoice.body.payment_hash.to_string());
+    let key = TransactionHash(invoice.body.payment_hash.0);
     assert!(payer.db().transactions().contains(key.clone()).unwrap());
     assert!(payee.db().transactions().contains(key).unwrap());
     let claimed_upstream = chain_a
@@ -351,7 +351,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     assert!(!payer
         .db()
         .pending_payments()
-        .contains(PendingPaymentHash(tampered.body.payment_hash.to_string()))
+        .contains(PendingPaymentHash(tampered.body.payment_hash.0))
         .unwrap());
 
     // The endpoint named for the payee does not know the invoice: it
@@ -378,9 +378,7 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     assert!(!payer
         .db()
         .pending_payments()
-        .contains(PendingPaymentHash(
-            misdirected.body.payment_hash.to_string()
-        ))
+        .contains(PendingPaymentHash(misdirected.body.payment_hash.0))
         .unwrap());
 
     // The payer locks to a key the payee does not claim with: PREPARE
@@ -411,14 +409,12 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     assert!(payer
         .db()
         .pending_payments()
-        .contains(PendingPaymentHash(
-            unreachable.body.payment_hash.to_string()
-        ))
+        .contains(PendingPaymentHash(unreachable.body.payment_hash.0))
         .unwrap());
     let forwarded = router
         .db()
         .hops()
-        .by_payment_hash(unreachable.body.payment_hash.to_string())
+        .by_payment_hash(unreachable.body.payment_hash.0)
         .unwrap();
     assert!(forwarded
         .iter()

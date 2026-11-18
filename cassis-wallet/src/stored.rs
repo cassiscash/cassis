@@ -51,7 +51,7 @@ pub enum StoredDescriptor {
         target: [u8; 32],
     },
     Liquid {
-        lockup_txid: String,
+        lockup_txid: [u8; 32],
         lockup_vout: u32,
         refund_pubkey: StoredPubKey,
         refund_locktime: u32,
@@ -66,7 +66,7 @@ pub enum StoredDescriptor {
         target: [u8; 32],
     },
     Bitcoin {
-        lockup_txid: String,
+        lockup_txid: [u8; 32],
         lockup_vout: u32,
         refund_pubkey: [u8; 32],
         refund_locktime: u32,
@@ -79,7 +79,7 @@ pub enum StoredDescriptor {
         target: StoredPubKey,
     },
     Fedimint {
-        funding_txid: String,
+        funding_txid: [u8; 32],
         funding_out_idx: u64,
         contract: String,
         target: [u8; 32],
@@ -301,7 +301,7 @@ impl From<&HtlcDescriptor> for StoredDescriptor {
                 refund_locktime,
                 target,
             } => Self::Liquid {
-                lockup_txid,
+                lockup_txid: lockup_txid.0,
                 lockup_vout,
                 refund_pubkey: (&refund_pubkey).into(),
                 refund_locktime,
@@ -329,7 +329,7 @@ impl From<&HtlcDescriptor> for StoredDescriptor {
                 refund_locktime,
                 target,
             } => Self::Bitcoin {
-                lockup_txid,
+                lockup_txid: lockup_txid.0,
                 lockup_vout,
                 refund_pubkey: refund_pubkey.0,
                 refund_locktime,
@@ -352,7 +352,7 @@ impl From<&HtlcDescriptor> for StoredDescriptor {
                 contract,
                 target,
             } => Self::Fedimint {
-                funding_txid,
+                funding_txid: funding_txid.0,
                 funding_out_idx,
                 contract,
                 target: target.0,
@@ -378,7 +378,7 @@ impl TryFrom<&StoredDescriptor> for HtlcDescriptor {
                 refund_locktime,
                 target,
             } => Self::Liquid {
-                lockup_txid,
+                lockup_txid: Bytes32(lockup_txid),
                 lockup_vout,
                 refund_pubkey: (&refund_pubkey).try_into()?,
                 refund_locktime,
@@ -406,7 +406,7 @@ impl TryFrom<&StoredDescriptor> for HtlcDescriptor {
                 refund_locktime,
                 target,
             } => Self::Bitcoin {
-                lockup_txid,
+                lockup_txid: Bytes32(lockup_txid),
                 lockup_vout,
                 refund_pubkey: x_only(refund_pubkey)?,
                 refund_locktime,
@@ -429,7 +429,7 @@ impl TryFrom<&StoredDescriptor> for HtlcDescriptor {
                 contract,
                 target,
             } => Self::Fedimint {
-                funding_txid,
+                funding_txid: Bytes32(funding_txid),
                 funding_out_idx,
                 contract,
                 target: x_only(target)?,
@@ -584,7 +584,7 @@ mod tests {
             amount_msat: 1000,
             expiry: 2000,
             descriptor: HtlcDescriptor::Liquid {
-                lockup_txid: "txid".into(),
+                lockup_txid: Bytes32([5; 32]),
                 lockup_vout: 1,
                 refund_pubkey: PubKey::from_x_only(&key).unwrap(),
                 refund_locktime: 2,

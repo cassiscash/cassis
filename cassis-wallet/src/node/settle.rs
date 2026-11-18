@@ -48,7 +48,7 @@ impl Node {
     }
 
     async fn expire_invoice(&self, invoice: Invoice) {
-        let key = invoice.payment_hash.0.clone();
+        let key = Bytes32(invoice.payment_hash.0);
         let Some(_busy) = self.busy(format!("invoice:{key}")) else {
             return;
         };
@@ -66,7 +66,7 @@ impl Node {
     }
 
     async fn advance_payment(&self, payment: PendingPayment) {
-        let key = payment.payment_hash.0.clone();
+        let key = Bytes32(payment.payment_hash.0);
         let Some(_busy) = self.busy(format!("pay:{key}")) else {
             return;
         };
@@ -77,11 +77,11 @@ impl Node {
         };
         let saved = match settle_outgoing(network.as_ref(), &htlc).await {
             Outcome::Pending => return,
-            Outcome::Claimed(preimage) => self.complete_payment(&key, &network_id, &htlc, preimage),
+            Outcome::Claimed(preimage) => self.complete_payment(key, &network_id, &htlc, preimage),
             Outcome::Refunded => self
                 .db()
                 .pending_payments()
-                .delete(PendingPaymentHash(key.clone()))
+                .delete(PendingPaymentHash(key.0))
                 .map(|_| ())
                 .map_err(db_error),
         };

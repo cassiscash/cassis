@@ -76,7 +76,7 @@ pub async fn create_invoice(
     );
     db.invoices()
         .insert(&StoredInvoice {
-            payment_hash: InvoiceHash(payment_hash.to_string()),
+            payment_hash: InvoiceHash(payment_hash.0),
             amount_msat,
             expires_at,
             networks: invoice.body.networks.iter().map(Into::into).collect(),
@@ -288,7 +288,7 @@ impl Node {
     pub(super) fn invoice(&self, hash: &Bytes32) -> Result<StoredInvoice, String> {
         self.db()
             .invoices()
-            .get(InvoiceHash(hash.to_string()))
+            .get(InvoiceHash(hash.0))
             .map_err(db_error)?
             .ok_or_else(|| "unknown invoice".to_string())
     }
@@ -311,9 +311,7 @@ impl Node {
         record: &StoredInvoice,
         claimed_on: Option<&NetworkId>,
     ) {
-        let Ok(hash) = record.payment_hash.0.parse::<Bytes32>() else {
-            return;
-        };
+        let hash = Bytes32(record.payment_hash.0);
         for entry in &record.networks {
             let id = NetworkId(entry.target.network().to_string());
             if Some(&id) == claimed_on {
@@ -346,7 +344,7 @@ pub(super) fn settle_invoice(
             ..record.clone()
         })?;
         tx.transactions().insert(&Transaction {
-            payment_hash: TransactionHash(record.payment_hash.0.clone()),
+            payment_hash: TransactionHash(record.payment_hash.0),
             direction: Direction::Incoming,
             amount_msat,
             network: network.0.clone(),

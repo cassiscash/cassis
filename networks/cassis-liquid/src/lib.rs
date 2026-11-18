@@ -191,7 +191,11 @@ impl HtlcSpec {
     /// with.
     fn to_descriptor(&self, lockup: OutPoint, target: PubKey) -> HtlcDescriptor {
         HtlcDescriptor::Liquid {
-            lockup_txid: lockup.txid.to_string(),
+            lockup_txid: lockup
+                .txid
+                .to_string()
+                .parse()
+                .expect("a txid is 32 bytes of hex"),
             lockup_vout: lockup.vout,
             refund_pubkey: PubKey::from_bytes(
                 self.refund_pubkey
@@ -361,7 +365,7 @@ impl LiquidAdapter {
         else {
             return Err(NetworkError::invalid("not a liquid HTLC"));
         };
-        let txid = Txid::from_str(lockup_txid).map_err(NetworkError::invalid)?;
+        let txid = Txid::from_str(&lockup_txid.to_string()).map_err(NetworkError::invalid)?;
         let spec = HtlcSpec::build(
             &htlc.payment_hash,
             even_y_pubkey(claim)?,

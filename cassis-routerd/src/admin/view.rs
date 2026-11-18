@@ -13,6 +13,7 @@ use cassis_admin::view::{act, ago, fact, field, number, options, short_hash, sub
 use cassis_admin::wallets::{self, Funds};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
+use cassis_core::OperationId;
 use cassis_networks::Can;
 use cassis_routerd::db::{Hop, HopState};
 use cassis_wallet::stored::StoredFailReason;
@@ -226,7 +227,7 @@ fn overview(ctx: &Context) -> Node {
                 .text(format!("{count} {name}"))
         });
     let active = ctx.hops.in_flight.iter().map(|hop| {
-        text(format!("hop/{}", hop.operation_id.0)).text(format!(
+        text(format!("hop/{}", OperationId(hop.operation_id.0))).text(format!(
             "{} → {} · {} msat · {}",
             hop.incoming_network,
             hop.outgoing_network,

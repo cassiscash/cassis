@@ -30,22 +30,21 @@ pub mod db_schema {
     #[embed]
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Delegation {
-        /// Hex iroh key.
-        pub gateway: String,
+        /// Iroh key.
+        pub gateway: [u8; 32],
         pub gateway_relay: Option<String>,
-        /// Hex iroh key.
-        pub preimage_server: String,
+        /// Iroh key.
+        pub preimage_server: [u8; 32],
         pub authorization: StoredAuthorization,
     }
 
     /// An invoice this wallet issued.
     #[entity]
     #[derive(Clone, Debug, PartialEq)]
-    #[index(to_check_on_preimage_server: String = |r| r.to_check_on_preimage_server())]
+    #[index(to_check_on_preimage_server: [u8; 32] = |r| r.to_check_on_preimage_server())]
     #[index(waiting_until: u64 = |r| (r.state == InvoiceState::Waiting).then(|| r.expires_after()))]
     pub struct Invoice {
-        /// Hex.
-        #[id(String)]
+        #[id([u8; 32])]
         pub payment_hash: InvoiceHash,
         pub amount_msat: u64,
         pub expires_at: u64,
@@ -64,9 +63,9 @@ pub mod db_schema {
     impl Invoice {
         /// The preimage server to ask for this invoice's payment: that
         /// of a delegated invoice still waiting for it.
-        pub fn to_check_on_preimage_server(&self) -> Option<String> {
+        pub fn to_check_on_preimage_server(&self) -> Option<[u8; 32]> {
             let delegation = self.delegation.as_ref()?;
-            (self.state == InvoiceState::Waiting).then(|| delegation.preimage_server.clone())
+            (self.state == InvoiceState::Waiting).then_some(delegation.preimage_server)
         }
 
         /// When a waiting invoice expires: at its expiry, or for a
@@ -108,8 +107,7 @@ pub mod db_schema {
     #[derive(Clone, Debug, PartialEq)]
     #[index(direction: u8 = |r| r.direction.key())]
     pub struct Transaction {
-        /// Hex.
-        #[id(String)]
+        #[id([u8; 32])]
         pub payment_hash: TransactionHash,
         pub direction: Direction,
         pub amount_msat: u64,
@@ -125,8 +123,7 @@ pub mod db_schema {
     #[entity]
     #[derive(Clone, Debug, PartialEq)]
     pub struct PendingPayment {
-        /// Hex.
-        #[id(String)]
+        #[id([u8; 32])]
         pub payment_hash: PendingPaymentHash,
         pub network: String,
         pub htlc: StoredHtlc,
@@ -139,15 +136,15 @@ pub mod db_schema {
     #[entity]
     #[derive(Clone, Debug, PartialEq)]
     pub struct FullDelegation {
-        /// Hex [`ReceiveAuthorization::id`](cassis_core::offline::ReceiveAuthorization::id).
-        #[id(String)]
+        /// [`ReceiveAuthorization::id`](cassis_core::offline::ReceiveAuthorization::id).
+        #[id([u8; 32])]
         pub authorization_id: FullDelegationId,
-        /// Hex iroh key.
-        pub gateway: String,
+        /// Iroh key.
+        pub gateway: [u8; 32],
         pub gateway_relay: Option<String>,
-        /// Hex iroh key.
+        /// Iroh key.
         #[index]
-        pub preimage_server: String,
+        pub preimage_server: [u8; 32],
         pub authorization: StoredAuthorization,
         pub created_at: u64,
     }

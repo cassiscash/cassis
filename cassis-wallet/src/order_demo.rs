@@ -381,7 +381,7 @@ impl Flow {
         .await?;
         let flow = self.clone();
         let payment_hash = invoice.body.payment_hash;
-        let key = InvoiceHash(payment_hash.to_string());
+        let key = InvoiceHash(payment_hash.0);
         let expires_at = invoice.body.expires_at;
         tokio::spawn(async move {
             while unix_now() < expires_at {

@@ -138,27 +138,50 @@ impl<'de> Deserialize<'de> for PubKey {
 /// Opaque identifier of one protocol attempt (a PREPARE reservation, a
 /// COMMIT). Payment hashes identify payment intent; operation ids
 /// identify attempts.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct OperationId(pub String);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OperationId(pub [u8; 16]);
 
 impl OperationId {
     /// Fresh 128-bit identifier.
     pub fn random() -> Self {
-        Self(lowercase_hex::encode(rand::random::<[u8; 16]>()))
+        Self(rand::random())
     }
+}
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn is_valid(&self) -> bool {
-        self.0.len() == 32 && self.0.bytes().all(|byte| byte.is_ascii_hexdigit())
+impl fmt::Debug for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
     }
 }
 
 impl fmt::Display for OperationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&lowercase_hex::encode(self.0))
+    }
+}
+
+impl std::str::FromStr for OperationId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut bytes = [0u8; 16];
+        lowercase_hex::decode_to_slice(value, &mut bytes)
+            .map_err(|e| format!("expected 16 hex-encoded bytes: {e}"))?;
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for OperationId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 

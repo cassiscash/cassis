@@ -2874,6 +2874,7 @@ dependencies = [
  "clap",
  "futures",
  "hypereffect",
+ "iroh-base 1.0.3",
  "lowercase-hex",
  "orangedb",
  "ritualistic",

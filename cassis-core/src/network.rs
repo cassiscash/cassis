@@ -507,7 +507,7 @@ pub enum HtlcDescriptor {
     /// P2WSH lockup output on Liquid (see `cassis-liquid`). Refund opens
     /// at an absolute block height.
     Liquid {
-        lockup_txid: String,
+        lockup_txid: Bytes32,
         lockup_vout: u32,
         refund_pubkey: PubKey,
         refund_locktime: u32,
@@ -526,7 +526,7 @@ pub enum HtlcDescriptor {
     /// P2TR lockup output on Bitcoin (see `cassis-bitcoin`). Refund
     /// opens at an absolute unix timestamp.
     Bitcoin {
-        lockup_txid: String,
+        lockup_txid: Bytes32,
         lockup_vout: u32,
         refund_pubkey: XOnlyPubKey,
         refund_locktime: u32,
@@ -543,7 +543,7 @@ pub enum HtlcDescriptor {
     /// Fedimint LNv2 direct HTLC: the funded `OutgoingContract`
     /// (consensus JSON) and where it was funded.
     Fedimint {
-        funding_txid: String,
+        funding_txid: Bytes32,
         funding_out_idx: u64,
         contract: String,
         target: XOnlyPubKey,

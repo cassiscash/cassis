@@ -30,13 +30,14 @@ use cassis_core::offline::{
 use cassis_core::protocol::{GatewayInvoiceFor, Request, Response};
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
 use cassis_core::transport::{PeerAddr, Transport};
-use cassis_core::{unix_now, Invoice, NetworkId};
+use cassis_core::{unix_now, Bytes32, Invoice, NetworkId};
 use cassis_wallet::db::{Direction, InvoiceHash, InvoiceState};
 use cassis_wallet::node::{
     authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
 };
 use cassis_wallet::{Home, Node, NodeConfig};
 use clap::{Parser, Subcommand};
+use iroh_base::PublicKey;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info_span, Span};
@@ -599,11 +600,14 @@ async fn run(cli: Cli) -> Result<(), String> {
                 let via = invoice
                     .delegation
                     .as_ref()
-                    .map(|delegation| format!(" via gateway {}", delegation.gateway))
+                    .map(|delegation| format!(" via gateway {}", hex_key(&delegation.gateway)))
                     .unwrap_or_default();
                 println!(
                     "{} {:>12} msat {:?} expires {}{via}",
-                    invoice.payment_hash.0, invoice.amount_msat, invoice.state, invoice.expires_at
+                    Bytes32(invoice.payment_hash.0),
+                    invoice.amount_msat,
+                    invoice.state,
+                    invoice.expires_at
                 );
             }
             for delegation in home
@@ -626,8 +630,8 @@ async fn run(cli: Cli) -> Result<(), String> {
                     authorization.min_amount_msat,
                     authorization.max_amount_msat,
                     authorization.valid_until,
-                    delegation.gateway,
-                    delegation.preimage_server
+                    hex_key(&delegation.gateway),
+                    hex_key(&delegation.preimage_server)
                 );
             }
         }
@@ -639,7 +643,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 };
                 println!(
                     "{} {direction} {:>12} msat on {} at {}",
-                    transaction.payment_hash.0,
+                    Bytes32(transaction.payment_hash.0),
                     transaction.amount_msat,
                     transaction.network,
                     transaction.at
@@ -653,7 +657,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             {
                 println!(
                     "{} out {:>12} msat on {} pending until {}",
-                    payment.payment_hash.0,
+                    Bytes32(payment.payment_hash.0),
                     payment.htlc.amount_msat,
                     payment.network,
                     payment.htlc.expiry
@@ -698,7 +702,7 @@ fn print_invoice(invoice: &Invoice) -> Result<(), String> {
 const CLAIM_GRACE: Duration = Duration::from_secs(30);
 
 async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
-    let key = InvoiceHash(invoice.body.payment_hash.to_string());
+    let key = InvoiceHash(invoice.body.payment_hash.0);
     loop {
         let record = home
             .db
@@ -756,7 +760,7 @@ async fn redeem(
         let authorization: ReceiveAuthorization = (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
-                id: delegation.preimage_server,
+                id: hex_key(&delegation.preimage_server),
                 relay: authorization.preimage_server_relay.clone(),
             },
             authorization,
@@ -771,7 +775,7 @@ async fn redeem(
         let authorization: ReceiveAuthorization = (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
-                id: delegation.preimage_server,
+                id: hex_key(&delegation.preimage_server),
                 relay: authorization.preimage_server_relay.clone(),
             },
             authorization,
@@ -884,4 +888,11 @@ fn relays(cli: &Cli) -> Vec<String> {
         DEFAULT_NOSTR_RELAYS
     };
     defaults.iter().map(|relay| relay.to_string()).collect()
+}
+
+/// The iroh endpoint id of a stored key, as peers are addressed by.
+fn hex_key(key: &[u8; 32]) -> String {
+    PublicKey::from_bytes(key)
+        .map(|key| key.to_string())
+        .unwrap_or_else(|_| "invalid key".into())
 }

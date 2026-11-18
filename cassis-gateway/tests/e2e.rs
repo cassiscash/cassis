@@ -538,7 +538,7 @@ async fn payee_offline_behind_a_gateway() {
     let record = payee
         .db
         .invoices()
-        .get(InvoiceHash(invoice.body.payment_hash.to_string()))
+        .get(InvoiceHash(invoice.body.payment_hash.0))
         .unwrap()
         .unwrap();
     assert_eq!(record.state, InvoiceState::Settled);

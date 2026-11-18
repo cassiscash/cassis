@@ -143,7 +143,7 @@ pub async fn create_gateway_invoice(
     }
     db.invoices()
         .insert(&StoredInvoice {
-            payment_hash: InvoiceHash(invoice.body.payment_hash.to_string()),
+            payment_hash: InvoiceHash(invoice.body.payment_hash.0),
             amount_msat,
             expires_at,
             networks: invoice.body.networks.iter().map(Into::into).collect(),
@@ -151,9 +151,9 @@ pub async fn create_gateway_invoice(
             metadata: stored_metadata(&invoice.body.metadata),
             preimage: None,
             delegation: Some(Delegation {
-                gateway: endpoints.gateway.id.clone(),
+                gateway: *endpoint_key(&endpoints.gateway)?.as_bytes(),
                 gateway_relay: endpoints.gateway.relay.clone(),
-                preimage_server: endpoints.preimage_server.id.clone(),
+                preimage_server: *endpoint_key(&endpoints.preimage_server)?.as_bytes(),
                 authorization: (&authorization).into(),
             }),
             state: InvoiceState::Waiting,
@@ -289,12 +289,14 @@ pub async fn authorize_gateway(
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     }
+    let gateway = *endpoint_key(&endpoints.gateway)?.as_bytes();
+    let preimage_server = *endpoint_key(&endpoints.preimage_server)?.as_bytes();
     db.full_delegations()
         .upsert(&FullDelegation {
-            authorization_id: FullDelegationId(authorization.id()?.to_string()),
-            gateway: endpoints.gateway.id,
+            authorization_id: FullDelegationId(authorization.id()?.0),
+            gateway,
             gateway_relay: endpoints.gateway.relay,
-            preimage_server: endpoints.preimage_server.id,
+            preimage_server,
             authorization: (&authorization).into(),
             created_at: unix_now(),
         })
@@ -373,28 +375,24 @@ pub async fn redeem_offline_payments(
                 metadata,
             ),
         };
-        let key = payment_hash.to_string();
+        let key = payment_hash.0;
         if db
             .transactions()
-            .contains(TransactionHash(key.clone()))
+            .contains(TransactionHash(key))
             .map_err(db_error)?
         {
             continue;
         }
         match redeem(networks, &network, &htlc, preimage).await {
             Ok(()) => {
-                match db
-                    .invoices()
-                    .get(InvoiceHash(key.clone()))
-                    .map_err(db_error)?
-                {
+                match db.invoices().get(InvoiceHash(key)).map_err(db_error)? {
                     Some(invoice) => {
                         settle_invoice(db, &invoice, &network, htlc.amount_msat, preimage)?
                     }
                     None => db
                         .transactions()
                         .insert(&Transaction {
-                            payment_hash: TransactionHash(key.clone()),
+                            payment_hash: TransactionHash(key),
                             direction: Direction::Incoming,
                             amount_msat: htlc.amount_msat,
                             network: network.0.clone(),

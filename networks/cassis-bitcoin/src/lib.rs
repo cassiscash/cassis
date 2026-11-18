@@ -223,7 +223,8 @@ impl HtlcOptions {
         }
         Ok(Self {
             payment_hash160: Self::payment_hash160(&htlc.payment_hash),
-            lockup_txid: bitcoin::Txid::from_str(lockup_txid).map_err(NetworkError::invalid)?,
+            lockup_txid: bitcoin::Txid::from_str(&lockup_txid.to_string())
+                .map_err(NetworkError::invalid)?,
             lockup_vout: *lockup_vout,
             claim_pubkey: b_xonly(claim)?,
             refund_pubkey: b_xonly(refund_pubkey)?,
@@ -233,7 +234,11 @@ impl HtlcOptions {
 
     fn descriptor(&self) -> HtlcDescriptor {
         HtlcDescriptor::Bitcoin {
-            lockup_txid: self.lockup_txid.to_string(),
+            lockup_txid: self
+                .lockup_txid
+                .to_string()
+                .parse()
+                .expect("a txid is 32 bytes of hex"),
             lockup_vout: self.lockup_vout,
             refund_pubkey: XOnlyPubKey::from_bytes(self.refund_pubkey.serialize())
                 .expect("valid x-only key"),
