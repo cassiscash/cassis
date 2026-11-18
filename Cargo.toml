@@ -1,0 +1,30 @@
+[package]
+name = "hyperb-cassis-wallet"
+version = "0.1.0"
+edition = "2021"
+description = "A hyperb interface to manage Cassis wallets: add networks to a config file, see their funds, deposit and withdraw"
+
+# One feature per network the Cassis wallets can be on, as in `cassis-wallet`:
+# turn on the ones the host binary should offer.
+[features]
+default = []
+arkade = ["cassis-networks/arkade"]
+bark-lightning = ["cassis-networks/bark-lightning"]
+bitcoin = ["cassis-networks/bitcoin"]
+cashu = ["cassis-networks/cashu"]
+fedimint = ["cassis-networks/fedimint"]
+lightning = ["cassis-networks/lightning"]
+liquid = ["cassis-networks/liquid"]
+rootstock = ["cassis-networks/rootstock"]
+all = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
+
+[dependencies]
+cassis-core = { git = "https://github.com/andunieee/cassis", tag = "v0.3.0", default-features = false, features = ["node"] }
+cassis-networks = { git = "https://github.com/andunieee/cassis", tag = "v0.3.0", default-features = false }
+hypereffect = "0.6.3"
+lowercase-hex = "0.1.1"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
+toml = "0.8.23"
+toml_edit = "0.22.27"
+tracing = "0.1.44"
