@@ -29,10 +29,14 @@ pub struct HtlcTerms {
 
 impl HtlcTerms {
     pub fn of(proof: &Proof) -> Result<Self, NetworkError> {
+        Self::of_secret(&proof.secret)
+    }
+
+    pub fn of_secret(secret: &Secret) -> Result<Self, NetworkError> {
         let SpendingConditions::HTLCConditions {
             data,
             conditions: Some(conditions),
-        } = SpendingConditions::try_from(&proof.secret).map_err(NetworkError::invalid)?
+        } = SpendingConditions::try_from(secret).map_err(NetworkError::invalid)?
         else {
             return Err(NetworkError::invalid("proof is not an HTLC with terms"));
         };

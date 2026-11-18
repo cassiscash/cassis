@@ -68,6 +68,23 @@ fn network_error(error: impl std::fmt::Display) -> NetworkError {
     NetworkError::network(error)
 }
 
+/// A proof the wallet holds, as a list shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeldProof {
+    pub amount_sat: u64,
+    pub keyset: String,
+}
+
+/// An HTLC-locked output of a swap whose answer is not in yet: ecash the wallet will get back
+/// by refund once `locktime` has passed, if nothing claims it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LockedProof {
+    pub amount_sat: u64,
+    pub keyset: String,
+    pub payment_hash: Bytes32,
+    pub locktime: u64,
+}
+
 pub struct CashuAdapter {
     id: NetworkId,
     mint_url: MintUrl,
@@ -132,6 +149,37 @@ impl CashuAdapter {
     /// Spendable ecash, in msat.
     pub fn balance_msat(&self) -> Result<u64, String> {
         Ok(sum_sats(&self.wallet.proofs()?) * 1000)
+    }
+
+    /// The unrestricted proofs the wallet holds.
+    pub fn held_proofs(&self) -> Result<Vec<HeldProof>, String> {
+        Ok(self
+            .wallet
+            .proofs()?
+            .into_iter()
+            .map(|proof| HeldProof {
+                amount_sat: u64::from(proof.amount),
+                keyset: proof.keyset_id.to_string(),
+            })
+            .collect())
+    }
+
+    /// The HTLC-locked outputs of swaps still waiting to be settled.
+    pub fn locked_proofs(&self) -> Result<Vec<LockedProof>, String> {
+        let mut locked = Vec::new();
+        for swap in self.wallet.pending_swaps()? {
+            for output in &swap.outputs {
+                if let Ok(terms) = HtlcTerms::of_secret(&output.secret) {
+                    locked.push(LockedProof {
+                        amount_sat: u64::from(output.amount),
+                        keyset: swap.keyset.to_string(),
+                        payment_hash: terms.payment_hash,
+                        locktime: terms.locktime,
+                    });
+                }
+            }
+        }
+        Ok(locked)
     }
 
     /// Redeem a cashu token from this mint into the wallet. Returns the
