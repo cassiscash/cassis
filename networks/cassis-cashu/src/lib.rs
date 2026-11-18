@@ -3,7 +3,8 @@
 //! * **Lock**: swap wallet proofs at the mint for proofs whose secret is
 //!   a NUT-14 HTLC (payment hash, receiver key, refund key, refund
 //!   locktime). The proofs themselves are the descriptor handed to the
-//!   receiver.
+//!   receiver, worth the HTLC amount once the mint takes its input fee
+//!   to claim them.
 //! * **Verify**: the proofs are locked to us and the hash, carry the
 //!   mint's DLEQ signature proof, and the mint reports them unspent.
 //! * **Claim**: swap them at the mint with the preimage and our
@@ -576,7 +577,11 @@ impl Network for CashuAdapter {
             refund: cashu_key(&self.claim_pubkey)?,
             locktime: expiry,
         };
-        let proofs = self.take(sats_for_msat(amount_msat), Some(&terms)).await?;
+        // The receiver pays the mint's input fee when claiming: lock
+        // enough for it to still net the HTLC amount.
+        let keyset = self.active_keyset().await?;
+        let amount_sat = htlc_amount_sat(sats_for_msat(amount_msat), keyset.input_fee_ppk);
+        let proofs = self.take(amount_sat, Some(&terms)).await?;
         info!(
             parent: &self.span,
             "locked {} sat for {} until {expiry}",
@@ -620,8 +625,9 @@ impl Network for CashuAdapter {
 
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
         let keyset = self.active_keyset().await?;
+        let amount_sat = htlc_amount_sat(sats_for_msat(amount_msat), keyset.input_fee_ppk);
         self.wallet
-            .select_preview(keyset.id, sats_for_msat(amount_msat), keyset.input_fee_ppk)
+            .select_preview(keyset.id, amount_sat, keyset.input_fee_ppk)
             .map_err(NetworkError::invalid)
     }
 
@@ -694,6 +700,22 @@ fn input_fee_sat(inputs: usize, input_fee_ppk: u64) -> u64 {
     input_fee_ppk.saturating_mul(inputs as u64).div_ceil(1000)
 }
 
+/// The amount to lock so its proofs still leave `amount_sat` after the
+/// receiver pays the mint's input fee to claim them. Proofs are powers
+/// of two, so the fee grows with the bits of the amount: add it until
+/// the net stops falling short.
+fn htlc_amount_sat(amount_sat: u64, input_fee_ppk: u64) -> u64 {
+    let mut outputs = amount_sat;
+    loop {
+        let fee = input_fee_sat(outputs.count_ones() as usize, input_fee_ppk);
+        let needed = amount_sat.saturating_add(fee);
+        if needed <= outputs {
+            return outputs;
+        }
+        outputs = needed;
+    }
+}
+
 fn plain_outputs(
     amount_sat: u64,
     keyset: KeysetId,
@@ -754,6 +776,20 @@ mod tests {
         assert_eq!(input_fee_sat(1, 1), 1);
         assert_eq!(input_fee_sat(3, 1000), 3);
         assert_eq!(input_fee_sat(usize::MAX, u64::MAX), u64::MAX / 1000 + 1);
+    }
+
+    #[test]
+    fn locked_proofs_cover_the_claim_fee() {
+        // Proofs are split by bits, so a fee per proof can change the
+        // split: 7 needs 9 (bits 0 and 3) after two rounds.
+        assert_eq!(htlc_amount_sat(7, 1000), 9);
+        assert_eq!(htlc_amount_sat(1000, 1), 1001);
+        assert_eq!(htlc_amount_sat(0, 1000), 0);
+        for amount in [1, 2, 3, 7, 8, 1000, 1 << 40] {
+            let outputs = htlc_amount_sat(amount, 1000);
+            let fee = input_fee_sat(outputs.count_ones() as usize, 1000);
+            assert!(outputs - fee >= amount, "{outputs} - {fee} < {amount}");
+        }
     }
 
     #[test]
