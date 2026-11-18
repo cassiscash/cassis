@@ -613,12 +613,21 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .map_err(|e| e.to_string())?
             {
                 let authorization = &delegation.authorization;
+                // An expired authorization may still have payments to
+                // claim (ones issued while it was valid), so it is kept
+                // for `redeem`, but it is no longer standing.
+                let state = if authorization.valid_until > unix_now() {
+                    "active"
+                } else {
+                    "expired"
+                };
                 println!(
-                    "standing: {}..{} msat until {} via gateway {}",
+                    "standing {state}: {}..{} msat until {} via gateway {}, preimage server {}",
                     authorization.min_amount_msat,
                     authorization.max_amount_msat,
                     authorization.valid_until,
-                    delegation.gateway
+                    delegation.gateway,
+                    delegation.preimage_server
                 );
             }
         }
@@ -792,6 +801,11 @@ async fn redeem(
 }
 
 /// Claim what each of `servers` logged for this node since `since`.
+///
+/// Every server is tried even when one fails, so a single unreachable
+/// server does not keep the others from being redeemed from. The
+/// failures are reported together at the end, after every claim that
+/// could be made was made.
 async fn redeem_from(
     home: &Home,
     transport: &Transport,
@@ -799,9 +813,17 @@ async fn redeem_from(
     since: u64,
     span: &Span,
 ) -> Result<(), String> {
+    let mut errors = Vec::new();
     for (preimage_server, networks) in servers {
-        let opened = home.open_networks(&networks, span).await?;
-        let report = redeem_offline_payments(
+        let id = preimage_server.id.clone();
+        let opened = match home.open_networks(&networks, span).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                errors.push(format!("{id}: {error}"));
+                continue;
+            }
+        };
+        let report = match redeem_offline_payments(
             &home.db,
             &home.keys,
             transport,
@@ -809,7 +831,14 @@ async fn redeem_from(
             &opened,
             since,
         )
-        .await?;
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                errors.push(format!("{id}: {error}"));
+                continue;
+            }
+        };
         for (hash, network, amount_msat) in &report.claimed {
             println!("claimed {hash} {amount_msat:>12} msat on {network}");
         }
@@ -826,7 +855,14 @@ async fn redeem_from(
             println!("failed  {hash}: {reason}");
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not redeem from every preimage server: {}",
+            errors.join("; ")
+        ))
+    }
 }
 
 /// `specs` parsed, or every network of the node when empty.
