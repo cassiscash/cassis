@@ -85,10 +85,10 @@ use tracing::{debug, info, Span};
 
 /// Public mainnet operator. Serves gRPC + REST on 443.
 pub const MAINNET_SERVER_URL: &str = "https://arkade.computer";
-/// Public mutinynet operator ("testnet" for cassis purposes).
-pub const TESTNET_SERVER_URL: &str = "https://mutinynet.arkade.sh";
+/// Public mutinynet operator.
+pub const MUTINYNET_SERVER_URL: &str = "https://mutinynet.arkade.sh";
 const MAINNET_ESPLORA_URL: &str = "https://mempool.space/api";
-const TESTNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
+const MUTINYNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
 
 /// How long the SDK may wait for the next batch event. Its default is
 /// 30s, but joining a round means waiting for the operator's session:
@@ -237,15 +237,15 @@ impl ArkadeAdapter {
         install_rustls_crypto_provider();
         let server_url = match id.param() {
             None => MAINNET_SERVER_URL.to_string(),
-            Some("mutinynet") => TESTNET_SERVER_URL.to_string(),
+            Some("mutinynet") => MUTINYNET_SERVER_URL.to_string(),
             Some(_) => id.host_url()?,
         };
         let network = operator_network(&server_url).await?;
         let esplora_url = match (esplora_url, network) {
             (Some(url), _) => url,
             (None, bitcoin::Network::Bitcoin) => MAINNET_ESPLORA_URL,
-            // The only signet arkade operators run on.
-            (None, bitcoin::Network::Signet) => TESTNET_ESPLORA_URL,
+            // The only chain arkade operators run on besides mainnet.
+            (None, bitcoin::Network::Signet) => MUTINYNET_ESPLORA_URL,
             (None, other) => {
                 return Err(format!(
                     "arkade operator {server_url} is on {other}: it needs an esplora URL"
