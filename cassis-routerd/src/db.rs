@@ -8,11 +8,11 @@ pub use db_schema::*;
 
 #[orangedb::schema]
 pub mod db_schema {
-    use cassis_wallet::stored::{StoredHtlc, StoredInvoiceTarget};
+    use cassis_wallet::stored::{StoredFailReason, StoredHtlc, StoredInvoiceTarget};
 
     /// Where a hop is.
     #[embed]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum HopState {
         /// Waiting for the incoming HTLC to verify (to confirm, say).
         /// Nothing is funded yet.
@@ -24,48 +24,12 @@ pub mod db_schema {
         /// The incoming HTLC is claimed.
         Settled,
         /// Over without the incoming HTLC claimed.
-        Failed { reason: FailReason },
+        Failed { reason: StoredFailReason },
     }
 
     impl HopState {
-        pub fn in_flight(self) -> bool {
+        pub fn in_flight(&self) -> bool {
             matches!(self, Self::Verifying | Self::Funding | Self::Forwarded)
-        }
-    }
-
-    /// Why a hop failed.
-    #[embed]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum FailReason {
-        /// A network of the hop is not open.
-        NetworkUnavailable,
-        /// The incoming HTLC did not verify.
-        IncomingRejected,
-        /// The outgoing expiry passed before the incoming HTLC verified.
-        ExpiredWhileVerifying,
-        /// The outgoing HTLC could not be funded.
-        FundingFailed,
-        /// A restart interrupted funding the outgoing HTLC: whether it
-        /// exists is unknown.
-        InterruptedWhileFunding,
-        /// The outgoing HTLC was refunded: no preimage came back.
-        PreimageNotReceived,
-        /// The incoming HTLC could not be claimed before it expired, so
-        /// the outgoing one was paid for nothing.
-        ClaimFailed,
-    }
-
-    impl FailReason {
-        pub fn describe(self) -> &'static str {
-            match self {
-                FailReason::NetworkUnavailable => "a network of the hop is not open",
-                FailReason::IncomingRejected => "the incoming HTLC was rejected",
-                FailReason::ExpiredWhileVerifying => "the outgoing expiry passed while verifying",
-                FailReason::FundingFailed => "the outgoing HTLC could not be funded",
-                FailReason::InterruptedWhileFunding => "interrupted while funding",
-                FailReason::PreimageNotReceived => "no preimage came back: refunded",
-                FailReason::ClaimFailed => "the incoming HTLC could not be claimed in time",
-            }
         }
     }
 

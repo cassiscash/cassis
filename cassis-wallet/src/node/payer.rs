@@ -5,11 +5,11 @@ use crate::db::{Direction, PendingPayment, PendingPaymentHash, Transaction, Tran
 use cassis_core::network::{Htlc, NetworkId};
 use cassis_core::offline::endpoint_public_key;
 use cassis_core::protocol::{
-    Commit, Discard, Execute, Invoice, Prepare, PreparePayee, Request, Response, Settle,
+    Commit, Discard, Execute, FailReason, Invoice, Prepare, PreparePayee, Request, Response, Settle,
 };
 use cassis_core::routing::{self, RouteAnnouncement};
 use cassis_core::transport::PeerAddr;
-use cassis_core::{unix_now, Bytes32, OperationId};
+use cassis_core::{unix_now, Bytes32, OperationId, XOnlyPubKey};
 use futures::future::join_all;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -18,10 +18,86 @@ use tracing::{info, warn};
 /// How often a pending EXECUTE or COMMIT is asked again.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// What came of an attempt to [`Node::pay`] an invoice.
+#[derive(Clone, Debug)]
+pub struct PayReport {
+    /// The route attempted: empty when the payment was direct or was
+    /// already paid.
+    pub route: Vec<RouteAnnouncement>,
+    /// The preimage, or what went wrong.
+    pub outcome: Result<Bytes32, PayFailure>,
+}
+
+/// Why a payment attempt failed, once it had a route.
+#[derive(Clone, Debug)]
+pub struct PayFailure {
+    /// What happened, with a note on what stays locked, if anything.
+    pub message: String,
+    /// The hop the attempt failed at, when a hop is to blame.
+    pub hop: Option<FailedHop>,
+}
+
+/// A hop of the route that failed the payment.
+#[derive(Clone, Debug)]
+pub struct FailedHop {
+    /// Position in the route, from 0.
+    pub index: usize,
+    /// Router to skip to route around the hop (see [`Node::pay`]).
+    pub node: XOnlyPubKey,
+    pub error: HopError,
+}
+
+/// How a hop failed.
+#[derive(Clone, Debug)]
+pub enum HopError {
+    /// The hop did not accept PREPARE.
+    PrepareRefused(String),
+    /// The hop did not answer, or not as expected.
+    Unresponsive(String),
+    /// The hop gave up forwarding.
+    Failed(FailReason),
+}
+
+impl std::fmt::Display for HopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrepareRefused(reason) => write!(f, "refused: {reason}"),
+            Self::Unresponsive(error) => f.write_str(error),
+            Self::Failed(reason) => reason.fmt(f),
+        }
+    }
+}
+
+impl PayReport {
+    /// The preimage, or the failure's message.
+    pub fn into_result(self) -> Result<Bytes32, String> {
+        self.outcome.map_err(|failure| failure.message)
+    }
+
+    fn paid(route: Vec<RouteAnnouncement>, preimage: Bytes32) -> Self {
+        Self {
+            route,
+            outcome: Ok(preimage),
+        }
+    }
+
+    fn failed(route: Vec<RouteAnnouncement>, message: String, hop: Option<FailedHop>) -> Self {
+        Self {
+            route,
+            outcome: Err(PayFailure { message, hop }),
+        }
+    }
+}
+
 impl Node {
     /// Pay `invoice` from this node's `from` network, routing through
     /// routers announced on `relays` when the invoice is not payable on
-    /// `from` directly. Returns the preimage.
+    /// `from` directly. Routers in `skip` are not routed through: a
+    /// caller whose attempt failed at a hop retries with that hop's
+    /// [`FailedHop::node`] added.
+    ///
+    /// `Err` is a payment that could not start. Otherwise the report
+    /// holds the route attempted and the preimage, or what failed.
     ///
     /// Once the first HTLC is funded the payment is journaled as a
     /// [`PendingPayment`]: if the payment fails afterwards, a serving
@@ -36,7 +112,8 @@ impl Node {
         invoice: &Invoice,
         from: &NetworkId,
         relays: &[String],
-    ) -> Result<Bytes32, String> {
+        skip: &HashSet<XOnlyPubKey>,
+    ) -> Result<PayReport, String> {
         let hash = invoice.body.payment_hash;
         let _busy = self
             .busy(format!("pay:{hash}"))
@@ -63,7 +140,7 @@ impl Node {
             .map_err(db_error)?
         {
             return match previous.direction {
-                Direction::Outgoing => Ok(Bytes32(previous.preimage)),
+                Direction::Outgoing => Ok(PayReport::paid(Vec::new(), Bytes32(previous.preimage))),
                 Direction::Incoming => Err("this wallet was paid this invoice".into()),
             };
         }
@@ -79,7 +156,7 @@ impl Node {
             ));
         }
         let sender = self.network(from)?;
-        let (route, payee_network) = self.choose_route(invoice, from, relays).await?;
+        let (route, payee_network) = self.choose_route(invoice, from, relays, skip).await?;
         let payee_target = invoice
             .target_for(&payee_network)
             .cloned()
@@ -97,6 +174,12 @@ impl Node {
             invoice.incoming_delta_for(&payee_network),
             unix_now(),
         )?;
+        // Hop `i` of the route, as the report names it.
+        let failed_hop = |i: usize, error: HopError| FailedHop {
+            index: i,
+            node: route[i].node_pubkey,
+            error,
+        };
         let hops: Vec<Hop> = route
             .iter()
             .enumerate()
@@ -146,11 +229,20 @@ impl Node {
                 Ok(Response::Prepared(Ok(target))) => targets.push(target),
                 Ok(Response::Prepared(Err(reason))) => {
                     self.discard_hops(&hops).await;
-                    return Err(format!("hop {} refused: {reason}", i + 1));
+                    return Ok(PayReport::failed(
+                        route.clone(),
+                        format!("hop {} refused: {reason}", i + 1),
+                        Some(failed_hop(i, HopError::PrepareRefused(reason))),
+                    ));
                 }
                 other => {
                     self.discard_hops(&hops).await;
-                    return Err(format!("hop {}: {}", i + 1, unexpected(other)));
+                    let error = unexpected(other);
+                    return Ok(PayReport::failed(
+                        route.clone(),
+                        format!("hop {}: {error}", i + 1),
+                        Some(failed_hop(i, HopError::Unresponsive(error))),
+                    ));
                 }
             }
         }
@@ -158,11 +250,19 @@ impl Node {
             Ok(Response::PayeePrepared(Ok(()))) => {}
             Ok(Response::PayeePrepared(Err(reason))) => {
                 self.discard_hops(&hops).await;
-                return Err(format!("payee refused: {reason}"));
+                return Ok(PayReport::failed(
+                    route,
+                    format!("payee refused: {reason}"),
+                    None,
+                ));
             }
             other => {
                 self.discard_hops(&hops).await;
-                return Err(format!("payee: {}", unexpected(other)));
+                return Ok(PayReport::failed(
+                    route,
+                    format!("payee: {}", unexpected(other)),
+                    None,
+                ));
             }
         }
         targets.push(payee_target);
@@ -179,7 +279,11 @@ impl Node {
             },
             Err(error) => {
                 self.discard_hops(&hops).await;
-                return Err(format!("cannot fund the first HTLC on {from}: {error}"));
+                return Ok(PayReport::failed(
+                    route,
+                    format!("cannot fund the first HTLC on {from}: {error}"),
+                    None,
+                ));
             }
         };
         self.db()
@@ -218,11 +322,15 @@ impl Node {
                 Ok(Response::Executed(next)) => next,
                 other => {
                     self.discard_hops(&hops[i..]).await;
-                    return Err(locked(format!(
-                        "hop {} failed: {}",
-                        i + 1,
-                        unexpected(other)
-                    )));
+                    let error = match other {
+                        Ok(Response::HopFailed(reason)) => HopError::Failed(reason),
+                        other => HopError::Unresponsive(unexpected(other)),
+                    };
+                    return Ok(PayReport::failed(
+                        route.clone(),
+                        locked(format!("hop {} failed: {error}", i + 1)),
+                        Some(failed_hop(i, error)),
+                    ));
                 }
             };
         }
@@ -241,13 +349,18 @@ impl Node {
         {
             Ok(Response::Committed(preimage)) if hash.matches_preimage(&preimage) => preimage,
             Ok(Response::Committed(_)) => {
-                return Err(locked("payee answered with a wrong preimage".into()))
+                return Ok(PayReport::failed(
+                    route,
+                    locked("payee answered with a wrong preimage".into()),
+                    None,
+                ))
             }
             other => {
-                return Err(locked(format!(
-                    "payee did not claim: {}",
-                    unexpected(other)
-                )))
+                return Ok(PayReport::failed(
+                    route,
+                    locked(format!("payee did not claim: {}", unexpected(other))),
+                    None,
+                ))
             }
         };
         self.complete_payment(&key, from, &first, preimage)?;
@@ -267,7 +380,7 @@ impl Node {
             }
         }))
         .await;
-        Ok(preimage)
+        Ok(PayReport::paid(route, preimage))
     }
 
     /// Turn the pending payment of `htlc` on `network` into an outgoing
@@ -303,6 +416,7 @@ impl Node {
         invoice: &Invoice,
         from: &NetworkId,
         relays: &[String],
+        skip: &HashSet<XOnlyPubKey>,
     ) -> Result<(Vec<RouteAnnouncement>, NetworkId), String> {
         if invoice.target_for(from).is_some() {
             return Ok((Vec::new(), from.clone()));
@@ -320,7 +434,7 @@ impl Node {
                     from,
                     entry.target.network(),
                     invoice.body.amount_msat,
-                    &HashSet::new(),
+                    skip,
                 )
                 .ok()?;
                 // Fails when a leg runs longer than its receiver accepts.

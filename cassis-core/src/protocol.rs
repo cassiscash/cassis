@@ -1013,6 +1013,58 @@ pub enum Request {
     GatewayInvoiceFor(GatewayInvoiceFor),
 }
 
+/// Why a hop failed to forward a payment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailReason {
+    /// A network of the hop is not open on the router.
+    NetworkUnavailable,
+    /// The incoming HTLC did not verify.
+    IncomingRejected,
+    /// The outgoing expiry passed before the incoming HTLC verified.
+    ExpiredWhileVerifying,
+    /// The target the router was to fund the outgoing HTLC to is not
+    /// valid for its network.
+    InvalidOutgoingTarget,
+    /// The router could not journal the hop before funding it, so it
+    /// did not fund it.
+    JournalingFailed,
+    /// The outgoing network refused to fund the outgoing HTLC, with this
+    /// error (an empty wallet, an unreachable mint, ...).
+    OutgoingFundingRefused(String),
+    /// A restart interrupted funding the outgoing HTLC: whether it
+    /// exists is unknown.
+    InterruptedWhileFunding,
+    /// The outgoing HTLC was refunded: no preimage came back.
+    PreimageNotReceived,
+    /// The incoming HTLC could not be claimed before it expired, so
+    /// the outgoing one was paid for nothing.
+    ClaimFailed,
+}
+
+impl std::fmt::Display for FailReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NetworkUnavailable => f.write_str("a network of the hop is not open"),
+            Self::IncomingRejected => f.write_str("the incoming HTLC was rejected"),
+            Self::ExpiredWhileVerifying => {
+                f.write_str("the outgoing expiry passed while verifying the incoming HTLC")
+            }
+            Self::InvalidOutgoingTarget => {
+                f.write_str("the outgoing target is not valid for its network")
+            }
+            Self::JournalingFailed => {
+                f.write_str("the router could not journal the hop, so it did not fund it")
+            }
+            Self::OutgoingFundingRefused(error) => {
+                write!(f, "the outgoing network refused to fund the HTLC: {error}")
+            }
+            Self::InterruptedWhileFunding => f.write_str("interrupted while funding"),
+            Self::PreimageNotReceived => f.write_str("no preimage came back: refunded"),
+            Self::ClaimFailed => f.write_str("the incoming HTLC could not be claimed in time"),
+        }
+    }
+}
+
 // One per request, so the size of its largest variant does not matter.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1031,6 +1083,8 @@ pub enum Response {
     /// EXECUTE or COMMIT accepted and still in progress: repeat the
     /// request to learn its outcome.
     Pending,
+    /// EXECUTE's hop is over without having forwarded the payment.
+    HopFailed(FailReason),
     Error(String),
     PreimageIssued(Result<PreimageIssuance, String>),
     PreimageReleased(Result<Bytes32, String>),

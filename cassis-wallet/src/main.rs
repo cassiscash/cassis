@@ -518,9 +518,45 @@ async fn run(cli: Cli) -> Result<(), String> {
                 vec![sender],
             )
             .await?;
-            let preimage = node.pay(&invoice, &from, &relays).await;
+            let report = node
+                .pay(&invoice, &from, &relays, &Default::default())
+                .await;
             node.shutdown().await;
-            println!("paid; preimage {}", preimage?);
+            let report = report?;
+            let route = report
+                .route
+                .iter()
+                .map(|hop| {
+                    format!(
+                        "{} -> {} via {}",
+                        hop.from,
+                        hop.to,
+                        hop.node_pubkey.to_hex()
+                    )
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "route: {}",
+                if route.is_empty() {
+                    "direct".into()
+                } else {
+                    route.join(", ")
+                }
+            );
+            match report.outcome {
+                Ok(preimage) => println!("paid; preimage {preimage}"),
+                Err(failure) => {
+                    if let Some(hop) = &failure.hop {
+                        println!(
+                            "failed at hop {} ({}): {}",
+                            hop.index + 1,
+                            hop.node.to_hex(),
+                            hop.error
+                        );
+                    }
+                    return Err(failure.message.into());
+                }
+            }
         }
         Command::Route {
             from,

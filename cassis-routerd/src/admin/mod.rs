@@ -350,7 +350,7 @@ impl Admin {
             let mut failed = BTreeMap::new();
             let mut settled = 0;
             for hop in db.hops().by_in_flight(false)? {
-                match hop.state {
+                match &hop.state {
                     HopState::Failed { reason } => {
                         *failed
                             .entry(view::fail_kind(reason).to_string())

@@ -487,7 +487,12 @@ async fn payee_offline_behind_a_gateway() {
         setup.gateway.peer_id()
     );
 
-    let preimage = setup.payer.pay(&invoice, &network, &[]).await.unwrap();
+    let preimage = setup
+        .payer
+        .pay(&invoice, &network, &[], &Default::default())
+        .await
+        .and_then(|report| report.into_result())
+        .unwrap();
     assert!(invoice.body.payment_hash.matches_preimage(&preimage));
 
     // The payer's HTLC runs as for any payee and the gateway claimed it;
@@ -501,7 +506,12 @@ async fn payee_offline_behind_a_gateway() {
 
     // Paying again gets the same preimage without new HTLCs.
     assert_eq!(
-        setup.payer.pay(&invoice, &network, &[]).await.unwrap(),
+        setup
+            .payer
+            .pay(&invoice, &network, &[], &Default::default())
+            .await
+            .and_then(|report| report.into_result())
+            .unwrap(),
         preimage
     );
     setup.locks(invoice.body.payment_hash, 2);
@@ -662,7 +672,12 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
         Response::GatewayInvoice(Err(_))
     ));
 
-    let preimage = setup.payer.pay(&invoice, &network, &[]).await.unwrap();
+    let preimage = setup
+        .payer
+        .pay(&invoice, &network, &[], &Default::default())
+        .await
+        .and_then(|report| report.into_result())
+        .unwrap();
     assert!(invoice.body.payment_hash.matches_preimage(&preimage));
     let (to_gateway, to_payee) = setup.locks(invoice.body.payment_hash, 3);
     assert_eq!(to_gateway.state, LockState::Claimed(preimage));
@@ -766,7 +781,12 @@ async fn networks_and_terms_change_while_running() {
         .invoice(&setup.endpoints, 50_000, timeout)
         .await
         .unwrap();
-    setup.payer.pay(&invoice, &network, &[]).await.unwrap();
+    setup
+        .payer
+        .pay(&invoice, &network, &[], &Default::default())
+        .await
+        .and_then(|report| report.into_result())
+        .unwrap();
     assert_eq!(setup.gateway.in_flight(&network), 1);
     assert!(!networks.sync(&none, None, &|| {}).await);
     assert_eq!(setup.gateway.network_ids(), [network.clone()]);

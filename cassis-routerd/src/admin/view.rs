@@ -14,7 +14,8 @@ use cassis_admin::wallets::{self, Funds};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
 use cassis_networks::Can;
-use cassis_routerd::db::{FailReason, Hop, HopState};
+use cassis_routerd::db::{Hop, HopState};
+use cassis_wallet::stored::StoredFailReason;
 use hypereffect::vtree::{badge, card, checkbox, column, list, row, select, tab, text, Node};
 use hypereffect::{cel, json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,9 +64,9 @@ impl Hops {
 }
 
 /// How a hop that failed for `reason` is counted.
-pub fn fail_kind(reason: FailReason) -> &'static str {
+pub fn fail_kind(reason: &StoredFailReason) -> &'static str {
     match reason {
-        FailReason::PreimageNotReceived => "refunded",
+        StoredFailReason::PreimageNotReceived => "refunded",
         _ => "failed",
     }
 }
@@ -183,7 +184,7 @@ fn overview(ctx: &Context) -> Node {
         ),
         fact("identity/iroh", "Iroh id (cassis-hop)", &ctx.iroh_peer_id),
     ]);
-    let state_name = |state: HopState| match state {
+    let state_name = |state: &HopState| match state {
         HopState::Verifying => "verifying",
         HopState::Funding => "funding",
         HopState::Forwarded => "forwarded",
@@ -195,7 +196,7 @@ fn overview(ctx: &Context) -> Node {
             .hops
             .in_flight
             .iter()
-            .filter(|hop| state_name(hop.state) == name)
+            .filter(|hop| state_name(&hop.state) == name)
             .count();
         (name, count)
     });
@@ -230,7 +231,7 @@ fn overview(ctx: &Context) -> Node {
             hop.incoming_network,
             hop.outgoing_network,
             hop.outgoing_amount_msat,
-            state_name(hop.state)
+            state_name(&hop.state)
         ))
     });
     let hops = card("hops")

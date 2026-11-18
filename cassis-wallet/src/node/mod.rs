@@ -38,6 +38,7 @@ pub use offline::{
     RedeemReport,
 };
 pub use payee::create_invoice;
+pub use payer::{FailedHop, HopError, PayFailure, PayReport};
 pub use settle::{settle_outgoing, Outcome};
 pub use verify::{verify_incoming, Unverified};
 

@@ -427,7 +427,10 @@ impl Flow {
             .find(|network| ours.contains(network))
             .ok_or("the refund invoice is on none of this node's networks")?;
         info!("paying refund for order {} on {from}", self.id);
-        self.node.pay(&invoice, &from, &[]).await?;
+        self.node
+            .pay(&invoice, &from, &[], &Default::default())
+            .await?
+            .into_result()?;
         let order = self.update(|order| order.refunded = true);
         self.redraw(&order).await
     }

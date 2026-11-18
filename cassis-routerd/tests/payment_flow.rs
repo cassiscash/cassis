@@ -299,8 +299,14 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .await
         .unwrap();
     let preimage = payer
-        .pay(&invoice, &NetworkId(a.into()), &[RELAY.into()])
+        .pay(
+            &invoice,
+            &NetworkId(a.into()),
+            &[RELAY.into()],
+            &Default::default(),
+        )
         .await
+        .and_then(|report| report.into_result())
         .unwrap();
     assert!(invoice.body.payment_hash.matches_preimage(&preimage));
     // The SETTLE fanout claimed the router's incoming HTLC: the hop is
@@ -332,8 +338,14 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .unwrap();
     tampered.body.amount_msat = 40_000;
     let error = payer
-        .pay(&tampered, &NetworkId(a.into()), &[RELAY.into()])
+        .pay(
+            &tampered,
+            &NetworkId(a.into()),
+            &[RELAY.into()],
+            &Default::default(),
+        )
         .await
+        .and_then(|report| report.into_result())
         .unwrap_err();
     assert!(error.contains("invalid invoice signature"), "{error}");
     assert!(!payer
@@ -353,8 +365,14 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     }
     misdirected.sign_as_payee(&router_keys.iroh).unwrap();
     let error = payer
-        .pay(&misdirected, &NetworkId(a.into()), &[RELAY.into()])
+        .pay(
+            &misdirected,
+            &NetworkId(a.into()),
+            &[RELAY.into()],
+            &Default::default(),
+        )
         .await
+        .and_then(|report| report.into_result())
         .unwrap_err();
     assert!(error.contains("payee refused: unknown invoice"), "{error}");
     assert!(!payer
@@ -380,8 +398,14 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
     };
     unreachable.sign_as_payee(&payee_keys.iroh).unwrap();
     let error = payer
-        .pay(&unreachable, &NetworkId(a.into()), &[RELAY.into()])
+        .pay(
+            &unreachable,
+            &NetworkId(a.into()),
+            &[RELAY.into()],
+            &Default::default(),
+        )
         .await
+        .and_then(|report| report.into_result())
         .unwrap_err();
     assert!(error.contains("payee did not claim"), "{error}");
     assert!(payer

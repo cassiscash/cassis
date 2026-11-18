@@ -7,7 +7,7 @@ use cassis_core::network::{Htlc, HtlcDescriptor, InvoiceTarget};
 use cassis_core::offline::{
     AuthorizationKind, GatewayDestination, ReceiveAuthorization, Signature,
 };
-use cassis_core::protocol::{InvoiceNetwork, Metadata};
+use cassis_core::protocol::{FailReason, InvoiceNetwork, Metadata};
 use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
 use iroh_base::PublicKey;
 
@@ -622,5 +622,61 @@ mod tests {
             ReceiveAuthorization::try_from(&stored).unwrap(),
             authorization
         );
+    }
+}
+
+/// A [`FailReason`]. Variants keep their position: `FundingFailed` is
+/// what hops journaled before funding failures were told apart.
+#[orangedb::embed]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredFailReason {
+    NetworkUnavailable,
+    IncomingRejected,
+    ExpiredWhileVerifying,
+    FundingFailed,
+    InterruptedWhileFunding,
+    PreimageNotReceived,
+    ClaimFailed,
+    InvalidOutgoingTarget,
+    JournalingFailed,
+    OutgoingFundingRefused(String),
+}
+
+impl From<&FailReason> for StoredFailReason {
+    fn from(reason: &FailReason) -> Self {
+        match reason {
+            FailReason::NetworkUnavailable => Self::NetworkUnavailable,
+            FailReason::IncomingRejected => Self::IncomingRejected,
+            FailReason::ExpiredWhileVerifying => Self::ExpiredWhileVerifying,
+            FailReason::InvalidOutgoingTarget => Self::InvalidOutgoingTarget,
+            FailReason::JournalingFailed => Self::JournalingFailed,
+            FailReason::OutgoingFundingRefused(error) => {
+                Self::OutgoingFundingRefused(error.clone())
+            }
+            FailReason::InterruptedWhileFunding => Self::InterruptedWhileFunding,
+            FailReason::PreimageNotReceived => Self::PreimageNotReceived,
+            FailReason::ClaimFailed => Self::ClaimFailed,
+        }
+    }
+}
+
+impl From<&StoredFailReason> for FailReason {
+    fn from(reason: &StoredFailReason) -> Self {
+        match reason {
+            StoredFailReason::NetworkUnavailable => Self::NetworkUnavailable,
+            StoredFailReason::IncomingRejected => Self::IncomingRejected,
+            StoredFailReason::ExpiredWhileVerifying => Self::ExpiredWhileVerifying,
+            StoredFailReason::FundingFailed => {
+                Self::OutgoingFundingRefused("cause not journaled".into())
+            }
+            StoredFailReason::InterruptedWhileFunding => Self::InterruptedWhileFunding,
+            StoredFailReason::PreimageNotReceived => Self::PreimageNotReceived,
+            StoredFailReason::ClaimFailed => Self::ClaimFailed,
+            StoredFailReason::InvalidOutgoingTarget => Self::InvalidOutgoingTarget,
+            StoredFailReason::JournalingFailed => Self::JournalingFailed,
+            StoredFailReason::OutgoingFundingRefused(error) => {
+                Self::OutgoingFundingRefused(error.clone())
+            }
+        }
     }
 }

@@ -7,13 +7,14 @@
 //! the preimage shows up downstream, refund the outgoing one once it
 //! expires.
 
-use crate::db::{Db, FailReason, Hop, HopId, HopState};
+use crate::db::{Db, Hop, HopId, HopState};
 use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId};
-use cassis_core::protocol::{Discard, Execute, Prepare, Request, Response, Settle};
+use cassis_core::protocol::{Discard, Execute, FailReason, Prepare, Request, Response, Settle};
 use cassis_core::routing::{self, RouteAnnouncement};
 use cassis_core::transport::Handler;
 use cassis_core::{unix_now, Bytes32, OperationId};
 use cassis_wallet::node::{settle_outgoing, verify_incoming, Outcome, Unverified, INLINE_WAIT};
+use cassis_wallet::stored::StoredFailReason;
 use cassis_wallet::Node;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -618,7 +619,9 @@ impl Router {
             Ok(target) => target,
             Err(error) => {
                 error!("hop {}: {error}", hop.operation_id.0);
-                return self.fail(&hop, FailReason::FundingFailed, true).await;
+                return self
+                    .fail(&hop, FailReason::InvalidOutgoingTarget, true)
+                    .await;
             }
         };
         let sent = |descriptor| Htlc {
@@ -640,7 +643,7 @@ impl Router {
         hop.state = HopState::Funding;
         if let Err(error) = self.db().hops().update(&hop) {
             warn!("EXECUTE {hash} failed: journaling: {error}");
-            return self.fail(&hop, FailReason::FundingFailed, true).await;
+            return self.fail(&hop, FailReason::JournalingFailed, true).await;
         }
         let funded = outgoing
             .create_outgoing_htlc(
@@ -669,7 +672,12 @@ impl Router {
             }
             Err(error) => {
                 warn!("EXECUTE {hash}: cannot fund on {network}: {error}");
-                self.fail(&hop, FailReason::FundingFailed, false).await;
+                self.fail(
+                    &hop,
+                    FailReason::OutgoingFundingRefused(error.to_string()),
+                    false,
+                )
+                .await;
             }
         }
     }
@@ -683,7 +691,12 @@ impl Router {
                     .await;
             }
         }
-        self.end(hop, HopState::Failed { reason });
+        self.end(
+            hop,
+            HopState::Failed {
+                reason: (&reason).into(),
+            },
+        );
     }
 
     /// Journal `hop` as over, in `state`.
@@ -818,7 +831,7 @@ impl Router {
                     self.end(
                         &hop,
                         HopState::Failed {
-                            reason: FailReason::InterruptedWhileFunding,
+                            reason: StoredFailReason::InterruptedWhileFunding,
                         },
                     );
                 }
@@ -941,7 +954,7 @@ impl Router {
 
 /// What EXECUTE answers about `hop`.
 fn report(hop: &Hop) -> Response {
-    match hop.state {
+    match &hop.state {
         HopState::Verifying | HopState::Funding => Response::Pending,
         HopState::Forwarded | HopState::Settled => match &hop.outgoing {
             Some(outgoing) => Htlc::try_from(outgoing)
@@ -949,7 +962,7 @@ fn report(hop: &Hop) -> Response {
                 .unwrap_or_else(Response::Error),
             None => Response::Error("the forwarded HTLC is missing".into()),
         },
-        HopState::Failed { reason } => Response::Error(reason.describe().into()),
+        HopState::Failed { reason } => Response::HopFailed(FailReason::from(reason)),
     }
 }
 
