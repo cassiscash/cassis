@@ -3,13 +3,14 @@
 //! these change only with a migration. Shared by the schemas of the
 //! wallet, the router and the gateway.
 
-use cassis_core::network::{Htlc, HtlcDescriptor, InvoiceTarget};
+use cassis_core::network::{Htlc, HtlcDescriptor, InvoiceTarget, LightningTarget};
 use cassis_core::offline::{
     AuthorizationKind, GatewayDestination, ReceiveAuthorization, Signature,
 };
 use cassis_core::protocol::{FailReason, InvoiceNetwork, Metadata};
 use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
 use iroh_base::PublicKey;
+use std::convert::Infallible;
 
 /// A compressed secp256k1 public key: its parity byte and X coordinate.
 /// Stored as exactly 33 bytes, since serde and orangedb know arrays only
@@ -107,26 +108,11 @@ pub struct StoredInvoiceNetwork {
     pub incoming_delta_secs: Option<u64>,
 }
 
-/// An [`InvoiceTarget`].
+/// An [`InvoiceTarget`]: `L` is what a Lightning target carries, as
+/// stored (see [`StoredLightning`]).
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StoredInvoiceTarget {
-    Key(StoredGatewayDestination),
-    Lightning { network: String, invoice: String },
-}
-
-/// An [`AuthorizationKind`].
-#[orangedb::embed]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoredAuthorizationKind {
-    Single,
-    Standing,
-}
-
-/// A [`GatewayDestination`].
-#[orangedb::embed]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StoredGatewayDestination {
+pub enum StoredInvoiceTarget<L = String> {
     Cashu {
         network: String,
         target: [u8; 32],
@@ -151,6 +137,60 @@ pub enum StoredGatewayDestination {
         network: String,
         target: StoredPubKey,
     },
+    Lightning {
+        network: String,
+        invoice: L,
+    },
+}
+
+/// A [`GatewayDestination`]: an invoice target without Lightning.
+pub type StoredGatewayDestination = StoredInvoiceTarget<StoredNever>;
+
+/// Stored where nothing is: what [`std::convert::Infallible`] is
+/// stored as, which orangedb has no fingerprint for.
+#[orangedb::embed]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredNever {}
+
+/// What a core [`InvoiceTarget`] carries on Lightning, and what stores it.
+pub trait StoredLightning: LightningTarget {
+    type Stored;
+
+    fn store(&self) -> Self::Stored;
+
+    fn load(stored: &Self::Stored) -> Self;
+}
+
+impl StoredLightning for String {
+    type Stored = String;
+
+    fn store(&self) -> String {
+        self.clone()
+    }
+
+    fn load(stored: &String) -> Self {
+        stored.clone()
+    }
+}
+
+impl StoredLightning for Infallible {
+    type Stored = StoredNever;
+
+    fn store(&self) -> StoredNever {
+        match *self {}
+    }
+
+    fn load(stored: &StoredNever) -> Self {
+        match *stored {}
+    }
+}
+
+/// An [`AuthorizationKind`].
+#[orangedb::embed]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredAuthorizationKind {
+    Single,
+    Standing,
 }
 
 /// A [`ReceiveAuthorization`].
@@ -186,104 +226,89 @@ pub fn endpoint_key(bytes: &[u8; 32]) -> Result<PublicKey, String> {
     PublicKey::from_bytes(bytes).map_err(|_| corrupt("endpoint key"))
 }
 
-impl From<&InvoiceTarget> for StoredInvoiceTarget {
-    fn from(target: &InvoiceTarget) -> Self {
-        match target.clone().destination() {
-            Ok(destination) => Self::Key((&destination).into()),
-            Err((network, invoice)) => Self::Lightning {
-                network: network.0,
-                invoice,
+impl<L: StoredLightning> From<&InvoiceTarget<L>> for StoredInvoiceTarget<L::Stored> {
+    fn from(target: &InvoiceTarget<L>) -> Self {
+        match target {
+            InvoiceTarget::Cashu { network, target } => Self::Cashu {
+                network: network.0.clone(),
+                target: target.0,
+            },
+            InvoiceTarget::Fedimint { network, target } => Self::Fedimint {
+                network: network.0.clone(),
+                target: target.0,
+            },
+            InvoiceTarget::Arkade { network, target } => Self::Arkade {
+                network: network.0.clone(),
+                target: target.0,
+            },
+            InvoiceTarget::Bitcoin { network, target } => Self::Bitcoin {
+                network: network.0.clone(),
+                target: target.0,
+            },
+            InvoiceTarget::Liquid { network, target } => Self::Liquid {
+                network: network.0.clone(),
+                target: target.into(),
+            },
+            InvoiceTarget::Rootstock { network, target } => Self::Rootstock {
+                network: network.0.clone(),
+                target: target.into(),
+            },
+            InvoiceTarget::Lightning { network, invoice } => Self::Lightning {
+                network: network.0.clone(),
+                invoice: invoice.store(),
             },
         }
     }
 }
 
-impl TryFrom<&StoredInvoiceTarget> for InvoiceTarget {
+impl<L: StoredLightning> TryFrom<&StoredInvoiceTarget<L::Stored>> for InvoiceTarget<L> {
     type Error = String;
 
-    fn try_from(target: &StoredInvoiceTarget) -> Result<Self, String> {
+    fn try_from(target: &StoredInvoiceTarget<L::Stored>) -> Result<Self, String> {
         Ok(match target {
-            StoredInvoiceTarget::Key(destination) => {
-                GatewayDestination::try_from(destination)?.into()
-            }
-            StoredInvoiceTarget::Lightning { network, invoice } => InvoiceTarget::Lightning {
+            StoredInvoiceTarget::Cashu { network, target } => Self::Cashu {
                 network: NetworkId(network.clone()),
-                invoice: invoice.clone(),
+                target: x_only(*target)?,
+            },
+            StoredInvoiceTarget::Fedimint { network, target } => Self::Fedimint {
+                network: NetworkId(network.clone()),
+                target: x_only(*target)?,
+            },
+            StoredInvoiceTarget::Arkade { network, target } => Self::Arkade {
+                network: NetworkId(network.clone()),
+                target: x_only(*target)?,
+            },
+            StoredInvoiceTarget::Bitcoin { network, target } => Self::Bitcoin {
+                network: NetworkId(network.clone()),
+                target: x_only(*target)?,
+            },
+            StoredInvoiceTarget::Liquid { network, target } => Self::Liquid {
+                network: NetworkId(network.clone()),
+                target: target.try_into()?,
+            },
+            StoredInvoiceTarget::Rootstock { network, target } => Self::Rootstock {
+                network: NetworkId(network.clone()),
+                target: target.try_into()?,
+            },
+            StoredInvoiceTarget::Lightning { network, invoice } => Self::Lightning {
+                network: NetworkId(network.clone()),
+                invoice: L::load(invoice),
             },
         })
     }
 }
 
-impl StoredInvoiceTarget {
+impl<L> StoredInvoiceTarget<L> {
     pub fn network(&self) -> &str {
         match self {
-            Self::Key(destination) => destination.network(),
-            Self::Lightning { network, .. } => network,
+            Self::Cashu { network, .. }
+            | Self::Fedimint { network, .. }
+            | Self::Arkade { network, .. }
+            | Self::Bitcoin { network, .. }
+            | Self::Liquid { network, .. }
+            | Self::Rootstock { network, .. }
+            | Self::Lightning { network, .. } => network,
         }
-    }
-}
-
-impl From<&GatewayDestination> for StoredGatewayDestination {
-    fn from(destination: &GatewayDestination) -> Self {
-        match destination.clone() {
-            GatewayDestination::Cashu { network, target } => Self::Cashu {
-                network: network.0,
-                target: target.0,
-            },
-            GatewayDestination::Fedimint { network, target } => Self::Fedimint {
-                network: network.0,
-                target: target.0,
-            },
-            GatewayDestination::Arkade { network, target } => Self::Arkade {
-                network: network.0,
-                target: target.0,
-            },
-            GatewayDestination::Bitcoin { network, target } => Self::Bitcoin {
-                network: network.0,
-                target: target.0,
-            },
-            GatewayDestination::Liquid { network, target } => Self::Liquid {
-                network: network.0,
-                target: (&target).into(),
-            },
-            GatewayDestination::Rootstock { network, target } => Self::Rootstock {
-                network: network.0,
-                target: (&target).into(),
-            },
-        }
-    }
-}
-
-impl TryFrom<&StoredGatewayDestination> for GatewayDestination {
-    type Error = String;
-
-    fn try_from(destination: &StoredGatewayDestination) -> Result<Self, String> {
-        Ok(match destination.clone() {
-            StoredGatewayDestination::Cashu { network, target } => Self::Cashu {
-                network: NetworkId(network),
-                target: x_only(target)?,
-            },
-            StoredGatewayDestination::Fedimint { network, target } => Self::Fedimint {
-                network: NetworkId(network),
-                target: x_only(target)?,
-            },
-            StoredGatewayDestination::Arkade { network, target } => Self::Arkade {
-                network: NetworkId(network),
-                target: x_only(target)?,
-            },
-            StoredGatewayDestination::Bitcoin { network, target } => Self::Bitcoin {
-                network: NetworkId(network),
-                target: x_only(target)?,
-            },
-            StoredGatewayDestination::Liquid { network, target } => Self::Liquid {
-                network: NetworkId(network),
-                target: (&target).try_into()?,
-            },
-            StoredGatewayDestination::Rootstock { network, target } => Self::Rootstock {
-                network: NetworkId(network),
-                target: (&target).try_into()?,
-            },
-        })
     }
 }
 
@@ -480,19 +505,6 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
             target: (&entry.target).try_into()?,
             incoming_delta_secs: entry.incoming_delta_secs,
         })
-    }
-}
-
-impl StoredGatewayDestination {
-    pub fn network(&self) -> &str {
-        match self {
-            Self::Cashu { network, .. }
-            | Self::Fedimint { network, .. }
-            | Self::Arkade { network, .. }
-            | Self::Bitcoin { network, .. }
-            | Self::Liquid { network, .. }
-            | Self::Rootstock { network, .. } => network,
-        }
     }
 }
 
