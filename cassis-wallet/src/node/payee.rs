@@ -352,7 +352,6 @@ pub(super) fn settle_invoice(
             network: network.0.clone(),
             preimage: preimage.0,
             at: now,
-            invoice: Some(record.payment_hash.clone()),
         })
     })
     .map_err(db_error)

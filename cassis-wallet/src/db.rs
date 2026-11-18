@@ -2,8 +2,7 @@
 //!
 //! * [`Invoice`]s it issued, direct or delegated to a gateway and a
 //!   preimage server, until settled or expired.
-//! * [`Transaction`]s: money that moved in or out, by payment hash,
-//!   with or without an invoice of its own.
+//! * [`Transaction`]s: money that moved in or out, by payment hash.
 //! * [`PendingPayment`]s: HTLCs it funded that are neither claimed nor
 //!   refunded yet.
 //! * [`FullDelegation`]s: the gateways it lets issue invoices in its
@@ -119,8 +118,6 @@ pub mod db_schema {
         pub preimage: [u8; 32],
         #[index]
         pub at: u64,
-        #[references(Invoice, on_delete = set_null)]
-        pub invoice: Option<InvoiceHash>,
     }
 
     /// An HTLC this wallet funded to pay an invoice, until it is claimed

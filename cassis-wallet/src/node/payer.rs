@@ -3,6 +3,7 @@
 use super::{db_error, Node};
 use crate::db::{Direction, PendingPayment, PendingPaymentHash, Transaction, TransactionHash};
 use cassis_core::network::{Htlc, NetworkId};
+use cassis_core::offline::endpoint_public_key;
 use cassis_core::protocol::{
     Commit, Discard, Execute, Invoice, Prepare, PreparePayee, Request, Response, Settle,
 };
@@ -41,6 +42,13 @@ impl Node {
             .busy(format!("pay:{hash}"))
             .ok_or("this invoice is already being paid")?;
         invoice.verify()?;
+        // The payee and payer journals both key on the payment hash, so
+        // a wallet cannot be both ends of one payment: claiming would
+        // record the incoming transaction only after the outgoing one was
+        // already journaled, or the other way around.
+        if invoice.receiver.payee() == &endpoint_public_key(&self.keys().iroh) {
+            return Err("this wallet issued the invoice and cannot pay itself".into());
+        }
         if invoice.body.amount_msat == 0 {
             return Err("invoice amount is zero".into());
         }
@@ -282,7 +290,6 @@ impl Node {
                     network: network.0.clone(),
                     preimage: preimage.0,
                     at: unix_now(),
-                    invoice: None,
                 })
             })
             .map_err(db_error)

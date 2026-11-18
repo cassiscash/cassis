@@ -400,7 +400,6 @@ pub async fn redeem_offline_payments(
                             network: network.0.clone(),
                             preimage: preimage.0,
                             at: unix_now(),
-                            invoice: None,
                         })
                         .map_err(db_error)?,
                 }
