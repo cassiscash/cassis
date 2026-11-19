@@ -130,14 +130,6 @@ struct Inner {
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
-/// What a gateway calls the preimage server with to have a preimage
-/// released: the invoice's terms say under which authorization and
-/// where.
-struct Release {
-    preimage_metadata: Metadata,
-    terms: GatewayTerms,
-}
-
 /// A COMMIT checked against the invoice its metadata carries.
 struct Forward {
     preimage_metadata: Metadata,
@@ -755,10 +747,10 @@ impl Gateway {
                 return Ok(());
             };
             lock(&self.0.refused).remove(&hash);
-            let release = htlc.preimage.is_none().then(|| Release {
-                preimage_metadata: carried.preimage_metadata,
-                terms,
-            });
+            let release = htlc
+                .preimage
+                .is_none()
+                .then_some((carried.preimage_metadata, terms));
             let gateway = self.clone();
             self.spawn(async move { gateway.finish(htlc, release, busy).await });
             return Ok(());
@@ -815,11 +807,8 @@ impl Gateway {
         let hash = forward.incoming.payment_hash;
         match self.verify_and_fund(&forward).await {
             Ok(htlc) => {
-                let release = Release {
-                    preimage_metadata: forward.preimage_metadata,
-                    terms: forward.terms,
-                };
-                self.finish(htlc, Some(release), busy).await
+                self.finish(htlc, Some((forward.preimage_metadata, forward.terms)), busy)
+                    .await
             }
             Err(reason) => {
                 warn!("forward {} failed: {reason}", hash.short());
@@ -908,16 +897,21 @@ impl Gateway {
 
     /// Have the preimage of a funded `htlc` released, unless known, and
     /// claim the payer's HTLC with it.
-    async fn finish(&self, mut htlc: PayeeHtlc, release: Option<Release>, _busy: BusyGuard) {
+    async fn finish(
+        &self,
+        mut htlc: PayeeHtlc,
+        release: Option<(Metadata, GatewayTerms)>,
+        _busy: BusyGuard,
+    ) {
         if htlc.preimage.is_none() {
-            let Some(release) = release else {
+            let Some((preimage_metadata, terms)) = release else {
                 warn!(
                     "forward {} is funded but has no preimage metadata to release with",
                     short(&htlc)
                 );
                 return;
             };
-            match self.release(&mut htlc, &release).await {
+            match self.release(&mut htlc, &preimage_metadata, &terms).await {
                 Ok(preimage) => {
                     info!("COMMIT {}: preimage released", short(&htlc));
                     htlc.preimage = Some(preimage.0);
@@ -939,17 +933,22 @@ impl Gateway {
 
     /// Present the HTLC to the payee to the preimage server, with what
     /// the invoice carried from it, until it releases the preimage.
-    async fn release(&self, htlc: &mut PayeeHtlc, release: &Release) -> Result<Bytes32, String> {
+    async fn release(
+        &self,
+        htlc: &mut PayeeHtlc,
+        preimage_metadata: &Metadata,
+        terms: &GatewayTerms,
+    ) -> Result<Bytes32, String> {
         let hash = Bytes32(htlc.payment_hash.0);
         let funded = htlc.htlc.as_ref().ok_or("nothing was paid to the payee")?;
         let request = Request::PreimageRelease(PreimageRelease {
-            preimage_metadata: release.preimage_metadata.clone(),
-            metadata: release.terms.payee_metadata.clone(),
+            preimage_metadata: preimage_metadata.clone(),
+            metadata: terms.payee_metadata.clone(),
             network: htlc.network.clone(),
             htlc: Htlc::try_from(funded)?,
-            authorization: release.terms.authorization.clone(),
+            authorization: terms.authorization.clone(),
         });
-        let preimage_server = release.terms.preimage_server();
+        let preimage_server = terms.preimage_server();
         let mut waiting = false;
         loop {
             // Learned meanwhile, from the payee's claim.
