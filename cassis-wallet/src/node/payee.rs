@@ -7,7 +7,7 @@ use crate::db::{
 };
 use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
-use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId};
+use cassis_core::network::{Htlc, HtlcReceiver, InvoiceTarget, NetworkId};
 use cassis_core::protocol::{
     Commit, Invoice, InvoiceBody, InvoiceNetwork, Metadata, PreparePayee, Response,
 };
@@ -34,7 +34,7 @@ pub async fn create_invoice(
     db: &Db,
     keys: &NodeKeys,
     iroh_relay: Option<String>,
-    networks: &[Arc<dyn Network>],
+    networks: &[Arc<dyn HtlcReceiver>],
     amount_msat: u64,
     expires_at: u64,
     description: Option<String>,
@@ -54,9 +54,9 @@ pub async fn create_invoice(
     let mut targets = Vec::with_capacity(networks.len());
     for network in networks {
         let target = network
-            .receive_target(payment_hash, amount_msat, expires_at)
+            .incoming_target(payment_hash, amount_msat, expires_at)
             .await
-            .map_err(|e| format!("cannot receive on {}: {e}", network.id()))?;
+            .map_err(|e| format!("cannot receive on {}: {e}", network.network_id()))?;
         targets.push(InvoiceNetwork {
             target,
             incoming_delta_secs: Some(network.incoming_delta_secs()),
@@ -105,7 +105,7 @@ impl Node {
     ) -> Result<Invoice, String> {
         let networks = networks
             .iter()
-            .map(|id| self.network(id))
+            .map(|id| self.receiver(id))
             .collect::<Result<Vec<_>, _>>()?;
         let relay = self.0.transport.home_relay().await;
         create_invoice(
@@ -155,7 +155,7 @@ impl Node {
         record: &StoredInvoice,
         network: &NetworkId,
         expiry: u64,
-    ) -> Result<(InvoiceTarget, Arc<dyn Network>, u64), String> {
+    ) -> Result<(InvoiceTarget, Arc<dyn HtlcReceiver>, u64), String> {
         if record.state == InvoiceState::Expired || record.expires_at <= unix_now() {
             return Err("invoice expired".into());
         }
@@ -165,7 +165,7 @@ impl Node {
             .find(|entry| entry.target.network() == network.0)
             .ok_or_else(|| format!("invoice is not payable on {network}"))?;
         let target = InvoiceNetwork::try_from(entry)?.target;
-        let network = self.network(network)?;
+        let network = self.receiver(network)?;
         // The invoice carries the minimum margin this payee needs; any
         // later expiry is fine. The claim itself must still start before
         // the HTLC expires.
@@ -276,7 +276,7 @@ impl Node {
             htlc.amount_msat, key, commit.network
         );
         network
-            .claim_incoming_htlc(&htlc, preimage)
+            .claim_incoming(&htlc, preimage)
             .await
             .map_err(|e| format!("claim failed: {e}"))?;
         self.settle_invoice(&record, &commit.network, htlc.amount_msat, preimage)?;
@@ -317,10 +317,10 @@ impl Node {
             if Some(&id) == claimed_on {
                 continue;
             }
-            let Ok(network) = self.network(&id) else {
+            let Ok(network) = self.receiver(&id) else {
                 continue;
             };
-            if let Err(error) = network.cancel_receive(hash).await {
+            if let Err(error) = network.cancel_incoming(hash).await {
                 warn!("releasing invoice target on {id}: {error}");
             }
         }

@@ -27,8 +27,8 @@ pub mod signing;
 pub mod transport;
 
 pub use network::{
-    network_span, Htlc, HtlcDescriptor, InvoiceTarget, LightningTarget, Network, NetworkError,
-    NetworkId, OutgoingState,
+    network_span, Htlc, HtlcDescriptor, HtlcFunder, HtlcReceiver, HtlcRequest, InvoiceTarget,
+    LightningTarget, Network, NetworkError, NetworkId, OutgoingHtlcs, OutgoingState,
 };
 pub use primitives::{
     sats_for_msat, unix_now, Bytes32, OperationId, PubKey, XOnlyPubKey, MSAT_PER_SAT,

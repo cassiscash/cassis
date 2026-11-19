@@ -627,6 +627,157 @@ impl NetworkError {
     }
 }
 
+/// What a payer has to lock to fund the first HTLC of a payment, worked
+/// out by the node: the network is [`InvoiceTarget::network`] of `target`.
+#[derive(Clone, Debug)]
+pub struct HtlcRequest {
+    pub payment_hash: Bytes32,
+    /// What the receiver must be able to claim. A network that charges
+    /// the claimer a fee has the funder lock more to cover it.
+    pub amount_msat: u64,
+    /// The HTLC cannot be refunded before this (unix seconds).
+    pub expiry: u64,
+    pub target: InvoiceTarget,
+}
+
+/// The part of a network that watches and refunds the HTLCs a node
+/// funded. Every [`Network`] is one; so is an [`HtlcFunder`].
+#[async_trait]
+pub trait OutgoingHtlcs: Send + Sync {
+    /// The network the HTLCs are on, for logs.
+    fn network_id(&self) -> NetworkId;
+
+    /// One-shot look at an outgoing HTLC, see [`Network::check_outgoing_htlc`].
+    async fn check_outgoing(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError>;
+
+    /// Take an expired outgoing HTLC back, see [`Network::refund_outgoing_htlc`].
+    async fn refund_outgoing(&self, htlc: &Htlc) -> Result<(), NetworkError>;
+}
+
+#[async_trait]
+impl<N: Network + ?Sized> OutgoingHtlcs for N {
+    fn network_id(&self) -> NetworkId {
+        self.id()
+    }
+
+    async fn check_outgoing(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
+        self.check_outgoing_htlc(htlc).await
+    }
+
+    async fn refund_outgoing(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        self.refund_outgoing_htlc(htlc).await
+    }
+}
+
+/// Funds a node's outgoing HTLCs from a wallet the node does not own,
+/// in place of the network's own (see `Node::set_funder`). The node
+/// prepares the payment and hands over each [`HtlcRequest`]; the funder
+/// locks the money, with a refund path only it can take, and returns
+/// the descriptor. The node also asks it for the HTLC's state and, once
+/// expired, to refund it.
+#[async_trait]
+pub trait HtlcFunder: OutgoingHtlcs {
+    /// Lock the HTLC. Returns once the receiver can verify it, like
+    /// [`Network::create_outgoing_htlc`].
+    async fn fund(&self, request: &HtlcRequest) -> Result<HtlcDescriptor, NetworkError>;
+}
+
+/// What a node that is paid needs of the wallet behind a network: where
+/// payers lock HTLCs, and checking and claiming them. Every [`Network`]
+/// is one; so is a wallet the node does not own (see `Node::set_receiver`),
+/// which claims with its own keys and funds. Each method is the one of
+/// [`Network`] it is named after, with the same guarantees from the node
+/// and the same checks from the implementer.
+#[async_trait]
+pub trait HtlcReceiver: Send + Sync {
+    fn network_id(&self) -> NetworkId;
+
+    /// See [`Network::incoming_delta_secs`].
+    fn incoming_delta_secs(&self) -> u64;
+
+    /// See [`Network::receive_target`].
+    async fn incoming_target(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+    ) -> Result<InvoiceTarget, NetworkError>;
+
+    /// See [`Network::cancel_receive`].
+    async fn cancel_incoming(&self, payment_hash: Bytes32) -> Result<(), NetworkError>;
+
+    /// See [`Network::verify_incoming_htlc`].
+    async fn verify_incoming(&self, htlc: &Htlc) -> Result<(), NetworkError>;
+
+    /// See [`Network::claim_incoming_htlc`].
+    async fn claim_incoming(&self, htlc: &Htlc, preimage: Bytes32) -> Result<(), NetworkError>;
+}
+
+#[async_trait]
+impl<N: Network + ?Sized> HtlcReceiver for N {
+    fn network_id(&self) -> NetworkId {
+        self.id()
+    }
+
+    fn incoming_delta_secs(&self) -> u64 {
+        Network::incoming_delta_secs(self)
+    }
+
+    async fn incoming_target(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+    ) -> Result<InvoiceTarget, NetworkError> {
+        self.receive_target(payment_hash, amount_msat, expiry).await
+    }
+
+    async fn cancel_incoming(&self, payment_hash: Bytes32) -> Result<(), NetworkError> {
+        self.cancel_receive(payment_hash).await
+    }
+
+    async fn verify_incoming(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        self.verify_incoming_htlc(htlc).await
+    }
+
+    async fn claim_incoming(&self, htlc: &Htlc, preimage: Bytes32) -> Result<(), NetworkError> {
+        self.claim_incoming_htlc(htlc, preimage).await
+    }
+}
+
+/// A shared network, as what receives on it.
+#[async_trait]
+impl HtlcReceiver for std::sync::Arc<dyn Network> {
+    fn network_id(&self) -> NetworkId {
+        self.id()
+    }
+
+    fn incoming_delta_secs(&self) -> u64 {
+        Network::incoming_delta_secs(self.as_ref())
+    }
+
+    async fn incoming_target(
+        &self,
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expiry: u64,
+    ) -> Result<InvoiceTarget, NetworkError> {
+        self.receive_target(payment_hash, amount_msat, expiry).await
+    }
+
+    async fn cancel_incoming(&self, payment_hash: Bytes32) -> Result<(), NetworkError> {
+        self.cancel_receive(payment_hash).await
+    }
+
+    async fn verify_incoming(&self, htlc: &Htlc) -> Result<(), NetworkError> {
+        self.verify_incoming_htlc(htlc).await
+    }
+
+    async fn claim_incoming(&self, htlc: &Htlc, preimage: Bytes32) -> Result<(), NetworkError> {
+        self.claim_incoming_htlc(htlc, preimage).await
+    }
+}
+
 /// The one trait every network implements.
 ///
 /// Callers (the node) guarantee before each call: amounts are

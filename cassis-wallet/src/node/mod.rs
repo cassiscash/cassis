@@ -24,7 +24,7 @@ mod verify;
 
 use crate::db::Db;
 use cassis_core::keys::NodeKeys;
-use cassis_core::network::{Network, NetworkId};
+use cassis_core::network::{HtlcFunder, HtlcReceiver, Network, NetworkId};
 use cassis_core::protocol::{Request, Response};
 use cassis_core::transport::{Handler, Transport};
 use cassis_core::{Bytes32, XOnlyPubKey};
@@ -70,6 +70,12 @@ struct Inner {
     transport: Transport,
     span: Span,
     networks: RwLock<HashMap<NetworkId, Arc<dyn Network>>>,
+    /// Wallets that fund (and refund) the HTLCs paid from a network,
+    /// in place of the network's own.
+    funders: RwLock<HashMap<NetworkId, Arc<dyn HtlcFunder>>>,
+    /// Wallets that receive the HTLCs paid on a network, in place of
+    /// the network's own.
+    receivers: RwLock<HashMap<NetworkId, Arc<dyn HtlcReceiver>>>,
     /// Answers PREPARE, EXECUTE, DISCARD and SETTLE, when routing.
     router: RwLock<Option<Handler>>,
     /// Keys of records some task is currently acting on; others skip
@@ -99,6 +105,8 @@ impl Node {
                     .map(|network| (network.id(), network))
                     .collect(),
             ),
+            funders: Default::default(),
+            receivers: Default::default(),
             router: RwLock::new(None),
             busy: Default::default(),
             commits: Default::default(),
@@ -180,6 +188,55 @@ impl Node {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(network.id(), network);
+    }
+
+    /// Fund the HTLCs this node pays from `network` with `funder`
+    /// instead of the network's own wallet, which is then not needed to
+    /// pay: the node asks `funder` to lock each first HTLC, to report
+    /// on it and to refund it. Set it before paying; payments journaled
+    /// under it are settled through it, also after a restart.
+    pub fn set_funder(&self, network: NetworkId, funder: Arc<dyn HtlcFunder>) {
+        self.0
+            .funders
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(network, funder);
+    }
+
+    /// Receive the HTLCs paid to this node on `network` with `receiver`
+    /// instead of the network's own wallet, which is then not needed to
+    /// be paid: invoices take their targets from it, and it verifies and
+    /// claims what payers lock.
+    pub fn set_receiver(&self, network: NetworkId, receiver: Arc<dyn HtlcReceiver>) {
+        self.0
+            .receivers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(network, receiver);
+    }
+
+    /// What receives on `id`: the receiver set for it, else its network.
+    pub fn receiver(&self, id: &NetworkId) -> Result<Arc<dyn HtlcReceiver>, String> {
+        if let Some(receiver) = self
+            .0
+            .receivers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            return Ok(receiver.clone());
+        }
+        let network = self.network(id)?;
+        Ok(Arc::new(network))
+    }
+
+    pub fn funder(&self, network: &NetworkId) -> Option<Arc<dyn HtlcFunder>> {
+        self.0
+            .funders
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(network)
+            .cloned()
     }
 
     /// Stop using `id`, returning it. Tasks that hold it already keep

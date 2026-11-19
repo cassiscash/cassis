@@ -20,6 +20,7 @@
 //! (NUT-09).
 
 mod htlc;
+pub use htlc::{sign_refund, HtlcTerms};
 mod wallet;
 
 use async_trait::async_trait;
@@ -38,7 +39,7 @@ use cdk::nuts::nut12::ProofDleq;
 use cdk::nuts::nut14::HTLCWitness;
 use cdk::nuts::{CurrencyUnit, KeySetInfo, Keys, RestoreRequest, Token, Witness};
 use cdk::wallet::MintConnector;
-use htlc::{htlc_outputs, sign_refund, HtlcTerms};
+use htlc::htlc_outputs;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -470,33 +471,59 @@ impl CashuAdapter {
         Ok(response.states)
     }
 
-    async fn unspent(&self, proofs: &Proofs) -> Result<bool, NetworkError> {
-        Ok(self
-            .states(proofs)
-            .await?
-            .iter()
-            .all(|state| state.state == State::Unspent))
-    }
-
     /// How the first spent proof of `proofs` was spent, if any is.
     async fn spent_state(&self, proofs: &Proofs) -> Result<Option<Spent>, NetworkError> {
-        for state in self.states(proofs).await? {
-            if state.state != State::Spent {
-                continue;
-            }
-            // A refund's witness carries an empty preimage.
-            let preimage = match state.witness {
-                Some(Witness::HTLCWitness(HTLCWitness { preimage, .. })) => {
-                    Bytes32::from_str(&preimage).ok()
-                }
-                _ => None,
-            };
-            return Ok(Some(match preimage {
-                Some(preimage) => Spent::Claimed(preimage),
-                None => Spent::WithoutPreimage,
-            }));
+        Ok(spent_from(self.states(proofs).await?))
+    }
+}
+
+/// How the first spent proof of `states` was spent, if any is.
+fn spent_from(states: Vec<ProofState>) -> Option<Spent> {
+    for state in states {
+        if state.state != State::Spent {
+            continue;
         }
-        Ok(None)
+        // A refund's witness carries an empty preimage.
+        let preimage = match state.witness {
+            Some(Witness::HTLCWitness(HTLCWitness { preimage, .. })) => {
+                Bytes32::from_str(&preimage).ok()
+            }
+            _ => None,
+        };
+        return Some(match preimage {
+            Some(preimage) => Spent::Claimed(preimage),
+            None => Spent::WithoutPreimage,
+        });
+    }
+    None
+}
+
+/// Where an outgoing HTLC of `proofs` stands, given the mint's NUT-07
+/// `states` of them (one per proof, in order). For a funder that
+/// locks the proofs with its own wallet, see [`cassis_core::HtlcFunder`].
+pub fn outgoing_state(
+    proofs: &[Proof],
+    states: Vec<ProofState>,
+) -> Result<OutgoingState, NetworkError> {
+    match spent_from(states) {
+        None => Ok(OutgoingState::Pending),
+        Some(Spent::Claimed(preimage)) => Ok(OutgoingState::Claimed(preimage)),
+        Some(Spent::WithoutPreimage) => {
+            // Until the locktime only the receiver can spend, with the
+            // preimage: a mint that does not show it (NUT-07 makes the
+            // witness optional) must not pass for a refund.
+            let refundable = proofs
+                .iter()
+                .all(|proof| HtlcTerms::of(proof).is_ok_and(|terms| terms.locktime <= unix_now()));
+            if refundable {
+                Ok(OutgoingState::Refunded)
+            } else {
+                Err(NetworkError::network(
+                    "proofs were spent before their refund opened, and the mint does not \
+                     show the preimage",
+                ))
+            }
+        }
     }
 }
 
@@ -527,59 +554,7 @@ impl Network for CashuAdapter {
     }
 
     async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let (proofs, receiver) = decode_proofs(&htlc.descriptor)?;
-        let claim_key = cashu_key(&receiver)?;
-        // A proof listed twice would count twice and claim once.
-        let mut secrets = HashSet::new();
-        if !proofs.iter().all(|proof| secrets.insert(&proof.secret)) {
-            return Err(NetworkError::invalid("cashu HTLC lists a proof twice"));
-        }
-        for proof in &proofs {
-            let terms = HtlcTerms::of(proof)?;
-            if terms.payment_hash != htlc.payment_hash {
-                return Err(NetworkError::invalid("proof is locked to another hash"));
-            }
-            if terms.receiver.x_only_public_key() != claim_key.x_only_public_key() {
-                return Err(NetworkError::invalid("proof is locked to another key"));
-            }
-            if terms.locktime < htlc.expiry {
-                return Err(NetworkError::invalid(
-                    "proof refund opens before the expiry",
-                ));
-            }
-        }
-        // Only the mint's signature makes a proof worth anything: check
-        // it against the keyset (NUT-12) before asking about its state.
-        let keysets = self.keysets().await?;
-        let mut fee_ppk = 0u64;
-        for proof in &proofs {
-            let Some(keyset) = keysets.iter().find(|keyset| keyset.id == proof.keyset_id) else {
-                return Err(NetworkError::invalid(
-                    "proof is not from an active sat keyset",
-                ));
-            };
-            fee_ppk = fee_ppk.saturating_add(keyset.input_fee_ppk);
-            let keys = self.keys(proof.keyset_id).await?;
-            let key = keys
-                .amount_key(proof.amount)
-                .ok_or_else(|| NetworkError::invalid("proof amount has no mint key"))?;
-            proof
-                .verify_dleq(key)
-                .map_err(|e| NetworkError::invalid(format!("proof signature: {e}")))?;
-        }
-        // The claim pays the mint's fee on every proof: many small
-        // proofs must still leave the HTLC amount.
-        if sum_sats(&proofs).saturating_sub(fee_ppk.div_ceil(1000))
-            < sats_for_msat(htlc.amount_msat)
-        {
-            return Err(NetworkError::invalid(
-                "proofs are worth less than the HTLC after the mint's fee",
-            ));
-        }
-        if !self.unspent(&proofs).await? {
-            return Err(NetworkError::invalid("proofs are already spent or pending"));
-        }
-        Ok(())
+        verify_htlc_proofs(&self.client, htlc).await
     }
 
     async fn claim_incoming_htlc(
@@ -641,26 +616,7 @@ impl Network for CashuAdapter {
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
         let (proofs, _) = decode_proofs(&htlc.descriptor)?;
-        match self.spent_state(&proofs).await? {
-            None => Ok(OutgoingState::Pending),
-            Some(Spent::Claimed(preimage)) => Ok(OutgoingState::Claimed(preimage)),
-            Some(Spent::WithoutPreimage) => {
-                // Until the locktime only the receiver can spend, with
-                // the preimage: a mint that does not show it (NUT-07
-                // makes the witness optional) must not pass for a refund.
-                let refundable = proofs.iter().all(|proof| {
-                    HtlcTerms::of(proof).is_ok_and(|terms| terms.locktime <= unix_now())
-                });
-                if refundable {
-                    Ok(OutgoingState::Refunded)
-                } else {
-                    Err(NetworkError::network(
-                        "proofs were spent before their refund opened, and the mint does not \
-                         show the preimage",
-                    ))
-                }
-            }
-        }
+        outgoing_state(&proofs, self.states(&proofs).await?)
     }
 
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
@@ -692,6 +648,101 @@ impl Network for CashuAdapter {
     async fn maintain(&self) -> Result<(), NetworkError> {
         self.recover_swaps().await
     }
+}
+
+/// Check that `htlc` is a cashu HTLC of real, unspent proofs of `mint`,
+/// locked to the hash, refundable no earlier than its expiry, and worth
+/// its amount after the claim's fee: every check of
+/// [`Network::verify_htlc`], for whoever claims it. Whose key it is
+/// locked to is the caller's to check, with [`decode_proofs`].
+pub async fn verify_htlc_proofs(
+    mint: &(dyn MintConnector + Send + Sync),
+    htlc: &Htlc,
+) -> Result<(), NetworkError> {
+    let (proofs, receiver) = decode_proofs(&htlc.descriptor)?;
+    let claim_key = cashu_key(&receiver)?;
+    // A proof listed twice would count twice and claim once.
+    let mut secrets = HashSet::new();
+    if !proofs.iter().all(|proof| secrets.insert(&proof.secret)) {
+        return Err(NetworkError::invalid("cashu HTLC lists a proof twice"));
+    }
+    for proof in &proofs {
+        let terms = HtlcTerms::of(proof)?;
+        if terms.payment_hash != htlc.payment_hash {
+            return Err(NetworkError::invalid("proof is locked to another hash"));
+        }
+        if terms.receiver.x_only_public_key() != claim_key.x_only_public_key() {
+            return Err(NetworkError::invalid("proof is locked to another key"));
+        }
+        if terms.locktime < htlc.expiry {
+            return Err(NetworkError::invalid(
+                "proof refund opens before the expiry",
+            ));
+        }
+    }
+    // Only the mint's signature makes a proof worth anything: check it
+    // against the keyset (NUT-12) before asking about its state.
+    let keysets: Vec<KeySetInfo> = mint
+        .get_mint_keysets()
+        .await
+        .map_err(network_error)?
+        .keysets
+        .into_iter()
+        .filter(|keyset| keyset.active && keyset.unit == CurrencyUnit::Sat)
+        .collect();
+    let mut keys: HashMap<KeysetId, Keys> = HashMap::new();
+    let mut fee_ppk = 0u64;
+    for proof in &proofs {
+        let Some(keyset) = keysets.iter().find(|keyset| keyset.id == proof.keyset_id) else {
+            return Err(NetworkError::invalid(
+                "proof is not from an active sat keyset",
+            ));
+        };
+        fee_ppk = fee_ppk.saturating_add(keyset.input_fee_ppk);
+        if !keys.contains_key(&proof.keyset_id) {
+            let fetched = mint
+                .get_mint_keyset(proof.keyset_id)
+                .await
+                .map_err(network_error)?
+                .keys;
+            keys.insert(proof.keyset_id, fetched);
+        }
+        let key = keys[&proof.keyset_id]
+            .amount_key(proof.amount)
+            .ok_or_else(|| NetworkError::invalid("proof amount has no mint key"))?;
+        proof
+            .verify_dleq(key)
+            .map_err(|e| NetworkError::invalid(format!("proof signature: {e}")))?;
+    }
+    // The claim pays the mint's fee on every proof: many small proofs
+    // must still leave the HTLC amount.
+    if sum_sats(&proofs).saturating_sub(fee_ppk.div_ceil(1000)) < sats_for_msat(htlc.amount_msat) {
+        return Err(NetworkError::invalid(
+            "proofs are worth less than the HTLC after the mint's fee",
+        ));
+    }
+    let ys = proofs
+        .iter()
+        .map(|proof| proof.y())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(NetworkError::invalid)?;
+    let response = mint
+        .post_check_state(CheckStateRequest { ys })
+        .await
+        .map_err(network_error)?;
+    if response.states.len() != proofs.len() {
+        return Err(NetworkError::network(
+            "mint returned an incomplete state set",
+        ));
+    }
+    if !response
+        .states
+        .iter()
+        .all(|state| state.state == State::Unspent)
+    {
+        return Err(NetworkError::invalid("proofs are already spent or pending"));
+    }
+    Ok(())
 }
 
 /// How spent HTLC proofs were spent, as far as the mint shows.
@@ -734,7 +785,7 @@ pub fn mint_url(id: &NetworkId) -> Result<String, String> {
 
 /// The cdk key of an x-only identity: its even-Y point. NUT-11/14
 /// signatures are BIP340, so parity does not matter.
-fn cashu_key(key: &XOnlyPubKey) -> Result<PublicKey, NetworkError> {
+pub fn cashu_key(key: &XOnlyPubKey) -> Result<PublicKey, NetworkError> {
     let compressed = cassis_core::PubKey::from_x_only(key).map_err(NetworkError::invalid)?;
     PublicKey::from_slice(compressed.as_bytes()).map_err(NetworkError::invalid)
 }
@@ -752,7 +803,7 @@ fn input_fee_sat(inputs: usize, input_fee_ppk: u64) -> u64 {
 /// receiver pays the mint's input fee to claim them. Proofs are powers
 /// of two, so the fee grows with the bits of the amount: add it until
 /// the net stops falling short.
-fn htlc_amount_sat(amount_sat: u64, input_fee_ppk: u64) -> u64 {
+pub fn htlc_amount_sat(amount_sat: u64, input_fee_ppk: u64) -> u64 {
     let mut outputs = amount_sat;
     loop {
         let fee = input_fee_sat(outputs.count_ones() as usize, input_fee_ppk);
@@ -787,7 +838,7 @@ fn plain_outputs(
     Ok(())
 }
 
-fn encode_proofs(proofs: &Proofs, target: XOnlyPubKey) -> Result<HtlcDescriptor, NetworkError> {
+pub fn encode_proofs(proofs: &Proofs, target: XOnlyPubKey) -> Result<HtlcDescriptor, NetworkError> {
     let proofs_b64 = proofs
         .iter()
         .map(|proof| serde_json::to_string(proof).map(|json| BASE64.encode(json)))
@@ -797,7 +848,7 @@ fn encode_proofs(proofs: &Proofs, target: XOnlyPubKey) -> Result<HtlcDescriptor,
 }
 
 /// The proofs of a cashu HTLC and the key they are locked to.
-fn decode_proofs(descriptor: &HtlcDescriptor) -> Result<(Proofs, XOnlyPubKey), NetworkError> {
+pub fn decode_proofs(descriptor: &HtlcDescriptor) -> Result<(Proofs, XOnlyPubKey), NetworkError> {
     let HtlcDescriptor::Cashu { proofs_b64, target } = descriptor else {
         return Err(NetworkError::invalid("not a cashu HTLC"));
     };

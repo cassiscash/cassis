@@ -2,7 +2,7 @@
 
 use super::{db_error, Node};
 use crate::db::{Invoice, InvoiceState, PendingPayment, PendingPaymentHash};
-use cassis_core::network::{Htlc, Network, OutgoingState};
+use cassis_core::network::{Htlc, OutgoingHtlcs, OutgoingState};
 use cassis_core::{unix_now, Bytes32, NetworkId};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -71,11 +71,17 @@ impl Node {
             return;
         };
         let network_id = NetworkId(payment.network.clone());
-        let (Ok(network), Ok(htlc)) = (self.network(&network_id), Htlc::try_from(&payment.htlc))
-        else {
+        let Ok(htlc) = Htlc::try_from(&payment.htlc) else {
             return;
         };
-        let saved = match settle_outgoing(network.as_ref(), &htlc).await {
+        let outcome = match self.funder(&network_id) {
+            Some(funder) => settle_outgoing(funder.as_ref(), &htlc).await,
+            None => match self.network(&network_id) {
+                Ok(network) => settle_outgoing(network.as_ref(), &htlc).await,
+                Err(_) => return,
+            },
+        };
+        let saved = match outcome {
             Outcome::Pending => return,
             Outcome::Claimed(preimage) => self.complete_payment(key, &network_id, &htlc, preimage),
             Outcome::Refunded => self
@@ -92,13 +98,13 @@ impl Node {
 }
 
 /// Look at an outgoing HTLC and refund it once expired.
-pub async fn settle_outgoing(network: &dyn Network, htlc: &Htlc) -> Outcome {
-    match network.check_outgoing_htlc(htlc).await {
+pub async fn settle_outgoing<T: OutgoingHtlcs + ?Sized>(network: &T, htlc: &Htlc) -> Outcome {
+    match network.check_outgoing(htlc).await {
         Ok(OutgoingState::Claimed(preimage)) if htlc.payment_hash.matches_preimage(&preimage) => {
             return Outcome::Claimed(preimage)
         }
         Ok(OutgoingState::Claimed(_)) => {
-            warn!("{} reported a wrong preimage", network.id());
+            warn!("{} reported a wrong preimage", network.network_id());
             return Outcome::Pending;
         }
         Ok(OutgoingState::Refunded) => return Outcome::Refunded,
@@ -107,7 +113,7 @@ pub async fn settle_outgoing(network: &dyn Network, htlc: &Htlc) -> Outcome {
             warn!(
                 "checking {} on {}: {error}",
                 htlc.payment_hash.short(),
-                network.id()
+                network.network_id()
             );
             return Outcome::Pending;
         }
@@ -115,16 +121,20 @@ pub async fn settle_outgoing(network: &dyn Network, htlc: &Htlc) -> Outcome {
     if unix_now() < htlc.expiry {
         return Outcome::Pending;
     }
-    match network.refund_outgoing_htlc(htlc).await {
+    match network.refund_outgoing(htlc).await {
         Ok(()) => {
-            info!("{} refunded on {}", htlc.payment_hash.short(), network.id());
+            info!(
+                "{} refunded on {}",
+                htlc.payment_hash.short(),
+                network.network_id()
+            );
             Outcome::Refunded
         }
         Err(error) => {
             warn!(
                 "refunding {} on {}: {error}; retrying",
                 htlc.payment_hash.short(),
-                network.id()
+                network.network_id()
             );
             Outcome::Pending
         }

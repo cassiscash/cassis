@@ -1,7 +1,7 @@
 //! Waiting for an incoming HTLC to verify.
 
 use super::VERIFY_RETRY_INTERVAL;
-use cassis_core::network::{Htlc, Network, NetworkError};
+use cassis_core::network::{Htlc, HtlcReceiver, NetworkError};
 use cassis_core::unix_now;
 use std::fmt;
 use tracing::info;
@@ -28,15 +28,15 @@ impl fmt::Display for Unverified {
 /// until `deadline` (unix seconds) while it is not final yet or the
 /// network cannot tell: nothing depends on it before it verifies, so
 /// waiting costs nothing. `request` names what is waiting, in the logs.
-pub async fn verify_incoming(
-    network: &dyn Network,
+pub async fn verify_incoming<T: HtlcReceiver + ?Sized>(
+    network: &T,
     htlc: &Htlc,
     deadline: u64,
     request: &str,
 ) -> Result<(), Unverified> {
     let mut waiting = false;
     loop {
-        match network.verify_incoming_htlc(htlc).await {
+        match network.verify_incoming(htlc).await {
             Ok(()) => return Ok(()),
             Err(NetworkError::Invalid(reason)) => return Err(Unverified::Rejected(reason)),
             Err(error) if unix_now() < deadline => {

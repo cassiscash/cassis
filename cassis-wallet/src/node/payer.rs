@@ -2,7 +2,7 @@
 
 use super::{db_error, Node};
 use crate::db::{Direction, PendingPayment, PendingPaymentHash, Transaction, TransactionHash};
-use cassis_core::network::{Htlc, NetworkId};
+use cassis_core::network::{Htlc, HtlcRequest, NetworkId};
 use cassis_core::offline::endpoint_public_key;
 use cassis_core::protocol::{
     Commit, Discard, Execute, FailReason, Invoice, Prepare, PreparePayee, Request, Response, Settle,
@@ -154,7 +154,11 @@ impl Node {
                 previous.htlc.expiry
             ));
         }
-        let sender = self.network(from)?;
+        let funder = self.funder(from);
+        let sender = match funder {
+            Some(_) => None,
+            None => Some(self.network(from)?),
+        };
         let (route, payee_network) = self.choose_route(invoice, from, relays, skip).await?;
         let payee_target = invoice
             .target_for(&payee_network)
@@ -266,10 +270,25 @@ impl Node {
         }
         targets.push(payee_target);
 
-        let first = match sender
-            .create_outgoing_htlc(hash, plan.amounts[0], plan.expiries[0], &targets[0])
-            .await
-        {
+        let funded = match (&funder, &sender) {
+            (Some(funder), _) => {
+                funder
+                    .fund(&HtlcRequest {
+                        payment_hash: hash,
+                        amount_msat: plan.amounts[0],
+                        expiry: plan.expiries[0],
+                        target: targets[0].clone(),
+                    })
+                    .await
+            }
+            (None, Some(sender)) => {
+                sender
+                    .create_outgoing_htlc(hash, plan.amounts[0], plan.expiries[0], &targets[0])
+                    .await
+            }
+            (None, None) => unreachable!("a network or a funder was chosen"),
+        };
+        let first = match funded {
             Ok(descriptor) => Htlc {
                 payment_hash: hash,
                 amount_msat: plan.amounts[0],

@@ -70,7 +70,7 @@ impl HtlcTerms {
         })
     }
 
-    fn conditions(&self) -> Result<SpendingConditions, NetworkError> {
+    pub fn conditions(&self) -> Result<SpendingConditions, NetworkError> {
         let conditions = Conditions::new(
             Some(self.locktime),
             Some(vec![self.receiver]),
