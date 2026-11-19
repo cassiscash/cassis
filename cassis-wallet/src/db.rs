@@ -35,6 +35,7 @@ pub mod db_schema {
         pub gateway_relay: Option<String>,
         /// Iroh key.
         pub preimage_server: [u8; 32],
+        pub preimage_server_relay: Option<String>,
         pub authorization: StoredReceiveAuthorization,
     }
 
@@ -145,6 +146,7 @@ pub mod db_schema {
         /// Iroh key.
         #[index]
         pub preimage_server: [u8; 32],
+        pub preimage_server_relay: Option<String>,
         pub authorization: StoredReceiveAuthorization,
         pub created_at: u64,
     }

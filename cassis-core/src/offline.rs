@@ -36,6 +36,7 @@ use crate::network::NetworkId;
 use crate::primitives::Bytes32;
 use crate::protocol::Metadata;
 use crate::signing::SigningMessage;
+use crate::transport::PeerAddr;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::{ChaCha20, Key as ChachaKey, Nonce as ChachaNonce};
 use hmac::{Hmac, Mac};
@@ -451,6 +452,18 @@ pub struct GatewayTerms {
     pub expires_at: u64,
     /// The payee's metadata, which the issuance commits to.
     pub payee_metadata: Option<Metadata>,
+}
+
+impl GatewayTerms {
+    /// Where the gateway reaches the authorization's preimage server:
+    /// its signed key and the relay the payee gave, so the terms alone
+    /// say how to call it.
+    pub fn preimage_server(&self) -> PeerAddr {
+        PeerAddr {
+            id: self.authorization.preimage_server.to_string(),
+            relay: self.preimage_server_relay.clone(),
+        }
+    }
 }
 
 /// The key a gateway seals its terms with, derived from its signing

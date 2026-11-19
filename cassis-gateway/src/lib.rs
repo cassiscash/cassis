@@ -47,7 +47,6 @@ use cassis_core::protocol::{
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
 use cassis_wallet::node::verify_incoming;
-use cassis_wallet::stored::{metadata, stored_metadata, StoredReceiveAuthorization};
 use iroh_base::PublicKey;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -129,6 +128,14 @@ struct Inner {
     /// forwards still waiting on the preimage server.
     learned: Mutex<HashMap<Bytes32, Bytes32>>,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+/// What a gateway calls the preimage server with to have a preimage
+/// released: the invoice's terms say under which authorization and
+/// where.
+struct Release {
+    preimage_metadata: Metadata,
+    terms: GatewayTerms,
 }
 
 /// A COMMIT checked against the invoice its metadata carries.
@@ -439,10 +446,8 @@ impl Gateway {
             .upsert(&HandledDelegation {
                 authorization_id: HandledDelegationId(id.0),
                 payee: *authorization.payee.as_bytes(),
-                authorization: StoredReceiveAuthorization::from_with_preimage_server_relay(
-                    &authorization,
-                    preimage_server_relay,
-                ),
+                authorization: (&authorization).into(),
+                preimage_server_relay,
                 registered_at: unix_now(),
             })
             .map_err(db_error)
@@ -465,10 +470,7 @@ impl Gateway {
                 && authorization.allows_amount(request.amount_msat)
                 && authorization.allows_description(request.description.as_deref())
             {
-                candidates.push((
-                    authorization,
-                    delegation.authorization.preimage_server_relay,
-                ));
+                candidates.push((authorization, delegation.preimage_server_relay));
             }
         }
         let (authorization, preimage_server_relay) = candidates
@@ -749,9 +751,12 @@ impl Gateway {
                 return Ok(());
             };
             lock(&self.0.refused).remove(&hash);
-            let preimage_metadata = htlc.preimage.is_none().then_some(carried.preimage_metadata);
+            let release = htlc.preimage.is_none().then(|| Release {
+                preimage_metadata: carried.preimage_metadata,
+                terms,
+            });
             let gateway = self.clone();
-            self.spawn(async move { gateway.finish(htlc, preimage_metadata, busy).await });
+            self.spawn(async move { gateway.finish(htlc, release, busy).await });
             return Ok(());
         }
         let (target, _, claim_by) = self
@@ -806,8 +811,11 @@ impl Gateway {
         let hash = forward.incoming.payment_hash;
         match self.verify_and_fund(&forward).await {
             Ok(htlc) => {
-                self.finish(htlc, Some(forward.preimage_metadata), busy)
-                    .await
+                let release = Release {
+                    preimage_metadata: forward.preimage_metadata,
+                    terms: forward.terms,
+                };
+                self.finish(htlc, Some(release), busy).await
             }
             Err(reason) => {
                 warn!("forward {} failed: {reason}", hash.short());
@@ -850,11 +858,6 @@ impl Gateway {
             incoming_network: forward.incoming_network.clone(),
             incoming: (&forward.incoming).into(),
             claim_by: forward.claim_by,
-            authorization: StoredReceiveAuthorization::from_with_preimage_server_relay(
-                authorization,
-                forward.terms.preimage_server_relay.clone(),
-            ),
-            payee_metadata: stored_metadata(&forward.terms.payee_metadata),
             network: destination.network().clone(),
             htlc: None,
             outcome: None,
@@ -901,21 +904,16 @@ impl Gateway {
 
     /// Have the preimage of a funded `htlc` released, unless known, and
     /// claim the payer's HTLC with it.
-    async fn finish(
-        &self,
-        mut htlc: PayeeHtlc,
-        preimage_metadata: Option<Metadata>,
-        _busy: BusyGuard,
-    ) {
+    async fn finish(&self, mut htlc: PayeeHtlc, release: Option<Release>, _busy: BusyGuard) {
         if htlc.preimage.is_none() {
-            let Some(preimage_metadata) = preimage_metadata else {
+            let Some(release) = release else {
                 warn!(
                     "forward {} is funded but has no preimage metadata to release with",
                     short(&htlc)
                 );
                 return;
             };
-            match self.release(&mut htlc, &preimage_metadata).await {
+            match self.release(&mut htlc, &release).await {
                 Ok(preimage) => {
                     info!("COMMIT {}: preimage released", short(&htlc));
                     htlc.preimage = Some(preimage.0);
@@ -937,25 +935,17 @@ impl Gateway {
 
     /// Present the HTLC to the payee to the preimage server, with what
     /// the invoice carried from it, until it releases the preimage.
-    async fn release(
-        &self,
-        htlc: &mut PayeeHtlc,
-        preimage_metadata: &Metadata,
-    ) -> Result<Bytes32, String> {
+    async fn release(&self, htlc: &mut PayeeHtlc, release: &Release) -> Result<Bytes32, String> {
         let hash = Bytes32(htlc.payment_hash.0);
-        let authorization = ReceiveAuthorization::try_from(&htlc.authorization)?;
         let funded = htlc.htlc.as_ref().ok_or("nothing was paid to the payee")?;
         let request = Request::PreimageRelease(PreimageRelease {
-            preimage_metadata: preimage_metadata.clone(),
-            metadata: metadata(&htlc.payee_metadata)?,
+            preimage_metadata: release.preimage_metadata.clone(),
+            metadata: release.terms.payee_metadata.clone(),
             network: htlc.network.clone(),
             htlc: Htlc::try_from(funded)?,
-            authorization: authorization.clone(),
+            authorization: release.terms.authorization.clone(),
         });
-        let preimage_server = PeerAddr {
-            id: authorization.preimage_server.to_string(),
-            relay: htlc.authorization.preimage_server_relay.clone(),
-        };
+        let preimage_server = release.terms.preimage_server();
         let mut waiting = false;
         loop {
             // Learned meanwhile, from the payee's claim.

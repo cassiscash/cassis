@@ -29,6 +29,8 @@ pub mod db_schema {
         #[index]
         pub payee: [u8; 32],
         pub authorization: StoredReceiveAuthorization,
+        /// Iroh relay the payee gave for reaching the preimage server.
+        pub preimage_server_relay: Option<String>,
         pub registered_at: u64,
     }
 
@@ -57,9 +59,6 @@ pub mod db_schema {
         pub incoming: StoredHtlc,
         /// The payer's HTLC must be claimed by then.
         pub claim_by: u64,
-        /// The invoice's terms, from its metadata.
-        pub authorization: StoredReceiveAuthorization,
-        pub payee_metadata: Option<Vec<u8>>,
         /// The HTLC to the payee, once funded; while `None`, funding is
         /// under way, or was interrupted.
         #[fingerprint = "network_id"]

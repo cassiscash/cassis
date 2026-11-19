@@ -201,9 +201,6 @@ pub struct StoredReceiveAuthorization {
     pub payee: [u8; 32],
     pub gateway: [u8; 32],
     pub preimage_server: [u8; 32],
-    /// Iroh relay to reach the preimage server through: not part of the
-    /// signed [`ReceiveAuthorization`], so rebuilding one skips it.
-    pub preimage_server_relay: Option<String>,
     pub description: Option<String>,
     pub valid_from: u64,
     pub valid_until: u64,
@@ -510,13 +507,8 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
     }
 }
 
-impl StoredReceiveAuthorization {
-    /// Store `authorization` with the relay to reach its preimage
-    /// server through, which it does not carry.
-    pub fn from_with_preimage_server_relay(
-        authorization: &ReceiveAuthorization,
-        preimage_server_relay: Option<String>,
-    ) -> Self {
+impl From<&ReceiveAuthorization> for StoredReceiveAuthorization {
+    fn from(authorization: &ReceiveAuthorization) -> Self {
         Self {
             kind: match authorization.kind {
                 AuthorizationKind::Single => StoredAuthorizationKind::Single,
@@ -525,7 +517,6 @@ impl StoredReceiveAuthorization {
             payee: *authorization.payee.as_bytes(),
             gateway: *authorization.gateway.as_bytes(),
             preimage_server: *authorization.preimage_server.as_bytes(),
-            preimage_server_relay,
             description: authorization.description.clone(),
             valid_from: authorization.valid_from,
             valid_until: authorization.valid_until,
@@ -634,17 +625,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let stored = StoredReceiveAuthorization::from_with_preimage_server_relay(
-            &authorization,
-            Some("https://relay.example".into()),
-        );
+        let stored = StoredReceiveAuthorization::from(&authorization);
         assert_eq!(
             ReceiveAuthorization::try_from(&stored).unwrap(),
             authorization
-        );
-        assert_eq!(
-            stored.preimage_server_relay.as_deref(),
-            Some("https://relay.example")
         );
     }
 }
