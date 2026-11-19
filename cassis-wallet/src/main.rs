@@ -168,7 +168,7 @@ enum Command {
     RequestInvoice {
         /// Iroh id of the gateway.
         #[arg(long, value_name = "ID")]
-        gateway: String,
+        gateway: PublicKey,
         #[arg(long, value_name = "URL")]
         gateway_relay: Option<String>,
         /// The payee's key, its iroh id (see `info`).
@@ -188,7 +188,7 @@ enum Command {
         /// Only this preimage server; by default every one this node
         /// receives through.
         #[arg(long = "preimage-server", visible_alias = "ps", value_name = "ID")]
-        preimage_server: Option<String>,
+        preimage_server: Option<PublicKey>,
         #[arg(
             long = "preimage-server-relay",
             visible_alias = "ps-relay",
@@ -238,7 +238,7 @@ struct OfflineArgs {
     /// node can stay offline. It pays this node on with an HTLC once
     /// paid.
     #[arg(long, value_name = "ID", requires = "preimage_server")]
-    gateway: Option<String>,
+    gateway: Option<PublicKey>,
     #[arg(long, value_name = "URL", requires = "gateway")]
     gateway_relay: Option<String>,
     /// Iroh id of the preimage server that picks the payment hash and
@@ -249,7 +249,7 @@ struct OfflineArgs {
         value_name = "ID",
         requires = "gateway"
     )]
-    preimage_server: Option<String>,
+    preimage_server: Option<PublicKey>,
     #[arg(
         long = "preimage-server-relay",
         visible_alias = "ps-relay",
@@ -726,7 +726,7 @@ async fn wait_for_claim(home: &Home, invoice: &Invoice) -> Result<(), String> {
 async fn redeem(
     home: &Home,
     span: &Span,
-    preimage_server: Option<String>,
+    preimage_server: Option<PublicKey>,
     preimage_server_relay: Option<String>,
     since: u64,
 ) -> Result<(), String> {
@@ -761,7 +761,8 @@ async fn redeem(
             (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
-                id: hex_key(&delegation.preimage_server),
+                id: PublicKey::from_bytes(&delegation.preimage_server)
+                    .map_err(|e| format!("stored preimage server key: {e}"))?,
                 relay: delegation.preimage_server_relay.clone(),
             },
             authorization,
@@ -777,7 +778,8 @@ async fn redeem(
             (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
-                id: hex_key(&delegation.preimage_server),
+                id: PublicKey::from_bytes(&delegation.preimage_server)
+                    .map_err(|e| format!("stored preimage server key: {e}"))?,
                 relay: delegation.preimage_server_relay.clone(),
             },
             authorization,

@@ -20,14 +20,13 @@ const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// home relay.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PeerAddr {
-    pub id: String,
+    pub id: PublicKey,
     pub relay: Option<String>,
 }
 
 impl PeerAddr {
     fn endpoint_addr(&self) -> Result<EndpointAddr, String> {
-        let id = PublicKey::from_str(&self.id).map_err(|e| format!("peer id {}: {e}", self.id))?;
-        let mut addr = EndpointAddr::new(id);
+        let mut addr = EndpointAddr::new(self.id);
         if let Some(relay) = &self.relay {
             addr = addr.with_relay_url(
                 RelayUrl::from_str(relay).map_err(|e| format!("relay {relay}: {e}"))?,

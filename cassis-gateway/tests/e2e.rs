@@ -363,11 +363,11 @@ async fn setup() -> Setup {
     .unwrap();
     let endpoints = OfflineEndpoints {
         gateway: PeerAddr {
-            id: gateway.peer_id(),
+            id: gateway.peer_id().parse().unwrap(),
             relay: gateway.home_relay().await,
         },
         preimage_server: PeerAddr {
-            id: server.peer_id(),
+            id: server.peer_id().parse().unwrap(),
             relay: server.home_relay().await,
         },
     };

@@ -460,7 +460,7 @@ impl GatewayTerms {
     /// say how to call it.
     pub fn preimage_server(&self) -> PeerAddr {
         PeerAddr {
-            id: self.authorization.preimage_server.to_string(),
+            id: self.authorization.preimage_server,
             relay: self.preimage_server_relay.clone(),
         }
     }

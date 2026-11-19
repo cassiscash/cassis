@@ -485,7 +485,7 @@ impl Gateway {
             return Err("invoice expiry must be in the future".into());
         }
         let preimage_server = PeerAddr {
-            id: authorization.preimage_server.to_string(),
+            id: authorization.preimage_server,
             relay: preimage_server_relay.clone(),
         };
         let issue = Request::PreimageIssue {

@@ -27,7 +27,6 @@ use cassis_core::protocol::{
 };
 use cassis_core::transport::{PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
-use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -64,13 +63,6 @@ async fn destinations(networks: &[Arc<dyn Network>]) -> Result<Vec<GatewayDestin
         })?);
     }
     Ok(destinations)
-}
-
-fn endpoint_key(peer: &PeerAddr) -> Result<PublicKey, String> {
-    peer.id
-        .trim()
-        .parse()
-        .map_err(|e| format!("endpoint key {}: {e}", peer.id))
 }
 
 /// Check `transport` speaks as this node, whose payee key is the
@@ -116,8 +108,8 @@ pub async fn create_gateway_invoice(
     let authorization = PayeeGatewayReceiveAuthorization::sign(
         &secret,
         PayeeGatewayReceiveAuthorizationKind::Single,
-        endpoint_key(&endpoints.gateway)?,
-        endpoint_key(&endpoints.preimage_server)?,
+        endpoints.gateway.id,
+        endpoints.preimage_server.id,
         description.clone(),
         now,
         expires_at,
@@ -150,9 +142,9 @@ pub async fn create_gateway_invoice(
             metadata: stored_metadata(&invoice.body.metadata),
             preimage: None,
             delegation: Some(Delegation {
-                gateway: *endpoint_key(&endpoints.gateway)?.as_bytes(),
+                gateway: *endpoints.gateway.id.as_bytes(),
                 gateway_relay: endpoints.gateway.relay.clone(),
-                preimage_server: *endpoint_key(&endpoints.preimage_server)?.as_bytes(),
+                preimage_server: *endpoints.preimage_server.id.as_bytes(),
                 preimage_server_relay: endpoints.preimage_server.relay.clone(),
                 authorization: (&authorization).into(),
             }),
@@ -264,8 +256,8 @@ pub async fn authorize_gateway(
     let authorization = PayeeGatewayReceiveAuthorization::sign(
         &secret,
         PayeeGatewayReceiveAuthorizationKind::Standing,
-        endpoint_key(&endpoints.gateway)?,
-        endpoint_key(&endpoints.preimage_server)?,
+        endpoints.gateway.id,
+        endpoints.preimage_server.id,
         description,
         valid_from,
         valid_until,
@@ -290,8 +282,8 @@ pub async fn authorize_gateway(
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     }
-    let gateway = *endpoint_key(&endpoints.gateway)?.as_bytes();
-    let preimage_server = *endpoint_key(&endpoints.preimage_server)?.as_bytes();
+    let gateway = *endpoints.gateway.id.as_bytes();
+    let preimage_server = *endpoints.preimage_server.id.as_bytes();
     db.full_delegations()
         .upsert(&FullDelegation {
             authorization_id: FullDelegationId(authorization.id()?.0),

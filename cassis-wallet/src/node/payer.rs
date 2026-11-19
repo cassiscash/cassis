@@ -168,7 +168,7 @@ impl Node {
         // paid in the payee's place.
         let endpoint = invoice.receiver.iroh_peer_id();
         let payee = PeerAddr {
-            id: endpoint.to_string(),
+            id: *endpoint,
             relay: invoice.body.iroh_relay.clone(),
         };
         let plan = routing::plan_route(
@@ -186,23 +186,28 @@ impl Node {
         let hops: Vec<Hop> = route
             .iter()
             .enumerate()
-            .map(|(i, announcement)| Hop {
-                peer: PeerAddr {
-                    id: announcement.iroh_peer_id.clone(),
-                    relay: announcement.iroh_relay.clone(),
-                },
-                prepare: Prepare {
-                    payment_hash: hash,
-                    operation_id: OperationId::random(),
-                    amount_msat: plan.amounts[i],
-                    outgoing_amount_msat: plan.amounts[i + 1],
-                    incoming_network: announcement.from.clone(),
-                    outgoing_network: announcement.to.clone(),
-                    incoming_expiry: plan.expiries[i],
-                    outgoing_expiry: plan.expiries[i + 1],
-                },
+            .map(|(i, announcement)| {
+                let id = announcement.iroh_peer_id.trim().parse().map_err(|e| {
+                    format!("hop {} peer id {}: {e}", i + 1, announcement.iroh_peer_id)
+                })?;
+                Ok(Hop {
+                    peer: PeerAddr {
+                        id,
+                        relay: announcement.iroh_relay.clone(),
+                    },
+                    prepare: Prepare {
+                        payment_hash: hash,
+                        operation_id: OperationId::random(),
+                        amount_msat: plan.amounts[i],
+                        outgoing_amount_msat: plan.amounts[i + 1],
+                        incoming_network: announcement.from.clone(),
+                        outgoing_network: announcement.to.clone(),
+                        incoming_expiry: plan.expiries[i],
+                        outgoing_expiry: plan.expiries[i + 1],
+                    },
+                })
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         info!(
             "paying {} msat ({} msat with fees) from {from} to {payee_network} over {} hop(s)",
             invoice.body.amount_msat,
