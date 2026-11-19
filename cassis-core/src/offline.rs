@@ -445,6 +445,9 @@ pub struct GatewayTerms {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
     pub authorization: ReceiveAuthorization,
+    /// Iroh relay to reach the authorization's preimage server through,
+    /// as the payee gave it: a hint the authorization does not sign.
+    pub preimage_server_relay: Option<String>,
     pub expires_at: u64,
     /// The payee's metadata, which the issuance commits to.
     pub payee_metadata: Option<Metadata>,
@@ -775,6 +778,7 @@ mod tests {
             payment_hash: issuance.payment_hash,
             amount_msat: issuance.amount_msat,
             authorization,
+            preimage_server_relay: Some("https://relay.example".into()),
             expires_at: 1500,
             payee_metadata: Some(payee_metadata),
         };

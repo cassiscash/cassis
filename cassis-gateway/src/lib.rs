@@ -371,6 +371,7 @@ impl Gateway {
     async fn invoice(&self, request: GatewayInvoiceRequest, peer: &str) -> Result<Invoice, String> {
         let GatewayInvoiceRequest {
             authorization,
+            preimage_server_relay,
             issuance,
             expires_at,
             description,
@@ -403,6 +404,7 @@ impl Gateway {
             payment_hash: issuance.payment_hash,
             amount_msat: issuance.amount_msat,
             authorization,
+            preimage_server_relay,
             expires_at,
             payee_metadata: metadata,
         };
@@ -487,7 +489,7 @@ impl Gateway {
         }
         let preimage_server = PeerAddr {
             id: authorization.preimage_server.to_string(),
-            relay: preimage_server_relay,
+            relay: preimage_server_relay.clone(),
         };
         let issue = Request::PreimageIssue {
             authorization: authorization.clone(),
@@ -511,6 +513,7 @@ impl Gateway {
             payment_hash: issuance.payment_hash,
             amount_msat: issuance.amount_msat,
             authorization: authorization.clone(),
+            preimage_server_relay,
             expires_at,
             payee_metadata: request.metadata,
         };
@@ -842,14 +845,6 @@ impl Gateway {
         let expiry = unix_now()
             .saturating_add(authorization.min_final_timeout_secs)
             .saturating_add(self.policy().final_slack_secs);
-        // The relay to the preimage server is only known from the
-        // standing authorization the payee gave, if it did.
-        let preimage_server_relay = self
-            .db()
-            .handled_delegations()
-            .get(HandledDelegationId(authorization.id()?.0))
-            .map_err(db_error)?
-            .and_then(|delegation| delegation.authorization.preimage_server_relay);
         let mut htlc = PayeeHtlc {
             payment_hash: PayeeHtlcHash(hash.0),
             incoming_network: forward.incoming_network.clone(),
@@ -857,7 +852,7 @@ impl Gateway {
             claim_by: forward.claim_by,
             authorization: StoredReceiveAuthorization::from_with_preimage_server_relay(
                 authorization,
-                preimage_server_relay,
+                forward.terms.preimage_server_relay.clone(),
             ),
             payee_metadata: stored_metadata(&forward.terms.payee_metadata),
             network: destination.network().clone(),

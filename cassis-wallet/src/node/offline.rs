@@ -198,6 +198,7 @@ async fn issue(
     }
     let request = Request::GatewayInvoice(GatewayInvoiceRequest {
         authorization: authorization.clone(),
+        preimage_server_relay: endpoints.preimage_server.relay.clone(),
         issuance: issuance.clone(),
         expires_at,
         description: description.clone(),

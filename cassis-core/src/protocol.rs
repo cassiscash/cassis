@@ -936,6 +936,8 @@ pub struct PreimageRelease {
 pub struct GatewayInvoiceRequest {
     /// A [`AuthorizationKind::Single`] authorization.
     pub authorization: ReceiveAuthorization,
+    /// Hint for reaching the authorization's preimage server.
+    pub preimage_server_relay: Option<String>,
     pub issuance: PreimageIssuance,
     pub expires_at: u64,
     pub description: Option<String>,
@@ -1297,6 +1299,7 @@ mod tests {
                 payment_hash: body.payment_hash,
                 amount_msat: body.amount_msat,
                 authorization: authorization.clone(),
+                preimage_server_relay: None,
                 expires_at: body.expires_at,
                 payee_metadata: body.metadata.take(),
             },
