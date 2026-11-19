@@ -437,10 +437,10 @@ impl Gateway {
             .upsert(&HandledDelegation {
                 authorization_id: HandledDelegationId(id.0),
                 payee: *authorization.payee.as_bytes(),
-                authorization: StoredReceiveAuthorization {
+                authorization: StoredReceiveAuthorization::from_with_preimage_server_relay(
+                    &authorization,
                     preimage_server_relay,
-                    ..(&authorization).into()
-                },
+                ),
                 registered_at: unix_now(),
             })
             .map_err(db_error)
@@ -855,10 +855,10 @@ impl Gateway {
             incoming_network: forward.incoming_network.clone(),
             incoming: (&forward.incoming).into(),
             claim_by: forward.claim_by,
-            authorization: StoredReceiveAuthorization {
+            authorization: StoredReceiveAuthorization::from_with_preimage_server_relay(
+                authorization,
                 preimage_server_relay,
-                ..authorization.into()
-            },
+            ),
             payee_metadata: stored_metadata(&forward.terms.payee_metadata),
             network: destination.network().clone(),
             htlc: None,

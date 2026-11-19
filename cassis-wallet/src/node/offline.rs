@@ -153,10 +153,10 @@ pub async fn create_gateway_invoice(
                 gateway: *endpoint_key(&endpoints.gateway)?.as_bytes(),
                 gateway_relay: endpoints.gateway.relay.clone(),
                 preimage_server: *endpoint_key(&endpoints.preimage_server)?.as_bytes(),
-                authorization: StoredReceiveAuthorization {
-                    preimage_server_relay: endpoints.preimage_server.relay.clone(),
-                    ..(&authorization).into()
-                },
+                authorization: StoredReceiveAuthorization::from_with_preimage_server_relay(
+                    &authorization,
+                    endpoints.preimage_server.relay.clone(),
+                ),
             }),
             state: InvoiceState::Waiting,
             created_at: now,
@@ -299,10 +299,10 @@ pub async fn authorize_gateway(
             gateway,
             gateway_relay: endpoints.gateway.relay,
             preimage_server,
-            authorization: StoredReceiveAuthorization {
-                preimage_server_relay: endpoints.preimage_server.relay,
-                ..(&authorization).into()
-            },
+            authorization: StoredReceiveAuthorization::from_with_preimage_server_relay(
+                &authorization,
+                endpoints.preimage_server.relay,
+            ),
             created_at: unix_now(),
         })
         .map_err(db_error)?;
