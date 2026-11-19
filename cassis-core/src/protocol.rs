@@ -25,7 +25,8 @@
 
 use crate::network::{Htlc, HtlcDescriptor, InvoiceTarget, NetworkId};
 use crate::offline::{
-    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
+    endpoint_public_key, PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind,
+    PreimageIssuance, Signature,
 };
 use crate::primitives::{Bytes32, OperationId};
 use crate::signing::SigningMessage;
@@ -136,7 +137,7 @@ pub enum InvoiceReceiver {
     /// hash the payee got from a preimage server, and signed by both.
     Gateway(GatewayReceiver),
     /// Issued by a gateway alone while the payee is offline, under the
-    /// payee's standing [`ReceiveAuthorization`] and for a hash its
+    /// payee's standing [`PayeeGatewayReceiveAuthorization`] and for a hash its
     /// preimage server vouches for.
     Delegated(DelegatedReceiver),
 }
@@ -185,7 +186,7 @@ pub struct DelegatedReceiver {
     pub preimage_server_issuance: PreimageIssuance,
     /// The payee's leave for the gateway to issue this invoice, in
     /// place of a payee signature.
-    pub payee_authorization: ReceiveAuthorization,
+    pub payee_authorization: PayeeGatewayReceiveAuthorization,
 }
 
 impl InvoiceReceiver {
@@ -342,7 +343,7 @@ impl Invoice {
         secret: &[u8; 32],
         preimage_server: PublicKey,
         preimage_server_issuance: PreimageIssuance,
-        payee_authorization: ReceiveAuthorization,
+        payee_authorization: PayeeGatewayReceiveAuthorization,
     ) -> Self {
         let gateway = endpoint_public_key(secret);
         let mut invoice = Self {
@@ -468,7 +469,7 @@ impl Invoice {
                     .map_err(|_| "invalid invoice signature by the gateway".to_string())?;
                 let authorization = &receiver.payee_authorization;
                 authorization.verify()?;
-                if authorization.kind != AuthorizationKind::Standing {
+                if authorization.kind != PayeeGatewayReceiveAuthorizationKind::Standing {
                     return Err(
                         "the payee's authorization does not let the gateway issue invoices".into(),
                     );
@@ -919,7 +920,7 @@ pub struct Settle {
 /// checks out, [`Response::Pending`] while it is not final yet.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreimageRelease {
-    pub authorization: ReceiveAuthorization,
+    pub authorization: PayeeGatewayReceiveAuthorization,
     /// The preimage server's opaque metadata for the hash, as carried
     /// in the invoice.
     pub preimage_metadata: Metadata,
@@ -934,8 +935,8 @@ pub struct PreimageRelease {
 /// issued it under `authorization`, which the payee then signs too.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatewayInvoiceRequest {
-    /// A [`AuthorizationKind::Single`] authorization.
-    pub authorization: ReceiveAuthorization,
+    /// A [`PayeeGatewayReceiveAuthorizationKind::Single`] authorization.
+    pub authorization: PayeeGatewayReceiveAuthorization,
     /// Hint for reaching the authorization's preimage server.
     pub preimage_server_relay: Option<String>,
     pub issuance: PreimageIssuance,
@@ -997,7 +998,7 @@ pub enum Request {
     /// server: a payment hash for an invoice of `amount_msat` carrying
     /// `metadata`.
     PreimageIssue {
-        authorization: ReceiveAuthorization,
+        authorization: PayeeGatewayReceiveAuthorization,
         amount_msat: u64,
         metadata: Option<Metadata>,
     },
@@ -1011,7 +1012,7 @@ pub enum Request {
     /// authorization. The relay is a hint for reaching the preimage
     /// server, which the signed authorization names by key only.
     GatewayAuthorize {
-        authorization: ReceiveAuthorization,
+        authorization: PayeeGatewayReceiveAuthorization,
         preimage_server_relay: Option<String>,
     },
     GatewayInvoiceFor(GatewayInvoiceFor),
@@ -1231,8 +1232,10 @@ mod tests {
     const GATEWAY: [u8; 32] = [8; 32];
     const PREIMAGE_SERVER: [u8; 32] = [9; 32];
 
-    fn authorization(kind: AuthorizationKind) -> ReceiveAuthorization {
-        ReceiveAuthorization::sign(
+    fn authorization(
+        kind: PayeeGatewayReceiveAuthorizationKind,
+    ) -> PayeeGatewayReceiveAuthorization {
+        PayeeGatewayReceiveAuthorization::sign(
             &PAYEE,
             kind,
             endpoint_public_key(&GATEWAY),
@@ -1253,7 +1256,7 @@ mod tests {
         .unwrap()
     }
 
-    fn issuance(authorization: &ReceiveAuthorization) -> PreimageIssuance {
+    fn issuance(authorization: &PayeeGatewayReceiveAuthorization) -> PreimageIssuance {
         let mut issuance = PreimageIssuance {
             payment_hash: Bytes32([1; 32]),
             amount_msat: 1000,
@@ -1276,20 +1279,22 @@ mod tests {
 
     /// Issued by the gateway alone.
     fn delegated_invoice() -> Invoice {
-        delegated_with(authorization(AuthorizationKind::Standing))
+        delegated_with(authorization(
+            PayeeGatewayReceiveAuthorizationKind::Standing,
+        ))
     }
 
     /// A standing authorization the payee pinned a description on,
     /// signed again over the changed terms.
-    fn described_authorization(description: &str) -> ReceiveAuthorization {
-        let mut authorization = authorization(AuthorizationKind::Standing);
+    fn described_authorization(description: &str) -> PayeeGatewayReceiveAuthorization {
+        let mut authorization = authorization(PayeeGatewayReceiveAuthorizationKind::Standing);
         authorization.description = Some(description.into());
         let message = authorization.message().unwrap();
         authorization.signature = Signature::sign(&PAYEE, &message);
         authorization
     }
 
-    fn delegated_with(authorization: ReceiveAuthorization) -> Invoice {
+    fn delegated_with(authorization: PayeeGatewayReceiveAuthorization) -> Invoice {
         let mut body = body();
         let preimage_issuance = issuance(&authorization);
         let carried = GatewayMetadata::sign(
@@ -1462,7 +1467,7 @@ mod tests {
         made_up.sign_as_gateway(&GATEWAY).unwrap();
         assert!(made_up.verify().is_err());
         // A single authorization does not let the gateway issue alone.
-        let single = authorization(AuthorizationKind::Single);
+        let single = authorization(PayeeGatewayReceiveAuthorizationKind::Single);
         let mut unauthorized = invoice.clone();
         if let InvoiceReceiver::Delegated(receiver) = &mut unauthorized.receiver {
             receiver.preimage_server_issuance = issuance(&single);

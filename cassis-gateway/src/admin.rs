@@ -23,7 +23,7 @@ use cassis_admin::networks::{
 };
 use cassis_admin::view::{act, ago, fact, number, sat, span, stat, submit, until};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity, Refresh};
-use cassis_core::offline::ReceiveAuthorization;
+use cassis_core::offline::PayeeGatewayReceiveAuthorization;
 use cassis_core::routing::{autohue, autoname};
 use cassis_core::{unix_now, Bytes32, Network, NetworkId, XOnlyPubKey};
 use futures::future::BoxFuture;
@@ -516,7 +516,7 @@ fn payment_hash(forward: &PayeeHtlc) -> Option<Bytes32> {
 /// A standing authorization, unless its signed terms no longer give an
 /// id: then it could not have been stored under one.
 fn authorization_row(record: &HandledDelegation, now: u64) -> Option<Node> {
-    let authorization = &ReceiveAuthorization::try_from(&record.authorization).ok()?;
+    let authorization = &PayeeGatewayReceiveAuthorization::try_from(&record.authorization).ok()?;
     let id = authorization.id().ok()?;
     let el = |part: &str| format!("authorization/{id}/{part}");
     let ended = authorization.valid_until <= now;

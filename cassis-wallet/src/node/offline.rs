@@ -19,8 +19,8 @@ use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
 use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, GatewayDestination, PreimageIssuance,
-    ReceiveAuthorization,
+    endpoint_public_key, GatewayDestination, PayeeGatewayReceiveAuthorization,
+    PayeeGatewayReceiveAuthorizationKind, PreimageIssuance,
 };
 use cassis_core::protocol::{
     GatewayInvoiceRequest, Invoice, InvoiceReceiver, Metadata, ReceivedPayment, Request, Response,
@@ -113,9 +113,9 @@ pub async fn create_gateway_invoice(
         return Err("invoice expiry must be in the future".into());
     }
     let secret = payee_secret(keys, transport)?;
-    let authorization = ReceiveAuthorization::sign(
+    let authorization = PayeeGatewayReceiveAuthorization::sign(
         &secret,
-        AuthorizationKind::Single,
+        PayeeGatewayReceiveAuthorizationKind::Single,
         endpoint_key(&endpoints.gateway)?,
         endpoint_key(&endpoints.preimage_server)?,
         description.clone(),
@@ -169,7 +169,7 @@ pub async fn create_gateway_invoice(
 async fn issue(
     transport: &Transport,
     endpoints: &OfflineEndpoints,
-    authorization: &ReceiveAuthorization,
+    authorization: &PayeeGatewayReceiveAuthorization,
     expires_at: u64,
     description: Option<String>,
     metadata: Option<Metadata>,
@@ -256,14 +256,14 @@ pub async fn authorize_gateway(
     max_amount_msat: u64,
     min_final_timeout_secs: u64,
     description: Option<String>,
-) -> Result<ReceiveAuthorization, String> {
+) -> Result<PayeeGatewayReceiveAuthorization, String> {
     if valid_until <= unix_now() {
         return Err("the authorization must end in the future".into());
     }
     let secret = payee_secret(keys, transport)?;
-    let authorization = ReceiveAuthorization::sign(
+    let authorization = PayeeGatewayReceiveAuthorization::sign(
         &secret,
-        AuthorizationKind::Standing,
+        PayeeGatewayReceiveAuthorizationKind::Standing,
         endpoint_key(&endpoints.gateway)?,
         endpoint_key(&endpoints.preimage_server)?,
         description,

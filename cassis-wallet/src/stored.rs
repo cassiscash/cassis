@@ -5,7 +5,8 @@
 
 use cassis_core::network::{Htlc, HtlcDescriptor, InvoiceTarget, LightningTarget};
 use cassis_core::offline::{
-    AuthorizationKind, GatewayDestination, ReceiveAuthorization, Signature,
+    GatewayDestination, PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind,
+    Signature,
 };
 use cassis_core::protocol::{FailReason, InvoiceNetwork, Metadata};
 use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
@@ -185,19 +186,19 @@ impl StoredLightning for Infallible {
     }
 }
 
-/// An [`AuthorizationKind`].
+/// An [`PayeeGatewayReceiveAuthorizationKind`].
 #[orangedb::embed]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoredAuthorizationKind {
+pub enum StoredPayeeGatewayReceiveAuthorizationKind {
     Single,
     Standing,
 }
 
-/// A [`ReceiveAuthorization`].
+/// A [`PayeeGatewayReceiveAuthorization`].
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredReceiveAuthorization {
-    pub kind: StoredAuthorizationKind,
+pub struct StoredPayeeGatewayReceiveAuthorization {
+    pub kind: StoredPayeeGatewayReceiveAuthorizationKind,
     pub payee: [u8; 32],
     pub gateway: [u8; 32],
     pub preimage_server: [u8; 32],
@@ -507,12 +508,16 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
     }
 }
 
-impl From<&ReceiveAuthorization> for StoredReceiveAuthorization {
-    fn from(authorization: &ReceiveAuthorization) -> Self {
+impl From<&PayeeGatewayReceiveAuthorization> for StoredPayeeGatewayReceiveAuthorization {
+    fn from(authorization: &PayeeGatewayReceiveAuthorization) -> Self {
         Self {
             kind: match authorization.kind {
-                AuthorizationKind::Single => StoredAuthorizationKind::Single,
-                AuthorizationKind::Standing => StoredAuthorizationKind::Standing,
+                PayeeGatewayReceiveAuthorizationKind::Single => {
+                    StoredPayeeGatewayReceiveAuthorizationKind::Single
+                }
+                PayeeGatewayReceiveAuthorizationKind::Standing => {
+                    StoredPayeeGatewayReceiveAuthorizationKind::Standing
+                }
             },
             payee: *authorization.payee.as_bytes(),
             gateway: *authorization.gateway.as_bytes(),
@@ -533,14 +538,18 @@ impl From<&ReceiveAuthorization> for StoredReceiveAuthorization {
     }
 }
 
-impl TryFrom<&StoredReceiveAuthorization> for ReceiveAuthorization {
+impl TryFrom<&StoredPayeeGatewayReceiveAuthorization> for PayeeGatewayReceiveAuthorization {
     type Error = String;
 
-    fn try_from(authorization: &StoredReceiveAuthorization) -> Result<Self, String> {
+    fn try_from(authorization: &StoredPayeeGatewayReceiveAuthorization) -> Result<Self, String> {
         Ok(Self {
             kind: match authorization.kind {
-                StoredAuthorizationKind::Single => AuthorizationKind::Single,
-                StoredAuthorizationKind::Standing => AuthorizationKind::Standing,
+                StoredPayeeGatewayReceiveAuthorizationKind::Single => {
+                    PayeeGatewayReceiveAuthorizationKind::Single
+                }
+                StoredPayeeGatewayReceiveAuthorizationKind::Standing => {
+                    PayeeGatewayReceiveAuthorizationKind::Standing
+                }
             },
             payee: endpoint_key(&authorization.payee)?,
             gateway: endpoint_key(&authorization.gateway)?,
@@ -602,9 +611,9 @@ mod tests {
         };
         assert_eq!(Htlc::try_from(&StoredHtlc::from(&htlc)).unwrap(), htlc);
 
-        let authorization = ReceiveAuthorization::sign(
+        let authorization = PayeeGatewayReceiveAuthorization::sign(
             &[1; 32],
-            AuthorizationKind::Standing,
+            PayeeGatewayReceiveAuthorizationKind::Standing,
             endpoint_public_key(&[2; 32]),
             endpoint_public_key(&[3; 32]),
             Some("coffee".into()),
@@ -625,9 +634,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let stored = StoredReceiveAuthorization::from(&authorization);
+        let stored = StoredPayeeGatewayReceiveAuthorization::from(&authorization);
         assert_eq!(
-            ReceiveAuthorization::try_from(&stored).unwrap(),
+            PayeeGatewayReceiveAuthorization::try_from(&stored).unwrap(),
             authorization
         );
     }

@@ -25,7 +25,7 @@ mod order_demo;
 mod wallets;
 
 use cassis_core::offline::{
-    endpoint_public_key, ReceiveAuthorization, DEFAULT_MIN_FINAL_TIMEOUT_SECS,
+    endpoint_public_key, PayeeGatewayReceiveAuthorization, DEFAULT_MIN_FINAL_TIMEOUT_SECS,
 };
 use cassis_core::protocol::{GatewayInvoiceFor, Request, Response};
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
@@ -734,7 +734,7 @@ async fn redeem(
     // networks it was paid on there: those of its delegated invoices
     // still waiting, and of its full delegations.
     let mut servers: Vec<(PeerAddr, Vec<NetworkId>)> = Vec::new();
-    let mut add = |server: PeerAddr, authorization: ReceiveAuthorization| {
+    let mut add = |server: PeerAddr, authorization: PayeeGatewayReceiveAuthorization| {
         let index = match servers.iter().position(|(known, _)| known.id == server.id) {
             Some(index) => index,
             None => {
@@ -757,7 +757,8 @@ async fn redeem(
         .into_iter()
         .filter_map(|invoice| invoice.delegation)
     {
-        let authorization: ReceiveAuthorization = (&delegation.authorization).try_into()?;
+        let authorization: PayeeGatewayReceiveAuthorization =
+            (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
                 id: hex_key(&delegation.preimage_server),
@@ -772,7 +773,8 @@ async fn redeem(
         .all()
         .map_err(|e| e.to_string())?
     {
-        let authorization: ReceiveAuthorization = (&delegation.authorization).try_into()?;
+        let authorization: PayeeGatewayReceiveAuthorization =
+            (&delegation.authorization).try_into()?;
         add(
             PeerAddr {
                 id: hex_key(&delegation.preimage_server),

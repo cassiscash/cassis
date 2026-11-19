@@ -12,7 +12,7 @@ pub use db_schema::*;
 
 #[orangedb::schema]
 pub mod db_schema {
-    use crate::stored::{StoredHtlc, StoredInvoiceNetwork, StoredReceiveAuthorization};
+    use crate::stored::{StoredHtlc, StoredInvoiceNetwork, StoredPayeeGatewayReceiveAuthorization};
 
     /// Whether an invoice may still be paid.
     #[embed]
@@ -36,7 +36,7 @@ pub mod db_schema {
         /// Iroh key.
         pub preimage_server: [u8; 32],
         pub preimage_server_relay: Option<String>,
-        pub authorization: StoredReceiveAuthorization,
+        pub authorization: StoredPayeeGatewayReceiveAuthorization,
     }
 
     /// An invoice this wallet issued.
@@ -137,7 +137,7 @@ pub mod db_schema {
     #[entity]
     #[derive(Clone, Debug, PartialEq)]
     pub struct FullDelegation {
-        /// [`ReceiveAuthorization::id`](cassis_core::offline::ReceiveAuthorization::id).
+        /// [`PayeeGatewayReceiveAuthorization::id`](cassis_core::offline::PayeeGatewayReceiveAuthorization::id).
         #[id([u8; 32])]
         pub authorization_id: FullDelegationId,
         /// Iroh key.
@@ -147,7 +147,7 @@ pub mod db_schema {
         #[index]
         pub preimage_server: [u8; 32],
         pub preimage_server_relay: Option<String>,
-        pub authorization: StoredReceiveAuthorization,
+        pub authorization: StoredPayeeGatewayReceiveAuthorization,
         pub created_at: u64,
     }
 }

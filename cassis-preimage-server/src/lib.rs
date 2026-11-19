@@ -4,7 +4,7 @@
 //!
 //! * The payee, or the gateway it authorized, asks for a payment hash
 //!   ([`Request::PreimageIssue`]) under the payee's signed
-//!   [`ReceiveAuthorization`], for an invoice of some amount and
+//!   [`PayeeGatewayReceiveAuthorization`], for an invoice of some amount and
 //!   metadata. The server keeps no record of it: the preimage is an
 //!   HMAC, keyed by a secret only the server knows, over a random nonce
 //!   in the [`PreimageIssuance`] it signs and returns. What the hash was
@@ -28,7 +28,8 @@ pub mod config;
 
 use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, PreimageIssuance, ReceiveAuthorization, Signature,
+    endpoint_public_key, PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind,
+    PreimageIssuance, Signature,
 };
 use cassis_core::protocol::{Metadata, PreimageRelease, ReceivedPayment, Request, Response};
 use cassis_core::transport::{Handler, Transport};
@@ -239,7 +240,10 @@ impl PreimageServer {
 
     /// Check `authorization` is the payee's, names this server and asks
     /// only for networks it verifies HTLCs on.
-    fn check_authorization(&self, authorization: &ReceiveAuthorization) -> Result<Bytes32, String> {
+    fn check_authorization(
+        &self,
+        authorization: &PayeeGatewayReceiveAuthorization,
+    ) -> Result<Bytes32, String> {
         authorization.verify()?;
         if authorization.preimage_server != self.key() {
             return Err("the authorization names another preimage server".into());
@@ -256,7 +260,7 @@ impl PreimageServer {
     fn issue(
         &self,
         peer: &str,
-        authorization: &ReceiveAuthorization,
+        authorization: &PayeeGatewayReceiveAuthorization,
         amount_msat: u64,
         metadata: Option<&Metadata>,
     ) -> Result<PreimageIssuance, String> {
@@ -281,20 +285,22 @@ impl PreimageServer {
     fn try_issue(
         &self,
         peer: &str,
-        authorization: &ReceiveAuthorization,
+        authorization: &PayeeGatewayReceiveAuthorization,
         amount_msat: u64,
         metadata: Option<&Metadata>,
     ) -> Result<PreimageIssuance, String> {
         let id = self.check_authorization(authorization)?;
         let peer = peer_key(peer)?;
         let allowed = match authorization.kind {
-            AuthorizationKind::Single => authorization.payee,
-            AuthorizationKind::Standing => authorization.gateway,
+            PayeeGatewayReceiveAuthorizationKind::Single => authorization.payee,
+            PayeeGatewayReceiveAuthorizationKind::Standing => authorization.gateway,
         };
         if peer != allowed {
             return Err(match authorization.kind {
-                AuthorizationKind::Single => "only the payee asks for hashes of its invoices",
-                AuthorizationKind::Standing => {
+                PayeeGatewayReceiveAuthorizationKind::Single => {
+                    "only the payee asks for hashes of its invoices"
+                }
+                PayeeGatewayReceiveAuthorizationKind::Standing => {
                     "only the authorized gateway asks for hashes under a standing authorization"
                 }
             }

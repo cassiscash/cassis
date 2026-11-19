@@ -15,7 +15,7 @@
 //! Everything here is signed by Ed25519 keys, the iroh keys each party
 //! talks to the others with:
 //!
-//! * [`ReceiveAuthorization`]: the payee lets a gateway and a preimage
+//! * [`PayeeGatewayReceiveAuthorization`]: the payee lets a gateway and a preimage
 //!   server act for it, within limits.
 //! * [`PreimageIssuance`]: the preimage server vouches that it issued a
 //!   payment hash under an authorization.
@@ -46,11 +46,11 @@ use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::fmt;
 
-/// Default of [`ReceiveAuthorization::min_final_timeout_secs`]: how
+/// Default of [`PayeeGatewayReceiveAuthorization::min_final_timeout_secs`]: how
 /// long the payee may stay offline after a payment before it claims.
 pub const DEFAULT_MIN_FINAL_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 
-/// Domain of [`ReceiveAuthorization::message`].
+/// Domain of [`PayeeGatewayReceiveAuthorization::message`].
 const AUTHORIZATION_DOMAIN: &str = "cassis/receive-authorization/v3";
 /// Domain of [`PreimageIssuance::message`].
 const ISSUANCE_DOMAIN: &str = "cassis/preimage-issuance/v2";
@@ -105,9 +105,9 @@ impl<'de> Deserialize<'de> for Signature {
     }
 }
 
-/// What a [`ReceiveAuthorization`] lets its gateway do.
+/// What a [`PayeeGatewayReceiveAuthorization`] lets its gateway do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthorizationKind {
+pub enum PayeeGatewayReceiveAuthorizationKind {
     /// One invoice the payee builds and signs itself: the preimage
     /// server issues hashes under it to the payee only, and the gateway
     /// cannot issue invoices with it.
@@ -118,8 +118,8 @@ pub enum AuthorizationKind {
     Standing,
 }
 
-impl AuthorizationKind {
-    /// Its tag in [`ReceiveAuthorization::message`].
+impl PayeeGatewayReceiveAuthorizationKind {
+    /// Its tag in [`PayeeGatewayReceiveAuthorization::message`].
     fn tag(&self) -> u8 {
         match self {
             Self::Single => 0,
@@ -141,8 +141,8 @@ pub type GatewayDestination = InvoiceTarget<Infallible>;
 /// its preimage, and the invoices it issues say the `description` I
 /// pinned, if I pinned one."
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceiveAuthorization {
-    pub kind: AuthorizationKind,
+pub struct PayeeGatewayReceiveAuthorization {
+    pub kind: PayeeGatewayReceiveAuthorizationKind,
     pub payee: PublicKey,
     pub gateway: PublicKey,
     pub preimage_server: PublicKey,
@@ -156,16 +156,16 @@ pub struct ReceiveAuthorization {
     pub max_amount_msat: u64,
     pub min_final_timeout_secs: u64,
     pub destinations: Vec<GatewayDestination>,
-    /// By `payee`, over [`ReceiveAuthorization::message`].
+    /// By `payee`, over [`PayeeGatewayReceiveAuthorization::message`].
     pub signature: Signature,
 }
 
-impl ReceiveAuthorization {
+impl PayeeGatewayReceiveAuthorization {
     /// Sign the terms as `payee`, whose secret is `payee_secret`.
     #[allow(clippy::too_many_arguments)]
     pub fn sign(
         payee_secret: &[u8; 32],
-        kind: AuthorizationKind,
+        kind: PayeeGatewayReceiveAuthorizationKind,
         gateway: PublicKey,
         preimage_server: PublicKey,
         description: Option<String>,
@@ -215,13 +215,13 @@ impl ReceiveAuthorization {
     /// ```
     ///
     /// Fails on terms that make no sense (see
-    /// [`ReceiveAuthorization::check_terms`]).
+    /// [`PayeeGatewayReceiveAuthorization::check_terms`]).
     pub fn message(&self) -> Result<Vec<u8>, String> {
         self.check_terms()?;
         Ok(self.encode())
     }
 
-    /// [`ReceiveAuthorization::message`], whatever the terms.
+    /// [`PayeeGatewayReceiveAuthorization::message`], whatever the terms.
     fn encode(&self) -> Vec<u8> {
         let mut message = SigningMessage::new(AUTHORIZATION_DOMAIN);
         message
@@ -274,14 +274,14 @@ impl ReceiveAuthorization {
             .map_err(|_| "invalid payee signature on the receive authorization".to_string())
     }
 
-    /// SHA-256 of [`ReceiveAuthorization::message`]: what a
+    /// SHA-256 of [`PayeeGatewayReceiveAuthorization::message`]: what a
     /// [`PreimageIssuance`] refers to it by.
     pub fn id(&self) -> Result<Bytes32, String> {
         self.check_terms()?;
         Ok(self.digest())
     }
 
-    /// [`ReceiveAuthorization::id`], whatever the terms: what an invoice
+    /// [`PayeeGatewayReceiveAuthorization::id`], whatever the terms: what an invoice
     /// signature covers it by.
     pub(crate) fn digest(&self) -> Bytes32 {
         Bytes32(Sha256::digest(self.encode()).into())
@@ -325,7 +325,7 @@ pub struct PreimageIssuance {
     /// [`Metadata::hash`] of the metadata of the invoice the hash is
     /// for; `None` for an invoice without.
     pub metadata_hash: Option<Bytes32>,
-    /// [`ReceiveAuthorization::id`].
+    /// [`PayeeGatewayReceiveAuthorization::id`].
     pub authorization: Bytes32,
     /// Not signed: the server derives the preimage from it, so a wrong
     /// one only fails to match the hash.
@@ -372,7 +372,7 @@ impl PreimageIssuance {
     pub fn verify(
         &self,
         preimage_server: &PublicKey,
-        authorization: &ReceiveAuthorization,
+        authorization: &PayeeGatewayReceiveAuthorization,
     ) -> Result<(), String> {
         if authorization.preimage_server != *preimage_server {
             return Err("the authorization names another preimage server".into());
@@ -445,7 +445,7 @@ pub struct GatewayMetadata {
 pub struct GatewayTerms {
     pub payment_hash: Bytes32,
     pub amount_msat: u64,
-    pub authorization: ReceiveAuthorization,
+    pub authorization: PayeeGatewayReceiveAuthorization,
     /// Iroh relay to reach the authorization's preimage server through,
     /// as the payee gave it: a hint the authorization does not sign.
     pub preimage_server_relay: Option<String>,
@@ -593,12 +593,17 @@ mod tests {
         endpoint_public_key(&[byte; 32])
     }
 
-    fn authorization(kind: AuthorizationKind) -> ReceiveAuthorization {
+    fn authorization(
+        kind: PayeeGatewayReceiveAuthorizationKind,
+    ) -> PayeeGatewayReceiveAuthorization {
         signed(kind, None)
     }
 
-    fn signed(kind: AuthorizationKind, description: Option<&str>) -> ReceiveAuthorization {
-        ReceiveAuthorization::sign(
+    fn signed(
+        kind: PayeeGatewayReceiveAuthorizationKind,
+        description: Option<&str>,
+    ) -> PayeeGatewayReceiveAuthorization {
+        PayeeGatewayReceiveAuthorization::sign(
             &[1; 32],
             kind,
             key(2),
@@ -621,7 +626,7 @@ mod tests {
 
     #[test]
     fn authorization_message_is_canonical() {
-        let authorization = authorization(AuthorizationKind::Standing);
+        let authorization = authorization(PayeeGatewayReceiveAuthorizationKind::Standing);
         let mut expected = Vec::new();
         expected.extend(31u32.to_be_bytes());
         expected.extend(b"cassis/receive-authorization/v3");
@@ -650,7 +655,7 @@ mod tests {
     #[test]
     fn authorization_description_is_a_signed_term() {
         let authorization = signed(
-            AuthorizationKind::Standing,
+            PayeeGatewayReceiveAuthorizationKind::Standing,
             Some("a \"quoted\"\ndescription"),
         );
         authorization.verify().unwrap();
@@ -661,18 +666,19 @@ mod tests {
         tampered.description = Some("coffee".into());
         assert!(tampered.verify().is_err());
         // Without one, any description does.
-        assert!(signed(AuthorizationKind::Single, None).allows_description(None));
-        assert!(signed(AuthorizationKind::Single, None).allows_description(Some("coffee")));
+        assert!(signed(PayeeGatewayReceiveAuthorizationKind::Single, None).allows_description(None));
+        assert!(signed(PayeeGatewayReceiveAuthorizationKind::Single, None)
+            .allows_description(Some("coffee")));
     }
 
     #[test]
     fn authorization_signature_covers_every_term() {
-        let authorization = authorization(AuthorizationKind::Single);
+        let authorization = authorization(PayeeGatewayReceiveAuthorizationKind::Single);
         let mut tampered = authorization.clone();
         tampered.max_amount_msat += 1;
         assert!(tampered.verify().is_err());
         let mut tampered = authorization.clone();
-        tampered.kind = AuthorizationKind::Standing;
+        tampered.kind = PayeeGatewayReceiveAuthorizationKind::Standing;
         assert!(tampered.verify().is_err());
         let mut tampered = authorization.clone();
         tampered.gateway = key(9);
@@ -688,10 +694,10 @@ mod tests {
 
     #[test]
     fn authorization_refuses_absurd_terms() {
-        let mut same = authorization(AuthorizationKind::Standing);
+        let mut same = authorization(PayeeGatewayReceiveAuthorizationKind::Standing);
         same.gateway = same.preimage_server;
         assert!(same.message().is_err());
-        let mut nowhere = authorization(AuthorizationKind::Standing);
+        let mut nowhere = authorization(PayeeGatewayReceiveAuthorizationKind::Standing);
         nowhere.destinations.clear();
         assert!(nowhere.message().is_err());
     }
@@ -726,7 +732,7 @@ mod tests {
 
     #[test]
     fn issuance_is_bound_to_server_and_authorization() {
-        let authorization = authorization(AuthorizationKind::Standing);
+        let authorization = authorization(PayeeGatewayReceiveAuthorizationKind::Standing);
         let metadata = Metadata::new(b"order 42".to_vec()).unwrap();
         let mut issuance = PreimageIssuance {
             payment_hash: Bytes32([5; 32]),
@@ -754,7 +760,7 @@ mod tests {
 
     #[test]
     fn issuance_metadata_round_trips() {
-        let authorization = authorization(AuthorizationKind::Standing);
+        let authorization = authorization(PayeeGatewayReceiveAuthorizationKind::Standing);
         let mut issuance = PreimageIssuance {
             payment_hash: Bytes32([5; 32]),
             amount_msat: 1000,
@@ -776,7 +782,7 @@ mod tests {
 
     #[test]
     fn gateway_metadata_is_signed_by_the_gateway() {
-        let authorization = authorization(AuthorizationKind::Standing);
+        let authorization = authorization(PayeeGatewayReceiveAuthorizationKind::Standing);
         let payee_metadata = Metadata::new(b"order 42".to_vec()).unwrap();
         let mut issuance = PreimageIssuance {
             payment_hash: Bytes32([5; 32]),

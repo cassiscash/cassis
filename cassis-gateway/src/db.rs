@@ -16,19 +16,19 @@ pub use db_schema::*;
 #[orangedb::schema]
 pub mod db_schema {
     use cassis_core::network::NetworkId;
-    use cassis_wallet::stored::{StoredHtlc, StoredReceiveAuthorization};
+    use cassis_wallet::stored::{StoredHtlc, StoredPayeeGatewayReceiveAuthorization};
 
     /// A standing authorization a payee gave this gateway.
     #[entity]
     #[derive(Clone, Debug, PartialEq)]
     pub struct HandledDelegation {
-        /// [`ReceiveAuthorization::id`](cassis_core::offline::ReceiveAuthorization::id).
+        /// [`PayeeGatewayReceiveAuthorization::id`](cassis_core::offline::PayeeGatewayReceiveAuthorization::id).
         #[id([u8; 32])]
         pub authorization_id: HandledDelegationId,
         /// The payee's iroh key.
         #[index]
         pub payee: [u8; 32],
-        pub authorization: StoredReceiveAuthorization,
+        pub authorization: StoredPayeeGatewayReceiveAuthorization,
         /// Iroh relay the payee gave for reaching the preimage server.
         pub preimage_server_relay: Option<String>,
         pub registered_at: u64,

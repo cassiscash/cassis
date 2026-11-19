@@ -13,7 +13,7 @@ use cassis_admin::networks::{NetworkConfig, Networks, Opened, Opener, Status};
 use cassis_admin::{App, Args, ConfigFile, Refresh};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::offline::{
-    endpoint_public_key, GatewayMetadata, GatewayTerms, ReceiveAuthorization,
+    endpoint_public_key, GatewayMetadata, GatewayTerms, PayeeGatewayReceiveAuthorization,
     DEFAULT_MIN_FINAL_TIMEOUT_SECS,
 };
 use cassis_core::protocol::{
@@ -723,7 +723,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
     // A forgotten authorization gives no more invoices.
     let delegations = setup.gateway.delegations().unwrap();
     assert_eq!(delegations.len(), 1);
-    let id = ReceiveAuthorization::try_from(&delegations[0].authorization)
+    let id = PayeeGatewayReceiveAuthorization::try_from(&delegations[0].authorization)
         .unwrap()
         .id()
         .unwrap();

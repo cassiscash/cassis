@@ -4,7 +4,7 @@
 //!
 //! * A payee has the gateway issue one invoice
 //!   ([`Request::GatewayInvoice`]) for a hash its preimage server issued
-//!   it, under a single [`ReceiveAuthorization`]; the payee then signs
+//!   it, under a single [`PayeeGatewayReceiveAuthorization`]; the payee then signs
 //!   the invoice too.
 //! * Or a payee hands the gateway a standing authorization
 //!   ([`Request::GatewayAuthorize`]), and anyone can then have the
@@ -37,8 +37,8 @@ use crate::db::{
 };
 use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId, OutgoingState};
 use cassis_core::offline::{
-    endpoint_public_key, AuthorizationKind, GatewayDestination, GatewayMetadata, GatewayTerms,
-    ReceiveAuthorization,
+    endpoint_public_key, GatewayDestination, GatewayMetadata, GatewayTerms,
+    PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind,
 };
 use cassis_core::protocol::{
     Commit, GatewayInvoiceFor, GatewayInvoiceRequest, Invoice, InvoiceBody, InvoiceNetwork,
@@ -336,8 +336,8 @@ impl Gateway {
     /// gateway can and wants to meet.
     fn check_authorization(
         &self,
-        authorization: &ReceiveAuthorization,
-        kind: AuthorizationKind,
+        authorization: &PayeeGatewayReceiveAuthorization,
+        kind: PayeeGatewayReceiveAuthorizationKind,
     ) -> Result<(), String> {
         authorization.verify()?;
         if authorization.kind != kind {
@@ -384,7 +384,7 @@ impl Gateway {
             description,
             metadata,
         } = request;
-        self.check_authorization(&authorization, AuthorizationKind::Single)?;
+        self.check_authorization(&authorization, PayeeGatewayReceiveAuthorizationKind::Single)?;
         if !authorization.allows_description(description.as_deref()) {
             return Err("the invoice must say what the payee authorized".into());
         }
@@ -429,10 +429,13 @@ impl Gateway {
     /// and the relay to reach its preimage server through.
     fn authorize(
         &self,
-        authorization: ReceiveAuthorization,
+        authorization: PayeeGatewayReceiveAuthorization,
         preimage_server_relay: Option<String>,
     ) -> Result<(), String> {
-        self.check_authorization(&authorization, AuthorizationKind::Standing)?;
+        self.check_authorization(
+            &authorization,
+            PayeeGatewayReceiveAuthorizationKind::Standing,
+        )?;
         let id = authorization.id()?;
         info!(
             "payee {} authorized invoices of {}..{} msat until {}",
@@ -465,7 +468,8 @@ impl Gateway {
             .by_payee(*request.payee.as_bytes())
             .map_err(db_error)?
         {
-            let authorization = ReceiveAuthorization::try_from(&delegation.authorization)?;
+            let authorization =
+                PayeeGatewayReceiveAuthorization::try_from(&delegation.authorization)?;
             if authorization.is_valid_at(now)
                 && authorization.allows_amount(request.amount_msat)
                 && authorization.allows_description(request.description.as_deref())
@@ -642,7 +646,7 @@ impl Gateway {
     /// now.
     async fn destination(
         &self,
-        authorization: &ReceiveAuthorization,
+        authorization: &PayeeGatewayReceiveAuthorization,
         amount_msat: u64,
     ) -> Result<(GatewayDestination, Arc<dyn Network>), String> {
         let mut reasons = Vec::new();
