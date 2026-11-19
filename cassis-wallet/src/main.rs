@@ -173,7 +173,7 @@ enum Command {
         gateway_relay: Option<String>,
         /// The payee's key, its iroh id (see `info`).
         #[arg(long, value_name = "KEY")]
-        payee: String,
+        payee: PublicKey,
         #[arg(long)]
         amount_msat: u64,
         #[arg(long)]
@@ -470,10 +470,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => {
             let transport = Transport::bind(None).await?;
             let request = Request::GatewayInvoiceFor(GatewayInvoiceFor {
-                payee: payee
-                    .trim()
-                    .parse()
-                    .map_err(|e| format!("payee key {payee}: {e}"))?,
+                payee,
                 amount_msat,
                 expires_at: expires_in.map(|secs| unix_now() + secs),
                 description,
