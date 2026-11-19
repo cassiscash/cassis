@@ -1,4 +1,5 @@
-//! The ecash wallet: unrestricted proofs kept in one JSON file.
+//! The ecash wallet: unrestricted proofs kept in one JSON file, and the
+//! counters of the NUT-13 secrets already used, per keyset.
 
 use crate::{Amount, KeysetId, Proof, Secret};
 use cdk::nuts::nut01::SecretKey;
@@ -10,6 +11,16 @@ use std::path::{Path, PathBuf};
 
 /// File of the swaps asked of the mint whose outputs are not held yet.
 const PENDING: &str = "pending.json";
+/// File of the NUT-13 counters.
+const COUNTERS: &str = "counters.json";
+
+/// The next NUT-13 counter of a keyset: every one below it has been used
+/// to derive an output (or is not known to be unused).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Counter {
+    keyset: KeysetId,
+    next: u32,
+}
 
 /// One output of a [`PendingSwap`]: what unblinds the mint's signature.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,6 +64,27 @@ impl Wallet {
                     proofs.push(proof.clone());
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Take `count` counters of `keyset` for outputs about to be derived,
+    /// and return the first. They are never handed out twice.
+    pub fn reserve(&self, keyset: KeysetId, count: u32) -> Result<u32, String> {
+        self.update_file(COUNTERS, |counters: &mut Vec<Counter>| {
+            let counter = counter_of(counters, keyset);
+            let start = counter.next;
+            counter.next = start.checked_add(count).ok_or("NUT-13 counter overflow")?;
+            Ok(start)
+        })
+    }
+
+    /// Make sure the counters of `keyset` start at `next` or later, after
+    /// a restore found outputs below it.
+    pub fn raise_counter(&self, keyset: KeysetId, next: u32) -> Result<(), String> {
+        self.update_file(COUNTERS, |counters: &mut Vec<Counter>| {
+            let counter = counter_of(counters, keyset);
+            counter.next = counter.next.max(next);
             Ok(())
         })
     }
@@ -149,6 +181,14 @@ impl Wallet {
     }
 }
 
+fn counter_of(counters: &mut Vec<Counter>, keyset: KeysetId) -> &mut Counter {
+    if let Some(index) = counters.iter().position(|c| c.keyset == keyset) {
+        return &mut counters[index];
+    }
+    counters.push(Counter { keyset, next: 0 });
+    counters.last_mut().expect("just pushed")
+}
+
 /// Largest proofs of `keyset` first until they cover `amount_sat` and
 /// the input fee of the picked set.
 fn pick(
@@ -221,6 +261,22 @@ mod tests {
         assert_eq!(pick(&proofs, keyset, 10, 1000).unwrap().len(), 2);
         assert!(pick(&proofs, keyset, 11, 1000).is_err());
         assert!(pick(&proofs, keyset, 14, 0).is_err());
+    }
+
+    #[test]
+    fn counters_are_reserved_once() {
+        let dir = std::env::temp_dir().join(format!("cassis-cashu-{}", rand_suffix()));
+        let wallet = Wallet::open(&dir).unwrap();
+        let keyset = KeysetId::from_str(ACTIVE).unwrap();
+        let other = KeysetId::from_str(OTHER).unwrap();
+        assert_eq!(wallet.reserve(keyset, 3).unwrap(), 0);
+        assert_eq!(wallet.reserve(keyset, 2).unwrap(), 3);
+        assert_eq!(wallet.reserve(other, 1).unwrap(), 0);
+        wallet.raise_counter(keyset, 2).unwrap();
+        assert_eq!(wallet.reserve(keyset, 1).unwrap(), 5);
+        wallet.raise_counter(keyset, 9).unwrap();
+        assert_eq!(wallet.reserve(keyset, 1).unwrap(), 9);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! `HMAC-SHA512(seed, "cassis/<label>")`, truncated to 32 bytes.
 
 use crate::network::NetworkId;
+pub use bip39::Mnemonic;
 use hmac::{Hmac, Mac};
 use ritualistic::SecretKey;
 use sha2::Sha512;
@@ -16,6 +17,10 @@ pub enum SeedError {
     InvalidMnemonic(#[from] bip39::Error),
     #[error("expected a {SEED_WORD_COUNT}-word mnemonic, got {0} words")]
     WrongWordCount(usize),
+    #[error("expected a 12- or 24-word mnemonic, got {0} words")]
+    WrongWalletWordCount(usize),
+    #[error("the seed derives an invalid key")]
+    InvalidDerivation,
 }
 
 #[derive(Clone)]
@@ -90,19 +95,65 @@ fn hmac(seed: &[u8; 64], label: &[u8], counter: Option<u32>) -> [u8; 32] {
         .expect("32 bytes")
 }
 
-/// A fresh wallet key for one network, from the OS CSPRNG: a valid
-/// secp256k1 scalar, which every network takes. Daemons and wallets
-/// write it to their config when a network is added; nothing derives
-/// it.
-pub fn new_network_secret() -> [u8; 32] {
-    use rand::RngCore;
-    loop {
-        let mut candidate = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut candidate);
-        if secp256k1::SecretKey::from_byte_array(candidate).is_ok() {
-            return candidate;
-        }
+/// Parse the 12- or 24-word BIP39 mnemonic a network wallet is restored
+/// from.
+pub fn parse_wallet_mnemonic(mnemonic: &str) -> Result<Mnemonic, SeedError> {
+    let words = mnemonic.split_whitespace().count();
+    if !matches!(words, 12 | 24) {
+        return Err(SeedError::WrongWalletWordCount(words));
     }
+    Ok(Mnemonic::parse(mnemonic)?)
+}
+
+/// The key at `path` below the BIP32 master key of `seed` (the BIP39
+/// seed of a mnemonic). Indexes from [`HARDENED`] up are hardened.
+pub fn bip32_key(seed: &[u8; 64], path: &[u32]) -> Result<[u8; 32], SeedError> {
+    let secp = secp256k1::Secp256k1::signing_only();
+    let mut mac = HmacSha512::new_from_slice(b"Bitcoin seed").expect("hmac accepts any key length");
+    mac.update(seed);
+    let node = mac.finalize().into_bytes();
+    let mut key = secp256k1::SecretKey::from_byte_array(node[..32].try_into().expect("32 bytes"))
+        .map_err(|_| SeedError::InvalidDerivation)?;
+    let mut chain_code: [u8; 32] = node[32..].try_into().expect("32 bytes");
+    for index in path {
+        let mut mac = HmacSha512::new_from_slice(&chain_code).expect("hmac accepts any key length");
+        if *index >= HARDENED {
+            mac.update(&[0]);
+            mac.update(&key.secret_bytes());
+        } else {
+            mac.update(&key.public_key(&secp).serialize());
+        }
+        mac.update(&index.to_be_bytes());
+        let node = mac.finalize().into_bytes();
+        let tweak = secp256k1::Scalar::from_be_bytes(node[..32].try_into().expect("32 bytes"))
+            .map_err(|_| SeedError::InvalidDerivation)?;
+        key = key
+            .add_tweak(&tweak)
+            .map_err(|_| SeedError::InvalidDerivation)?;
+        chain_code = node[32..].try_into().expect("32 bytes");
+    }
+    Ok(key.secret_bytes())
+}
+
+/// First hardened BIP32 index.
+pub const HARDENED: u32 = 1 << 31;
+
+/// The key of the first receiving address of a BIP86 (taproot) wallet,
+/// `m/86'/<coin>'/0'/0/0`: coin type 0 on bitcoin mainnet, 1 on every
+/// test network. The key is the internal one, which the address tweaks
+/// with an empty script tree.
+pub fn bip86_key(seed: &[u8; 64], mainnet: bool) -> Result<[u8; 32], SeedError> {
+    let coin = if mainnet { 0 } else { 1 };
+    bip32_key(seed, &[HARDENED + 86, HARDENED + coin, HARDENED, 0, 0])
+}
+
+/// The key of address `index` of the first account of a BIP44 wallet on
+/// `coin_type`, `m/44'/<coin_type>'/0'/0/<index>`.
+pub fn bip44_key(seed: &[u8; 64], coin_type: u32, index: u32) -> Result<[u8; 32], SeedError> {
+    bip32_key(
+        seed,
+        &[HARDENED + 44, HARDENED + coin_type, HARDENED, 0, index],
+    )
 }
 
 /// Fresh 12-word mnemonic from the OS CSPRNG.
@@ -158,6 +209,35 @@ mod tests {
         assert_eq!(keys.network_secret(&liquid), keys.network_secret(&liquid));
         assert_ne!(keys.network_secret(&liquid), keys.network_secret(&arkade));
         assert_ne!(&keys.network_secret(&liquid), keys.node.as_bytes());
+    }
+
+    /// BIP86 test vector: the x-only key of `m/86'/0'/0'/0/0` of the
+    /// "abandon ... about" mnemonic, tweaked, is the address
+    /// `bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr`;
+    /// its internal key is below.
+    #[test]
+    fn bip86_matches_the_test_vector() {
+        let seed = Mnemonic::parse(MNEMONIC).unwrap().to_seed("");
+        let key = bip86_key(&seed, true).unwrap();
+        let secp = secp256k1::Secp256k1::signing_only();
+        let public = secp256k1::SecretKey::from_byte_array(key)
+            .unwrap()
+            .public_key(&secp)
+            .x_only_public_key()
+            .0;
+        assert_eq!(
+            lowercase_hex::encode(public.serialize()),
+            "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+        );
+    }
+
+    #[test]
+    fn wallet_mnemonics_have_twelve_or_twenty_four_words() {
+        assert!(parse_wallet_mnemonic(MNEMONIC).is_ok());
+        assert!(matches!(
+            parse_wallet_mnemonic("abandon abandon"),
+            Err(SeedError::WrongWalletWordCount(2))
+        ));
     }
 
     #[test]

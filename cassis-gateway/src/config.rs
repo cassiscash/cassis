@@ -8,9 +8,9 @@
 //! mnemonic = "twelve words ..."    # the gateway's identity derives from it
 //!
 //! [networks."cashu::mint.example"]
-//! secret = "<64 hex>"              # wallet key on this network, written when added
+//! mnemonic = "twelve words ..."    # wallet on this network, 12 or 24 words, written when added
 //! [networks.arkade]
-//! secret = "<64 hex>"
+//! mnemonic = "twelve words ..."
 //! # esplora_url = "https://..."    # chain API of arkade and bitcoin
 //!
 //! [terms]                          # all optional, in seconds
@@ -42,16 +42,16 @@ pub fn template(mnemonic: &str) -> String {
     format!(
         r#"# cassis-gateway config, also edited by the admin interface, which keeps
 # comments and applies changes right away. The gateway's identity derives
-# from the mnemonic, and every network has a key of its own, written when
+# from the mnemonic, and every network has a mnemonic of its own, written when
 # it is added: back this file up, it controls the gateway's funds.
 mnemonic = "{mnemonic}"
 
 # One table per network to be paid on and to pay payees on, with its
-# wallet key, e.g.:
+# wallet's 12 or 24 words, e.g.:
 # [networks."cashu::mint.example"]
-# secret = "<64 hex>"
+# mnemonic = "twelve words ..."
 # [networks.arkade]
-# secret = "<64 hex>"
+# mnemonic = "twelve words ..."
 # esplora_url = "https://..."
 [networks]
 

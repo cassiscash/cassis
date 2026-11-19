@@ -63,6 +63,7 @@ use bitcoin::sighash::{SighashCache, TapSighashType};
 use bitcoin::taproot::{LeafVersion, TapLeafHash, TaprootBuilder};
 use bitcoin::transaction::Version;
 use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use cassis_core::keys::{bip86_key, Mnemonic};
 use cassis_core::{
     sats_for_msat, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
@@ -433,8 +434,8 @@ pub struct BitcoinAdapter {
 impl BitcoinAdapter {
     /// Open the wallet for `bitcoin` or `bitcoin::mutinynet`. All state
     /// is on-chain, so no data directory is needed.
-    pub fn open(id: NetworkId, secret: [u8; 32], span: &Span) -> Result<Self, String> {
-        Self::open_with_esplora(id, secret, None, span)
+    pub fn open(id: NetworkId, mnemonic: &Mnemonic, span: &Span) -> Result<Self, String> {
+        Self::open_with_esplora(id, mnemonic, None, span)
     }
 
     /// [`open`](Self::open), reading the chain from the Esplora API at
@@ -442,7 +443,7 @@ impl BitcoinAdapter {
     /// `bitcoin::regtest`, which has none).
     pub fn open_with_esplora(
         id: NetworkId,
-        secret: [u8; 32],
+        mnemonic: &Mnemonic,
         esplora_url: Option<&str>,
         span: &Span,
     ) -> Result<Self, String> {
@@ -456,6 +457,8 @@ impl BitcoinAdapter {
             .or(default_url)
             .ok_or_else(|| format!("{id} needs an esplora URL"))?;
         let secp = Secp256k1::new();
+        let secret = bip86_key(&mnemonic.to_seed(""), network == bitcoin::Network::Bitcoin)
+            .map_err(|e| format!("bitcoin key: {e}"))?;
         let wallet_sk = bitcoin::secp256k1::SecretKey::from_slice(&secret)
             .map_err(|e| format!("invalid bitcoin key: {e}"))?;
         let key_xonly = Keypair::from_secret_key(&secp, &wallet_sk)

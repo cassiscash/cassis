@@ -1,7 +1,7 @@
 //! The wallet's home directory:
 //!
 //! ```text
-//! <home>/config.toml        mnemonic, and every network with its key (see [`crate::config`])
+//! <home>/config.toml        mnemonic, and every network with its mnemonic (see [`crate::config`])
 //! <home>/wallet.redb        invoices, transactions, pending payments (see [`crate::db`])
 //! <home>/<kind>/<variant>/  private data of one network (wallets, ...)
 //! ```
@@ -11,7 +11,7 @@
 
 use crate::config::{self, WalletConfig};
 use crate::db::Db;
-use cassis_core::keys::NodeKeys;
+use cassis_core::keys::{Mnemonic, NodeKeys};
 use cassis_core::{Network, NetworkId};
 #[cfg(feature = "arkade")]
 use cassis_networks::arkade;
@@ -66,7 +66,7 @@ impl Home {
         })
     }
 
-    /// Add `network` to the config with a fresh key, if it is not there
+    /// Add `network` to the config with a fresh mnemonic, if it is not there
     /// yet, and apply `change` to its table.
     pub fn enable(
         &mut self,
@@ -79,7 +79,7 @@ impl Home {
         Ok(())
     }
 
-    /// Remove `networks` from the config. Their keys go with them.
+    /// Remove `networks` from the config. Their mnemonics go with them.
     pub fn disable(&mut self, networks: &[NetworkId]) -> Result<(), String> {
         self.config = config::edit(&self.dir, |doc| {
             if let Some(table) = doc.get_mut("networks").and_then(|n| n.as_table_mut()) {
@@ -97,9 +97,9 @@ impl Home {
         cassis_networks::network_dir(&self.dir, network)
     }
 
-    /// The wallet key on `network`, from the config.
-    pub fn secret(&self, network: &NetworkId) -> Result<[u8; 32], String> {
-        self.config.network(network)?.secret(network)
+    /// The wallet mnemonic on `network`, from the config.
+    pub fn mnemonic(&self, network: &NetworkId) -> Result<Mnemonic, String> {
+        self.config.network(network)?.mnemonic(network)
     }
 
     /// What opening `network` takes, as configured. `$CASSIS_ESPLORA_URL`
@@ -127,7 +127,7 @@ impl Home {
         })?;
         let adapter = bark_lightning::BarkLightningAdapter::open(
             network.clone(),
-            settings.secret,
+            &settings.mnemonic,
             &settings.dir,
             &config,
             span,
@@ -147,7 +147,7 @@ impl Home {
         let settings = self.settings(network)?;
         let adapter = arkade::ArkadeAdapter::open_with_esplora(
             network.clone(),
-            settings.secret,
+            &settings.mnemonic,
             &settings.dir,
             settings.esplora_url.as_deref(),
             span,
@@ -165,7 +165,7 @@ impl Home {
         span: &Span,
     ) -> Result<cashu::CashuAdapter, String> {
         let settings = self.settings(network)?;
-        cashu::CashuAdapter::open(network.clone(), settings.secret, &settings.dir, span)
+        cashu::CashuAdapter::open(network.clone(), &settings.mnemonic, &settings.dir, span)
     }
 
     /// Open the adapter of `network`, if this binary was built with it,

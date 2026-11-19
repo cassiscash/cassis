@@ -18,6 +18,13 @@
 //! journaled in `<data_dir>/pending.json` until its outputs are held:
 //! if the mint's answer is lost, upkeep asks for their signatures again
 //! (NUT-09).
+//!
+//! Unrestricted outputs have the secrets and blinding factors of NUT-13,
+//! derived from the BIP39 seed with a counter per keyset kept in
+//! `<data_dir>/counters.json`, so [`CashuAdapter::restore`] finds the
+//! wallet's proofs again from the mnemonic alone. HTLC-locked outputs
+//! carry a random nonce and are not derivable: the journal above is
+//! what recovers them.
 
 mod htlc;
 pub use htlc::{sign_refund, HtlcTerms};
@@ -26,6 +33,7 @@ mod wallet;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use cassis_core::keys::{bip32_key, Mnemonic, HARDENED};
 use cassis_core::{
     sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
     NetworkId, OutgoingState, XOnlyPubKey,
@@ -33,7 +41,7 @@ use cassis_core::{
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
 use cdk::mint_url::MintUrl;
-use cdk::nuts::nut00::{BlindedMessage, Proofs};
+use cdk::nuts::nut00::{BlindedMessage, PreMintSecrets, Proofs};
 use cdk::nuts::nut07::{CheckStateRequest, ProofState, State};
 use cdk::nuts::nut12::ProofDleq;
 use cdk::nuts::nut14::HTLCWitness;
@@ -62,6 +70,10 @@ type Blinding = (Secret, cdk::nuts::nut01::SecretKey, Amount);
 const KEYSETS_TTL: Duration = Duration::from_secs(10 * 60);
 /// How often a long-running node looks for swaps to recover.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Outputs asked for at once when restoring, as NUT-13 recommends.
+const RESTORE_BATCH: u32 = 100;
+/// Empty batches in a row that end a restore of one keyset.
+const RESTORE_EMPTY_BATCHES: u32 = 3;
 /// A journaled swap this old got no answer: its request is over.
 const SWAP_RECOVERY_AGE_SECS: u64 = 120;
 
@@ -90,6 +102,8 @@ pub struct CashuAdapter {
     id: NetworkId,
     mint_url: MintUrl,
     client: cdk::wallet::HttpClient,
+    /// BIP39 seed of the wallet: its NUT-13 secrets derive from it.
+    seed: [u8; 64],
     secret_key: cdk::nuts::nut01::SecretKey,
     /// Key counterparties lock HTLC proofs to. NUT-11/14 signatures are
     /// BIP340, so parity does not matter.
@@ -102,16 +116,22 @@ pub struct CashuAdapter {
     wallet: Wallet,
 }
 
+/// The claim key, the first P2PK key of NUT-13 under the BIP39 seed:
+/// `m/129373'/10'/0'/0'/0`, so a restore finds proofs locked to it.
+const CLAIM_KEY_PATH: [u32; 5] = [HARDENED + 129373, HARDENED + 10, HARDENED, HARDENED, 0];
+
 impl CashuAdapter {
     /// Open the wallet of mint `id` (`cashu::<host>`), keeping proofs
     /// under `data_dir`.
     pub fn open(
         id: NetworkId,
-        secret: [u8; 32],
+        mnemonic: &Mnemonic,
         data_dir: &Path,
         span: &Span,
     ) -> Result<Self, String> {
         let mint_url = MintUrl::from_str(&mint_url(&id)?).map_err(|e| e.to_string())?;
+        let seed = mnemonic.to_seed("");
+        let secret = bip32_key(&seed, &CLAIM_KEY_PATH).map_err(|e| format!("cashu key: {e}"))?;
         let secret_key = cdk::nuts::nut01::SecretKey::from_slice(&secret)
             .map_err(|e| format!("invalid cashu key: {e}"))?;
         let compressed = secret_key.public_key().to_bytes();
@@ -120,6 +140,7 @@ impl CashuAdapter {
         Ok(Self {
             client: cdk::wallet::HttpClient::new(mint_url.clone(), None),
             mint_url,
+            seed,
             secret_key,
             claim_pubkey,
             span: cassis_core::network_span(span, &id),
@@ -279,7 +300,7 @@ impl CashuAdapter {
                     messages.push(message);
                 }
             }
-            None => plain_outputs(
+            None => self.plain_outputs(
                 outputs_sat,
                 keyset.id,
                 &fee_and_amounts,
@@ -288,7 +309,7 @@ impl CashuAdapter {
             )?,
         }
         let locked = messages.len();
-        plain_outputs(
+        self.plain_outputs(
             change_sat,
             keyset.id,
             &fee_and_amounts,
@@ -325,6 +346,113 @@ impl CashuAdapter {
         self.wallet.add(&change).map_err(network_error)?;
         self.wallet.end_swap(pending.id).map_err(network_error)?;
         Ok(proofs)
+    }
+
+    /// Unrestricted outputs worth `amount_sat`, with the next NUT-13
+    /// secrets of `keyset`.
+    fn plain_outputs(
+        &self,
+        amount_sat: u64,
+        keyset: KeysetId,
+        fee_and_amounts: &FeeAndAmounts,
+        blindings: &mut Vec<Blinding>,
+        messages: &mut Vec<BlindedMessage>,
+    ) -> Result<(), NetworkError> {
+        if amount_sat == 0 {
+            return Ok(());
+        }
+        let split = Amount::from(amount_sat)
+            .split_targeted(&SplitTarget::None, fee_and_amounts)
+            .map_err(NetworkError::invalid)?;
+        let start = self
+            .wallet
+            .reserve(keyset, split.len() as u32)
+            .map_err(network_error)?;
+        for (counter, amount) in (start..).zip(split) {
+            let secret =
+                Secret::from_seed(&self.seed, keyset, counter).map_err(NetworkError::invalid)?;
+            let blinding = cdk::nuts::nut01::SecretKey::from_seed(&self.seed, keyset, counter)
+                .map_err(NetworkError::invalid)?;
+            let (blinded, r) =
+                blind_message(&secret.to_bytes(), Some(blinding)).map_err(NetworkError::invalid)?;
+            messages.push(BlindedMessage::new(amount, keyset, blinded));
+            blindings.push((secret, r, amount));
+        }
+        Ok(())
+    }
+
+    /// Find the wallet's proofs again from the mnemonic (NUT-13, NUT-09):
+    /// for every keyset of the mint, ask for the signatures of the
+    /// outputs derived at counters 0, 1, 2 ... in batches, until three
+    /// batches in a row come back empty, and keep the proofs the mint
+    /// still holds unspent. Returns the amount found, in sats.
+    pub async fn restore(&self) -> Result<u64, String> {
+        let keysets = self
+            .client
+            .get_mint_keysets()
+            .await
+            .map_err(|e| e.to_string())?
+            .keysets
+            .into_iter()
+            .filter(|keyset| keyset.unit == CurrencyUnit::Sat);
+        let mut restored = 0;
+        for keyset in keysets {
+            let keys = self.keys(keyset.id).await.map_err(|e| e.to_string())?;
+            let mut start = 0u32;
+            let mut empty = 0;
+            let mut next = 0u32;
+            while empty < RESTORE_EMPTY_BATCHES {
+                let end = start + RESTORE_BATCH;
+                let batch = PreMintSecrets::restore_batch(keyset.id, &self.seed, start, end)
+                    .map_err(|e| e.to_string())?;
+                let outputs: Vec<BlindedMessage> = batch
+                    .secrets
+                    .iter()
+                    .map(|pre_mint| pre_mint.blinded_message.clone())
+                    .collect();
+                let response = self
+                    .client
+                    .post_restore(RestoreRequest { outputs })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut proofs = Vec::new();
+                for (message, signature) in response.outputs.iter().zip(response.signatures) {
+                    let Some(index) = batch.secrets.iter().position(|pre| {
+                        pre.blinded_message.blinded_secret == message.blinded_secret
+                    }) else {
+                        continue;
+                    };
+                    let pre_mint = &batch.secrets[index];
+                    let amount = signature.amount;
+                    proofs.push(
+                        unblind(
+                            &keys,
+                            signature,
+                            pre_mint.secret.clone(),
+                            pre_mint.r.clone(),
+                            amount,
+                        )
+                        .map_err(|e| e.to_string())?,
+                    );
+                    next = next.max(start + index as u32 + 1);
+                }
+                empty = if proofs.is_empty() { empty + 1 } else { 0 };
+                if !proofs.is_empty() {
+                    let states = self.states(&proofs).await.map_err(|e| e.to_string())?;
+                    let unspent: Vec<Proof> = proofs
+                        .into_iter()
+                        .zip(states)
+                        .filter(|(_, state)| state.state == State::Unspent)
+                        .map(|(proof, _)| proof)
+                        .collect();
+                    restored += sum_sats(&unspent);
+                    self.wallet.add(&unspent)?;
+                }
+                start = end;
+            }
+            self.wallet.raise_counter(keyset.id, next)?;
+        }
+        Ok(restored)
     }
 
     /// Finish the journaled swaps whose answer never came: ask the mint
@@ -813,29 +941,6 @@ pub fn htlc_amount_sat(amount_sat: u64, input_fee_ppk: u64) -> u64 {
         }
         outputs = needed;
     }
-}
-
-fn plain_outputs(
-    amount_sat: u64,
-    keyset: KeysetId,
-    fee_and_amounts: &FeeAndAmounts,
-    blindings: &mut Vec<Blinding>,
-    messages: &mut Vec<BlindedMessage>,
-) -> Result<(), NetworkError> {
-    if amount_sat == 0 {
-        return Ok(());
-    }
-    let split = Amount::from(amount_sat)
-        .split_targeted(&SplitTarget::None, fee_and_amounts)
-        .map_err(NetworkError::invalid)?;
-    for amount in split {
-        let secret = Secret::generate();
-        let (blinded, r) =
-            blind_message(&secret.to_bytes(), None).map_err(NetworkError::invalid)?;
-        messages.push(BlindedMessage::new(amount, keyset, blinded));
-        blindings.push((secret, r, amount));
-    }
-    Ok(())
 }
 
 pub fn encode_proofs(proofs: &Proofs, target: XOnlyPubKey) -> Result<HtlcDescriptor, NetworkError> {

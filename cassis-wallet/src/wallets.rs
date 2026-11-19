@@ -98,6 +98,9 @@ pub enum CashuCommand {
         #[arg(long)]
         token: String,
     },
+    /// Find the wallet's ecash at the mint again from the mnemonic, e.g.
+    /// after losing its data directory.
+    Restore,
 }
 
 #[derive(Subcommand)]
@@ -178,6 +181,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                 CashuCommand::Receive { token } => {
                     println!("received {} sat", wallet.receive_token(&token).await?)
                 }
+                CashuCommand::Restore => println!("restored {} sat", wallet.restore().await?),
             }
         }
         #[cfg(feature = "liquid")]
@@ -185,7 +189,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "liquid")?;
             let wallet = cassis_networks::liquid::LiquidAdapter::open(
                 network.clone(),
-                home.secret(&network)?,
+                &home.mnemonic(&network)?,
                 &home.network_dir(&network),
                 span,
             )
@@ -213,7 +217,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "bitcoin")?;
             let wallet = cassis_networks::bitcoin::BitcoinAdapter::open(
                 network.clone(),
-                home.secret(&network)?,
+                &home.mnemonic(&network)?,
                 span,
             )?;
             routine_checks(&wallet).await;
@@ -292,7 +296,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "rootstock")?;
             let wallet = cassis_networks::rootstock::RootstockAdapter::open(
                 network.clone(),
-                home.secret(&network)?,
+                &home.mnemonic(&network)?,
                 span,
             )?;
             routine_checks(&wallet).await;
@@ -309,7 +313,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             let network = kind(&network, "fedimint")?;
             let wallet = cassis_networks::fedimint::FedimintAdapter::open(
                 network.clone(),
-                home.secret(&network)?,
+                &home.mnemonic(&network)?,
                 &home.network_dir(&network),
                 span,
             )

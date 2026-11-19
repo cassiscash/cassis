@@ -70,6 +70,7 @@ use bitcoin::Sequence;
 use bitcoin::TxOut;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
+use cassis_core::keys::{bip86_key, Mnemonic};
 use cassis_core::{
     sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
     NetworkId, OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
@@ -434,11 +435,11 @@ impl ArkadeAdapter {
     /// contract rows are persisted in `data_dir/contracts.db`.
     pub async fn open(
         id: NetworkId,
-        secret: [u8; 32],
+        mnemonic: &Mnemonic,
         data_dir: &Path,
         span: &Span,
     ) -> Result<Self, String> {
-        Self::open_with_esplora(id, secret, data_dir, None, span).await
+        Self::open_with_esplora(id, mnemonic, data_dir, None, span).await
     }
 
     /// [`open`](Self::open), reading the chain from the Esplora API at
@@ -446,7 +447,7 @@ impl ArkadeAdapter {
     /// (required on chains without one, like regtest).
     pub async fn open_with_esplora(
         id: NetworkId,
-        secret: [u8; 32],
+        mnemonic: &Mnemonic,
         data_dir: &Path,
         esplora_url: Option<&str>,
         span: &Span,
@@ -470,6 +471,8 @@ impl ArkadeAdapter {
             }
         };
         let secp = Secp256k1::new();
+        let secret = bip86_key(&mnemonic.to_seed(""), network == bitcoin::Network::Bitcoin)
+            .map_err(|e| format!("arkade key: {e}"))?;
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&secret)
             .map_err(|e| format!("invalid arkade key: {e}"))?;
         let keypair = Keypair::from_secret_key(&secp, &secret);

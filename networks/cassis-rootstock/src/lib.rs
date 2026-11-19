@@ -14,9 +14,9 @@
 //! itself, found by scanning blocks once `swaps()` no longer has the
 //! lock.
 //!
-//! The claim address of an x-only identity is the address of its even-Y
-//! point, and the adapter normalizes its own key to that point (see
-//! [`normalized_key`]).
+//! The claim address of a [`PubKey`] identity is the address of that
+//! point, and the adapter's account is the first standard BIP44 address
+//! of its mnemonic (see [`account_key`]).
 
 use alloy::consensus::Transaction as _;
 use alloy::eips::BlockNumberOrTag;
@@ -29,9 +29,10 @@ use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
+use cassis_core::keys::{bip44_key, Mnemonic};
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
-    OutgoingState, PubKey, XOnlyPubKey,
+    OutgoingState, PubKey,
 };
 use std::str::FromStr;
 use std::time::Duration;
@@ -419,9 +420,8 @@ pub struct RootstockAdapter {
     id: NetworkId,
     span: Span,
     address: Address,
-    /// x-only identity of the (normalized) key; `02 || x` maps to
-    /// `address`.
-    claim_pubkey: XOnlyPubKey,
+    /// Public key of the account, which maps to `address`.
+    claim_pubkey: PubKey,
     contract: Address,
     provider: Box<dyn Provider + Send + Sync>,
     /// Held while a transaction is sent, so that two never take the
@@ -432,13 +432,20 @@ pub struct RootstockAdapter {
 impl RootstockAdapter {
     /// Connect to `rootstock` or `rootstock::testnet` through a public
     /// node. All state is on chain.
-    pub fn open(id: NetworkId, secret: [u8; 32], span: &Span) -> Result<Self, String> {
+    pub fn open(id: NetworkId, mnemonic: &Mnemonic, span: &Span) -> Result<Self, String> {
         let (rpc_url, contract) = deployment(&id)?;
-        let (secret, claim_pubkey) = normalized_key(secret)?;
+        let secret = account_key(&id, mnemonic)?;
         let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&secret))
             .map_err(|e| format!("invalid rootstock key: {e}"))?;
         let address = signer.address();
-        if evm_address_from_xonly(&claim_pubkey) != address {
+        let claim_pubkey = PubKey::from_bytes(
+            secp256k1::SecretKey::from_byte_array(secret)
+                .map_err(|e| format!("invalid rootstock key: {e}"))?
+                .public_key(&secp256k1::Secp256k1::signing_only())
+                .serialize(),
+        )
+        .map_err(|e| format!("invalid rootstock public key: {e}"))?;
+        if evm_address_from_pubkey(&claim_pubkey) != address {
             return Err("claim identity does not map to the signing address".into());
         }
         let provider: Box<dyn Provider + Send + Sync> = Box::new(
@@ -492,7 +499,7 @@ impl RootstockAdapter {
     fn claim_target(&self) -> InvoiceTarget {
         InvoiceTarget::Rootstock {
             network: self.id.clone(),
-            target: PubKey::from_x_only(&self.claim_pubkey).expect("valid key"),
+            target: self.claim_pubkey.clone(),
         }
     }
 
@@ -729,61 +736,35 @@ pub fn gas_cost(gas: u64, gas_price: u128) -> U256 {
     U256::from(gas).saturating_mul(U256::from(gas_price))
 }
 
+/// SLIP-44 coin type of RSK mainnet, and the one RSK's wallets use on
+/// its testnet.
+const RSK_MAINNET_COIN_TYPE: u32 = 137;
+const RSK_TESTNET_COIN_TYPE: u32 = 37310;
+
+/// The key of the account of `mnemonic` on `id`: BIP44
+/// `m/44'/<RSK coin type>'/0'/0/0` (RSKIP-57), the first address every
+/// RSK wallet lists under the same mnemonic.
+pub fn account_key(id: &NetworkId, mnemonic: &Mnemonic) -> Result<[u8; 32], String> {
+    let coin_type = match id.param() {
+        None => RSK_MAINNET_COIN_TYPE,
+        Some(_) => RSK_TESTNET_COIN_TYPE,
+    };
+    bip44_key(&mnemonic.to_seed(""), coin_type, 0).map_err(|e| format!("rootstock key: {e}"))
+}
+
 /// Derive the EVM address for a 32-byte secret key without
 /// touching the network. Used by the CLI's `info` subcommand
 /// so showing the local address doesn't need an RPC
 /// connection.
 ///
-/// Normalizes the key exactly like [`RootstockAdapter::open`], so the
-/// address shown here is always the address the adapter actually uses.
 pub fn address_from_sk(sk: [u8; 32]) -> Result<Address, String> {
-    let (sk, _) = normalized_key(sk)?;
     let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&sk))
         .map_err(|e| format!("invalid secret key: {e}"))?;
     Ok(signer.address())
 }
 
-/// Normalize a secret key to the representative whose public key has an
-/// even Y coordinate, returning it unchanged if it already does.
-///
-/// Cassis identities are BIP340 x-only keys: 32 bytes of X with the Y
-/// parity discarded. Reconstructing a full point from one therefore has
-/// to assume a parity, and everything here assumes even (the `0x02`
-/// prefix). Ethereum addresses, however, are `keccak256(X || Y)[12..]`,
-/// so `P` and `-P` — same X, opposite Y — hash to *different*
-/// addresses.
-///
-/// Without this, a key whose public point has odd Y would advertise an
-/// x-only identity that maps to `evm_addr(-P)` while the signer could
-/// only produce signatures for `evm_addr(P)`: HTLCs would be locked to
-/// an address the adapter cannot claim from, for roughly half of all
-/// keys, at random.
-///
-/// Since `(n - sk) * G == -(sk * G)`, negating the scalar yields the
-/// even-Y twin with an identical X. The x-only pubkey is therefore
-/// unchanged, so nostr/npub and cashu (BIP340, x-only) identities are
-/// unaffected — only the EVM address becomes well defined.
-///
-/// Returns the normalized key together with the x-only identity it maps
-/// to (every caller needs both halves).
-pub fn normalized_key(sk: [u8; 32]) -> Result<([u8; 32], XOnlyPubKey), String> {
-    let secp = secp256k1::Secp256k1::signing_only();
-    let secret = secp256k1::SecretKey::from_byte_array(sk)
-        .map_err(|e| format!("invalid secret key: {e}"))?;
-    let (xonly, parity) = secret.x_only_public_key(&secp);
-    let normalized = match parity {
-        secp256k1::Parity::Even => sk,
-        // Negating the scalar flips Y and leaves X untouched, so the
-        // x-only identity computed above still holds.
-        secp256k1::Parity::Odd => secret.negate().secret_bytes(),
-    };
-    let pubkey = XOnlyPubKey::from_bytes(xonly.serialize())
-        .map_err(|e| format!("invalid x-only pubkey: {e}"))?;
-    Ok((normalized, pubkey))
-}
-
-/// Map a cassis x-only identity to the EVM address that can claim an
-/// HTLC locked to it: `keccak256(X || Y)[12..]` of the even-Y point.
+/// Map a cassis identity to the EVM address that can claim an HTLC
+/// locked to it: `keccak256(X || Y)[12..]` of its point.
 ///
 /// This is the single source of truth for the identity -> address
 /// mapping. It is used both to pick the `claimAddress` when locking an
@@ -795,67 +776,38 @@ pub fn evm_address_from_pubkey(pubkey: &PubKey) -> Address {
     Address::from_slice(&alloy::primitives::keccak256(&uncompressed[1..]).0[12..])
 }
 
-/// [`evm_address_from_pubkey`] of the even-Y point of an x-only identity.
-pub fn evm_address_from_xonly(pubkey: &XOnlyPubKey) -> Address {
-    let mut compressed = [0u8; 33];
-    compressed[0] = 0x02;
-    compressed[1..].copy_from_slice(pubkey.as_bytes());
-    let full = PubKey::from_bytes(compressed).expect("valid x-only public key");
-    evm_address_from_pubkey(&full)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The account is the standard BIP44 key of the first address, and
+    /// its identity maps to the address it signs for.
+    #[test]
+    fn account_is_the_first_bip44_address() {
+        let mnemonic = Mnemonic::parse(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let mainnet = account_key(&NetworkId("rootstock".into()), &mnemonic).unwrap();
+        let testnet = account_key(&NetworkId("rootstock::testnet".into()), &mnemonic).unwrap();
+        assert_ne!(mainnet, testnet);
+        let secret = secp256k1::SecretKey::from_byte_array(mainnet).unwrap();
+        let public = PubKey::from_bytes(
+            secret
+                .public_key(&secp256k1::Secp256k1::signing_only())
+                .serialize(),
+        )
+        .unwrap();
+        assert_eq!(
+            evm_address_from_pubkey(&public),
+            address_from_sk(mainnet).unwrap()
+        );
+    }
 
     #[test]
     fn msat_to_wei_uses_one_rbtc_per_100_billion_msat() {
         let one_rbtc_in_msat = 100_000_000_000u64;
         let one_rbtc_in_wei = U256::from(1_000_000_000_000_000_000u128);
         assert_eq!(msat_to_wei(one_rbtc_in_msat), one_rbtc_in_wei);
-    }
-
-    /// Walk enough keys to hit both Y parities (each is ~50% likely, so
-    /// 24 candidates makes a miss vanishingly unlikely) and assert the
-    /// normalization invariants on every one.
-    #[test]
-    fn normalize_sk_preserves_x_only_identity_and_yields_signable_address() {
-        let mut covered_even = false;
-        let mut covered_odd = false;
-        for seed in 1u8..25 {
-            let sk = [seed; 32];
-            let (normalized, pubkey) = normalized_key(sk).expect("valid key");
-            if normalized == sk {
-                covered_even = true;
-            } else {
-                covered_odd = true;
-            }
-
-            // The x-only identity must survive normalization, otherwise
-            // negating the scalar would change the node's identity on
-            // every other network (nostr, cashu) too.
-            let (renormalized, pubkey_again) = normalized_key(normalized).expect("valid key");
-            assert_eq!(
-                pubkey, pubkey_again,
-                "normalization must not change the x-only identity",
-            );
-
-            // The crux: the address derived from the advertised x-only
-            // identity must be the address the normalized key can sign
-            // for. Without normalization this fails for odd-Y keys.
-            assert_eq!(
-                evm_address_from_xonly(&pubkey),
-                address_from_sk(sk).unwrap(),
-                "advertised identity must map to the signable address",
-            );
-
-            // Idempotent: normalizing an already-normalized key is a
-            // no-op, so repeated construction is stable.
-            assert_eq!(renormalized, normalized);
-        }
-        assert!(
-            covered_even && covered_odd,
-            "expected the sample to cover both Y parities",
-        );
     }
 }

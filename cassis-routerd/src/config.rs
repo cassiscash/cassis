@@ -10,10 +10,10 @@
 //! nostr_relays = ["wss://nostr.wine"]  # where routes are announced
 //!
 //! [networks."cashu::mint.example"]
-//! secret = "<hex>"                 # wallet key on this network, written when added
+//! mnemonic = "twelve words ..."    # wallet on this network, 12 or 24 words, written when added
 //!
 //! [networks.lightning]
-//! secret = "<hex>"
+//! mnemonic = "twelve words ..."
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
 //!
@@ -271,7 +271,7 @@ fn write_new(path: &Path) -> Result<(), String> {
     let template = format!(
         r#"# cassis-routerd config, also edited by the admin interface, which
 # keeps comments. The router's identity derives from the mnemonic below
-# unless overridden, and every network has a key of its own, written
+# unless overridden, and every network has a mnemonic of its own, written
 # when it is added: back this file up, it controls the router's funds.
 #
 # iroh_secret = "<64 hex>"
@@ -281,11 +281,12 @@ fn write_new(path: &Path) -> Result<(), String> {
 # autoname derived from its key):
 # name = "My router"
 #
-# One table per network to open, with its wallet key, e.g.:
+# One table per network to open, with the 12 or 24 words its wallet is
+# restored from, e.g.:
 # [networks."cashu::mint.example"]
-# secret = "<64 hex>"
+# mnemonic = "twelve words ..."
 # [networks.lightning]
-# secret = "<64 hex>"
+# mnemonic = "twelve words ..."
 # lnd = {{ rest_url = "https://127.0.0.1:8080", tls_cert_path = "/path/tls.cert", macaroon_path = "/path/admin.macaroon" }}
 #
 # One entry per hop to offer and announce, e.g.:

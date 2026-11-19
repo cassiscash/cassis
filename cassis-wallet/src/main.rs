@@ -79,8 +79,8 @@ enum Command {
     /// Print the node identity and its networks.
     Info,
     /// Add networks this wallet holds funds on, e.g. `cashu::mint.host`,
-    /// `liquid`, `arkade::mutinynet`, `lightning`, each with a fresh key
-    /// written to its config.
+    /// `liquid`, `arkade::mutinynet`, `lightning`, each with a fresh
+    /// mnemonic written to its config.
     Enable {
         #[arg(required = true)]
         networks: Vec<String>,
@@ -107,7 +107,7 @@ enum Command {
         #[arg(long, value_name = "URL")]
         esplora_url: Option<String>,
     },
-    /// Remove networks, and their keys, from this wallet's config.
+    /// Remove networks, and their mnemonics, from this wallet's config.
     Disable {
         #[arg(required = true)]
         networks: Vec<String>,

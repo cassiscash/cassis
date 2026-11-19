@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
+use cassis_core::keys::Mnemonic;
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, XOnlyPubKey,
@@ -43,15 +44,13 @@ use fedimint_mintv2_client::{ECash, MintClientInit, MintClientModule};
 use fedimint_walletv2_client::{FinalSendOperationState, WalletClientInit, WalletClientModule};
 use tracing::{info, Span};
 
-/// Salt mixed into the per-network secret when constructing the
-/// fedimint root derivation. The federation id is added internally
-/// by `RootSecret::StandardDoubleDerive`, so this constant simply
-/// domain-separates the cassis-fedimint seed from other fedimint
-/// clients that might share the same mnemonic.
-const ROOT_SECRET_SALT: &[u8] = b"cassis/fedimint/v1";
+/// Salt of fedimint's own BIP39 root secret
+/// (`Bip39RootSecretStrategy`), which the federation id is added to
+/// internally by `RootSecret::StandardDoubleDerive`.
+const ROOT_SECRET_SALT: &[u8] = b"Fedimint Client Salt";
 
 /// Domain separator for the static claim keypair, hashed together
-/// with the per-network secret.
+/// with the BIP39 seed.
 const CLAIM_KEY_DOMAIN: &[u8] = b"cassis/fedimint/claim/v1";
 
 /// Seconds per block of a federation's chain, used to convert cassis's
@@ -93,7 +92,7 @@ impl FedimintAdapter {
     /// `fedimint::<invite code>`.
     pub async fn open(
         id: NetworkId,
-        secret: [u8; 32],
+        mnemonic: &Mnemonic,
         data_dir: &Path,
         span: &Span,
     ) -> Result<Self, String> {
@@ -103,16 +102,14 @@ impl FedimintAdapter {
             .await
             .map_err(|e| format!("failed to bind connector registry: {e}"))?;
 
-        // Derive the root secret. `DerivableSecret::new_root` wants
-        // `(root_key, salt)`. We expand the 32-byte per-network
-        // secret to 64 bytes by HKDF-style repetition so the root
-        // has enough entropy. `RootSecret::StandardDoubleDerive`
-        // then hashes in the federation id internally — so reusing
-        // one mnemonic across federations is safe.
-        let mut seed64 = [0u8; 64];
-        seed64[..32].copy_from_slice(&secret);
-        seed64[32..].copy_from_slice(&secret);
-        let root_secret = DerivableSecret::new_root(&seed64, ROOT_SECRET_SALT);
+        // The root secret of fedimint's own BIP39 strategy
+        // (`Bip39RootSecretStrategy`), so the mnemonic restores the
+        // wallet in other fedimint clients.
+        // `RootSecret::StandardDoubleDerive` then hashes in the
+        // federation id internally, so reusing one mnemonic across
+        // federations is safe.
+        let seed = mnemonic.to_seed("");
+        let root_secret = DerivableSecret::new_root(&seed, ROOT_SECRET_SALT);
         let root_secret = RootSecret::StandardDoubleDerive(root_secret);
 
         std::fs::create_dir_all(data_dir).map_err(|e| format!("create {data_dir:?}: {e}"))?;
@@ -164,7 +161,7 @@ impl FedimintAdapter {
         // Sanity-check that the LNv2 module is present.
         let _ln_module: &LightningClientModule =
             Self::ln_module(&client).map_err(|e| format!("federation has no LNv2 module: {e}"))?;
-        let claim_keypair = Self::derive_claim_keypair(&secret);
+        let claim_keypair = Self::derive_claim_keypair(&seed);
         let network = client
             .get_first_module::<WalletClientModule>()
             .map_err(|e| format!("federation has no walletv2 module: {e}"))?
@@ -180,13 +177,13 @@ impl FedimintAdapter {
         })
     }
 
-    /// Derive the static claim keypair from the per-network secret.
+    /// Derive the static claim keypair from the BIP39 seed.
     /// Hash candidates until the compressed public key has even
     /// (0x02) parity: cassis `PubKey`s are x-only, and counterparties
     /// reconstruct our claim key as `0x02 || x-only`, so the claim
     /// key must be parity-normalized for lock and claim to agree.
-    fn derive_claim_keypair(secret: &[u8; 32]) -> secp256k1::Keypair {
-        let mut seed = sha256::Hash::hash(&[CLAIM_KEY_DOMAIN, secret].concat());
+    fn derive_claim_keypair(seed: &[u8; 64]) -> secp256k1::Keypair {
+        let mut seed = sha256::Hash::hash(&[CLAIM_KEY_DOMAIN, &seed[..]].concat());
         loop {
             let Ok(sk) = secp256k1::SecretKey::from_slice(&seed.to_byte_array()) else {
                 seed = sha256::Hash::hash(&seed.to_byte_array());

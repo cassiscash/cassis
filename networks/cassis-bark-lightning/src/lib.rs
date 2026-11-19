@@ -34,12 +34,12 @@ use bark::ark::lightning::{PaymentHash, Preimage};
 use bark::lightning_invoice::Bolt11Invoice;
 use bark::{Config, OpenWalletArgs, Wallet, WalletSeed};
 use bitcoin_ext::BlockDelta;
+use cassis_core::keys::Mnemonic;
 use cassis_core::{
     unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
     OutgoingState, MSAT_PER_SAT,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -100,11 +100,11 @@ pub struct BarkLightningAdapter {
 
 impl BarkLightningAdapter {
     /// Open (or create) the bark wallet of `id` in `datadir`, its keys
-    /// derived from `secret`. `id` is `lightning` (mainnet),
+    /// derived from `mnemonic` the way bark does. `id` is `lightning` (mainnet),
     /// `lightning::signet`, `lightning::mutinynet` or `lightning::regtest`.
     pub async fn open(
         id: NetworkId,
-        secret: [u8; 32],
+        mnemonic: &Mnemonic,
         datadir: &Path,
         config: &BarkConfig,
         span: &Span,
@@ -116,11 +116,6 @@ impl BarkLightningAdapter {
             Some("regtest") => (BitcoinNetwork::Regtest, 600),
             Some(other) => return Err(format!("bark does not run on '{other}'")),
         };
-        let seed: [u8; 64] = Sha512::new()
-            .chain_update(b"cassis bark wallet")
-            .chain_update(secret)
-            .finalize()
-            .into();
         let bark_config = Config {
             server_address: config.server_url.clone(),
             esplora_address: Some(config.esplora_url.clone()),
@@ -128,7 +123,7 @@ impl BarkLightningAdapter {
         };
         let wallet = Wallet::open(
             network,
-            WalletSeed::new_from_seed(network, &seed),
+            WalletSeed::new_from_seed(network, &mnemonic.to_seed("")),
             bark_config,
             OpenWalletArgs {
                 datadir: Some(datadir.to_path_buf()),

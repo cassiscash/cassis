@@ -7,7 +7,6 @@ edition.workspace = true
 async-trait = { workspace = true }
 cassis-core = { workspace = true }
 serde = { workspace = true }
-sha2 = { workspace = true }
 tracing = { workspace = true }
 
 # Bark, Second's Ark wallet, with hash-only lightning receives (see the

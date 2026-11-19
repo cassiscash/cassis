@@ -3,6 +3,7 @@
 
 mod wallet;
 
+use cassis_core::keys::Mnemonic;
 use cassis_core::{Network, NetworkId};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,10 +28,12 @@ pub use cassis_lnd as lnd;
 pub use cassis_rootstock as rootstock;
 
 /// Everything needed to open one network besides its id.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NetworkSettings {
-    /// Signing key of the node on the network.
-    pub secret: [u8; 32],
+    /// The BIP39 mnemonic the wallet on the network is restored from.
+    /// Every network derives its keys from it the way that network's
+    /// wallets do (see each adapter).
+    pub mnemonic: Mnemonic,
     /// Private directory of the network's wallet (see [`network_dir`]).
     pub dir: PathBuf,
     /// Chain API instead of the public one, for `arkade` and `bitcoin`
@@ -42,6 +45,22 @@ pub struct NetworkSettings {
     /// The Ark server a `lightning` network goes through instead of LND.
     #[cfg(feature = "bark-lightning")]
     pub bark: Option<cassis_bark_lightning::BarkConfig>,
+}
+
+impl NetworkSettings {
+    /// Settings with nothing but a wallet: no chain API of its own, and
+    /// no LND or Ark server.
+    pub fn new(mnemonic: Mnemonic, dir: PathBuf) -> Self {
+        Self {
+            mnemonic,
+            dir,
+            esplora_url: None,
+            #[cfg(feature = "lightning")]
+            lnd: None,
+            #[cfg(feature = "bark-lightning")]
+            bark: None,
+        }
+    }
 }
 
 /// Private directory of `network` under `root`: `<root>/<kind>/<variant>`.
@@ -106,24 +125,24 @@ pub async fn open_wallet(
     settings: &NetworkSettings,
     span: &Span,
 ) -> Result<(Arc<dyn Network>, Wallet), String> {
-    let secret = settings.secret;
+    let mnemonic = &settings.mnemonic;
     let dir = &settings.dir;
     let (opened, wallet) = match network.kind() {
         #[cfg(feature = "cashu")]
         "cashu" => with_wallet(
-            cassis_cashu::CashuAdapter::open(network.clone(), secret, dir, span)?,
+            cassis_cashu::CashuAdapter::open(network.clone(), mnemonic, dir, span)?,
             Wallet::Cashu,
         ),
         #[cfg(feature = "liquid")]
         "liquid" => with_wallet(
-            cassis_liquid::LiquidAdapter::open(network.clone(), secret, dir, span).await?,
+            cassis_liquid::LiquidAdapter::open(network.clone(), mnemonic, dir, span).await?,
             Wallet::Liquid,
         ),
         #[cfg(feature = "bitcoin")]
         "bitcoin" => with_wallet(
             cassis_bitcoin::BitcoinAdapter::open_with_esplora(
                 network.clone(),
-                secret,
+                mnemonic,
                 settings.esplora_url.as_deref(),
                 span,
             )?,
@@ -133,7 +152,7 @@ pub async fn open_wallet(
         "arkade" => with_wallet(
             cassis_arkade::ArkadeAdapter::open_with_esplora(
                 network.clone(),
-                secret,
+                mnemonic,
                 dir,
                 settings.esplora_url.as_deref(),
                 span,
@@ -143,12 +162,12 @@ pub async fn open_wallet(
         ),
         #[cfg(feature = "rootstock")]
         "rootstock" => with_wallet(
-            cassis_rootstock::RootstockAdapter::open(network.clone(), secret, span)?,
+            cassis_rootstock::RootstockAdapter::open(network.clone(), mnemonic, span)?,
             Wallet::Rootstock,
         ),
         #[cfg(feature = "fedimint")]
         "fedimint" => with_wallet(
-            cassis_fedimint::FedimintAdapter::open(network.clone(), secret, dir, span).await?,
+            cassis_fedimint::FedimintAdapter::open(network.clone(), mnemonic, dir, span).await?,
             Wallet::Fedimint,
         ),
         #[cfg(any(feature = "lightning", feature = "bark-lightning"))]
@@ -172,7 +191,7 @@ async fn open_lightning(
         return Ok(with_wallet(
             cassis_bark_lightning::BarkLightningAdapter::open(
                 network.clone(),
-                settings.secret,
+                &settings.mnemonic,
                 &settings.dir,
                 bark,
                 span,

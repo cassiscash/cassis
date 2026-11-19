@@ -20,8 +20,8 @@
 //! blinding keys. Claim and refund fees come out of the HTLC value; the
 //! LWK wallet only pays for lockups.
 //!
-//! The claim key is a dedicated even-Y child key (`m/1037'/i`), so the
-//! target `02 || x` is always the real key.
+//! The claim key is a dedicated child key (`m/1037'/0`), and the target
+//! is its full public key.
 //!
 //! 0-conf: lockups are broadcast non-RBF. The sender returns once
 //! Blockstream's 0-conf service sees 4/5 of the functionaries holding
@@ -35,20 +35,19 @@ mod zeroconf;
 pub use lwk_wollet::elements;
 
 use async_trait::async_trait;
+use cassis_core::keys::Mnemonic;
 use cassis_core::{
     sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
     NetworkId, OutgoingState, PubKey, MSAT_PER_SAT,
 };
-use hmac::Mac;
 use lwk_common::Signer as LwkSigner;
 use lwk_signer::SwSigner;
 use lwk_wollet::clients::asyncr::EsploraClient;
 use lwk_wollet::clients::EsploraClientBuilder;
-use lwk_wollet::elements::bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv};
+use lwk_wollet::elements::bitcoin::bip32::{DerivationPath, Fingerprint};
 use lwk_wollet::elements::bitcoin::hashes::ripemd160;
 use lwk_wollet::elements::bitcoin::hashes::sha256;
 use lwk_wollet::elements::bitcoin::hashes::Hash;
-use lwk_wollet::elements::bitcoin::hex::DisplayHex as _;
 use lwk_wollet::elements::bitcoin::hex::FromHex as _;
 use lwk_wollet::elements::bitcoin::secp256k1;
 use lwk_wollet::elements::bitcoin::PublicKey as BtcPublicKey;
@@ -66,7 +65,6 @@ use lwk_wollet::elements::{
     TxOutSecrets, Txid,
 };
 use lwk_wollet::{Network as LwkNetwork, Wollet, WolletBuilder, WolletDescriptor};
-use sha2::Sha512;
 use std::fs::File;
 use std::path::Path;
 use std::str::FromStr;
@@ -97,12 +95,8 @@ const TESTNET_PROPAGATION_WAIT_SECS: u64 = 5;
 /// value itself, so tiny locks would be eaten by fees.
 pub const MIN_LOCK_SATS: u64 = 1_000;
 
-/// Hardened prefix of the HTLC claim-key derivation path. Paths are
-/// `m/1037'/{i}` with increasing `i` until the child pubkey has an
-/// even Y coordinate (see crate docs).
-const CLAIM_KEY_PATH_PREFIX: &str = "m/1037'";
-/// SLIP-0077 domain-separation label for the master blinding key.
-const SLIP77_LABEL: &[u8] = b"SLIP-0077";
+/// Derivation path of the HTLC claim key (see crate docs).
+const CLAIM_KEY_PATH: &str = "m/1037'/0";
 
 /// LWK errors (wallet, tx builder, signer, esplora) are network errors.
 fn error_from_lwk(e: impl std::fmt::Display) -> NetworkError {
@@ -221,8 +215,8 @@ impl HtlcSpec {
         let txid = Txid::from_str(&lockup_txid.to_string()).map_err(NetworkError::invalid)?;
         let spec = Self::build(
             &htlc.payment_hash,
-            even_y_pubkey(claim)?,
-            even_y_pubkey(refund_pubkey)?,
+            btc_pubkey(claim)?,
+            btc_pubkey(refund_pubkey)?,
             *refund_locktime,
         );
         Ok((spec, OutPoint::new(txid, *lockup_vout)))
@@ -339,9 +333,9 @@ pub struct LiquidAdapter {
     span: Span,
     signer: SwSigner,
     fingerprint: Fingerprint,
-    /// Derivation path of the claim key (even-Y child).
+    /// Derivation path of the claim key.
     claim_path: DerivationPath,
-    /// Full 33-byte claim pubkey (always `02 || X`).
+    /// Full 33-byte claim pubkey.
     claim_pk_full: BtcPublicKey,
     wollet: Mutex<Wollet>,
     /// Held while a lockup picks wallet coins and spends them, so that
@@ -361,7 +355,7 @@ impl LiquidAdapter {
     /// state under `data_dir` (locked while open).
     pub async fn open(
         id: NetworkId,
-        secret: [u8; 32],
+        mnemonic: &Mnemonic,
         data_dir: &Path,
         span: &Span,
     ) -> Result<Self, String> {
@@ -379,40 +373,35 @@ impl LiquidAdapter {
             Some(other) => return Err(format!("unknown liquid network '{other}'")),
         };
         let secp = secp256k1::Secp256k1::new();
-        let bip32_network = if network.is_mainnet() {
-            lwk_wollet::elements::bitcoin::Network::Bitcoin
-        } else {
-            lwk_wollet::elements::bitcoin::Network::Testnet
-        };
-        let xprv = Xpriv::new_master(bip32_network, &secret)
-            .map_err(|e| format!("invalid secret key: {e}"))?;
-        let signer = SwSigner::from_xprv(xprv);
+        let signer = SwSigner::new(&mnemonic.to_string(), network.is_mainnet())
+            .map_err(|e| format!("invalid mnemonic: {e}"))?;
         let fingerprint = signer.fingerprint();
 
-        // Claim key: first even-Y child under m/1037'.
-        let (claim_pk_full, claim_path) = (0u32..=64)
-            .find_map(|i| {
-                let path =
-                    DerivationPath::from_str(&format!("{CLAIM_KEY_PATH_PREFIX}/{i}")).ok()?;
-                let child = xprv.derive_priv(&secp, &path).ok()?;
-                let pk = child.private_key.public_key(&secp);
-                (pk.serialize()[0] == 0x02).then(|| (BtcPublicKey::new(pk), path))
-            })
-            .ok_or("no even-Y claim key found under m/1037' within 64 tries")?;
+        let claim_path =
+            DerivationPath::from_str(CLAIM_KEY_PATH).map_err(|e| format!("claim key path: {e}"))?;
+        let claim_pk_full = BtcPublicKey::new(
+            signer
+                .derive_xprv(&claim_path)
+                .map_err(|e| format!("claim key: {e}"))?
+                .private_key
+                .public_key(&secp),
+        );
 
-        // SLIP-0077 master blinding key derived from the secret, with
-        // the account-level xpub and origin.
-        let mut mac = <hmac::Hmac<Sha512> as hmac::Mac>::new_from_slice(SLIP77_LABEL)
-            .expect("hmac key length is always valid");
-        mac.update(&secret);
-        let mbk_hex = mac.finalize().into_bytes()[..32].to_lower_hex_string();
-        let account_path = DerivationPath::from_str("m/84'/1'/0'")
+        // SLIP-0077 master blinding key of the seed, and the BIP84
+        // account of the chain (SLIP-44 coin type 1776 on Liquid), with
+        // its origin.
+        let mbk_hex = signer
+            .slip77_master_blinding_key()
+            .map_err(|e| format!("slip77 key: {e}"))?
+            .to_string();
+        let coin_type = if network.is_mainnet() { 1776 } else { 1 };
+        let account_path = DerivationPath::from_str(&format!("m/84'/{coin_type}'/0'"))
             .map_err(|e| format!("wallet account path: {e}"))?;
         let account_xpub = signer
             .derive_xpub(&account_path)
             .map_err(|e| format!("wallet account xpub: {e}"))?;
         let descriptor: WolletDescriptor = format!(
-            "ct(slip77({mbk_hex}),elwpkh([{fingerprint}/84'/1'/0']{account_xpub}/<0;1>/*))"
+            "ct(slip77({mbk_hex}),elwpkh([{fingerprint}/84'/{coin_type}'/0']{account_xpub}/<0;1>/*))"
         )
         .parse()
         .map_err(|e| format!("wallet descriptor: {e}"))?;
@@ -823,7 +812,8 @@ pub fn ensure_non_rbf(tx: &Transaction) -> Result<(), NetworkError> {
     Ok(())
 }
 
-pub fn even_y_pubkey(pubkey: &PubKey) -> Result<BtcPublicKey, NetworkError> {
+/// The bitcoin key of a full cassis public key, parity included.
+pub fn btc_pubkey(pubkey: &PubKey) -> Result<BtcPublicKey, NetworkError> {
     let inner = secp256k1::PublicKey::from_slice(pubkey.as_bytes())
         .map_err(|e| NetworkError::Invalid(format!("invalid compressed pubkey: {e}")))?;
     Ok(BtcPublicKey::new(inner))
@@ -997,7 +987,7 @@ impl Network for LiquidAdapter {
         let refund_locktime = refund_locktime(tip, expiry)?;
         let spec = HtlcSpec::build(
             &payment_hash,
-            even_y_pubkey(claim)?,
+            btc_pubkey(claim)?,
             self.claim_pk_full,
             refund_locktime,
         );
@@ -1118,6 +1108,10 @@ impl Network for LiquidAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lwk_wollet::elements::bitcoin::hex::DisplayHex as _;
+
+    const TEST_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn test_pubkey(fill: u8) -> BtcPublicKey {
         let secp = secp256k1::Secp256k1::new();
@@ -1126,14 +1120,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_key_is_even_and_deterministic() {
+    async fn claim_key_is_deterministic() {
         let open = |dir: &str| {
             let dir =
                 std::env::temp_dir().join(format!("cassis-liquid-{dir}-{}", std::process::id()));
             async move {
                 LiquidAdapter::open(
                     NetworkId("liquid::testnet".into()),
-                    [7u8; 32],
+                    &Mnemonic::parse(TEST_MNEMONIC).unwrap(),
                     &dir,
                     &Span::none(),
                 )
@@ -1144,7 +1138,6 @@ mod tests {
         let first = open("a").await;
         let second = open("b").await;
         assert_eq!(first.claim_target(), second.claim_target());
-        assert_eq!(first.claim_pk_full.to_bytes()[0], 0x02);
     }
 
     #[test]

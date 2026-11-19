@@ -6,10 +6,10 @@
 //! mnemonic = "twelve words ..."    # the node's identity keys derive from it
 //!
 //! [networks."cashu::mint.example"]
-//! secret = "<64 hex>"              # wallet key on this network
+//! mnemonic = "twelve words ..."    # wallet on this network, 12 or 24 words
 //!
 //! [networks.arkade]
-//! secret = "<64 hex>"
+//! mnemonic = "twelve words ..."
 //! # esplora_url = "https://..."    # chain API of arkade and bitcoin
 //!
 //! [networks.lightning]
@@ -17,10 +17,15 @@
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
 //! ```
 //!
-//! Every network has a key of its own, written when it is enabled:
-//! nothing derives it, so back this file up.
+//! Every network has a BIP39 mnemonic of its own, written when it is
+//! enabled, and derives its keys from it the way that network's wallets
+//! do (see each adapter in `networks/`): BIP86 taproot on `bitcoin` and
+//! `arkade`, BIP84 under SLIP-44 coin type 1776 and SLIP-77 on `liquid`,
+//! BIP44 under RSK's coin type on `rootstock`, bark's own seed on a
+//! bark `lightning`, fedimint's own root secret on `fedimint`. Back this
+//! file up, or the mnemonics.
 
-use cassis_core::keys::{generate_mnemonic, new_network_secret, NodeKeys};
+use cassis_core::keys::{generate_mnemonic, parse_wallet_mnemonic, Mnemonic, NodeKeys};
 use cassis_core::NetworkId;
 use cassis_networks::NetworkSettings;
 use serde::Deserialize;
@@ -43,8 +48,8 @@ pub struct WalletConfig {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Hex wallet key on this network (see [`new_secret`]).
-    pub secret: Option<String>,
+    /// BIP39 mnemonic (12 or 24 words) of the wallet on this network.
+    pub mnemonic: Option<String>,
     /// Chain API of `arkade` and `bitcoin`, instead of the public one.
     pub esplora_url: Option<String>,
     /// The LND node of a `lightning` network.
@@ -119,19 +124,19 @@ impl WalletConfig {
 }
 
 impl NetworkConfig {
-    /// The wallet key on `network`.
-    pub fn secret(&self, network: &NetworkId) -> Result<[u8; 32], String> {
-        let hex = self
-            .secret
+    /// The wallet mnemonic on `network`.
+    pub fn mnemonic(&self, network: &NetworkId) -> Result<Mnemonic, String> {
+        let words = self
+            .mnemonic
             .as_deref()
-            .ok_or_else(|| format!("networks.\"{network}\" has no secret"))?;
-        parse_secret(hex).map_err(|e| format!("{network} secret: {e}"))
+            .ok_or_else(|| format!("networks.\"{network}\" has no mnemonic"))?;
+        parse_wallet_mnemonic(words).map_err(|e| format!("{network} mnemonic: {e}"))
     }
 
     /// What opening `network` takes, its wallet kept under `dir`.
     #[allow(unused_variables)]
     pub fn settings(&self, network: &NetworkId, dir: &Path) -> Result<NetworkSettings, String> {
-        let secret = self.secret(network)?;
+        let mnemonic = self.mnemonic(network)?;
         #[cfg(not(feature = "lightning"))]
         if self.lnd.is_some() {
             return Err(format!("{network}: this build has no LND support"));
@@ -160,7 +165,7 @@ impl NetworkConfig {
             }
         };
         Ok(NetworkSettings {
-            secret,
+            mnemonic,
             dir: cassis_networks::network_dir(dir, network),
             esplora_url: self.esplora_url.clone(),
             #[cfg(feature = "lightning")]
@@ -175,11 +180,6 @@ impl NetworkConfig {
             bark,
         })
     }
-}
-
-/// A fresh wallet key, as hex (see [`new_network_secret`]).
-pub fn new_secret() -> String {
-    lowercase_hex::encode(new_network_secret())
 }
 
 pub fn parse_secret(hex: &str) -> Result<[u8; 32], String> {
@@ -209,7 +209,7 @@ pub fn edit(
     Ok(config)
 }
 
-/// The table of `network` in `doc`, made with a fresh secret if
+/// The table of `network` in `doc`, made with a fresh mnemonic if
 /// missing.
 pub fn network_table<'a>(
     doc: &'a mut DocumentMut,
@@ -229,8 +229,8 @@ pub fn network_table<'a>(
         .or_insert_with(toml_edit::table)
         .as_table_mut()
         .ok_or_else(|| format!("networks.\"{network}\" is not a table"))?;
-    if !table.contains_key("secret") {
-        table.insert("secret", toml_edit::value(new_secret()));
+    if !table.contains_key("mnemonic") {
+        table.insert("mnemonic", toml_edit::value(generate_mnemonic()));
     }
     Ok(table)
 }
@@ -258,18 +258,19 @@ fn template(mnemonic: &str) -> String {
     format!(
         r#"# cassis-wallet config, also edited by `enable` and `disable`, which
 # keep comments. The node's identity derives from the mnemonic; every
-# network has a key of its own below. Back this file up: it controls
+# network has a mnemonic of its own below. Back this file up: it controls
 # the wallet's funds.
 mnemonic = "{mnemonic}"
 
-# One table per network, with its wallet key, e.g.:
+# One table per network, with the 12 or 24 words its wallet is restored
+# from, e.g.:
 # [networks."cashu::mint.example"]
-# secret = "<64 hex>"
+# mnemonic = "twelve words ..."
 # [networks.arkade]
-# secret = "<64 hex>"
+# mnemonic = "twelve words ..."
 # esplora_url = "https://..."
 # [networks.lightning]
-# secret = "<64 hex>"
+# mnemonic = "twelve words ..."
 # lnd = {{ rest_url = "https://127.0.0.1:8080", tls_cert_path = "/path/tls.cert", macaroon_path = "/path/admin.macaroon" }}
 "#
     )
@@ -280,20 +281,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enabling_writes_a_secret_once() {
+    fn enabling_writes_a_mnemonic_once() {
         let mut doc: DocumentMut = template(&generate_mnemonic()).parse().unwrap();
         let network = NetworkId::parse("arkade").unwrap();
-        let secret = network_table(&mut doc, &network).unwrap()["secret"]
+        let words = network_table(&mut doc, &network).unwrap()["mnemonic"]
             .as_str()
             .unwrap()
             .to_string();
         network_table(&mut doc, &network).unwrap();
         let config = WalletConfig::parse(&doc.to_string()).unwrap();
         let entry = config.network(&network).unwrap();
-        assert_eq!(entry.secret.as_deref(), Some(secret.as_str()));
-        assert_eq!(
-            entry.secret(&network).unwrap(),
-            parse_secret(&secret).unwrap()
-        );
+        assert_eq!(entry.mnemonic.as_deref(), Some(words.as_str()));
+        assert_eq!(entry.mnemonic(&network).unwrap().to_string(), words);
     }
 }

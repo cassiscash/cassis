@@ -4,9 +4,9 @@
 
 use cassis_admin::config::{child, implicit_table, put, put_text};
 use cassis_admin::Args;
+use cassis_core::keys::generate_mnemonic;
 use cassis_core::NetworkId;
 use cassis_routerd::router::RouteOffer;
-use cassis_wallet::config::new_secret;
 use hypereffect::Value;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike};
 
@@ -40,14 +40,14 @@ pub fn add_network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result
     network(doc, id, &args)
 }
 
-/// Adds `id` if missing, with a fresh wallet key. Fields:
+/// Adds `id` if missing, with a fresh wallet mnemonic. Fields:
 /// `esplora_url`, `backend` (`lnd`, `bark` or `none`), and the `lnd_*`
 /// and `bark_*` fields of whichever backend the network has.
 pub fn network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
     let networks = child(doc.as_table_mut(), "networks", implicit_table)?;
     let network = child(networks, &id.0, toml_edit::table)?;
-    if !network.contains_key("secret") {
-        put(network, "secret", Some(new_secret().into()));
+    if !network.contains_key("mnemonic") {
+        put(network, "mnemonic", Some(generate_mnemonic().into()));
     }
     put_text(network, "esplora_url", args.text("esplora_url")?);
     match args.text("backend")?.as_deref() {
@@ -282,17 +282,17 @@ mod tests {
         assert_eq!(cashu_id, id("cashu::mint.example"));
         add_network(&mut doc, &cashu_id, &cashu).unwrap();
         assert!(add_network(&mut doc, &cashu_id, &cashu).is_err());
-        // Each network gets a key of its own.
+        // Each network gets a mnemonic of its own.
         let text = doc.to_string();
-        let secrets: Vec<&str> = text
+        let mnemonics: Vec<&str> = text
             .lines()
-            .filter(|line| line.starts_with("secret = "))
+            .filter(|line| line.starts_with("mnemonic = "))
             .collect();
-        assert_eq!(secrets.len(), 2);
-        assert_ne!(secrets[0], secrets[1]);
+        assert_eq!(mnemonics.len(), 2);
+        assert_ne!(mnemonics[0], mnemonics[1]);
         let rest: String = text
             .lines()
-            .filter(|line| !line.starts_with("secret = "))
+            .filter(|line| !line.starts_with("mnemonic = "))
             .map(|line| format!("{line}\n"))
             .collect();
         assert_eq!(

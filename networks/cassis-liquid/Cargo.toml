@@ -25,7 +25,5 @@ lwk_common = { workspace = true }
 lwk_wollet = { workspace = true }
 lwk_signer = { workspace = true }
 
-hmac = { workspace = true }
-sha2 = { workspace = true }
 reqwest = { workspace = true }
 fs2 = { workspace = true }
