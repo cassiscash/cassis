@@ -39,7 +39,7 @@ impl PeerAddr {
 
 /// Answers one request; the second argument is the authenticated iroh
 /// id of the peer that sent it.
-pub type Handler = Arc<dyn Fn(Request, String) -> BoxFuture<'static, Response> + Send + Sync>;
+pub type Handler = Arc<dyn Fn(Request, PublicKey) -> BoxFuture<'static, Response> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Transport {
@@ -146,7 +146,7 @@ impl Transport {
 }
 
 async fn answer(connection: Connection, handler: Handler) -> Result<(), String> {
-    let peer = connection.remote_id().to_string();
+    let peer = connection.remote_id();
     let (mut send, mut receive) = tokio::time::timeout(CONNECT_TIMEOUT, connection.accept_bi())
         .await
         .map_err(|_| "no stream opened".to_string())?

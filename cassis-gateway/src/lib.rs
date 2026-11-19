@@ -273,10 +273,10 @@ impl Gateway {
             .count()
     }
 
-    async fn handle(&self, request: Request, peer: String) -> Response {
+    async fn handle(&self, request: Request, peer: PublicKey) -> Response {
         match request {
             Request::GatewayInvoice(request) => {
-                Response::GatewayInvoice(log_refusal("invoice", self.invoice(request, &peer).await))
+                Response::GatewayInvoice(log_refusal("invoice", self.invoice(request, peer).await))
             }
             Request::GatewayAuthorize {
                 authorization,
@@ -367,7 +367,11 @@ impl Gateway {
     /// A payee's own invoice: check its single authorization and the
     /// preimage server's issuance, and issue the invoice for the payee
     /// to sign too.
-    async fn invoice(&self, request: GatewayInvoiceRequest, peer: &str) -> Result<Invoice, String> {
+    async fn invoice(
+        &self,
+        request: GatewayInvoiceRequest,
+        peer: PublicKey,
+    ) -> Result<Invoice, String> {
         let GatewayInvoiceRequest {
             authorization,
             preimage_server_relay,
@@ -380,12 +384,7 @@ impl Gateway {
         if !authorization.allows_description(description.as_deref()) {
             return Err("the invoice must say what the payee authorized".into());
         }
-        if peer
-            .trim()
-            .parse::<PublicKey>()
-            .map_err(|e| format!("endpoint key {peer}: {e}"))?
-            != authorization.payee
-        {
+        if peer != authorization.payee {
             return Err("only the payee asks for its own invoices".into());
         }
         issuance.verify(&authorization.preimage_server, &authorization)?;

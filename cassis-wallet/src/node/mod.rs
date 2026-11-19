@@ -28,6 +28,7 @@ use cassis_core::network::{HtlcFunder, HtlcReceiver, Network, NetworkId};
 use cassis_core::protocol::{Request, Response};
 use cassis_core::transport::{Handler, Transport};
 use cassis_core::{Bytes32, XOnlyPubKey};
+use iroh_base::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -273,7 +274,7 @@ impl Node {
     }
 
     /// Answer one request from `peer`.
-    pub async fn handle(&self, request: Request, peer: String) -> Response {
+    pub async fn handle(&self, request: Request, peer: PublicKey) -> Response {
         match request {
             Request::PreparePayee(prepare) => Response::PayeePrepared(self.prepare_payee(prepare)),
             Request::Commit(commit) => self.commit(commit).await,

@@ -205,21 +205,21 @@ impl PreimageServer {
             .map_err(|e| format!("read payments: {e}"))
     }
 
-    async fn handle(&self, request: Request, peer: String) -> Response {
+    async fn handle(&self, request: Request, peer: PublicKey) -> Response {
         match request {
             Request::PreimageIssue {
                 authorization,
                 amount_msat,
                 metadata,
             } => Response::PreimageIssued(self.issue(
-                &peer,
+                peer,
                 &authorization,
                 amount_msat,
                 metadata.as_ref(),
             )),
-            Request::PreimageRelease(release) => self.release(&peer, release).await,
+            Request::PreimageRelease(release) => self.release(peer, release).await,
             Request::PreimagePayments { since } => {
-                Response::PreimagePayments(self.payments(&peer, since))
+                Response::PreimagePayments(self.payments(peer, since))
             }
             _ => Response::Error(
                 "this is a preimage server: it neither routes, pays nor receives".into(),
@@ -259,7 +259,7 @@ impl PreimageServer {
     /// single invoice, the gateway for a standing authorization.
     fn issue(
         &self,
-        peer: &str,
+        peer: PublicKey,
         authorization: &PayeeGatewayReceiveAuthorization,
         amount_msat: u64,
         metadata: Option<&Metadata>,
@@ -284,13 +284,12 @@ impl PreimageServer {
 
     fn try_issue(
         &self,
-        peer: &str,
+        peer: PublicKey,
         authorization: &PayeeGatewayReceiveAuthorization,
         amount_msat: u64,
         metadata: Option<&Metadata>,
     ) -> Result<PreimageIssuance, String> {
         let id = self.check_authorization(authorization)?;
-        let peer = peer_key(peer)?;
         let allowed = match authorization.kind {
             PayeeGatewayReceiveAuthorizationKind::Single => authorization.payee,
             PayeeGatewayReceiveAuthorizationKind::Standing => authorization.gateway,
@@ -335,7 +334,7 @@ impl PreimageServer {
     /// Verify the HTLC a gateway funded to the payee and release the
     /// preimage, logging the HTLC for the payee. [`Response::Pending`]
     /// while the HTLC is not final yet: the gateway asks again.
-    async fn release(&self, peer: &str, release: PreimageRelease) -> Response {
+    async fn release(&self, peer: PublicKey, release: PreimageRelease) -> Response {
         match self.try_release(peer, release).await {
             Ok(Some(preimage)) => Response::PreimageReleased(Ok(preimage)),
             Ok(None) => Response::Pending,
@@ -349,7 +348,7 @@ impl PreimageServer {
 
     async fn try_release(
         &self,
-        peer: &str,
+        peer: PublicKey,
         release: PreimageRelease,
     ) -> Result<Option<Bytes32>, String> {
         let PreimageRelease {
@@ -361,7 +360,7 @@ impl PreimageServer {
         } = release;
         let issuance = PreimageIssuance::from_metadata(&preimage_metadata)?;
         let id = self.check_authorization(&authorization)?;
-        if peer_key(peer)? != authorization.gateway {
+        if peer != authorization.gateway {
             return Err("only the authorized gateway gets preimages released".into());
         }
         issuance.verify(&self.key(), &authorization)?;
@@ -449,8 +448,8 @@ impl PreimageServer {
     }
 
     /// The HTLCs released to `peer`, as payee, since `since`.
-    fn payments(&self, peer: &str, since: u64) -> Result<Vec<ReceivedPayment>, String> {
-        let payee = *peer_key(peer)?.as_bytes();
+    fn payments(&self, peer: PublicKey, since: u64) -> Result<Vec<ReceivedPayment>, String> {
+        let payee = *peer.as_bytes();
         let mut payments = self
             .0
             .db
@@ -475,10 +474,4 @@ impl PreimageServer {
             })
             .collect()
     }
-}
-
-fn peer_key(peer: &str) -> Result<PublicKey, String> {
-    peer.trim()
-        .parse()
-        .map_err(|e| format!("endpoint key {peer}: {e}"))
 }

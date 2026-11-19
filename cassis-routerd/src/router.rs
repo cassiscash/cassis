@@ -171,10 +171,6 @@ impl Router {
     }
 
     async fn handle(&self, request: Request, peer: PublicKey) -> Response {
-        let peer = match peer.parse::<PublicKey>() {
-            Ok(peer) => peer,
-            Err(error) => return Response::Error(format!("peer id {peer}: {error}")),
-        };
         match request {
             Request::Prepare(prepare) => Response::Prepared(self.prepare(prepare, peer).await),
             Request::Execute(execute) => self.execute(execute, peer).await,
