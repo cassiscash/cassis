@@ -79,9 +79,9 @@ const RPC_TIMEOUT_SECS: u64 = 30;
 const ESPLORA_PAGE: usize = 25;
 /// `nLockTime` values below this threshold are block heights; HTLCs
 /// here always use unix timestamps.
-const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
+pub const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
 /// Satoshis: below this an output is unrelayable.
-const DUST_SATS: u64 = 330;
+pub const DUST_SATS: u64 = 330;
 /// Default feerate (sat/vB) for lockup / claim / refund spends.
 const DEFAULT_FEE_RATE_VB: u64 = 1;
 
@@ -96,12 +96,12 @@ const HTLC_OUTPUT_VB: u64 = 43;
 /// BIP-341's canonical Nothing-Up-My-Sleeve point, encoded as an
 /// x-only public key. Its discrete logarithm is unknown, so using it as
 /// the HTLC internal key makes key-path spending impossible.
-const NUMS_INTERNAL_KEY: [u8; 32] = [
+pub const NUMS_INTERNAL_KEY: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
-fn nums_internal_key() -> XOnlyPublicKey {
+pub fn nums_internal_key() -> XOnlyPublicKey {
     XOnlyPublicKey::from_slice(&NUMS_INTERNAL_KEY)
         .expect("BIP-341 NUMS point is a valid x-only public key")
 }
@@ -120,7 +120,7 @@ fn nums_internal_key() -> XOnlyPublicKey {
 /// OP_ELSE <locktime> OP_CLTV OP_DROP <refund_pubkey> OP_CHECKSIG
 /// OP_ENDIF
 /// ```
-fn htlc_script(
+pub fn htlc_script(
     payment_hash160: &[u8; 20],
     claim_pubkey: &[u8; 32],
     refund_pubkey: &[u8; 32],
@@ -144,7 +144,7 @@ fn htlc_script(
 }
 
 /// Core x-only key -> bitcoin crate x-only key.
-fn b_xonly(pk: &XOnlyPubKey) -> Result<XOnlyPublicKey, NetworkError> {
+pub fn b_xonly(pk: &XOnlyPubKey) -> Result<XOnlyPublicKey, NetworkError> {
     XOnlyPublicKey::from_slice(pk.as_bytes())
         .map_err(|e| NetworkError::Invalid(format!("x-only key: {e}")))
 }
@@ -153,27 +153,83 @@ fn b_xonly(pk: &XOnlyPubKey) -> Result<XOnlyPublicKey, NetworkError> {
 // ---------------------------------------------------------------------------
 
 /// A payment hash plus everything needed to rebuild the taproot
-/// output and either spend path of it.
+/// output and either spend path of it. This is what a wallet that
+/// funds or claims HTLCs without a [`BitcoinAdapter`] builds from an
+/// [`HtlcRequest`](cassis_core::HtlcRequest) or an [`Htlc`], so that its
+/// lockups are the outputs cassis receivers and routers expect.
 #[derive(Clone, Debug)]
-struct HtlcOptions {
-    payment_hash160: ripemd160::Hash,
+pub struct HtlcOptions {
+    pub payment_hash160: ripemd160::Hash,
     /// A txid-less descriptor can never be claim-verified, so the
     /// lockup outpoint rides along.
-    lockup_txid: bitcoin::Txid,
-    lockup_vout: u32,
+    pub lockup_txid: bitcoin::Txid,
+    pub lockup_vout: u32,
     /// Receiver's claim leaf key.
-    claim_pubkey: XOnlyPublicKey,
+    pub claim_pubkey: XOnlyPublicKey,
     /// Sender's refund leaf key.
-    refund_pubkey: XOnlyPublicKey,
-    refund_locktime: u32,
+    pub refund_pubkey: XOnlyPublicKey,
+    pub refund_locktime: u32,
 }
 
 impl HtlcOptions {
-    fn payment_hash160(payment_hash: &Bytes32) -> ripemd160::Hash {
+    /// The 20-byte value the script burns: RIPEMD160 of the payment
+    /// hash, which is HASH160 of the preimage.
+    pub fn payment_hash160(payment_hash: &Bytes32) -> ripemd160::Hash {
         ripemd160::Hash::hash(payment_hash.as_ref())
     }
 
-    fn witness_script(&self) -> ScriptBuf {
+    /// Whether `preimage` opens the HTLC's payment hash.
+    pub fn matches_preimage(&self, preimage: &Bytes32) -> bool {
+        ripemd160::Hash::hash(bitcoin::hashes::sha256::Hash::hash(preimage.as_ref()).as_ref())
+            == self.payment_hash160
+    }
+
+    /// The HTLC for a lockup not made yet: claimable by the `target`
+    /// of the invoice with the preimage of `payment_hash`, refundable by
+    /// `refund_pubkey` once `expiry` (a unix timestamp, the route's
+    /// expiry) has passed. Its lockup outpoint is set by
+    /// [`with_lockup`](Self::with_lockup) once the funding transaction
+    /// exists.
+    pub fn unfunded(
+        payment_hash: &Bytes32,
+        target: &InvoiceTarget,
+        refund_pubkey: &XOnlyPubKey,
+        expiry: u64,
+    ) -> Result<Self, NetworkError> {
+        let InvoiceTarget::Bitcoin { target: claim, .. } = target else {
+            return Err(NetworkError::invalid(
+                "bitcoin HTLCs are locked to an x-only key",
+            ));
+        };
+        let refund_locktime = u32::try_from(expiry).map_err(NetworkError::invalid)?;
+        if refund_locktime < MIN_TIMESTAMP_LOCKTIME {
+            return Err(NetworkError::invalid(
+                "refund locktime must be a unix timestamp",
+            ));
+        }
+        Ok(Self {
+            payment_hash160: Self::payment_hash160(payment_hash),
+            lockup_txid: bitcoin::Txid::all_zeros(),
+            lockup_vout: 0,
+            claim_pubkey: b_xonly(claim)?,
+            refund_pubkey: b_xonly(refund_pubkey)?,
+            refund_locktime,
+        })
+    }
+
+    /// These options once the lockup is output `vout` of `txid`.
+    pub fn with_lockup(mut self, txid: bitcoin::Txid, vout: u32) -> Self {
+        self.lockup_txid = txid;
+        self.lockup_vout = vout;
+        self
+    }
+
+    pub fn lockup_outpoint(&self) -> OutPoint {
+        OutPoint::new(self.lockup_txid, self.lockup_vout)
+    }
+
+    /// The taproot script leaf, see [`htlc_script`].
+    pub fn witness_script(&self) -> ScriptBuf {
         htlc_script(
             &self.payment_hash160.to_byte_array(),
             &self.claim_pubkey.serialize(),
@@ -185,7 +241,7 @@ impl HtlcOptions {
     /// The P2TR output the HTLC locks into (tweaked output key of the
     /// single-leaf tree). Internal key is always fixed NUMS, never the
     /// wallet key.
-    fn spend_info(
+    pub fn spend_info(
         &self,
         secp: &Secp256k1<bitcoin::secp256k1::VerifyOnly>,
     ) -> Result<bitcoin::taproot::TaprootSpendInfo, NetworkError> {
@@ -196,16 +252,28 @@ impl HtlcOptions {
             .map_err(|_| NetworkError::Network("taproot tree finalize failed".into()))
     }
 
-    fn taproot_spk(&self, secp: &Secp256k1<bitcoin::secp256k1::VerifyOnly>) -> ScriptBuf {
+    pub fn taproot_spk(&self, secp: &Secp256k1<bitcoin::secp256k1::VerifyOnly>) -> ScriptBuf {
         let info = self
             .spend_info(secp)
             .expect("single-leaf tree is always valid");
         ScriptBuf::new_p2tr_tweaked(info.output_key())
     }
 
+    /// The script pubkey a lockup pays: pay at least the HTLC's amount
+    /// to it.
+    pub fn lockup_script_pubkey(&self) -> ScriptBuf {
+        self.taproot_spk(&Secp256k1::verification_only())
+    }
+
+    /// The address of [`lockup_script_pubkey`](Self::lockup_script_pubkey).
+    pub fn lockup_address(&self, network: bitcoin::Network) -> Result<Address, NetworkError> {
+        Address::from_script(&self.lockup_script_pubkey(), network)
+            .map_err(|e| NetworkError::Invalid(format!("cannot derive lockup address: {e}")))
+    }
+
     /// The HTLC of `htlc`: claim key, refund terms and lockup from the
     /// descriptor.
-    fn of(htlc: &Htlc) -> Result<Self, NetworkError> {
+    pub fn of(htlc: &Htlc) -> Result<Self, NetworkError> {
         let HtlcDescriptor::Bitcoin {
             lockup_txid,
             lockup_vout,
@@ -232,7 +300,8 @@ impl HtlcOptions {
         })
     }
 
-    fn descriptor(&self) -> HtlcDescriptor {
+    /// The descriptor of the lockup, to return from a funder.
+    pub fn descriptor(&self) -> HtlcDescriptor {
         HtlcDescriptor::Bitcoin {
             lockup_txid: self
                 .lockup_txid
@@ -246,6 +315,98 @@ impl HtlcOptions {
             target: XOnlyPubKey::from_bytes(self.claim_pubkey.serialize())
                 .expect("valid x-only key"),
         }
+    }
+
+    /// The unsigned transaction spending the lockup to `destination`,
+    /// which gets `value` (the lockup's value less the fee): a claim
+    /// when `claim`, else a refund, which carries the locktime that
+    /// opens it.
+    pub fn spend_transaction(
+        &self,
+        claim: bool,
+        value: Amount,
+        destination: ScriptBuf,
+    ) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            // Refund spends gate on the CLTV; claims spend immediately.
+            lock_time: if claim {
+                absolute::LockTime::ZERO
+            } else {
+                absolute::LockTime::from_consensus(self.refund_locktime)
+            },
+            input: vec![TxIn {
+                previous_output: self.lockup_outpoint(),
+                script_sig: ScriptBuf::new(),
+                // Non-final so the transaction locktime applies.
+                sequence: Sequence::from_consensus(0xFFFFFFFE),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value,
+                script_pubkey: destination,
+            }],
+        }
+    }
+
+    /// What the claim or refund key signs for the lockup input of
+    /// `tx` (index 0 of [`spend_transaction`](Self::spend_transaction)),
+    /// `prevout` being the lockup output. The signature is a plain
+    /// BIP340 one by the untweaked leaf key (claim key for a claim,
+    /// refund key for a refund).
+    pub fn spend_sighash(
+        &self,
+        tx: &Transaction,
+        prevout: &TxOut,
+    ) -> Result<bitcoin::TapSighash, NetworkError> {
+        let leaf_hash = TapLeafHash::from_script(&self.witness_script(), LeafVersion::TapScript);
+        SighashCache::new(tx)
+            .taproot_script_spend_signature_hash(
+                0,
+                &bitcoin::sighash::Prevouts::All(std::slice::from_ref(prevout)),
+                leaf_hash,
+                TapSighashType::Default,
+            )
+            .map_err(|e| NetworkError::Network(format!("taproot sighash: {e}")))
+    }
+
+    /// The witness of the lockup input given the 64-byte `signature`
+    /// over [`spend_sighash`](Self::spend_sighash): a claim with the
+    /// `preimage`, else a refund.
+    pub fn spend_witness(
+        &self,
+        signature: &[u8],
+        preimage: Option<&Bytes32>,
+    ) -> Result<Witness, NetworkError> {
+        let witness_script = self.witness_script();
+        let control_block = self
+            .spend_info(&Secp256k1::verification_only())?
+            .control_block(&(witness_script.clone(), LeafVersion::TapScript))
+            .ok_or_else(|| NetworkError::Network("control block missing for spend leaf".into()))?;
+        // Witness items land on the stack in order: the signature sits
+        // at the bottom (CHECKSIG pops it after the branch supplies
+        // the pubkey), the preimage above it (OP_HASH160 pops it
+        // inside the claim branch), and the OP_TRUE / empty branch
+        // selector on top for OP_IF.
+        let mut items: Vec<Vec<u8>> = vec![signature.to_vec()];
+        items.extend(match preimage {
+            Some(p) => vec![p.0.to_vec(), vec![1u8]],
+            None => vec![Vec::new()],
+        });
+        items.push(witness_script.to_bytes());
+        items.push(control_block.serialize());
+        Ok(Witness::from_slice(&items))
+    }
+
+    /// The preimage a transaction spending the lockup reveals, if it
+    /// is a claim: parsed out of a spend input and checked against the
+    /// payment hash.
+    pub fn preimage_from_spend(&self, spend: &Transaction) -> Option<Bytes32> {
+        spend.input.iter().find_map(|txin| {
+            let bytes: &[u8] = txin.witness.nth(1)?;
+            let preimage = Bytes32(bytes.try_into().ok()?);
+            self.matches_preimage(&preimage).then_some(preimage)
+        })
     }
 }
 
@@ -740,17 +901,13 @@ impl BitcoinAdapter {
         preimage: Option<Bytes32>,
         destination: Address,
     ) -> Result<bitcoin::Txid, NetworkError> {
-        if let Some(preimage) = preimage {
-            let computed = ripemd160::Hash::hash(
-                bitcoin::hashes::sha256::Hash::hash(preimage.as_ref()).as_ref(),
-            );
-            if computed != options.payment_hash160 {
+        if let Some(preimage) = &preimage {
+            if !options.matches_preimage(preimage) {
                 return Err(NetworkError::Invalid(
                     "preimage does not match the HTLC payment hash".into(),
                 ));
             }
         }
-        let witness_script = options.witness_script();
         let verify_secp = Secp256k1::verification_only();
         let spk = options.taproot_spk(&verify_secp);
         let utxos = self.scan_unspent(&spk).await?;
@@ -783,73 +940,24 @@ impl BitcoinAdapter {
                 fee.to_sat()
             )));
         }
-        let out_value = value - fee;
         let is_claim = preimage.is_some();
-        let mut tx = Transaction {
-            version: Version::TWO,
-            // Refund spends gate on the CLTV; claims spend immediately.
-            lock_time: if is_claim {
-                absolute::LockTime::ZERO
-            } else {
-                absolute::LockTime::from_consensus(options.refund_locktime)
-            },
-            input: vec![TxIn {
-                previous_output: outpoint,
-                script_sig: ScriptBuf::new(),
-                // Non-final so the transaction locktime applies.
-                sequence: Sequence::from_consensus(0xFFFFFFFE),
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: out_value,
-                script_pubkey: destination.script_pubkey(),
-            }],
-        };
-        let tree_info = options
-            .spend_info(&verify_secp)
-            .map_err(|e| NetworkError::Network(e.to_string()))?;
+        let mut tx = options.spend_transaction(is_claim, value - fee, destination.script_pubkey());
         // Both leaf keys (claim for incoming, refund for outgoing HTLCs)
         // are our untweaked wallet key, and a script-path CHECKSIG
         // verifies against that key as written in the leaf.
         let signing_secp = Secp256k1::new();
         let signing_pair = Keypair::from_secret_key(&signing_secp, &self.wallet_sk);
-        let control_block = tree_info
-            .control_block(&(witness_script.clone(), LeafVersion::TapScript))
-            .ok_or_else(|| NetworkError::Network("control block missing for spend leaf".into()))?;
-        let leaf_hash = TapLeafHash::from_script(&witness_script, LeafVersion::TapScript);
-        let prevouts = [TxOut {
-            value,
-            script_pubkey: spk,
-        }];
-        let sighash = {
-            let mut cache = SighashCache::new(&tx);
-            cache
-                .taproot_script_spend_signature_hash(
-                    0,
-                    &bitcoin::sighash::Prevouts::All(&prevouts),
-                    leaf_hash,
-                    TapSighashType::Default,
-                )
-                .map_err(|e| NetworkError::Network(format!("taproot sighash: {e}")))?
-        };
+        debug_assert_eq!(outpoint, options.lockup_outpoint());
+        let sighash = options.spend_sighash(
+            &tx,
+            &TxOut {
+                value,
+                script_pubkey: spk,
+            },
+        )?;
         let msg = bitcoin::secp256k1::Message::from_digest(*sighash.as_ref());
-        let sig = signing_secp
-            .sign_schnorr_no_aux_rand(&msg, &signing_pair)
-            .serialize()
-            .to_vec();
-        // Witness items land on the stack in order: the signature sits
-        // at the bottom (CHECKSIG pops it after the branch supplies
-        // the pubkey), the preimage above it (OP_HASH160 pops it
-        // inside the claim branch), and the OP_TRUE / empty branch
-        // selector on top for OP_IF.
-        let mut witness_items: Vec<Vec<u8>> = vec![sig];
-        witness_items.extend(match preimage {
-            Some(p) => vec![p.0.to_vec(), vec![1u8]],
-            None => vec![Vec::new()],
-        });
-        witness_items.push(witness_script.to_bytes());
-        witness_items.push(control_block.serialize());
-        tx.input[0].witness = Witness::from_slice(&witness_items);
+        let sig = signing_secp.sign_schnorr_no_aux_rand(&msg, &signing_pair);
+        tx.input[0].witness = options.spend_witness(sig.as_ref(), preimage.as_ref())?;
         self.broadcast(
             &tx,
             if is_claim {
@@ -873,22 +981,6 @@ impl BitcoinAdapter {
             return Ok(None);
         };
         self.get_tx(spend.txid).await
-    }
-
-    /// Parse the claim preimage out of a spend input, verifying it
-    /// opens this HTLC's payment hash.
-    fn preimage_from_spend(spend: &Transaction, options: &HtlcOptions) -> Option<Bytes32> {
-        spend.input.iter().find_map(|txin| {
-            let bytes: &[u8] = txin.witness.nth(1)?;
-            if bytes.len() != 32 {
-                return None;
-            }
-            let preimage = Bytes32(bytes.try_into().ok()?);
-            let computed = ripemd160::Hash::hash(
-                bitcoin::hashes::sha256::Hash::hash(preimage.as_ref()).as_ref(),
-            );
-            (computed == options.payment_hash160).then_some(preimage)
-        })
     }
 
     async fn get_tx(&self, txid: bitcoin::Txid) -> Result<Option<Transaction>, NetworkError> {
@@ -968,20 +1060,13 @@ impl Network for BitcoinAdapter {
         expiry: u64,
         target: &InvoiceTarget,
     ) -> Result<HtlcDescriptor, NetworkError> {
-        let InvoiceTarget::Bitcoin { target: claim, .. } = target else {
-            return Err(NetworkError::invalid(
-                "bitcoin HTLCs are locked to an x-only key",
-            ));
-        };
         let amount_sat = sats_for_msat(amount_msat);
-        let mut options = HtlcOptions {
-            payment_hash160: HtlcOptions::payment_hash160(&payment_hash),
-            lockup_txid: bitcoin::Txid::all_zeros(),
-            lockup_vout: 0,
-            claim_pubkey: b_xonly(claim)?,
-            refund_pubkey: self.key_xonly,
-            refund_locktime: u32::try_from(expiry).map_err(NetworkError::invalid)?,
-        };
+        let mut options = HtlcOptions::unfunded(
+            &payment_hash,
+            target,
+            &XOnlyPubKey::from_bytes(self.key_xonly.serialize()).expect("valid x-only key"),
+            expiry,
+        )?;
         options.lockup_txid = self.lock_htlc(payment_hash, &options, amount_sat).await?;
         Ok(options.descriptor())
     }
@@ -990,7 +1075,8 @@ impl Network for BitcoinAdapter {
         let options = HtlcOptions::of(htlc)?;
         match self.scan_spend(&options).await? {
             None => Ok(OutgoingState::Pending),
-            Some(spend) => Ok(Self::preimage_from_spend(&spend, &options)
+            Some(spend) => Ok(options
+                .preimage_from_spend(&spend)
                 .map(OutgoingState::Claimed)
                 .unwrap_or(OutgoingState::Refunded)),
         }

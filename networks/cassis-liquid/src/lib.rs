@@ -30,6 +30,10 @@
 
 mod zeroconf;
 
+/// The `elements` crate (re-exported by LWK) whose script, key and
+/// transaction types the HTLC items below use.
+pub use lwk_wollet::elements;
+
 use async_trait::async_trait;
 use cassis_core::{
     sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
@@ -78,20 +82,20 @@ pub const TESTNET_ESPLORA_URL: &str = "https://liquid.network/liquidtestnet/api"
 pub const TESTNET_WATERFALLS_URL: &str = "https://waterfalls.liquidwebwallet.org/liquidtestnet/api";
 
 /// Liquid blocks land about every minute.
-const BLOCK_TIME_SECS: u64 = 60;
+pub const BLOCK_TIME_SECS: u64 = 60;
 /// Fee rate in sats/kilo-vbyte for lockups, claims and refunds
 /// (0.2 sat/vbyte — Liquid is cheap).
 const FEE_RATE_SATS_KVB: f32 = 200.0;
 /// Non-final nSequence so the tx's nLockTime (CLTV) is enforced.
 /// Also the BIP-125 boundary: any input sequence *below* this value
 /// signals replace-by-fee, which the 0-conf trust model forbids.
-const NON_FINAL_SEQUENCE: u32 = 0xFFFF_FFFE;
+pub const NON_FINAL_SEQUENCE: u32 = 0xFFFF_FFFE;
 /// Propagation pause replacing the 0-conf coverage wait on testnet,
 /// which the 0-conf service does not observe.
 const TESTNET_PROPAGATION_WAIT_SECS: u64 = 5;
 /// Minimum lockable amount in sats: fees are carved out of the HTLC
 /// value itself, so tiny locks would be eaten by fees.
-const MIN_LOCK_SATS: u64 = 1_000;
+pub const MIN_LOCK_SATS: u64 = 1_000;
 
 /// Hardened prefix of the HTLC claim-key derivation path. Paths are
 /// `m/1037'/{i}` with increasing `i` until the child pubkey has an
@@ -109,7 +113,7 @@ fn error_from_lwk(e: impl std::fmt::Display) -> NetworkError {
 /// burned into the claim script. Equals HASH160(preimage), since the
 /// payment hash is SHA256(preimage) and `OP_HASH160` checks
 /// RIPEMD160(SHA256(x)).
-fn payment_hash160(payment_hash: &Bytes32) -> [u8; 20] {
+pub fn payment_hash160(payment_hash: &Bytes32) -> [u8; 20] {
     *ripemd160::Hash::hash(payment_hash.as_ref()).as_byte_array()
 }
 
@@ -118,7 +122,7 @@ fn payment_hash160(payment_hash: &Bytes32) -> [u8; 20] {
 /// signature on the IF branch or CLTV-gated sender recovery on the
 /// ELSE branch; the hash check sits inside the claim branch, leaving
 /// the preimage on the stack for OP_HASH160.
-fn htlc_script(
+pub fn htlc_script(
     payment_hash160: &[u8; 20],
     claim_pubkey: &BtcPublicKey,
     refund_pubkey: &BtcPublicKey,
@@ -141,25 +145,45 @@ fn htlc_script(
         .into_script()
 }
 
+/// The block height an HTLC's refund opens at: the height of the
+/// chain `tip` plus the blocks `expiry` (a unix timestamp, the route's
+/// expiry) is away.
+pub fn refund_locktime(tip_height: u64, expiry: u64) -> Result<u32, NetworkError> {
+    let blocks = expiry.saturating_sub(unix_now()).div_ceil(BLOCK_TIME_SECS);
+    u32::try_from(tip_height + blocks).map_err(NetworkError::invalid)
+}
+
+/// The earliest refund height a receiver accepts for an HTLC expiring
+/// at `expiry`, given the chain `tip_height`. A lock made with
+/// [`refund_locktime`] is never below it.
+pub fn min_refund_locktime(tip_height: u64, expiry: u64) -> u64 {
+    tip_height + expiry.saturating_sub(unix_now()) / BLOCK_TIME_SECS
+}
+
 /// One HTLC's witness script and the parameters it was built from.
 /// Never crosses the wire as-is: the descriptor pins the lockup
 /// outpoint and carries only the refund parameters (see
 /// [`HtlcSpec::to_descriptor`]); the receiver rebuilds the same spec
 /// with its own claim key.
+///
+/// A wallet that funds or claims HTLCs without a [`LiquidAdapter`]
+/// builds this from an [`HtlcRequest`](cassis_core::HtlcRequest) or an
+/// [`Htlc`], so that its lockups are the outputs cassis receivers and
+/// routers expect.
 #[derive(Clone, Debug)]
-struct HtlcSpec {
+pub struct HtlcSpec {
     /// The route's 32-byte payment hash, SHA256(preimage). The
     /// script burns its RIPEMD160 (see [`payment_hash160`]).
-    payment_hash: Bytes32,
-    refund_pubkey: BtcPublicKey,
-    refund_locktime: u32,
-    witness_script: ElScript,
+    pub payment_hash: Bytes32,
+    pub refund_pubkey: BtcPublicKey,
+    pub refund_locktime: u32,
+    pub witness_script: ElScript,
     /// `P2WSH(witness_script)` — the lockup output's script pubkey.
-    lockup_script_pubkey: ElScript,
+    pub lockup_script_pubkey: ElScript,
 }
 
 impl HtlcSpec {
-    fn build(
+    pub fn build(
         payment_hash: &Bytes32,
         claim_pubkey: BtcPublicKey,
         refund_pubkey: BtcPublicKey,
@@ -181,7 +205,32 @@ impl HtlcSpec {
         }
     }
 
-    fn lockup_address(&self, params: &'static AddressParams) -> Result<Address, NetworkError> {
+    /// The spec and lockup outpoint of `htlc`, whose claim key and
+    /// refund terms are the descriptor's.
+    pub fn of(htlc: &Htlc) -> Result<(Self, OutPoint), NetworkError> {
+        let HtlcDescriptor::Liquid {
+            lockup_txid,
+            lockup_vout,
+            refund_pubkey,
+            refund_locktime,
+            target: claim,
+        } = &htlc.descriptor
+        else {
+            return Err(NetworkError::invalid("not a liquid HTLC"));
+        };
+        let txid = Txid::from_str(&lockup_txid.to_string()).map_err(NetworkError::invalid)?;
+        let spec = Self::build(
+            &htlc.payment_hash,
+            even_y_pubkey(claim)?,
+            even_y_pubkey(refund_pubkey)?,
+            *refund_locktime,
+        );
+        Ok((spec, OutPoint::new(txid, *lockup_vout)))
+    }
+
+    /// The address a lockup pays (unblinded): pay at least the HTLC's
+    /// amount of L-BTC to it, from a non-RBF transaction.
+    pub fn lockup_address(&self, params: &'static AddressParams) -> Result<Address, NetworkError> {
         Address::from_script(&self.lockup_script_pubkey, None, params)
             .ok_or_else(|| NetworkError::Invalid("cannot derive lockup address".into()))
     }
@@ -189,7 +238,7 @@ impl HtlcSpec {
     /// Build the wire descriptor: the pinned lockup outpoint, the
     /// refund parameters and the `target` claim key the spec was built
     /// with.
-    fn to_descriptor(&self, lockup: OutPoint, target: PubKey) -> HtlcDescriptor {
+    pub fn to_descriptor(&self, lockup: OutPoint, target: PubKey) -> HtlcDescriptor {
         HtlcDescriptor::Liquid {
             lockup_txid: lockup
                 .txid
@@ -208,6 +257,81 @@ impl HtlcSpec {
             target,
         }
     }
+
+    /// The witness of the lockup input given the DER `signature` (with
+    /// its sighash byte) of the claim key, or of the refund key when
+    /// there is no `preimage`: `[sig, preimage?, true-or-empty, script]`.
+    pub fn spend_witness(&self, signature: Vec<u8>, preimage: Option<&[u8; 32]>) -> Vec<Vec<u8>> {
+        // Witness items are pushed in order. The selector (OP_TRUE or
+        // empty vector) must sit on top of the stack for the leading
+        // OP_IF; on claims the preimage goes right below it, free for
+        // the branch's OP_HASH160.
+        let mut witness = vec![signature];
+        if let Some(preimage) = preimage {
+            witness.push(preimage.to_vec());
+        }
+        witness.push(if preimage.is_some() {
+            vec![1u8]
+        } else {
+            Vec::new()
+        });
+        witness.push(self.witness_script.to_bytes());
+        witness
+    }
+
+    /// Weight a spend of the lockup adds, for fee estimation.
+    pub fn max_weight_to_satisfy(&self, with_preimage: bool) -> usize {
+        let script_len = self.witness_script.len();
+        let mut witness_len = 1; // item count
+                                 // On claims: the 32-byte preimage (hashed by
+                                 // the claim branch) plus a 1-byte OP_TRUE
+                                 // selector; on refunds an empty push only.
+        witness_len += if with_preimage { 1 + 32 + 1 } else { 1 };
+        witness_len += 1 + 73; // der sig + sighash byte
+        witness_len += varint_len(script_len) + script_len;
+        witness_len * 4 + 64 // conservative overhead for the input shell
+    }
+
+    /// The preimage revealed by the claim witness of `tx`, which spends
+    /// `outpoint`. Spend witness layout:
+    /// `[sig, preimage?, selector, script]` — the preimage sits at
+    /// index 1 on claims, where the claim branch's OP_HASH160 pops
+    /// it; refunds carry an empty push there.
+    pub fn preimage_from_spend(
+        &self,
+        tx: &Transaction,
+        outpoint: OutPoint,
+    ) -> Result<[u8; 32], String> {
+        let vin_index = tx
+            .input
+            .iter()
+            .position(|i| i.previous_output == outpoint)
+            .ok_or("spending tx does not spend the lockup outpoint")?;
+        let stack = &tx.input[vin_index].witness.script_witness;
+        let preimage_bytes = stack.get(1).ok_or("spend witness has no preimage item")?;
+        let preimage: [u8; 32] = preimage_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("preimage has unexpected length {}", preimage_bytes.len()))?;
+        let sha = sha256::Hash::hash(&preimage);
+        if Bytes32(sha.to_byte_array()) != self.payment_hash {
+            return Err("witness preimage does not hash to the HTLC's payment hash".into());
+        }
+        Ok(preimage)
+    }
+}
+
+/// Wait until the lockup `txid` is covered by Blockstream's 0-conf
+/// service (mainnet only: nothing observes testnet), which is what a
+/// funder does before returning, since the receiver checks it.
+pub async fn wait_for_zeroconf_coverage(span: &Span, txid: &str) -> Result<(), String> {
+    zeroconf::wait_for_coverage(span, txid).await
+}
+
+/// Whether the 0-conf service covers the unconfirmed lockup `txid`,
+/// as a receiver checks it on mainnet. The error says what is missing.
+pub async fn check_zeroconf_coverage(http: &reqwest::Client, txid: &str) -> Result<(), String> {
+    zeroconf::check_coverage(http, txid).await
 }
 
 pub struct LiquidAdapter {
@@ -352,29 +476,6 @@ impl LiquidAdapter {
         }
     }
 
-    /// Lockup outpoint and the HTLC script of `htlc`, whose claim key
-    /// and refund terms are the descriptor's.
-    fn htlc_spec(htlc: &Htlc) -> Result<(HtlcSpec, OutPoint), NetworkError> {
-        let HtlcDescriptor::Liquid {
-            lockup_txid,
-            lockup_vout,
-            refund_pubkey,
-            refund_locktime,
-            target: claim,
-        } = &htlc.descriptor
-        else {
-            return Err(NetworkError::invalid("not a liquid HTLC"));
-        };
-        let txid = Txid::from_str(&lockup_txid.to_string()).map_err(NetworkError::invalid)?;
-        let spec = HtlcSpec::build(
-            &htlc.payment_hash,
-            even_y_pubkey(claim)?,
-            even_y_pubkey(refund_pubkey)?,
-            *refund_locktime,
-        );
-        Ok((spec, OutPoint::new(txid, *lockup_vout)))
-    }
-
     /// The lockup output at `outpoint`, which must pay explicit L-BTC to
     /// `spec` from a non-RBF transaction. Returns its value in sats.
     async fn lockup_value(&self, spec: &HtlcSpec, outpoint: OutPoint) -> Result<u64, NetworkError> {
@@ -489,18 +590,6 @@ impl LiquidAdapter {
         Ok(status.confirmed)
     }
 
-    fn max_weight_to_satisfy(script: &ElScript, with_preimage: bool) -> usize {
-        let script_len = script.len();
-        let mut witness_len = 1; // item count
-                                 // On claims: the 32-byte preimage (hashed by
-                                 // the claim branch) plus a 1-byte OP_TRUE
-                                 // selector; on refunds an empty push only.
-        witness_len += if with_preimage { 1 + 32 + 1 } else { 1 };
-        witness_len += 1 + 73; // der sig + sighash byte
-        witness_len += varint_len(script_len) + script_len;
-        witness_len * 4 + 64 // conservative overhead for the input shell
-    }
-
     /// Sign `pset` with the software signer and return the extracted
     /// transaction with every input's witness built by hand: the HTLC
     /// input gets `[sig, preimage?, true-or-empty, script]` (the
@@ -513,7 +602,7 @@ impl LiquidAdapter {
     async fn sign_and_extract(
         &self,
         mut pset: PartiallySignedTransaction,
-        htlc_input: Option<(OutPoint, Option<[u8; 32]>, &ElScript)>,
+        htlc_input: Option<(OutPoint, Option<[u8; 32]>, &HtlcSpec)>,
     ) -> Result<Transaction, NetworkError> {
         let added = self
             .signer
@@ -544,24 +633,8 @@ impl LiquidAdapter {
                     .ok_or_else(|| {
                         NetworkError::Network("claim signature missing after sign".into())
                     })?;
-                let (_, preimage, script) = htlc_input.as_ref().expect("matched above");
-                // Witness items are pushed in order. The selector
-                // (OP_TRUE or empty vector) must sit on top of the
-                // stack for the leading OP_IF; on claims the preimage
-                // goes right below it, free for the branch's
-                // OP_HASH160.
-                let selector = if preimage.is_some() {
-                    vec![1u8]
-                } else {
-                    Vec::new()
-                };
-                let mut witness = vec![sig.clone()];
-                if let Some(p) = preimage {
-                    witness.push(p.to_vec());
-                }
-                witness.push(selector);
-                witness.push(script.to_bytes());
-                witness
+                let (_, preimage, spec) = htlc_input.as_ref().expect("matched above");
+                spec.spend_witness(sig.clone(), preimage.as_ref())
             } else if !psbt_input.partial_sigs.is_empty() {
                 // P2WPKH wallet input: [sig, pubkey].
                 let (pk, sig) = psbt_input
@@ -631,10 +704,7 @@ impl LiquidAdapter {
                 value_sat,
                 ValueBlindingFactor::zero(),
             ),
-            max_weight_to_satisfy: Self::max_weight_to_satisfy(
-                &spec.witness_script,
-                preimage.is_some(),
-            ),
+            max_weight_to_satisfy: spec.max_weight_to_satisfy(preimage.is_some()),
         };
         let mut pset = {
             let wollet = self.wollet.lock().await;
@@ -675,7 +745,7 @@ impl LiquidAdapter {
         }
 
         let tx = self
-            .sign_and_extract(pset, Some((outpoint, preimage, &spec.witness_script)))
+            .sign_and_extract(pset, Some((outpoint, preimage, spec)))
             .await?;
         self.broadcast(&tx).await
     }
@@ -740,7 +810,7 @@ impl LiquidAdapter {
 /// only holds for non-RBF transactions (Elements nodes keep the
 /// first-seen spend of an input), so both ends refuse replaceable
 /// lockups.
-fn ensure_non_rbf(tx: &Transaction) -> Result<(), NetworkError> {
+pub fn ensure_non_rbf(tx: &Transaction) -> Result<(), NetworkError> {
     if tx
         .input
         .iter()
@@ -753,7 +823,7 @@ fn ensure_non_rbf(tx: &Transaction) -> Result<(), NetworkError> {
     Ok(())
 }
 
-fn even_y_pubkey(pubkey: &PubKey) -> Result<BtcPublicKey, NetworkError> {
+pub fn even_y_pubkey(pubkey: &PubKey) -> Result<BtcPublicKey, NetworkError> {
     let inner = secp256k1::PublicKey::from_slice(pubkey.as_bytes())
         .map_err(|e| NetworkError::Invalid(format!("invalid compressed pubkey: {e}")))?;
     Ok(BtcPublicKey::new(inner))
@@ -831,34 +901,6 @@ impl LiquidAdapter {
         }
         Ok(None)
     }
-
-    /// Pull the preimage from the claim witness of the tx spending
-    /// `outpoint`. Spend witness layout:
-    /// `[sig, preimage?, selector, script]` — the preimage sits at
-    /// index 1 on claims, where the claim branch's OP_HASH160 pops
-    /// it; refunds carry an empty push there.
-    fn extract_preimage(
-        tx: &Transaction,
-        outpoint: OutPoint,
-        spec: &HtlcSpec,
-    ) -> Result<[u8; 32], String> {
-        let vin_index = tx
-            .input
-            .iter()
-            .position(|i| i.previous_output == outpoint)
-            .ok_or("spending tx does not spend the lockup outpoint")?;
-        let stack = &tx.input[vin_index].witness.script_witness;
-        let preimage_bytes = stack.get(1).ok_or("spend witness has no preimage item")?;
-        let preimage: [u8; 32] = preimage_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| format!("preimage has unexpected length {}", preimage_bytes.len()))?;
-        let sha = sha256::Hash::hash(&preimage);
-        if Bytes32(sha.to_byte_array()) != spec.payment_hash {
-            return Err("witness preimage does not hash to the HTLC's payment hash".into());
-        }
-        Ok(preimage)
-    }
 }
 
 #[async_trait]
@@ -888,7 +930,7 @@ impl Network for LiquidAdapter {
     }
 
     async fn verify_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let (spec, outpoint) = Self::htlc_spec(htlc)?;
+        let (spec, outpoint) = HtlcSpec::of(htlc)?;
         // The script was rebuilt from the payment hash, so a lockup
         // paying it is bound to that hash.
         let value_sat = self.lockup_value(&spec, outpoint).await?;
@@ -896,8 +938,7 @@ impl Network for LiquidAdapter {
             return Err(NetworkError::invalid("lockup is worth less than the HTLC"));
         }
         let tip = self.tip_height().await?;
-        let blocks = htlc.expiry.saturating_sub(unix_now()) / BLOCK_TIME_SECS;
-        if u64::from(spec.refund_locktime) < tip + blocks {
+        if u64::from(spec.refund_locktime) < min_refund_locktime(tip, htlc.expiry) {
             return Err(NetworkError::invalid("refund opens before the expiry"));
         }
         if self.network.is_mainnet() && !self.tx_confirmed(&outpoint.txid).await? {
@@ -922,7 +963,7 @@ impl Network for LiquidAdapter {
         htlc: &Htlc,
         preimage: Bytes32,
     ) -> Result<(), NetworkError> {
-        let (spec, outpoint) = Self::htlc_spec(htlc)?;
+        let (spec, outpoint) = HtlcSpec::of(htlc)?;
         let value_sat = self.lockup_value(&spec, outpoint).await?;
         // TODO: a broadcast claim counts as settled, but nothing checks
         // that it confirms before the sender can refund. Watch it until
@@ -953,8 +994,7 @@ impl Network for LiquidAdapter {
             )));
         }
         let tip = self.tip_height().await?;
-        let blocks = expiry.saturating_sub(unix_now()).div_ceil(BLOCK_TIME_SECS);
-        let refund_locktime = u32::try_from(tip + blocks).map_err(NetworkError::invalid)?;
+        let refund_locktime = refund_locktime(tip, expiry)?;
         let spec = HtlcSpec::build(
             &payment_hash,
             even_y_pubkey(claim)?,
@@ -1009,7 +1049,7 @@ impl Network for LiquidAdapter {
     }
 
     async fn check_outgoing_htlc(&self, htlc: &Htlc) -> Result<OutgoingState, NetworkError> {
-        let (spec, outpoint) = Self::htlc_spec(htlc)?;
+        let (spec, outpoint) = HtlcSpec::of(htlc)?;
         let address = spec.lockup_address(self.network.address_params())?;
         match self
             .find_spending_tx(&address, outpoint)
@@ -1017,14 +1057,15 @@ impl Network for LiquidAdapter {
             .map_err(NetworkError::Network)?
         {
             None => Ok(OutgoingState::Pending),
-            Some(spend) => Ok(Self::extract_preimage(&spend, outpoint, &spec)
+            Some(spend) => Ok(spec
+                .preimage_from_spend(&spend, outpoint)
                 .map(|preimage| OutgoingState::Claimed(Bytes32(preimage)))
                 .unwrap_or(OutgoingState::Refunded)),
         }
     }
 
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError> {
-        let (spec, outpoint) = Self::htlc_spec(htlc)?;
+        let (spec, outpoint) = HtlcSpec::of(htlc)?;
         let tip = self.tip_height().await?;
         if tip < u64::from(spec.refund_locktime) {
             return Err(NetworkError::network(format!(
@@ -1134,7 +1175,7 @@ mod tests {
                 PubKey::from_bytes(claim.to_bytes().try_into().unwrap()).unwrap(),
             ),
         };
-        let (rebuilt, outpoint) = LiquidAdapter::htlc_spec(&htlc).unwrap();
+        let (rebuilt, outpoint) = HtlcSpec::of(&htlc).unwrap();
         assert_eq!(rebuilt.lockup_script_pubkey, spec.lockup_script_pubkey);
         assert_eq!(outpoint, OutPoint::new(txid, 3));
     }

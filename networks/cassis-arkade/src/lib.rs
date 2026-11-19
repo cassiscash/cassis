@@ -48,8 +48,7 @@ use ark_core::send::SendReceiver;
 use ark_core::send::VtxoInput;
 use ark_core::server::GetVtxosRequestFilter;
 use ark_core::server::VirtualTxOutPoint;
-use ark_core::vhtlc::VhtlcOptions;
-use ark_core::vhtlc::VhtlcScript;
+pub use ark_core::vhtlc::{VhtlcOptions, VhtlcScript};
 use ark_core::ArkAddress;
 use ark_core::ArkNote;
 use ark_core::Asset;
@@ -118,18 +117,18 @@ const MAINTENANCE_INTERVAL_SECS: u64 = 60 * 60;
 /// operator cooperation after unilaterally exiting. Small enough
 /// that it is not a burden, large enough to be a meaningful escape
 /// hatch.
-const UNILATERAL_CLAIM_DELAY_SECS: u32 = 12 * 60 * 60;
+pub const UNILATERAL_CLAIM_DELAY_SECS: u32 = 12 * 60 * 60;
 /// How much later (seconds) the sender-alone unilateral refund path
 /// opens compared to the receiver's unilateral claim path. The
 /// receiver needs a strict head start: with the operator gone, a
 /// refund path opening at or before the claim path would let the
 /// sender race the receiver for funds the preimage already entitles
 /// the receiver to.
-const UNILATERAL_REFUND_GAP_SECS: u32 = 12 * 60 * 60;
+pub const UNILATERAL_REFUND_GAP_SECS: u32 = 12 * 60 * 60;
 /// `nLockTime` values below this threshold are block heights, values
 /// at or above it unix timestamps (Bitcoin consensus rule; the
 /// operator applies the same cutoff to the refund CLTV).
-const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
+pub const MIN_TIMESTAMP_LOCKTIME: u32 = 500_000_000;
 
 const RPC_TIMEOUT_SECS: u64 = 30;
 /// The chain the operator at `server_url` runs on.
@@ -154,7 +153,7 @@ fn htlc(e: impl std::fmt::Display) -> NetworkError {
 /// RIPEMD160 of the route's 32-byte payment hash: the 20-byte value
 /// burned into the VHTLC script. Equals HASH160(preimage), since the
 /// payment hash is SHA256(preimage).
-fn vhtlc_payment_hash160(payment_hash: &Bytes32) -> ripemd160::Hash {
+pub fn vhtlc_payment_hash160(payment_hash: &Bytes32) -> ripemd160::Hash {
     ripemd160::Hash::hash(payment_hash.as_ref())
 }
 
@@ -162,12 +161,230 @@ fn vhtlc_payment_hash160(payment_hash: &Bytes32) -> ripemd160::Hash {
 /// when validating a VTXO script: seconds-type sequences count their
 /// real seconds (512-second granularity), height-type ones a nominal
 /// one second per block.
-fn exit_delay_secs(delay: Sequence) -> u32 {
+pub fn exit_delay_secs(delay: Sequence) -> u32 {
     match delay.to_relative_lock_time() {
         Some(relative::LockTime::Time(time)) => u32::from(time.value()) * 512,
         Some(relative::LockTime::Blocks(height)) => u32::from(height.value()),
         None => 0,
     }
+}
+
+/// The VHTLC of `htlc`, locked to the operator whose signer key is
+/// `server`: receiver, sender and timelocks from the descriptor.
+///
+/// A wallet that funds or claims HTLCs without an [`ArkadeAdapter`]
+/// builds its VHTLCs from this and [`outgoing_vhtlc_options`], and
+/// takes the script from [`vhtlc_script`], so that its lockups are the
+/// ones cassis receivers and routers expect.
+pub fn vhtlc_options(htlc: &Htlc, server: XOnlyPublicKey) -> Result<VhtlcOptions, NetworkError> {
+    let HtlcDescriptor::Arkade {
+        sender,
+        refund_locktime,
+        unilateral_claim_delay,
+        unilateral_refund_delay,
+        unilateral_refund_without_receiver_delay,
+        target: receiver,
+    } = &htlc.descriptor
+    else {
+        return Err(NetworkError::invalid("not an arkade HTLC"));
+    };
+    let xonly = |key: &XOnlyPubKey| {
+        XOnlyPublicKey::from_slice(key.as_bytes()).map_err(NetworkError::invalid)
+    };
+    // Consensus sequence numbers round-trip bit for bit
+    // (seconds-type sequences set bit 22).
+    let sequence = |value: u32| {
+        let sequence = Sequence::from_consensus(value);
+        if sequence.is_relative_lock_time() {
+            Ok(sequence)
+        } else {
+            Err(NetworkError::invalid(format!(
+                "{value} is not a relative locktime"
+            )))
+        }
+    };
+    Ok(VhtlcOptions {
+        sender: xonly(sender)?,
+        receiver: xonly(receiver)?,
+        server,
+        preimage_hash: vhtlc_payment_hash160(&htlc.payment_hash),
+        refund_locktime: *refund_locktime,
+        unilateral_claim_delay: sequence(*unilateral_claim_delay)?,
+        unilateral_refund_delay: sequence(*unilateral_refund_delay)?,
+        unilateral_refund_without_receiver_delay: sequence(
+            *unilateral_refund_without_receiver_delay,
+        )?,
+    })
+}
+
+/// The descriptor of a VHTLC, to return from a funder.
+pub fn vhtlc_descriptor(options: &VhtlcOptions) -> HtlcDescriptor {
+    HtlcDescriptor::Arkade {
+        sender: XOnlyPubKey::from_bytes(options.sender.serialize()).expect("valid key"),
+        refund_locktime: options.refund_locktime,
+        unilateral_claim_delay: options.unilateral_claim_delay.to_consensus_u32(),
+        unilateral_refund_delay: options.unilateral_refund_delay.to_consensus_u32(),
+        unilateral_refund_without_receiver_delay: options
+            .unilateral_refund_without_receiver_delay
+            .to_consensus_u32(),
+        target: XOnlyPubKey::from_bytes(options.receiver.serialize()).expect("valid key"),
+    }
+}
+
+/// The script of a VHTLC on `network` (the chain of the operator): its
+/// address is where the lockup is sent, and it holds the tapscript
+/// leaves and control blocks of every spend.
+pub fn vhtlc_script(
+    options: &VhtlcOptions,
+    network: bitcoin::Network,
+) -> Result<VhtlcScript, NetworkError> {
+    VhtlcScript::new(options.clone(), network).map_err(htlc)
+}
+
+/// A seconds-type CSV sequence of at least `secs`, floored at the
+/// operator's minimum exit delay `exit_delay_floor_secs` (its
+/// unilateral exit delay, see [`exit_delay_secs`]).
+pub fn exit_delay(secs: u32, exit_delay_floor_secs: u32) -> Result<Sequence, NetworkError> {
+    Sequence::from_seconds_ceil(secs.max(exit_delay_floor_secs))
+        .map_err(|e| NetworkError::Invalid(format!("CSV delay out of range: {e}")))
+}
+
+/// The operator accepts the VHTLC's timelocks and the receiver keeps
+/// its head start on every unilateral path. The operator rejects
+/// scripts whose smallest exit delay is below `exit_delay_floor_secs`.
+pub fn check_timelocks(
+    options: &VhtlcOptions,
+    exit_delay_floor_secs: u32,
+) -> Result<(), NetworkError> {
+    if options.refund_locktime < MIN_TIMESTAMP_LOCKTIME {
+        return Err(NetworkError::invalid(
+            "refund locktime must be a unix timestamp",
+        ));
+    }
+    for (name, delay) in [
+        ("unilateral claim", options.unilateral_claim_delay),
+        ("unilateral refund", options.unilateral_refund_delay),
+        (
+            "unilateral refund without receiver",
+            options.unilateral_refund_without_receiver_delay,
+        ),
+    ] {
+        if !delay.is_time_locked() {
+            return Err(NetworkError::invalid(format!(
+                "{name} delay must be in seconds"
+            )));
+        }
+        if exit_delay_secs(delay) < exit_delay_floor_secs {
+            return Err(NetworkError::invalid(format!(
+                "{name} delay is below the operator's minimum exit delay"
+            )));
+        }
+    }
+    if exit_delay_secs(options.unilateral_refund_without_receiver_delay)
+        <= exit_delay_secs(options.unilateral_claim_delay)
+    {
+        return Err(NetworkError::invalid(
+            "sender-only refund must open after the receiver's unilateral claim",
+        ));
+    }
+    Ok(())
+}
+
+/// The VHTLC to lock for a payment to `recipient`, the `target` of an
+/// invoice: from `sender` (the funder's key), expiring at `expiry`
+/// (unix seconds), at the operator with signer key `server` and
+/// `exit_delay_floor_secs` of minimum exit delay.
+pub fn outgoing_vhtlc_options(
+    payment_hash: &Bytes32,
+    sender: XOnlyPublicKey,
+    recipient: &XOnlyPubKey,
+    server: XOnlyPublicKey,
+    expiry: u64,
+    exit_delay_floor_secs: u32,
+) -> Result<VhtlcOptions, NetworkError> {
+    let now = cassis_core::unix_now();
+    if expiry <= now {
+        return Err(NetworkError::Invalid("expiry in the past".into()));
+    }
+    let recipient_xonly = XOnlyPublicKey::from_str(recipient.to_hex().as_str())
+        .map_err(|e| NetworkError::Invalid(format!("invalid recipient pubkey: {e}")))?;
+    // The refund CLTV takes the route expiry directly: cassis
+    // expiries are unix seconds, and the operator checks timestamp
+    // locktimes against the chain tip's block time.
+    let refund_locktime = u32::try_from(expiry)
+        .map_err(|_| NetworkError::Invalid(format!("expiry {expiry} overflows nLockTime")))?;
+    if refund_locktime < MIN_TIMESTAMP_LOCKTIME {
+        return Err(NetworkError::Invalid(format!(
+            "expiry {expiry} is not an absolute unix timestamp"
+        )));
+    }
+
+    let unilateral_claim_delay = exit_delay(UNILATERAL_CLAIM_DELAY_SECS, exit_delay_floor_secs)?;
+    // The sender-alone exit opens a strict gap after the
+    // receiver's claim exit (see [`UNILATERAL_REFUND_GAP_SECS`]),
+    // measured from the claim delay's actual (floored, 512s-
+    // granular) value so the ordering survives any operator floor.
+    let unilateral_refund_without_receiver_delay = Sequence::from_seconds_ceil(
+        exit_delay_secs(unilateral_claim_delay).saturating_add(UNILATERAL_REFUND_GAP_SECS),
+    )
+    .map_err(|e| NetworkError::Invalid(format!("CSV delay out of range: {e}")))?;
+
+    Ok(VhtlcOptions {
+        sender,
+        receiver: recipient_xonly,
+        server,
+        // `payment_hash160` is HASH160(preimage), represented by
+        // the RIPEMD160 of cassis' SHA256 payment hash.
+        preimage_hash: vhtlc_payment_hash160(payment_hash),
+        refund_locktime,
+        unilateral_claim_delay,
+        // The joint sender+receiver refund needs the receiver's
+        // signature, so it is safe at the earliest delay the
+        // operator accepts; only the sender-alone path must wait
+        // out the receiver's head start.
+        unilateral_refund_delay: unilateral_claim_delay,
+        unilateral_refund_without_receiver_delay,
+    })
+}
+
+/// The preimage revealed by the PSBT of a virtual transaction that
+/// spent a VHTLC output: `None` for a refund, which has no condition
+/// witness. This is how a funder learns of a claim.
+pub fn preimage_from_psbt(claim_psbt: &psbt::Psbt) -> Result<Option<[u8; 32]>, String> {
+    let condition_key = psbt::raw::Key {
+        type_value: 222,
+        key: VTXO_CONDITION_KEY.to_vec(),
+    };
+    for input in &claim_psbt.inputs {
+        let Some(condition_data) = input.unknown.get(&condition_key) else {
+            continue;
+        };
+        if condition_data.is_empty() || condition_data[0] == 0 {
+            continue;
+        }
+        let mut cursor = std::io::Cursor::new(&condition_data[1..]);
+        let VarInt(length) = VarInt::consensus_decode(&mut cursor)
+            .map_err(|e| format!("failed to decode varint length: {e}"))?;
+        let offset = cursor.position() as usize;
+        let remaining = condition_data
+            .get(1 + offset..)
+            .ok_or_else(|| format!("condition data shorter than varint suggests ({offset})"))?;
+        let length_usize = length as usize;
+        if remaining.len() < length_usize {
+            return Err(format!(
+                "condition data too short: expected {length_usize}, got {}",
+                remaining.len()
+            ));
+        }
+        let bytes = &remaining[..length_usize];
+        if bytes.len() != 32 {
+            return Err(format!("preimage has unexpected length {}", bytes.len()));
+        }
+        let mut preimage = [0u8; 32];
+        preimage.copy_from_slice(bytes);
+        return Ok(Some(preimage));
+    }
+    Ok(None)
 }
 
 fn sat_amount(amount_msat: u64) -> bitcoin::Amount {
@@ -387,94 +604,15 @@ impl ArkadeAdapter {
     /// VHTLC options of `htlc`: receiver, sender and timelocks from the
     /// descriptor, server is our operator.
     fn vhtlc_options(&self, htlc: &Htlc) -> Result<VhtlcOptions, NetworkError> {
-        let HtlcDescriptor::Arkade {
-            sender,
-            refund_locktime,
-            unilateral_claim_delay,
-            unilateral_refund_delay,
-            unilateral_refund_without_receiver_delay,
-            target: receiver,
-        } = &htlc.descriptor
-        else {
-            return Err(NetworkError::invalid("not an arkade HTLC"));
-        };
-        let xonly = |key: &XOnlyPubKey| {
-            XOnlyPublicKey::from_slice(key.as_bytes()).map_err(NetworkError::invalid)
-        };
-        // Consensus sequence numbers round-trip bit for bit
-        // (seconds-type sequences set bit 22).
-        let sequence = |value: u32| {
-            let sequence = Sequence::from_consensus(value);
-            if sequence.is_relative_lock_time() {
-                Ok(sequence)
-            } else {
-                Err(NetworkError::invalid(format!(
-                    "{value} is not a relative locktime"
-                )))
-            }
-        };
-        Ok(VhtlcOptions {
-            sender: xonly(sender)?,
-            receiver: xonly(receiver)?,
-            server: self.server_pk_xonly,
-            preimage_hash: vhtlc_payment_hash160(&htlc.payment_hash),
-            refund_locktime: *refund_locktime,
-            unilateral_claim_delay: sequence(*unilateral_claim_delay)?,
-            unilateral_refund_delay: sequence(*unilateral_refund_delay)?,
-            unilateral_refund_without_receiver_delay: sequence(
-                *unilateral_refund_without_receiver_delay,
-            )?,
-        })
+        vhtlc_options(htlc, self.server_pk_xonly)
     }
 
     fn descriptor(options: &VhtlcOptions) -> HtlcDescriptor {
-        HtlcDescriptor::Arkade {
-            sender: XOnlyPubKey::from_bytes(options.sender.serialize()).expect("valid key"),
-            refund_locktime: options.refund_locktime,
-            unilateral_claim_delay: options.unilateral_claim_delay.to_consensus_u32(),
-            unilateral_refund_delay: options.unilateral_refund_delay.to_consensus_u32(),
-            unilateral_refund_without_receiver_delay: options
-                .unilateral_refund_without_receiver_delay
-                .to_consensus_u32(),
-            target: XOnlyPubKey::from_bytes(options.receiver.serialize()).expect("valid key"),
-        }
+        vhtlc_descriptor(options)
     }
 
-    /// The operator accepts the VHTLC's timelocks and the receiver keeps
-    /// its head start on every unilateral path.
     fn check_timelocks(&self, options: &VhtlcOptions) -> Result<(), NetworkError> {
-        if options.refund_locktime < MIN_TIMESTAMP_LOCKTIME {
-            return Err(NetworkError::invalid(
-                "refund locktime must be a unix timestamp",
-            ));
-        }
-        for (name, delay) in [
-            ("unilateral claim", options.unilateral_claim_delay),
-            ("unilateral refund", options.unilateral_refund_delay),
-            (
-                "unilateral refund without receiver",
-                options.unilateral_refund_without_receiver_delay,
-            ),
-        ] {
-            if !delay.is_time_locked() {
-                return Err(NetworkError::invalid(format!(
-                    "{name} delay must be in seconds"
-                )));
-            }
-            if exit_delay_secs(delay) < self.exit_delay_floor_secs {
-                return Err(NetworkError::invalid(format!(
-                    "{name} delay is below the operator's minimum exit delay"
-                )));
-            }
-        }
-        if exit_delay_secs(options.unilateral_refund_without_receiver_delay)
-            <= exit_delay_secs(options.unilateral_claim_delay)
-        {
-            return Err(NetworkError::invalid(
-                "sender-only refund must open after the receiver's unilateral claim",
-            ));
-        }
-        Ok(())
+        check_timelocks(options, self.exit_delay_floor_secs)
     }
 
     fn build_options_for_outgoing(
@@ -483,60 +621,18 @@ impl ArkadeAdapter {
         recipient: &XOnlyPubKey,
         expiry: u64,
     ) -> Result<VhtlcOptions, NetworkError> {
-        let now = cassis_core::unix_now();
-        if expiry <= now {
-            return Err(NetworkError::Invalid("expiry in the past".into()));
-        }
-        let recipient_xonly = XOnlyPublicKey::from_str(recipient.to_hex().as_str())
-            .map_err(|e| NetworkError::Invalid(format!("invalid recipient pubkey: {e}")))?;
-        // The refund CLTV takes the route expiry directly: cassis
-        // expiries are unix seconds, and the operator checks timestamp
-        // locktimes against the chain tip's block time.
-        let refund_locktime = u32::try_from(expiry)
-            .map_err(|_| NetworkError::Invalid(format!("expiry {expiry} overflows nLockTime")))?;
-        if refund_locktime < MIN_TIMESTAMP_LOCKTIME {
-            return Err(NetworkError::Invalid(format!(
-                "expiry {expiry} is not an absolute unix timestamp"
-            )));
-        }
-
-        let unilateral_claim_delay = self.exit_delay(UNILATERAL_CLAIM_DELAY_SECS)?;
-        // The sender-alone exit opens a strict gap after the
-        // receiver's claim exit (see [`UNILATERAL_REFUND_GAP_SECS`]),
-        // measured from the claim delay's actual (floored, 512s-
-        // granular) value so the ordering survives any operator floor.
-        let unilateral_refund_without_receiver_delay = Sequence::from_seconds_ceil(
-            exit_delay_secs(unilateral_claim_delay).saturating_add(UNILATERAL_REFUND_GAP_SECS),
+        outgoing_vhtlc_options(
+            payment_hash,
+            self.xonly,
+            recipient,
+            self.server_pk_xonly,
+            expiry,
+            self.exit_delay_floor_secs,
         )
-        .map_err(|e| NetworkError::Invalid(format!("CSV delay out of range: {e}")))?;
-
-        Ok(VhtlcOptions {
-            sender: self.xonly,
-            receiver: recipient_xonly,
-            server: self.server_pk_xonly,
-            // `payment_hash160` is HASH160(preimage), represented by
-            // the RIPEMD160 of cassis' SHA256 payment hash.
-            preimage_hash: vhtlc_payment_hash160(payment_hash),
-            refund_locktime,
-            unilateral_claim_delay,
-            // The joint sender+receiver refund needs the receiver's
-            // signature, so it is safe at the earliest delay the
-            // operator accepts; only the sender-alone path must wait
-            // out the receiver's head start.
-            unilateral_refund_delay: unilateral_claim_delay,
-            unilateral_refund_without_receiver_delay,
-        })
-    }
-
-    /// A seconds-type CSV sequence of at least `secs`, floored at the
-    /// operator's minimum exit delay.
-    fn exit_delay(&self, secs: u32) -> Result<Sequence, NetworkError> {
-        Sequence::from_seconds_ceil(secs.max(self.exit_delay_floor_secs))
-            .map_err(|e| NetworkError::Invalid(format!("CSV delay out of range: {e}")))
     }
 
     fn script_for(&self, options: &VhtlcOptions) -> Result<VhtlcScript, NetworkError> {
-        VhtlcScript::new(options.clone(), self.network).map_err(htlc)
+        vhtlc_script(options, self.network)
     }
 
     /// Timestamp of the chain tip block: what the operator holds
@@ -759,40 +855,7 @@ impl ArkadeAdapter {
     /// revealed preimage, mirroring the SDK's own extraction used by
     /// submarine swap bookkeeping.
     fn extract_preimage_from_psbt(claim_psbt: &psbt::Psbt) -> Result<Option<[u8; 32]>, String> {
-        let condition_key = psbt::raw::Key {
-            type_value: 222,
-            key: VTXO_CONDITION_KEY.to_vec(),
-        };
-        for input in &claim_psbt.inputs {
-            let Some(condition_data) = input.unknown.get(&condition_key) else {
-                continue;
-            };
-            if condition_data.is_empty() || condition_data[0] == 0 {
-                continue;
-            }
-            let mut cursor = std::io::Cursor::new(&condition_data[1..]);
-            let VarInt(length) = VarInt::consensus_decode(&mut cursor)
-                .map_err(|e| format!("failed to decode varint length: {e}"))?;
-            let offset = cursor.position() as usize;
-            let remaining = condition_data
-                .get(1 + offset..)
-                .ok_or_else(|| format!("condition data shorter than varint suggests ({offset})"))?;
-            let length_usize = length as usize;
-            if remaining.len() < length_usize {
-                return Err(format!(
-                    "condition data too short: expected {length_usize}, got {}",
-                    remaining.len()
-                ));
-            }
-            let bytes = &remaining[..length_usize];
-            if bytes.len() != 32 {
-                return Err(format!("preimage has unexpected length {}", bytes.len()));
-            }
-            let mut preimage = [0u8; 32];
-            preimage.copy_from_slice(bytes);
-            return Ok(Some(preimage));
-        }
-        Ok(None)
+        preimage_from_psbt(claim_psbt)
     }
 
     /// Current offchain balance (confirmed + pre-confirmed spendable
