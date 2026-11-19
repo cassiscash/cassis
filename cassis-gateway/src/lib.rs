@@ -47,7 +47,7 @@ use cassis_core::protocol::{
 use cassis_core::transport::{Handler, PeerAddr, Transport};
 use cassis_core::{unix_now, Bytes32};
 use cassis_wallet::node::verify_incoming;
-use cassis_wallet::stored::{metadata, stored_metadata};
+use cassis_wallet::stored::{metadata, stored_metadata, StoredReceiveAuthorization};
 use iroh_base::PublicKey;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -279,9 +279,13 @@ impl Gateway {
             Request::GatewayInvoice(request) => {
                 Response::GatewayInvoice(log_refusal("invoice", self.invoice(request, &peer).await))
             }
-            Request::GatewayAuthorize { authorization } => Response::GatewayAuthorized(
-                log_refusal("authorization", self.authorize(authorization)),
-            ),
+            Request::GatewayAuthorize {
+                authorization,
+                preimage_server_relay,
+            } => Response::GatewayAuthorized(log_refusal(
+                "authorization",
+                self.authorize(authorization, preimage_server_relay),
+            )),
             Request::GatewayInvoiceFor(request) => {
                 Response::GatewayInvoice(log_refusal("invoice", self.invoice_for(request).await))
             }
@@ -412,8 +416,13 @@ impl Gateway {
         Ok(self.issued(invoice))
     }
 
-    /// Keep a standing authorization, so invoices can be issued under it.
-    fn authorize(&self, authorization: ReceiveAuthorization) -> Result<(), String> {
+    /// Keep a standing authorization, so invoices can be issued under it,
+    /// and the relay to reach its preimage server through.
+    fn authorize(
+        &self,
+        authorization: ReceiveAuthorization,
+        preimage_server_relay: Option<String>,
+    ) -> Result<(), String> {
         self.check_authorization(&authorization, AuthorizationKind::Standing)?;
         let id = authorization.id()?;
         info!(
@@ -428,7 +437,10 @@ impl Gateway {
             .upsert(&HandledDelegation {
                 authorization_id: HandledDelegationId(id.0),
                 payee: *authorization.payee.as_bytes(),
-                authorization: (&authorization).into(),
+                authorization: StoredReceiveAuthorization {
+                    preimage_server_relay,
+                    ..(&authorization).into()
+                },
                 registered_at: unix_now(),
             })
             .map_err(db_error)
@@ -451,12 +463,15 @@ impl Gateway {
                 && authorization.allows_amount(request.amount_msat)
                 && authorization.allows_description(request.description.as_deref())
             {
-                candidates.push(authorization);
+                candidates.push((
+                    authorization,
+                    delegation.authorization.preimage_server_relay,
+                ));
             }
         }
-        let authorization = candidates
+        let (authorization, preimage_server_relay) = candidates
             .into_iter()
-            .max_by_key(|authorization| authorization.valid_until)
+            .max_by_key(|(authorization, _)| authorization.valid_until)
             .ok_or("this payee authorized no invoice like this one")?;
         // The payee may pin what its invoices say: then they say that.
         let description = authorization
@@ -472,7 +487,7 @@ impl Gateway {
         }
         let preimage_server = PeerAddr {
             id: authorization.preimage_server.to_string(),
-            relay: authorization.preimage_server_relay.clone(),
+            relay: preimage_server_relay,
         };
         let issue = Request::PreimageIssue {
             authorization: authorization.clone(),
@@ -827,12 +842,23 @@ impl Gateway {
         let expiry = unix_now()
             .saturating_add(authorization.min_final_timeout_secs)
             .saturating_add(self.policy().final_slack_secs);
+        // The relay to the preimage server is only known from the
+        // standing authorization the payee gave, if it did.
+        let preimage_server_relay = self
+            .db()
+            .handled_delegations()
+            .get(HandledDelegationId(authorization.id()?.0))
+            .map_err(db_error)?
+            .and_then(|delegation| delegation.authorization.preimage_server_relay);
         let mut htlc = PayeeHtlc {
             payment_hash: PayeeHtlcHash(hash.0),
             incoming_network: forward.incoming_network.clone(),
             incoming: (&forward.incoming).into(),
             claim_by: forward.claim_by,
-            authorization: authorization.into(),
+            authorization: StoredReceiveAuthorization {
+                preimage_server_relay,
+                ..authorization.into()
+            },
             payee_metadata: stored_metadata(&forward.terms.payee_metadata),
             network: destination.network().clone(),
             htlc: None,
@@ -933,7 +959,7 @@ impl Gateway {
         });
         let preimage_server = PeerAddr {
             id: authorization.preimage_server.to_string(),
-            relay: authorization.preimage_server_relay.clone(),
+            relay: htlc.authorization.preimage_server_relay.clone(),
         };
         let mut waiting = false;
         loop {

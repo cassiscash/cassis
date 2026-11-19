@@ -761,7 +761,7 @@ async fn redeem(
         add(
             PeerAddr {
                 id: hex_key(&delegation.preimage_server),
-                relay: authorization.preimage_server_relay.clone(),
+                relay: delegation.authorization.preimage_server_relay.clone(),
             },
             authorization,
         );
@@ -776,7 +776,7 @@ async fn redeem(
         add(
             PeerAddr {
                 id: hex_key(&delegation.preimage_server),
-                relay: authorization.preimage_server_relay.clone(),
+                relay: delegation.authorization.preimage_server_relay.clone(),
             },
             authorization,
         );

@@ -16,7 +16,7 @@ pub use db_schema::*;
 #[orangedb::schema]
 pub mod db_schema {
     use cassis_core::network::NetworkId;
-    use cassis_wallet::stored::{StoredAuthorization, StoredHtlc};
+    use cassis_wallet::stored::{StoredHtlc, StoredReceiveAuthorization};
 
     /// A standing authorization a payee gave this gateway.
     #[entity]
@@ -28,7 +28,7 @@ pub mod db_schema {
         /// The payee's iroh key.
         #[index]
         pub payee: [u8; 32],
-        pub authorization: StoredAuthorization,
+        pub authorization: StoredReceiveAuthorization,
         pub registered_at: u64,
     }
 
@@ -58,7 +58,7 @@ pub mod db_schema {
         /// The payer's HTLC must be claimed by then.
         pub claim_by: u64,
         /// The invoice's terms, from its metadata.
-        pub authorization: StoredAuthorization,
+        pub authorization: StoredReceiveAuthorization,
         pub payee_metadata: Option<Vec<u8>>,
         /// The HTLC to the payee, once funded; while `None`, funding is
         /// under way, or was interrupted.

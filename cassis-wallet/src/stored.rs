@@ -196,11 +196,14 @@ pub enum StoredAuthorizationKind {
 /// A [`ReceiveAuthorization`].
 #[orangedb::embed]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredAuthorization {
+pub struct StoredReceiveAuthorization {
     pub kind: StoredAuthorizationKind,
     pub payee: [u8; 32],
     pub gateway: [u8; 32],
     pub preimage_server: [u8; 32],
+    /// Iroh relay to reach the preimage server through: not part of the
+    /// signed [`ReceiveAuthorization`], so rebuilding one skips it and
+    /// converting one into this leaves it `None`.
     pub preimage_server_relay: Option<String>,
     pub description: Option<String>,
     pub valid_from: u64,
@@ -508,7 +511,7 @@ impl TryFrom<&StoredInvoiceNetwork> for InvoiceNetwork {
     }
 }
 
-impl From<&ReceiveAuthorization> for StoredAuthorization {
+impl From<&ReceiveAuthorization> for StoredReceiveAuthorization {
     fn from(authorization: &ReceiveAuthorization) -> Self {
         Self {
             kind: match authorization.kind {
@@ -518,7 +521,7 @@ impl From<&ReceiveAuthorization> for StoredAuthorization {
             payee: *authorization.payee.as_bytes(),
             gateway: *authorization.gateway.as_bytes(),
             preimage_server: *authorization.preimage_server.as_bytes(),
-            preimage_server_relay: authorization.preimage_server_relay.clone(),
+            preimage_server_relay: None,
             description: authorization.description.clone(),
             valid_from: authorization.valid_from,
             valid_until: authorization.valid_until,
@@ -535,10 +538,10 @@ impl From<&ReceiveAuthorization> for StoredAuthorization {
     }
 }
 
-impl TryFrom<&StoredAuthorization> for ReceiveAuthorization {
+impl TryFrom<&StoredReceiveAuthorization> for ReceiveAuthorization {
     type Error = String;
 
-    fn try_from(authorization: &StoredAuthorization) -> Result<Self, String> {
+    fn try_from(authorization: &StoredReceiveAuthorization) -> Result<Self, String> {
         Ok(Self {
             kind: match authorization.kind {
                 StoredAuthorizationKind::Single => AuthorizationKind::Single,
@@ -547,7 +550,6 @@ impl TryFrom<&StoredAuthorization> for ReceiveAuthorization {
             payee: endpoint_key(&authorization.payee)?,
             gateway: endpoint_key(&authorization.gateway)?,
             preimage_server: endpoint_key(&authorization.preimage_server)?,
-            preimage_server_relay: authorization.preimage_server_relay.clone(),
             description: authorization.description.clone(),
             valid_from: authorization.valid_from,
             valid_until: authorization.valid_until,
@@ -610,7 +612,6 @@ mod tests {
             AuthorizationKind::Standing,
             endpoint_public_key(&[2; 32]),
             endpoint_public_key(&[3; 32]),
-            Some("https://relay.example".into()),
             Some("coffee".into()),
             1000,
             2000,
@@ -629,7 +630,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let stored = StoredAuthorization::from(&authorization);
+        let stored = StoredReceiveAuthorization::from(&authorization);
         assert_eq!(
             ReceiveAuthorization::try_from(&stored).unwrap(),
             authorization

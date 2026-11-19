@@ -1006,9 +1006,11 @@ pub enum Request {
     },
     GatewayInvoice(GatewayInvoiceRequest),
     /// Payee to gateway: let it issue invoices under this standing
-    /// authorization.
+    /// authorization. The relay is a hint for reaching the preimage
+    /// server, which the signed authorization names by key only.
     GatewayAuthorize {
         authorization: ReceiveAuthorization,
+        preimage_server_relay: Option<String>,
     },
     GatewayInvoiceFor(GatewayInvoiceFor),
 }
@@ -1233,7 +1235,6 @@ mod tests {
             kind,
             endpoint_public_key(&GATEWAY),
             endpoint_public_key(&PREIMAGE_SERVER),
-            None,
             None,
             1000,
             5000,

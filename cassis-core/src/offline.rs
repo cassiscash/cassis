@@ -50,7 +50,7 @@ use std::fmt;
 pub const DEFAULT_MIN_FINAL_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 
 /// Domain of [`ReceiveAuthorization::message`].
-const AUTHORIZATION_DOMAIN: &str = "cassis/receive-authorization/v2";
+const AUTHORIZATION_DOMAIN: &str = "cassis/receive-authorization/v3";
 /// Domain of [`PreimageIssuance::message`].
 const ISSUANCE_DOMAIN: &str = "cassis/preimage-issuance/v2";
 /// Domain of [`GatewayMetadata::message`].
@@ -145,9 +145,6 @@ pub struct ReceiveAuthorization {
     pub payee: PublicKey,
     pub gateway: PublicKey,
     pub preimage_server: PublicKey,
-    /// Where the gateway reaches the preimage server.
-    #[serde(default)]
-    pub preimage_server_relay: Option<String>,
     /// What every invoice issued under this authorization must say, if set.
     pub description: Option<String>,
     /// Unix seconds.
@@ -170,7 +167,6 @@ impl ReceiveAuthorization {
         kind: AuthorizationKind,
         gateway: PublicKey,
         preimage_server: PublicKey,
-        preimage_server_relay: Option<String>,
         description: Option<String>,
         valid_from: u64,
         valid_until: u64,
@@ -184,7 +180,6 @@ impl ReceiveAuthorization {
             payee: endpoint_public_key(payee_secret),
             gateway,
             preimage_server,
-            preimage_server_relay,
             description,
             valid_from,
             valid_until,
@@ -202,12 +197,11 @@ impl ReceiveAuthorization {
     /// The bytes the payee signs, in [`crate::signing`]'s encoding:
     ///
     /// ```text
-    /// str     "cassis/receive-authorization/v2"
+    /// str     "cassis/receive-authorization/v3"
     /// u8      kind: 0 single, 1 standing
     /// key     payee
     /// key     gateway
     /// key     preimage server
-    /// option  str  preimage server relay
     /// option  str  description
     /// u64     valid from (unix seconds)
     /// u64     valid until (unix seconds)
@@ -234,7 +228,6 @@ impl ReceiveAuthorization {
             .key(&self.payee)
             .key(&self.gateway)
             .key(&self.preimage_server)
-            .option(self.preimage_server_relay.as_deref(), SigningMessage::str)
             .option(self.description.as_deref(), SigningMessage::str)
             .u64(self.valid_from)
             .u64(self.valid_until)
@@ -594,7 +587,6 @@ mod tests {
             kind,
             key(2),
             key(3),
-            Some("https://relay.example".into()),
             description.map(Into::into),
             1000,
             2000,
@@ -616,14 +608,11 @@ mod tests {
         let authorization = authorization(AuthorizationKind::Standing);
         let mut expected = Vec::new();
         expected.extend(31u32.to_be_bytes());
-        expected.extend(b"cassis/receive-authorization/v2");
+        expected.extend(b"cassis/receive-authorization/v3");
         expected.push(1);
         expected.extend(key(1).as_bytes());
         expected.extend(key(2).as_bytes());
         expected.extend(key(3).as_bytes());
-        expected.push(1);
-        expected.extend(21u32.to_be_bytes());
-        expected.extend(b"https://relay.example");
         expected.push(0);
         for value in [1000u64, 2000, 1, 50_000, DEFAULT_MIN_FINAL_TIMEOUT_SECS] {
             expected.extend(value.to_be_bytes());
@@ -671,9 +660,6 @@ mod tests {
         assert!(tampered.verify().is_err());
         let mut tampered = authorization.clone();
         tampered.gateway = key(9);
-        assert!(tampered.verify().is_err());
-        let mut tampered = authorization.clone();
-        tampered.preimage_server_relay = None;
         assert!(tampered.verify().is_err());
         let mut tampered = authorization;
         tampered.destinations[0] = GatewayDestination::parse(

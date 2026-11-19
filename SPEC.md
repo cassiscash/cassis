@@ -84,7 +84,7 @@ Times are unix seconds. Amounts are millisatoshis.
 
 | Statement            | Signed by        | Domain                             |
 |----------------------|------------------|------------------------------------|
-| Receive authorization| payee            | `cassis/receive-authorization/v2`  |
+| Receive authorization| payee            | `cassis/receive-authorization/v3`  |
 | Preimage issuance    | preimage server  | `cassis/preimage-issuance/v2`      |
 | Invoice (gateway)    | gateway          | `cassis/invoice/gateway/v3`        |
 | Invoice (payee)      | payee            | `cassis/invoice/payee/v3`          |
@@ -99,12 +99,11 @@ The payee lets a gateway and a preimage server act for it, within
 limits.
 
 ```
-str     "cassis/receive-authorization/v2"
+str     "cassis/receive-authorization/v3"
 u8      kind: 0x00 single, 0x01 standing
 key     payee
 key     gateway
 key     preimage server
-option  str      preimage server relay
 option  str      description
 u64     valid from
 u64     valid until
