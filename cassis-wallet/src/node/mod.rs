@@ -19,6 +19,7 @@
 mod offline;
 mod payee;
 mod payer;
+mod releaser;
 mod settle;
 mod verify;
 
@@ -38,8 +39,9 @@ pub use offline::{
     authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
     RedeemReport,
 };
-pub use payee::create_invoice;
+pub use payee::{build_invoice, create_invoice};
 pub use payer::{FailedHop, HopError, PayFailure, PayReport};
+pub use releaser::{PreimageReleaser, Released};
 pub use settle::{settle_outgoing, Outcome};
 pub use verify::{verify_incoming, Unverified};
 
@@ -77,6 +79,8 @@ struct Inner {
     /// Wallets that receive the HTLCs paid on a network, in place of
     /// the network's own.
     receivers: RwLock<HashMap<NetworkId, Arc<dyn HtlcReceiver>>>,
+    /// Answers PREPARE and COMMIT for invoices the node has no record of.
+    releaser: RwLock<Option<Arc<dyn PreimageReleaser>>>,
     /// Answers PREPARE, EXECUTE, DISCARD and SETTLE, when routing.
     router: RwLock<Option<Handler>>,
     /// Keys of records some task is currently acting on; others skip
@@ -108,6 +112,7 @@ impl Node {
             ),
             funders: Default::default(),
             receivers: Default::default(),
+            releaser: RwLock::new(None),
             router: RwLock::new(None),
             busy: Default::default(),
             commits: Default::default(),
@@ -231,6 +236,23 @@ impl Node {
         Ok(Arc::new(network))
     }
 
+    /// Answer PREPARE and COMMIT for the payment hashes this node has
+    /// no stored invoice for with `releaser`: it accepts or refuses the
+    /// payment, and hands over the preimage to claim it with. Lets a
+    /// node receive invoices made with [`Node::build_invoice`], which it
+    /// keeps no record of.
+    pub fn set_preimage_releaser(&self, releaser: Arc<dyn PreimageReleaser>) {
+        *self.0.releaser.write().unwrap_or_else(|e| e.into_inner()) = Some(releaser);
+    }
+
+    fn preimage_releaser(&self) -> Option<Arc<dyn PreimageReleaser>> {
+        self.0
+            .releaser
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn funder(&self, network: &NetworkId) -> Option<Arc<dyn HtlcFunder>> {
         self.0
             .funders
@@ -276,7 +298,9 @@ impl Node {
     /// Answer one request from `peer`.
     pub async fn handle(&self, request: Request, peer: PublicKey) -> Response {
         match request {
-            Request::PreparePayee(prepare) => Response::PayeePrepared(self.prepare_payee(prepare)),
+            Request::PreparePayee(prepare) => {
+                Response::PayeePrepared(self.prepare_payee(prepare).await)
+            }
             Request::Commit(commit) => self.commit(commit).await,
             Request::Prepare(_)
             | Request::Execute(_)

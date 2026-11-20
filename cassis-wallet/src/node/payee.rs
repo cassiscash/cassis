@@ -23,6 +23,60 @@ pub(super) enum CommitState {
     Failed(String),
 }
 
+/// Build an invoice for `payment_hash`, payable on each of `networks`
+/// and signed by `keys`, carrying `metadata` back to this node with
+/// every PREPARE and COMMIT. Nothing is recorded: whoever calls it
+/// answers PREPARE and COMMIT for the hash, with a stored invoice or a
+/// [`PreimageReleaser`].
+///
+/// Needs no running node: the payee endpoint is derived from `keys`.
+/// `iroh_relay` is the home relay of the node that will claim it, if
+/// known.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_invoice(
+    keys: &NodeKeys,
+    iroh_relay: Option<String>,
+    networks: &[Arc<dyn HtlcReceiver>],
+    payment_hash: Bytes32,
+    amount_msat: u64,
+    expires_at: u64,
+    description: Option<String>,
+    metadata: Option<Metadata>,
+) -> Result<Invoice, String> {
+    if amount_msat == 0 {
+        return Err("invoice amount must be positive".into());
+    }
+    if expires_at <= unix_now() {
+        return Err("invoice expiry must be in the future".into());
+    }
+    if networks.is_empty() {
+        return Err("an invoice needs at least one network".into());
+    }
+    let mut targets = Vec::with_capacity(networks.len());
+    for network in networks {
+        let target = network
+            .incoming_target(payment_hash, amount_msat, expires_at)
+            .await
+            .map_err(|e| format!("cannot receive on {}: {e}", network.network_id()))?;
+        targets.push(InvoiceNetwork {
+            target,
+            incoming_delta_secs: Some(network.incoming_delta_secs()),
+        });
+    }
+    Ok(Invoice::direct(
+        InvoiceBody {
+            payment_hash,
+            amount_msat,
+            expires_at,
+            networks: targets,
+            description,
+            metadata,
+            iroh_relay,
+        },
+        &keys.iroh,
+    ))
+}
+
 /// Create and record an invoice payable on each of `networks`, carrying
 /// `metadata` back to this node with every PREPARE and COMMIT.
 ///
@@ -40,40 +94,19 @@ pub async fn create_invoice(
     description: Option<String>,
     metadata: Option<Metadata>,
 ) -> Result<Invoice, String> {
-    if amount_msat == 0 {
-        return Err("invoice amount must be positive".into());
-    }
-    if expires_at <= unix_now() {
-        return Err("invoice expiry must be in the future".into());
-    }
-    if networks.is_empty() {
-        return Err("an invoice needs at least one network".into());
-    }
     let preimage = Bytes32::random();
     let payment_hash = preimage.sha256();
-    let mut targets = Vec::with_capacity(networks.len());
-    for network in networks {
-        let target = network
-            .incoming_target(payment_hash, amount_msat, expires_at)
-            .await
-            .map_err(|e| format!("cannot receive on {}: {e}", network.network_id()))?;
-        targets.push(InvoiceNetwork {
-            target,
-            incoming_delta_secs: Some(network.incoming_delta_secs()),
-        });
-    }
-    let invoice = Invoice::direct(
-        InvoiceBody {
-            payment_hash,
-            amount_msat,
-            expires_at,
-            networks: targets,
-            description,
-            metadata,
-            iroh_relay,
-        },
-        &keys.iroh,
-    );
+    let invoice = build_invoice(
+        keys,
+        iroh_relay,
+        networks,
+        payment_hash,
+        amount_msat,
+        expires_at,
+        description,
+        metadata,
+    )
+    .await?;
     db.invoices()
         .insert(&StoredInvoice {
             payment_hash: InvoiceHash(payment_hash.0),
@@ -93,6 +126,36 @@ pub async fn create_invoice(
 }
 
 impl Node {
+    /// [`build_invoice`] for `payment_hash` on networks of this node,
+    /// reachable through this node's endpoint. Nothing is recorded: set
+    /// a [`PreimageReleaser`](super::PreimageReleaser) to be paid it.
+    pub async fn build_invoice(
+        &self,
+        networks: &[NetworkId],
+        payment_hash: Bytes32,
+        amount_msat: u64,
+        expires_at: u64,
+        description: Option<String>,
+        metadata: Option<Metadata>,
+    ) -> Result<Invoice, String> {
+        let networks = networks
+            .iter()
+            .map(|id| self.receiver(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let relay = self.0.transport.home_relay().await;
+        build_invoice(
+            &self.0.keys,
+            relay,
+            &networks,
+            payment_hash,
+            amount_msat,
+            expires_at,
+            description,
+            metadata,
+        )
+        .await
+    }
+
     /// [`create_invoice`] on networks of this node, reachable through
     /// this node's endpoint.
     pub async fn create_invoice(
@@ -123,9 +186,9 @@ impl Node {
 
     /// Whether this node expects the HTLC `prepare` announces. Nothing
     /// is reserved: COMMIT checks everything again.
-    pub(super) fn prepare_payee(&self, prepare: PreparePayee) -> Result<(), String> {
+    pub(super) async fn prepare_payee(&self, prepare: PreparePayee) -> Result<(), String> {
         let hash = prepare.payment_hash;
-        let result = self.check_prepare_payee(&prepare);
+        let result = self.check_prepare_payee(&prepare).await;
         match &result {
             Ok(()) => info!(
                 "PREPARE {} accepted as payee on {}",
@@ -137,13 +200,37 @@ impl Node {
         result
     }
 
-    fn check_prepare_payee(&self, prepare: &PreparePayee) -> Result<(), String> {
-        let record = self.invoice(&prepare.payment_hash)?;
+    async fn check_prepare_payee(&self, prepare: &PreparePayee) -> Result<(), String> {
+        let Some(record) = self.recorded_invoice(&prepare.payment_hash)? else {
+            return self.check_prepare_released(prepare).await;
+        };
         if record.state == InvoiceState::Settled {
             return Err("invoice already paid".into());
         }
         self.payable_on(&record, &prepare.network, prepare.expiry)
             .map(|_| ())
+    }
+
+    /// PREPARE for a hash without a stored invoice: the releaser decides.
+    async fn check_prepare_released(&self, prepare: &PreparePayee) -> Result<(), String> {
+        let releaser = self.preimage_releaser().ok_or("unknown invoice")?;
+        let network = self.receiver(&prepare.network)?;
+        self.claim_by(network.as_ref(), prepare.expiry)?;
+        if releaser.accept(prepare).await {
+            Ok(())
+        } else {
+            Err("the payment is not expected".into())
+        }
+    }
+
+    /// The time by which the claim of an HTLC on `network` expiring at
+    /// `expiry` must start.
+    fn claim_by(&self, network: &dyn HtlcReceiver, expiry: u64) -> Result<u64, String> {
+        let claim_by = expiry.saturating_sub(network.incoming_delta_secs());
+        if claim_by <= unix_now() {
+            return Err("HTLC expires too soon to claim it".into());
+        }
+        Ok(claim_by)
     }
 
     /// What paying `record` with an HTLC on `network` expiring at
@@ -206,9 +293,11 @@ impl Node {
                 .invoice(&hash)
                 .ok()
                 .filter(|record| record.state == InvoiceState::Settled)
-                .and_then(|record| record.preimage);
+                .and_then(|record| record.preimage)
+                .map(Bytes32)
+                .or_else(|| self.received_preimage(&hash));
             if let Some(preimage) = preimage {
-                return Response::Committed(Bytes32(preimage));
+                return Response::Committed(preimage);
             }
             {
                 let mut commits = self.0.commits.lock().unwrap_or_else(|e| e.into_inner());
@@ -248,7 +337,9 @@ impl Node {
         let _busy = self
             .busy(format!("invoice:{key}"))
             .ok_or("this invoice is already being claimed")?;
-        let record = self.invoice(&commit.payment_hash)?;
+        let Some(record) = self.recorded_invoice(&commit.payment_hash)? else {
+            return self.try_claim_released(commit).await;
+        };
         if record.state == InvoiceState::Settled {
             return Ok(());
         }
@@ -284,12 +375,86 @@ impl Node {
         Ok(())
     }
 
-    /// The invoice `hash` names.
-    pub(super) fn invoice(&self, hash: &Bytes32) -> Result<StoredInvoice, String> {
+    /// Claim the HTLC of `commit` for a hash without a stored invoice,
+    /// with what the releaser hands over, and record the payment.
+    async fn try_claim_released(&self, commit: Commit) -> Result<(), String> {
+        let releaser = self.preimage_releaser().ok_or("unknown invoice")?;
+        if self.received_preimage(&commit.payment_hash).is_some() {
+            return Ok(());
+        }
+        let released = releaser
+            .release(&commit)
+            .await
+            .ok_or("the payment is not expected")?;
+        if !commit.payment_hash.matches_preimage(&released.preimage) {
+            return Err("the preimage released is not the payment hash's".into());
+        }
+        let network = self.receiver(&commit.network)?;
+        let claim_by = self.claim_by(network.as_ref(), commit.expiry)?;
+        // The target is worked out again: networks whose target depends
+        // on the invoice cannot receive without a stored one.
+        let target = network
+            .incoming_target(commit.payment_hash, released.amount_msat, commit.expiry)
+            .await
+            .map_err(|e| format!("cannot receive on {}: {e}", commit.network))?;
+        if !commit.descriptor.pays(&target) {
+            return Err("the HTLC does not pay this invoice".into());
+        }
+        let htlc = Htlc {
+            payment_hash: commit.payment_hash,
+            amount_msat: released.amount_msat,
+            expiry: commit.expiry,
+            descriptor: commit.descriptor,
+        };
+        verify_incoming(network.as_ref(), &htlc, claim_by, "COMMIT")
+            .await
+            .map_err(|e| e.to_string())?;
+        info!(
+            "claiming {} msat for released payment {} on {}",
+            htlc.amount_msat,
+            htlc.payment_hash.short(),
+            commit.network
+        );
+        network
+            .claim_incoming(&htlc, released.preimage)
+            .await
+            .map_err(|e| format!("claim failed: {e}"))?;
+        self.db()
+            .write(|tx| {
+                tx.transactions().insert(&Transaction {
+                    payment_hash: TransactionHash(htlc.payment_hash.0),
+                    direction: Direction::Incoming,
+                    amount_msat: htlc.amount_msat,
+                    network: commit.network.0.clone(),
+                    preimage: released.preimage.0,
+                    at: unix_now(),
+                })
+            })
+            .map_err(db_error)
+    }
+
+    /// The preimage of a payment this node was paid, from its record.
+    fn received_preimage(&self, hash: &Bytes32) -> Option<Bytes32> {
+        self.db()
+            .transactions()
+            .get(TransactionHash(hash.0))
+            .ok()
+            .flatten()
+            .filter(|tx| tx.direction == Direction::Incoming)
+            .map(|tx| Bytes32(tx.preimage))
+    }
+
+    /// The invoice `hash` names, if this node stored it.
+    fn recorded_invoice(&self, hash: &Bytes32) -> Result<Option<StoredInvoice>, String> {
         self.db()
             .invoices()
             .get(InvoiceHash(hash.0))
-            .map_err(db_error)?
+            .map_err(db_error)
+    }
+
+    /// The invoice `hash` names.
+    pub(super) fn invoice(&self, hash: &Bytes32) -> Result<StoredInvoice, String> {
+        self.recorded_invoice(hash)?
             .ok_or_else(|| "unknown invoice".to_string())
     }
 

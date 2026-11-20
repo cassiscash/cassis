@@ -22,6 +22,7 @@ liquid = ["cassis-networks/liquid"]
 rootstock = ["cassis-networks/rootstock"]
 
 [dependencies]
+async-trait = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
 clap = { workspace = true, features = ["env"] }

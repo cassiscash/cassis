@@ -2888,6 +2888,7 @@ dependencies = [
 name = "cassis-wallet"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "cassis-core",
  "cassis-networks",
  "clap",
