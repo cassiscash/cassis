@@ -457,21 +457,21 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
     }
     nodes.push(fact(
         &el("key"),
-        "Wallet key",
-        match (slot.reveal, &entry.secret) {
-            (true, Some(secret)) => secret.as_str(),
+        "Wallet mnemonic",
+        match (slot.reveal, &entry.mnemonic) {
+            (true, Some(mnemonic)) => mnemonic.as_str(),
             (true, None) => "none",
             (false, _) => "hidden",
         },
     ));
     nodes.push(match slot.reveal {
-        true => act(el("hide"), "Hide the key", "network.hide", json!({"id": id})),
-        false => act(el("reveal"), "Show the key", "network.reveal", json!({"id": id})),
+        true => act(el("hide"), "Hide the mnemonic", "network.hide", json!({"id": id})),
+        false => act(el("reveal"), "Show the mnemonic", "network.reveal", json!({"id": id})),
     });
     nodes.push(
         text(el("key/note"))
             .variant("caption")
-            .text("Whoever has the key controls the funds on this network."),
+            .text("Whoever has the mnemonic controls the funds on this network."),
     );
 
     let form = edit_fields(id, entry);
@@ -504,10 +504,10 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
         nodes.push(
             notice(el("confirm"))
                 .variant("warning")
-                .text(format!("Remove {id}? Its key is deleted from the config file.{funds}")),
+                .text(format!("Remove {id}? Its mnemonic is deleted from the config file.{funds}")),
         );
         nodes.push(row(el("confirm/buttons")).children([
-            act(el("remove/confirm"), "Remove and delete its key", "network.remove.confirm", json!({"id": id}))
+            act(el("remove/confirm"), "Remove and delete its mnemonic", "network.remove.confirm", json!({"id": id}))
                 .variant("failure"),
             act(el("remove/cancel"), "Keep it", "network.remove.cancel", json!({"id": id})),
         ]));
@@ -601,7 +601,7 @@ fn new_network() -> Node {
     card("hw/new")
         .title("Add a network")
         .child(text("hw/new/note").variant("caption").text(
-            "A new wallet key is made for it and written to the config file.",
+            "A new wallet mnemonic is made for it and written to the config file.",
         ))
         .child(row("hw/new/kinds").wrap(true).children(picker))
         .children(missing)

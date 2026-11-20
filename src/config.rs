@@ -6,19 +6,19 @@
 //!
 //! ```toml
 //! [networks."cashu::mint.example"]
-//! secret = "<64 hex>"              # wallet key on this network
+//! mnemonic = "twelve words ..."    # wallet on this network, 12 or 24 words
 //!
 //! [networks.arkade]
-//! secret = "<64 hex>"
+//! mnemonic = "twelve words ..."
 //! esplora_url = "https://..."      # chain API of arkade and bitcoin
 //!
 //! [networks.lightning]
-//! secret = "<64 hex>"
+//! mnemonic = "twelve words ..."
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
 //! ```
 
-use cassis_core::keys::new_network_secret;
+use cassis_core::keys::{generate_mnemonic, parse_wallet_mnemonic};
 use cassis_core::NetworkId;
 use cassis_networks::NetworkSettings;
 use serde::Deserialize;
@@ -29,8 +29,9 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table};
 /// How one network is opened.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct Entry {
-    /// Hex wallet key on this network, written when it is added.
-    pub secret: Option<String>,
+    /// BIP39 mnemonic (12 or 24 words) of the wallet on this network,
+    /// written when it is added.
+    pub mnemonic: Option<String>,
     /// Chain API of `arkade` and `bitcoin`, instead of the public one.
     pub esplora_url: Option<String>,
     /// The LND node of a `lightning` network.
@@ -62,13 +63,12 @@ impl Entry {
     /// `cassis-wallet`.
     #[allow(unused_variables)]
     pub fn settings(&self, network: &NetworkId, dir: &Path) -> Result<NetworkSettings, String> {
-        let hex = self
-            .secret
-            .as_deref()
-            .ok_or_else(|| format!("{network} has no secret"))?;
-        let mut secret = [0u8; 32];
-        lowercase_hex::decode_to_slice(hex.trim(), &mut secret)
-            .map_err(|e| format!("{network} secret: expected 64 hex characters: {e}"))?;
+        let mnemonic = parse_wallet_mnemonic(
+            self.mnemonic
+                .as_deref()
+                .ok_or_else(|| format!("{network} has no mnemonic"))?,
+        )
+        .map_err(|e| format!("{network} mnemonic: {e}"))?;
         #[cfg(not(feature = "lightning"))]
         if self.lnd.is_some() {
             return Err(format!("{network}: this build has no LND support"));
@@ -101,7 +101,7 @@ impl Entry {
             esplora_url = std::env::var("CASSIS_ESPLORA_URL").ok();
         }
         Ok(NetworkSettings {
-            secret,
+            mnemonic,
             dir: cassis_networks::network_dir(dir, network),
             esplora_url,
             #[cfg(feature = "lightning")]
@@ -266,11 +266,8 @@ pub fn set(
     bark: bool,
 ) -> Result<(), String> {
     let table = child(networks, &id.0, toml_edit::table)?;
-    if !table.contains_key("secret") {
-        table.insert(
-            "secret",
-            toml_edit::value(lowercase_hex::encode(new_network_secret())),
-        );
+    if !table.contains_key("mnemonic") {
+        table.insert("mnemonic", toml_edit::value(generate_mnemonic()));
     }
     match id.kind() {
         "arkade" | "bitcoin" => put(table, "esplora_url", &fields.esplora_url),
@@ -402,8 +399,8 @@ mod tests {
         let file = file("add", "# mine\nmnemonic = \"x\"\n");
         let id = NetworkId::parse("arkade").unwrap();
         file.edit(|t| set(t, &id, &Fields::default(), false)).unwrap();
-        let secret = file.read().unwrap()["arkade"].secret.clone().unwrap();
-        assert_eq!(secret.len(), 64);
+        let mnemonic = file.read().unwrap()["arkade"].mnemonic.clone().unwrap();
+        assert_eq!(mnemonic.split_whitespace().count(), 12);
         // saving again keeps the key
         let fields = Fields {
             esplora_url: "https://esplora.example".into(),
@@ -411,7 +408,7 @@ mod tests {
         };
         file.edit(|t| set(t, &id, &fields, false)).unwrap();
         let entry = file.read().unwrap().remove("arkade").unwrap();
-        assert_eq!(entry.secret.as_deref(), Some(secret.as_str()));
+        assert_eq!(entry.mnemonic.as_deref(), Some(mnemonic.as_str()));
         assert_eq!(entry.esplora_url.as_deref(), Some("https://esplora.example"));
         let text = std::fs::read_to_string(file.path()).unwrap();
         assert!(text.starts_with("# mine\nmnemonic"));

@@ -8,14 +8,14 @@ with every network `cassis-networks` supports (one cargo feature each, as in
 What the page does:
 
 - **Add, edit and remove networks** in a config file: a table of
-  `[networks."<id>"]` with a wallet `secret` (made when added) and the
+  `[networks."<id>"]` with a wallet `mnemonic` (made when added) and the
   network's settings. A Cassis home's `config.toml` is one (table `networks`);
   any other TOML file works with a table of any name, and the rest of the file,
-  comments included, is left alone. Removing asks first, since the key goes.
+  comments included, is left alone. Removing asks first, since the mnemonic goes.
 - **Keep them open**: networks are opened, closed and reopened as the file
   changes (also by hand), with the upkeep each network needs.
 - **See the internals** of each: kind, status, what its wallet can do, its
-  settings, and its key (on request).
+  settings, and its mnemonic (on request).
 - **Deposit**: deposit addresses, new addresses, peg-in addresses, Lightning
   invoices, redeeming tokens, onboarding.
 - **Withdraw**: send, pay a Lightning invoice, take funds out as a token.

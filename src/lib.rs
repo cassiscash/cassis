@@ -37,7 +37,7 @@
 //! | `network.remove`         | `id` (asks to confirm)                   |
 //! | `network.remove.confirm` | `id`                                     |
 //! | `network.remove.cancel`  | `id`                                     |
-//! | `network.reveal`         | `id` (shows the wallet key)              |
+//! | `network.reveal`         | `id` (shows the mnemonic)              |
 //! | `network.hide`           | `id`                                     |
 //! | `wallet.refresh`         | `id`                                     |
 //! | `wallet.address`         | `id`                                     |
@@ -363,7 +363,7 @@ impl WalletAdmin {
                 let id = id()?;
                 self.file.edit(|networks| config::remove(networks, &id))?;
                 self.reconcile_in_background(None);
-                Ok(format!("{id} removed, with its key"))
+                Ok(format!("{id} removed, with its mnemonic"))
             }
             "network.reveal" | "network.hide" => {
                 let id = id()?;
