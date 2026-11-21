@@ -645,7 +645,11 @@ impl Gateway {
             let Ok(network) = self.network(destination.network()) else {
                 continue;
             };
-            match network.can_send(amount_msat).await {
+            let checked = match network.check_htlc_amount(amount_msat) {
+                Ok(()) => network.can_send(amount_msat).await,
+                Err(error) => Err(error),
+            };
+            match checked {
                 Ok(()) => return Ok((destination.clone(), network)),
                 Err(error) => reasons.push(format!("{}: {error}", destination.network())),
             }

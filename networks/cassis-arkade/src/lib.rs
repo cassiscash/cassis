@@ -1159,14 +1159,8 @@ impl Network for ArkadeAdapter {
                 "arkade HTLCs are locked to an x-only key",
             ));
         };
+        self.check_htlc_amount(amount_msat)?;
         let amount = sat_amount(amount_msat);
-        if amount < self.dust {
-            return Err(NetworkError::invalid(format!(
-                "{} sats is below the operator's dust limit of {} sats",
-                amount.to_sat(),
-                self.dust.to_sat()
-            )));
-        }
         let options = self.build_options_for_outgoing(&payment_hash, receiver, expiry)?;
         let _spending = self.spending.lock().await;
         self.refresh_vtxos_expiring_before(expiry.saturating_add(SWEEP_MARGIN_SECS))
@@ -1252,6 +1246,19 @@ impl Network for ArkadeAdapter {
             .spend_vhtlc(&options, bitcoin::Amount::ZERO, false, None)
             .await?;
         info!(parent: &self.span, "refunded {}: tx {txid}", htlc.payment_hash.short());
+        Ok(())
+    }
+
+    /// The operator rejects VTXOs below its dust limit.
+    fn check_htlc_amount(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        let amount = sat_amount(amount_msat);
+        if amount < self.dust {
+            return Err(NetworkError::invalid(format!(
+                "{} sats is below the operator's dust limit of {} sats",
+                amount.to_sat(),
+                self.dust.to_sat()
+            )));
+        }
         Ok(())
     }
 

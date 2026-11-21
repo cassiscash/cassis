@@ -1094,6 +1094,17 @@ impl Network for BitcoinAdapter {
         Ok(())
     }
 
+    /// A lockup output below dust does not relay.
+    fn check_htlc_amount(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        let amount_sat = sats_for_msat(amount_msat);
+        if amount_sat < DUST_SATS {
+            return Err(NetworkError::invalid(format!(
+                "{amount_sat} sats is below the dust limit of {DUST_SATS} sats"
+            )));
+        }
+        Ok(())
+    }
+
     /// The wallet funds the lockup and its fee.
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
         self.select_for_lock(sats_for_msat(amount_msat))

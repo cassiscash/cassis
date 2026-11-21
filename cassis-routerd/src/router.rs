@@ -429,6 +429,12 @@ impl Router {
         };
         let asked = async {
             outgoing
+                .check_htlc_amount(prepare.outgoing_amount_msat)
+                .map_err(|e| format!("cannot send on {}: {e}", prepare.outgoing_network))?;
+            incoming
+                .check_htlc_amount(prepare.amount_msat)
+                .map_err(|e| format!("cannot receive on {}: {e}", prepare.incoming_network))?;
+            outgoing
                 .can_send(prepare.outgoing_amount_msat.saturating_add(promised))
                 .await
                 .map_err(|e| format!("cannot send on {}: {e}", prepare.outgoing_network))?;

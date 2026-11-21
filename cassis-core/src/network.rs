@@ -881,6 +881,14 @@ pub trait Network: Send + Sync {
     /// the refund yet.
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError>;
 
+    /// Whether a single HTLC of `amount_msat` can exist on this network
+    /// at all, whichever side holds it (e.g. not below a dust limit).
+    /// Unlike [`Network::can_send`] it judges one HTLC, not a total.
+    fn check_htlc_amount(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        let _ = amount_msat;
+        Ok(())
+    }
+
     /// Whether this node can fund an outgoing HTLC of `amount_msat`
     /// right now (balance plus any fees the lock costs).
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError>;
