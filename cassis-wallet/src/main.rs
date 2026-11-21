@@ -34,6 +34,7 @@ use cassis_core::{unix_now, Bytes32, Invoice, NetworkId};
 use cassis_wallet::db::{Direction, InvoiceHash, InvoiceState};
 use cassis_wallet::node::{
     authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
+    DEFAULT_MAX_ROUTES,
 };
 use cassis_wallet::{Home, Node, NodeConfig};
 use clap::{Parser, Subcommand};
@@ -206,6 +207,9 @@ enum Command {
         invoice: String,
         #[arg(long)]
         from: String,
+        /// Routes to try when hops refuse at PREPARE, before giving up.
+        #[arg(long, default_value_t = DEFAULT_MAX_ROUTES)]
+        max_routes: usize,
     },
     /// Show the cheapest announced route between two networks.
     Route {
@@ -501,7 +505,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             preimage_server_relay,
             since,
         } => redeem(&home, &span, preimage_server, preimage_server_relay, since).await?,
-        Command::Pay { invoice, from } => {
+        Command::Pay {
+            invoice,
+            from,
+            max_routes,
+        } => {
             let invoice: Invoice =
                 serde_json::from_str(&invoice).map_err(|e| format!("invalid invoice: {e}"))?;
             let from = NetworkId::parse(&from)?;
@@ -517,7 +525,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             )
             .await?;
             let report = node
-                .pay(&invoice, &from, &relays, &Default::default())
+                .pay_retrying(&invoice, &from, &relays, max_routes)
                 .await;
             node.shutdown().await;
             let report = report?;

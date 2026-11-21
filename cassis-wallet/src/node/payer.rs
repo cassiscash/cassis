@@ -18,6 +18,9 @@ use tracing::{info, warn};
 /// How often a pending EXECUTE or COMMIT is asked again.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Routes [`Node::pay_retrying`] tries by default.
+pub const DEFAULT_MAX_ROUTES: usize = 3;
+
 /// What came of an attempt to [`Node::pay`] an invoice.
 #[derive(Clone, Debug)]
 pub struct PayReport {
@@ -31,10 +34,28 @@ pub struct PayReport {
 /// Why a payment attempt failed, once it had a route.
 #[derive(Clone, Debug)]
 pub struct PayFailure {
+    /// The step of the attempt that failed.
+    pub phase: PayPhase,
     /// What happened, with a note on what stays locked, if anything.
     pub message: String,
     /// The hop the attempt failed at, when a hop is to blame.
     pub hop: Option<FailedHop>,
+}
+
+/// The steps of a payment attempt, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayPhase {
+    /// Hops and the payee were asked to reserve: nothing is funded
+    /// yet, so another route can be tried.
+    Prepare,
+    /// Funding the first HTLC failed: nothing stays locked.
+    Fund,
+    /// A hop failed to forward: the HTLCs up to it stay locked, and
+    /// claimable with the preimage, until they expire.
+    Execute,
+    /// The payee did not claim: every HTLC stays locked until it
+    /// expires.
+    Commit,
 }
 
 /// A hop of the route that failed the payment.
@@ -81,15 +102,75 @@ impl PayReport {
         }
     }
 
-    fn failed(route: Vec<RouteAnnouncement>, message: String, hop: Option<FailedHop>) -> Self {
+    fn failed(
+        phase: PayPhase,
+        route: Vec<RouteAnnouncement>,
+        message: String,
+        hop: Option<FailedHop>,
+    ) -> Self {
         Self {
             route,
-            outcome: Err(PayFailure { message, hop }),
+            outcome: Err(PayFailure {
+                phase,
+                message,
+                hop,
+            }),
         }
     }
 }
 
 impl Node {
+    /// [`Node::pay`] over up to `max_routes` routes: when an attempt
+    /// fails at PREPARE because of a hop, the next one routes around
+    /// that hop's router. A failure after PREPARE ends the payment: its
+    /// HTLCs stay locked, and claimable with the preimage, so paying
+    /// again under the same payment hash could pay twice.
+    ///
+    /// The report is the last attempt's.
+    pub async fn pay_retrying(
+        &self,
+        invoice: &Invoice,
+        from: &NetworkId,
+        relays: &[String],
+        max_routes: usize,
+    ) -> Result<PayReport, String> {
+        let mut skip = HashSet::new();
+        let mut last: Option<PayReport> = None;
+        for attempt in 1..=max_routes.max(1) {
+            let report = match self.pay(invoice, from, relays, &skip).await {
+                Ok(report) => report,
+                // Typically no route is left once failed hops are
+                // skipped: the last failure says more.
+                Err(error) => {
+                    return match last {
+                        Some(report) => {
+                            warn!("attempt {attempt} could not start: {error}");
+                            Ok(report)
+                        }
+                        None => Err(error),
+                    }
+                }
+            };
+            let node = match &report.outcome {
+                Err(PayFailure {
+                    phase: PayPhase::Prepare,
+                    hop: Some(hop),
+                    message,
+                }) => {
+                    warn!(
+                        "attempt {attempt} failed: {message}; routing around {}",
+                        hop.node.to_hex()
+                    );
+                    hop.node
+                }
+                _ => return Ok(report),
+            };
+            skip.insert(node);
+            last = Some(report);
+        }
+        Ok(last.expect("at least one attempt ran"))
+    }
+
     /// Pay `invoice` from this node's `from` network, routing through
     /// routers announced on `relays` when the invoice is not payable on
     /// `from` directly. Routers in `skip` are not routed through: a
@@ -244,6 +325,7 @@ impl Node {
                 Ok(Response::Prepared(Err(reason))) => {
                     self.discard_hops(&hops).await;
                     return Ok(PayReport::failed(
+                        PayPhase::Prepare,
                         route.clone(),
                         format!("hop {} refused: {reason}", i + 1),
                         Some(failed_hop(i, HopError::PrepareRefused(reason))),
@@ -253,6 +335,7 @@ impl Node {
                     self.discard_hops(&hops).await;
                     let error = unexpected(other);
                     return Ok(PayReport::failed(
+                        PayPhase::Prepare,
                         route.clone(),
                         format!("hop {}: {error}", i + 1),
                         Some(failed_hop(i, HopError::Unresponsive(error))),
@@ -265,6 +348,7 @@ impl Node {
             Ok(Response::PayeePrepared(Err(reason))) => {
                 self.discard_hops(&hops).await;
                 return Ok(PayReport::failed(
+                    PayPhase::Prepare,
                     route,
                     format!("payee refused: {reason}"),
                     None,
@@ -273,6 +357,7 @@ impl Node {
             other => {
                 self.discard_hops(&hops).await;
                 return Ok(PayReport::failed(
+                    PayPhase::Prepare,
                     route,
                     format!("payee: {}", unexpected(other)),
                     None,
@@ -309,6 +394,7 @@ impl Node {
             Err(error) => {
                 self.discard_hops(&hops).await;
                 return Ok(PayReport::failed(
+                    PayPhase::Fund,
                     route,
                     format!("cannot fund the first HTLC on {from}: {error}"),
                     None,
@@ -356,6 +442,7 @@ impl Node {
                         other => HopError::Unresponsive(unexpected(other)),
                     };
                     return Ok(PayReport::failed(
+                        PayPhase::Execute,
                         route.clone(),
                         locked(format!("hop {} failed: {error}", i + 1)),
                         Some(failed_hop(i, error)),
@@ -379,6 +466,7 @@ impl Node {
             Ok(Response::Committed(preimage)) if hash.matches_preimage(&preimage) => preimage,
             Ok(Response::Committed(_)) => {
                 return Ok(PayReport::failed(
+                    PayPhase::Commit,
                     route,
                     locked("payee answered with a wrong preimage".into()),
                     None,
@@ -386,6 +474,7 @@ impl Node {
             }
             other => {
                 return Ok(PayReport::failed(
+                    PayPhase::Commit,
                     route,
                     locked(format!("payee did not claim: {}", unexpected(other))),
                     None,

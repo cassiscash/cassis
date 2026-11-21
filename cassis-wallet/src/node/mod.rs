@@ -40,7 +40,7 @@ pub use offline::{
     RedeemReport,
 };
 pub use payee::{build_invoice, create_invoice};
-pub use payer::{FailedHop, HopError, PayFailure, PayReport};
+pub use payer::{FailedHop, HopError, PayFailure, PayPhase, PayReport, DEFAULT_MAX_ROUTES};
 pub use releaser::{PreimageReleaser, Released};
 pub use settle::{settle_outgoing, Outcome};
 pub use verify::{verify_incoming, Unverified};
