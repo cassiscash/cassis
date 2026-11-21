@@ -1094,15 +1094,11 @@ impl Network for BitcoinAdapter {
         Ok(())
     }
 
-    /// A lockup output below dust does not relay.
-    fn check_htlc_amount(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        let amount_sat = sats_for_msat(amount_msat);
-        if amount_sat < DUST_SATS {
-            return Err(NetworkError::invalid(format!(
-                "{amount_sat} sats is below the dust limit of {DUST_SATS} sats"
-            )));
-        }
-        Ok(())
+    /// Claim fees come out of the HTLC, which must leave the receiver
+    /// more than dust; that also keeps the lockup output above dust.
+    fn min_htlc_msat(&self) -> u64 {
+        let claim_fee = self.fee_for(Self::vsize_for(0, 1, 1, 0)).to_sat();
+        (claim_fee + DUST_SATS + 1) * MSAT_PER_SAT
     }
 
     /// The wallet funds the lockup and its fee.
@@ -1112,15 +1108,9 @@ impl Network for BitcoinAdapter {
             .map(|_| ())
     }
 
-    /// Claim fees come out of the HTLC, which must be worth claiming.
-    async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        let needed = self.fee_for(Self::vsize_for(0, 1, 1, 0)).to_sat() + DUST_SATS;
-        let amount_sat = sats_for_msat(amount_msat);
-        if amount_sat <= needed {
-            return Err(NetworkError::invalid(format!(
-                "{amount_sat} sats do not cover a claim: it takes more than {needed} sats"
-            )));
-        }
+    /// Claim fees come out of the HTLC, which [`Self::min_htlc_msat`]
+    /// keeps worth claiming.
+    async fn can_receive(&self, _amount_msat: u64) -> Result<(), NetworkError> {
         Ok(())
     }
 }

@@ -91,9 +91,18 @@ pub const NON_FINAL_SEQUENCE: u32 = 0xFFFF_FFFE;
 /// Propagation pause replacing the 0-conf coverage wait on testnet,
 /// which the 0-conf service does not observe.
 const TESTNET_PROPAGATION_WAIT_SECS: u64 = 5;
-/// Minimum lockable amount in sats: fees are carved out of the HTLC
-/// value itself, so tiny locks would be eaten by fees.
-pub const MIN_LOCK_SATS: u64 = 1_000;
+/// Weight of a claim before its HTLC input's witness, as lwk prices
+/// it with the ELIP-200 discount (proofs and commitments count as
+/// explicit): 4-byte version, flag, one-byte counts, the 41-byte input
+/// shell, a 122-byte confidential P2WPKH wallet output, the 44-byte
+/// fee output and 4-byte locktime, times 4; the 8 bytes of empty input
+/// and output witnesses; less the value (24) and nonce (32) commitment
+/// bytes the discount drops, times 4.
+const CLAIM_TX_WEIGHT: usize = 218 * 4 + 8 - (24 + 32) * 4;
+/// Dust threshold of the explicit P2WSH lockup output under the relay
+/// policy Elements keeps from Bitcoin Core: (78-byte output + 67-byte
+/// spend) at 3 sat/vbyte.
+const LOCKUP_DUST_SATS: u64 = (78 + 67) * 3;
 
 /// Derivation path of the HTLC claim key (see crate docs).
 const CLAIM_KEY_PATH: &str = "m/1037'/0";
@@ -819,6 +828,17 @@ pub fn btc_pubkey(pubkey: &PubKey) -> Result<BtcPublicKey, NetworkError> {
     Ok(BtcPublicKey::new(inner))
 }
 
+/// The smallest HTLC worth locking: a claim's fee, as lwk computes it
+/// at [`FEE_RATE_SATS_KVB`], plus [`LOCKUP_DUST_SATS`]. Any compressed
+/// `key` sizes the witness script like the real ones.
+fn min_lock_sats(key: &BtcPublicKey) -> u64 {
+    // The longest witness script: the largest refund locktime push.
+    let spec = HtlcSpec::build(&Bytes32([0; 32]), *key, *key, u32::MAX);
+    let weight = CLAIM_TX_WEIGHT + spec.max_weight_to_satisfy(true);
+    let claim_fee = (weight.div_ceil(4) as f32 * FEE_RATE_SATS_KVB / 1000.0).ceil() as u64;
+    claim_fee + LOCKUP_DUST_SATS
+}
+
 fn varint_len(n: usize) -> usize {
     match n {
         0..=0xFC => 1,
@@ -977,12 +997,8 @@ impl Network for LiquidAdapter {
                 "liquid HTLCs are locked to a full key",
             ));
         };
+        self.check_htlc_amount(amount_msat)?;
         let sats = sats_for_msat(amount_msat);
-        if sats < MIN_LOCK_SATS {
-            return Err(NetworkError::invalid(format!(
-                "liquid HTLCs lock at least {MIN_LOCK_SATS} sats"
-            )));
-        }
         let tip = self.tip_height().await?;
         let refund_locktime = refund_locktime(tip, expiry)?;
         let spec = HtlcSpec::build(
@@ -1071,14 +1087,15 @@ impl Network for LiquidAdapter {
         Ok(())
     }
 
+    /// The claim fee comes out of the HTLC, which must still leave the
+    /// receiver more than dust.
+    fn min_htlc_msat(&self) -> u64 {
+        min_lock_sats(&self.claim_pk_full) * MSAT_PER_SAT
+    }
+
     /// The wallet can build the lockup, fee included.
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
         let needed = sats_for_msat(amount_msat);
-        if needed < MIN_LOCK_SATS {
-            return Err(NetworkError::invalid(format!(
-                "liquid HTLCs lock at least {MIN_LOCK_SATS} sats"
-            )));
-        }
         let available = self.lbtc_balance_sat().await?;
         let address = self.next_wallet_address().await?;
         let wollet = self.wollet.lock().await;
@@ -1094,13 +1111,9 @@ impl Network for LiquidAdapter {
         Ok(())
     }
 
-    /// Claim fees come out of the HTLC, which must be worth claiming.
-    async fn can_receive(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        if sats_for_msat(amount_msat) < MIN_LOCK_SATS {
-            return Err(NetworkError::invalid(format!(
-                "liquid HTLCs lock at least {MIN_LOCK_SATS} sats"
-            )));
-        }
+    /// Claim fees come out of the HTLC, which [`Self::min_htlc_msat`]
+    /// keeps worth claiming.
+    async fn can_receive(&self, _amount_msat: u64) -> Result<(), NetworkError> {
         Ok(())
     }
 }
@@ -1138,6 +1151,12 @@ mod tests {
         let first = open("a").await;
         let second = open("b").await;
         assert_eq!(first.claim_target(), second.claim_target());
+    }
+
+    #[test]
+    fn min_lock_covers_the_claim_fee_and_dust() {
+        // A 394 vbyte claim at 0.2 sat/vbyte, plus 435 sats of dust.
+        assert_eq!(min_lock_sats(&test_pubkey(0xaa)), 79 + 435);
     }
 
     #[test]

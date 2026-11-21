@@ -24,7 +24,8 @@ pub(super) enum CommitState {
 }
 
 /// Build an invoice for `payment_hash`, payable on each of `networks`
-/// and signed by `keys`, carrying `metadata` back to this node with
+/// that can hold an HTLC of `amount_msat` (see
+/// [`HtlcReceiver::min_htlc_msat`]), and signed by `keys`, carrying `metadata` back to this node with
 /// every PREPARE and COMMIT. Nothing is recorded: whoever calls it
 /// answers PREPARE and COMMIT for the hash, with a stored invoice or a
 /// [`PreimageReleaser`].
@@ -53,7 +54,17 @@ pub async fn build_invoice(
         return Err("an invoice needs at least one network".into());
     }
     let mut targets = Vec::with_capacity(networks.len());
+    // Networks left out because the amount is below their minimum.
+    let mut too_small = Vec::new();
     for network in networks {
+        let min = network.min_htlc_msat();
+        if amount_msat < min {
+            too_small.push(format!(
+                "{} needs at least {min} msat",
+                network.network_id()
+            ));
+            continue;
+        }
         let target = network
             .incoming_target(payment_hash, amount_msat, expires_at)
             .await
@@ -62,6 +73,18 @@ pub async fn build_invoice(
             target,
             incoming_delta_secs: Some(network.incoming_delta_secs()),
         });
+    }
+    if targets.is_empty() {
+        return Err(format!(
+            "{amount_msat} msat is too small for every network: {}",
+            too_small.join("; ")
+        ));
+    }
+    if !too_small.is_empty() {
+        warn!(
+            "invoice for {amount_msat} msat leaves out {}",
+            too_small.join("; ")
+        );
     }
     Ok(Invoice::direct(
         InvoiceBody {

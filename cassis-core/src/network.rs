@@ -695,6 +695,11 @@ pub trait HtlcReceiver: Send + Sync {
     /// See [`Network::incoming_delta_secs`].
     fn incoming_delta_secs(&self) -> u64;
 
+    /// See [`Network::min_htlc_msat`].
+    fn min_htlc_msat(&self) -> u64 {
+        0
+    }
+
     /// See [`Network::receive_target`].
     async fn incoming_target(
         &self,
@@ -721,6 +726,10 @@ impl<N: Network + ?Sized> HtlcReceiver for N {
 
     fn incoming_delta_secs(&self) -> u64 {
         Network::incoming_delta_secs(self)
+    }
+
+    fn min_htlc_msat(&self) -> u64 {
+        Network::min_htlc_msat(self)
     }
 
     async fn incoming_target(
@@ -754,6 +763,10 @@ impl HtlcReceiver for std::sync::Arc<dyn Network> {
 
     fn incoming_delta_secs(&self) -> u64 {
         Network::incoming_delta_secs(self.as_ref())
+    }
+
+    fn min_htlc_msat(&self) -> u64 {
+        Network::min_htlc_msat(self.as_ref())
     }
 
     async fn incoming_target(
@@ -881,11 +894,24 @@ pub trait Network: Send + Sync {
     /// the refund yet.
     async fn refund_outgoing_htlc(&self, htlc: &Htlc) -> Result<(), NetworkError>;
 
-    /// Whether a single HTLC of `amount_msat` can exist on this network
-    /// at all, whichever side holds it (e.g. not below a dust limit).
-    /// Unlike [`Network::can_send`] it judges one HTLC, not a total.
+    /// The smallest HTLC this network can hold, whichever side holds it
+    /// (e.g. a dust limit). Routers announce it, so payers route around
+    /// hops a payment is too small for, and payees leave it out of
+    /// invoices. It may change while the node runs.
+    fn min_htlc_msat(&self) -> u64 {
+        0
+    }
+
+    /// Whether a single HTLC of `amount_msat` is at least
+    /// [`Network::min_htlc_msat`]. Unlike [`Network::can_send`] it
+    /// judges one HTLC, not a total.
     fn check_htlc_amount(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        let _ = amount_msat;
+        let min = self.min_htlc_msat();
+        if amount_msat < min {
+            return Err(NetworkError::invalid(format!(
+                "{amount_msat} msat is below its minimum HTLC of {min} msat"
+            )));
+        }
         Ok(())
     }
 

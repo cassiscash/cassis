@@ -243,7 +243,8 @@ impl Router {
                     .or_default()
                     .insert(d_tag.clone());
             }
-            let (Ok(incoming), Ok(_)) = (node.network(&route.from), node.network(&route.to)) else {
+            let (Ok(incoming), Ok(outgoing)) = (node.network(&route.from), node.network(&route.to))
+            else {
                 warn!(
                     "not announcing {d_tag}: {} or {} is not open",
                     route.from, route.to
@@ -259,6 +260,7 @@ impl Router {
                 fee_base_msat: route.fee_base_msat,
                 fee_ppm: route.fee_ppm,
                 incoming_delta_secs: route.incoming_delta_secs(incoming.as_ref()),
+                min_htlc_msat: incoming.min_htlc_msat().max(outgoing.min_htlc_msat()),
                 test_money: route.test_money,
             };
             for (d_tag, accepted) in routing::publish_announcements(

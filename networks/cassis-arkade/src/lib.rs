@@ -77,6 +77,7 @@ use cassis_core::{
 };
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Once;
@@ -418,7 +419,9 @@ pub struct ArkadeAdapter {
     /// Operator signer key reported by GetInfo; both parties of a VHTLC
     /// use the same operator.
     server_pk_xonly: XOnlyPublicKey,
-    dust: bitcoin::Amount,
+    /// The operator's dust limit in sats, as GetInfo last reported it
+    /// (see [`Network::maintain`]).
+    dust_sats: AtomicU64,
     client: Arc<ArkClient>,
     chain: Arc<esplora::EsploraBlockchain>,
     /// How long the operator's batches last, at least (see
@@ -518,7 +521,7 @@ impl ArkadeAdapter {
             keypair,
             xonly: keypair.x_only_public_key().0,
             server_pk_xonly: XOnlyPublicKey::from(info.signer_pk),
-            dust: info.dust,
+            dust_sats: AtomicU64::new(info.dust.to_sat()),
             client: Arc::new(client),
             chain,
             batch_lifetime_secs: Mutex::new(None),
@@ -553,6 +556,25 @@ impl ArkadeAdapter {
             *lifetime = seen;
             info!(parent: &self.span, "operator batches last {}s", seen.unwrap_or(0));
         }
+    }
+
+    fn dust_msat(&self) -> u64 {
+        self.dust_sats.load(Ordering::Relaxed) * MSAT_PER_SAT
+    }
+
+    /// Pick up a dust limit the operator changed since it was read.
+    async fn refresh_dust(&self) -> Result<(), NetworkError> {
+        let info = self
+            .client
+            .server_info()
+            .await
+            .map_err(|e| NetworkError::Network(format!("operator info: {e}")))?;
+        let dust = info.dust.to_sat();
+        let previous = self.dust_sats.swap(dust, Ordering::Relaxed);
+        if previous != dust {
+            info!(parent: &self.span, "operator dust limit is now {dust} sats (was {previous})");
+        }
+        Ok(())
     }
 
     /// Settle into a new batch every spendable VTXO whose batch expires
@@ -1250,16 +1272,8 @@ impl Network for ArkadeAdapter {
     }
 
     /// The operator rejects VTXOs below its dust limit.
-    fn check_htlc_amount(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        let amount = sat_amount(amount_msat);
-        if amount < self.dust {
-            return Err(NetworkError::invalid(format!(
-                "{} sats is below the operator's dust limit of {} sats",
-                amount.to_sat(),
-                self.dust.to_sat()
-            )));
-        }
-        Ok(())
+    fn min_htlc_msat(&self) -> u64 {
+        self.dust_msat()
     }
 
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
@@ -1274,7 +1288,7 @@ impl Network for ArkadeAdapter {
         // only leaves sub-dust change when nothing else is left to add,
         // and the operator rejects that output.
         let change = available - needed;
-        let dust = self.dust.to_sat() * MSAT_PER_SAT;
+        let dust = self.dust_msat();
         if change > 0 && change < dust {
             return Err(NetworkError::invalid(format!(
                 "sending {needed} msat of {available} msat would leave change below the \
@@ -1306,6 +1320,7 @@ impl Network for ArkadeAdapter {
     /// refresh VTXOs past half their batch lifetime, so the wallet never
     /// holds coins the operator may sweep.
     async fn maintain(&self) -> Result<(), NetworkError> {
+        self.refresh_dust().await?;
         let _spending = self.spending.lock().await;
         if let Some(txid) = self.onboard().await? {
             info!(parent: &self.span, "settled boarding outputs in {txid}");

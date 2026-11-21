@@ -177,6 +177,12 @@ impl Node {
             invoice.incoming_delta_for(&payee_network),
             unix_now(),
         )?;
+        // Routers and the payee check the other legs at PREPARE.
+        if let Some(sender) = &sender {
+            sender
+                .check_htlc_amount(plan.amounts[0])
+                .map_err(|e| format!("cannot send on {from}: {e}"))?;
+        }
         // Hop `i` of the route, as the report names it.
         let failed_hop = |i: usize, error: HopError| FailedHop {
             index: i,

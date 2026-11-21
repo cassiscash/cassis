@@ -76,6 +76,12 @@ pub struct RouteAnnouncement {
     /// outgoing network's `NetworkId::outgoing_lag_secs`; payers add
     /// [`DELTA_OVERSHOOT_SECS`] on top.
     pub incoming_delta_secs: u64,
+    /// Smallest amount the router forwards on this hop: the larger
+    /// `Network::min_htlc_msat` of its two networks, e.g. a dust limit.
+    /// The hop receives at least as much as it forwards, so this bounds
+    /// both of its HTLCs.
+    #[serde(default)]
+    pub min_htlc_msat: u64,
     /// The router moves test money on this hop ([`TEST_MONEY_TAG`]).
     #[serde(default)]
     pub test_money: bool,
@@ -131,6 +137,12 @@ impl RouteAnnouncement {
                 self.incoming_delta_secs.to_string(),
             ],
         ];
+        if self.min_htlc_msat > 0 {
+            tags.push(vec![
+                "min_htlc_msat".to_string(),
+                self.min_htlc_msat.to_string(),
+            ]);
+        }
         if self.test_money {
             tags.push(vec![TEST_MONEY_TAG.to_string()]);
         }
@@ -163,6 +175,7 @@ impl RouteAnnouncement {
             incoming_delta_secs: number("incoming_delta_secs")
                 .filter(|delta| *delta > 0)
                 .unwrap_or_else(|| from.default_incoming_delta()),
+            min_htlc_msat: number("min_htlc_msat").unwrap_or(0),
             test_money: event
                 .tags
                 .iter()
@@ -409,7 +422,8 @@ pub async fn delete_announcements(
 
 /// Cheapest chain of hops carrying `amount_msat` from `from` to `to`.
 /// Empty when `from == to`. Hops of routers in `skip` (e.g. ones that
-/// failed an earlier attempt) are never used.
+/// failed an earlier attempt), and hops that would forward less than
+/// their `min_htlc_msat`, are never used.
 ///
 /// Searches backwards from the destination, where the amount is known,
 /// so every hop's fee is computed on the amount it actually forwards.
@@ -428,6 +442,8 @@ pub fn find_route(
     let mut needed: HashMap<&NetworkId, u64> = HashMap::from([(to, amount_msat)]);
     let mut next_hop: HashMap<&NetworkId, &RouteAnnouncement> = HashMap::new();
     let mut queue = BinaryHeap::from([Reverse((amount_msat, to))]);
+    // Whether a hop was left out only for the amount being too small.
+    let mut too_small = false;
     while let Some(Reverse((amount, network))) = queue.pop() {
         if needed.get(network).is_some_and(|best| amount > *best) {
             continue;
@@ -453,6 +469,10 @@ pub fn find_route(
             .iter()
             .filter(|hop| hop.to == *network && !skip.contains(&hop.node_pubkey))
         {
+            if amount < hop.min_htlc_msat {
+                too_small = true;
+                continue;
+            }
             let Some(upstream) = amount.checked_add(hop.fee_msat(amount)) else {
                 continue;
             };
@@ -463,7 +483,11 @@ pub fn find_route(
             }
         }
     }
-    Err(format!("no route from {from} to {to}"))
+    Err(if too_small {
+        format!("no route from {from} to {to} for {amount_msat} msat: some hops need more")
+    } else {
+        format!("no route from {from} to {to}")
+    })
 }
 
 /// Amounts and expiries of every leg of a route.
@@ -596,6 +620,7 @@ mod tests {
             fee_base_msat,
             fee_ppm,
             incoming_delta_secs: 90,
+            min_htlc_msat: 0,
             test_money: false,
         }
     }
@@ -623,11 +648,12 @@ mod tests {
     #[test]
     fn announcements_round_trip_through_events() {
         let key = ritualistic::SecretKey::generate();
-        for test_money in [false, true] {
+        for (test_money, min_htlc_msat) in [(false, 0), (true, 330_000)] {
             let announcement = RouteAnnouncement {
                 node_pubkey: key.pubkey(),
                 iroh_relay: Some("https://relay.example".into()),
                 test_money,
+                min_htlc_msat,
                 ..hop(0, "cashu::mint.example", "liquid::testnet", 10, 20)
             };
             let event = announcement.to_event_template().finalize(&key);
@@ -688,6 +714,34 @@ mod tests {
         ];
         assert_eq!(route_skipping(&graph, "a", "c", &[1]).unwrap(), vec![2, 3]);
         assert!(route_skipping(&graph, "a", "c", &[1, 3]).is_err());
+    }
+
+    /// The cheap route forwards less than its hop's minimum on the
+    /// payee side, so the pricier one is taken; without it, none is.
+    #[test]
+    fn avoids_hops_the_amount_is_too_small_for() {
+        let graph = [
+            hop(1, "a", "c", 0, 0),
+            hop(2, "a", "b", 100, 0),
+            RouteAnnouncement {
+                min_htlc_msat: 330_000,
+                ..hop(3, "b", "c", 100, 0)
+            },
+            RouteAnnouncement {
+                min_htlc_msat: 2_000_000,
+                ..hop(4, "a", "c", 0, 0)
+            },
+        ];
+        // 1_000_000 msat clears hop 3's minimum.
+        assert_eq!(route_skipping(&graph, "a", "c", &[1]).unwrap(), vec![2, 3]);
+        let tiny = find_route(
+            &graph[1..],
+            &NetworkId("a".into()),
+            &NetworkId("c".into()),
+            1_000,
+            &HashSet::new(),
+        );
+        assert!(tiny.unwrap_err().contains("some hops need more"));
     }
 
     #[test]
