@@ -2,16 +2,14 @@
 //! released, for whom, and the networks it verifies HTLCs on, over its
 //! [`config`](crate::config). It issues hashes without keeping them, so
 //! those show as counts since it started. Preimages stay out of the page:
-//! payees fetch them, nobody else needs them. Besides what every daemon
-//! has: `network.*`, see [`cassis_admin::networks`].
+//! payees fetch them, nobody else needs them. Its networks are edited in
+//! the config file only, and applied as it changes; it has no actions
+//! beyond what every daemon has.
 
-use crate::config::Config;
+use crate::config::{fill_mnemonics, Config};
 use crate::db::Payment;
 use crate::PreimageServer;
-use cassis_admin::networks::{
-    config_cards, config_drafts, new_network, new_network_draft, Daemon, NetworkConfig, Networks,
-    Opened, Opener, OFFLINE_KINDS,
-};
+use cassis_admin::networks::{Daemon, NetworkConfig, Networks, Opened, Opener};
 use cassis_admin::view::{ago, fact, sat, stat, until};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity, Refresh};
 use cassis_core::routing::{autohue, autoname};
@@ -19,7 +17,6 @@ use cassis_core::{unix_now, Bytes32, Network, NetworkId, XOnlyPubKey};
 use cassis_wallet::stored;
 use futures::future::BoxFuture;
 use hypereffect::vtree::{badge, card, column, list, notice, row, tab, text, Node};
-use hypereffect::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,6 +115,11 @@ impl PreimageAdmin {
                 "Home relay",
                 self.relay.as_deref().unwrap_or("unknown"),
             ),
+            fact(
+                "identity/networks",
+                "Verifies HTLCs on",
+                networks(&self.server.network_ids()),
+            ),
         ]);
         let released = card("released").title("Released").children([
             row("released/figures").gap("large").wrap(true).children([
@@ -162,27 +164,12 @@ impl PreimageAdmin {
                 notice("no-networks")
                     .variant("warning")
                     .title("On no network")
-                    .text("It refuses every payee until it is on one: add one under Networks.")
+                    .text(
+                        "It refuses every payee until it is on one: add one under [networks] \
+                         in its config.toml.",
+                    )
             }))
             .children([identity, released, since_start])
-    }
-
-    fn networks(&self, now: u64) -> Node {
-        let config = self.file.get();
-        let (closing, cards) = config_cards(&self.networks, &config.networks, "payment", now);
-        tab("tab/networks")
-            .label("Networks")
-            .child(text("networks/help").variant("caption").text(
-                "It verifies HTLCs to payees on these. Removing one refuses payees receiving \
-                 on it, those whose invoices are still unpaid included.",
-            ))
-            .children(closing)
-            .children([
-                list("networks")
-                    .empty("No networks yet: add one below.")
-                    .children(cards),
-                new_network(&OFFLINE_KINDS),
-            ])
     }
 }
 
@@ -204,14 +191,6 @@ impl App for PreimageAdmin {
         self.file.edit_admin(edit)
     }
 
-    fn drafts(&self) -> Map<String, Value> {
-        config_drafts(&self.file.get().networks, false)
-    }
-
-    fn new_drafts(&self) -> Map<String, Value> {
-        Map::from_iter([new_network_draft()])
-    }
-
     fn tabs(&self, access: Node) -> Vec<Node> {
         let now = unix_now();
         let listed = |what: &str, error: String| warn!("admin: listing {what}: {error}");
@@ -226,27 +205,33 @@ impl App for PreimageAdmin {
             self.overview(&payments, payees.len(), now),
             payments_tab(&payments, now),
             payees_tab(&payees, &payments, now),
-            self.networks(now),
             access,
         ]
     }
 
-    fn act(self: Arc<Self>, name: &str, args: &Args) -> Result<String, String> {
-        self.networks.act(
-            name,
-            args,
-            &self.file,
-            |config: &Config| &config.networks,
-            &OFFLINE_KINDS,
-            &self.refresh,
-        )
+    fn act(self: Arc<Self>, name: &str, _args: &Args) -> Result<String, String> {
+        Err(format!("unknown action {name}"))
     }
 
     fn tick(self: Arc<Self>, _pages_open: bool) {
         self.file.reload_if_modified();
+        if let Err(error) = fill_mnemonics(&self.file) {
+            warn!("admin: giving networks a mnemonic: {error}");
+        }
         self.networks
             .sync_in_background(self.file.get().networks, None, &self.refresh);
     }
+}
+
+/// The networks `ids`, as a list.
+fn networks(ids: &[NetworkId]) -> String {
+    if ids.is_empty() {
+        return "none".into();
+    }
+    ids.iter()
+        .map(|id| id.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn payments_tab(payments: &[Payment], now: u64) -> Node {

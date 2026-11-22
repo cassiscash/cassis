@@ -17,7 +17,7 @@ use cassis_admin::networks::Networks;
 use cassis_admin::{reexec, shutdown_signal, ConfigFile, Refresh, Server, RESTART_GRACE};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_preimage_server::admin::{PreimageAdmin, PreimageOpener};
-use cassis_preimage_server::config::{Config, TEMPLATE};
+use cassis_preimage_server::config::{fill_mnemonics, Config, TEMPLATE};
 use cassis_preimage_server::{Db, PreimageServer, ServerConfig};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let keys = NodeKeys::from_mnemonic(&read_or_create_seed(&dir)?).map_err(|e| e.to_string())?;
     let file: ConfigFile<Config> = ConfigFile::load_or_create(&dir, TEMPLATE)?;
+    fill_mnemonics(&file)?;
     let config = file.get();
     let db = Db::open(dir.join("releases.redb")).map_err(|e| format!("open database: {e}"))?;
     let span = info_span!("preimage-server");
