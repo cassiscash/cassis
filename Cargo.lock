@@ -2615,6 +2615,7 @@ dependencies = [
  "cassis-core",
  "cassis-networks",
  "futures",
+ "hyperb-cassis-wallet",
  "hypereffect",
  "iroh 1.0.3",
  "lowercase-hex",
@@ -2751,6 +2752,7 @@ dependencies = [
  "cassis-wallet",
  "clap",
  "futures",
+ "hyperb-cassis-wallet",
  "hypereffect",
  "iroh-base 1.0.3",
  "orangedb",
@@ -2861,6 +2863,7 @@ dependencies = [
  "cassis-wallet",
  "clap",
  "futures",
+ "hyperb-cassis-wallet",
  "hypereffect",
  "iroh-base 1.0.3",
  "lowercase-hex",
@@ -3812,7 +3815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -6212,10 +6215,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperb-cassis-wallet"
+version = "0.1.0"
+dependencies = [
+ "cassis-core",
+ "cassis-networks",
+ "hypereffect",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
+ "tracing",
+]
+
+[[package]]
 name = "hypereffect"
-version = "0.6.1"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d07ffec93e04e434af4cf14672e959276cd85c8c8e669bd8659ee5b2f5a866c4"
+checksum = "51fed57ea32950c8b667334c4cc48241e4f7d246730f19f25b60856e6caf7a43"
 dependencies = [
  "cel 0.15.0",
  "serde",
@@ -12161,7 +12178,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

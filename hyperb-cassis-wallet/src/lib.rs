@@ -163,6 +163,8 @@ pub(crate) struct State {
     pub config_error: Option<String>,
     /// What the last action did.
     pub result: Option<Result<String, String>>,
+    /// The kinds of network the page adds.
+    pub kinds: Vec<config::Kind>,
 }
 
 /// What an action leaves for the host to do.
@@ -212,7 +214,10 @@ impl WalletAdmin {
             dir: dir.into(),
             span,
             host: OnceLock::new(),
-            state: Default::default(),
+            state: Mutex::new(State {
+                kinds: config::KINDS.to_vec(),
+                ..State::default()
+            }),
             syncing: Default::default(),
             changed: broadcast::channel(16).0,
             watchers: AtomicUsize::new(0),
@@ -237,6 +242,16 @@ impl WalletAdmin {
                 }
             }
         });
+    }
+
+    /// Add only networks of these `kinds` (names of [`config::KINDS`]),
+    /// instead of every kind.
+    pub fn offer(&self, kinds: &[&str]) {
+        self.state().kinds = config::KINDS
+            .into_iter()
+            .filter(|(kind, _)| kinds.contains(kind))
+            .collect();
+        self.notify();
     }
 
     /// Fires when the page is out of date.
@@ -281,7 +296,11 @@ impl WalletAdmin {
 
     /// The page: what to put in a tab of the host's.
     pub fn view(&self) -> Vec<Node> {
-        view::page(unix_now(), &self.state(), self.file.path().display().to_string())
+        view::page(
+            unix_now(),
+            &self.state(),
+            self.file.path().display().to_string(),
+        )
     }
 
     /// Do what `action` says, if it is for the wallets: `None` if not.
@@ -313,6 +332,10 @@ impl WalletAdmin {
         let amount = || args.sats("amount_sat");
         match name {
             "network.add" => {
+                let kind = args.text("kind");
+                if !self.state().kinds.iter().any(|(name, _)| *name == kind) {
+                    return Err(format!("{kind:?} networks are not added here"));
+                }
                 let id = config::network_id(
                     &args.text("kind"),
                     &args.text("chain"),
@@ -433,7 +456,10 @@ impl WalletAdmin {
 
     fn slot(&self, id: &str, change: impl FnOnce(&mut Slot)) -> Result<(), String> {
         let mut state = self.state();
-        let slot = state.slots.get_mut(id).ok_or_else(|| format!("{id} is not open"))?;
+        let slot = state
+            .slots
+            .get_mut(id)
+            .ok_or_else(|| format!("{id} is not open"))?;
         change(slot);
         Ok(())
     }
@@ -470,7 +496,8 @@ impl WalletAdmin {
         let wanted = match self.file.read() {
             Ok(wanted) => wanted,
             Err(error) => {
-                let changed = self.state().config_error.replace(error.clone()) != Some(error.clone());
+                let changed =
+                    self.state().config_error.replace(error.clone()) != Some(error.clone());
                 if changed {
                     self.notify();
                 }
@@ -705,7 +732,10 @@ impl WalletAdmin {
                 .slots
                 .get_mut(&id.0)
                 .ok_or_else(|| format!("{id} is not open"))?;
-            let wallet = slot.wallet.clone().ok_or_else(|| format!("{id} is not open"))?;
+            let wallet = slot
+                .wallet
+                .clone()
+                .ok_or_else(|| format!("{id} is not open"))?;
             if let Some(busy) = slot.funds.busy {
                 return Err(format!("{id} is busy: {busy}"));
             }

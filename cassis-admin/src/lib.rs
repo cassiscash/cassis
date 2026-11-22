@@ -24,6 +24,11 @@
 //! A form's payload names its `draft` instead of the fields it edits
 //! (see [`Args`]). The outcome of an action is the `result` notice of
 //! the page of the session that sent it.
+//!
+//! A daemon that keeps wallets hands their [`WalletAdmin`] over
+//! ([`App::wallets`]) and draws its page in one of its tabs: its
+//! `network.*` and `wallet.*` actions, its drafts and its updates go
+//! through the sessions of the interface.
 
 mod args;
 pub mod config;
@@ -32,11 +37,11 @@ mod icon;
 mod iroh;
 pub mod networks;
 pub mod view;
-pub mod wallets;
 
 pub use args::Args;
 pub use config::{AdminConfig, AdminEdit, AdminSection, ConfigFile, DaemonConfig};
 
+use hyperb_cassis_wallet::{Drafts, WalletAdmin, Watching};
 use hypereffect::vtree::{self, Node};
 use hypereffect::{json, Action, Map, Metadata, RendererMessage, ServerMessage, Value};
 use std::collections::BTreeMap;
@@ -96,8 +101,7 @@ pub trait App: Send + Sync + 'static {
     }
 
     /// The drafts of the forms that add something, empty: named `new_*`,
-    /// they are emptied when their action succeeds, as are the `w_*`
-    /// ones of [`wallets`].
+    /// they are emptied when their action succeeds.
     fn new_drafts(&self) -> Map<String, Value> {
         Map::new()
     }
@@ -107,6 +111,12 @@ pub trait App: Send + Sync + 'static {
 
     /// Do what the action `name` says, returning what happened.
     fn act(self: Arc<Self>, name: &str, args: &Args) -> Result<String, String>;
+
+    /// The wallets the daemon keeps, if any, whose page it draws in one
+    /// of its tabs.
+    fn wallets(&self) -> Option<Arc<WalletAdmin>> {
+        None
+    }
 
     /// Called every few seconds, before the pages are brought up to
     /// date, with whether any is open.
@@ -132,6 +142,10 @@ pub struct Session {
     access: Access,
     out: mpsc::UnboundedSender<String>,
     shown: Mutex<Shown>,
+    /// The drafts of the wallets' forms it was sent.
+    wallet_drafts: Mutex<Drafts>,
+    /// Keeps the wallets' balances fresh while it is open.
+    _watching: Option<Watching>,
 }
 
 #[derive(Default)]
@@ -219,6 +233,19 @@ impl Server {
                 server.bring_up_to_date();
             }
         });
+        if let Some(wallets) = self.app.wallets() {
+            let refresh = self.refresh.clone();
+            let mut updates = wallets.updates();
+            tokio::spawn(async move {
+                use tokio::sync::broadcast::error::RecvError;
+                loop {
+                    match updates.recv().await {
+                        Ok(()) | Err(RecvError::Lagged(_)) => refresh.now(),
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
     }
 
     /// Resolves when `daemon.restart` is asked for.
@@ -262,6 +289,8 @@ impl Server {
             access,
             out,
             shown: Default::default(),
+            wallet_drafts: Default::default(),
+            _watching: self.app.wallets().map(|wallets| wallets.watch()),
         });
         let identity = self.app.identity();
         let mut metadata = self.metadata(&identity);
@@ -301,6 +330,17 @@ impl Server {
     }
 
     fn on_action(self: &Arc<Self>, session: &Arc<Session>, action: &Action) {
+        // The wallets show what their actions did in their own page.
+        if self.allowed(&session.access) {
+            if let Some(handled) = self.app.wallets().and_then(|wallets| wallets.act(action)) {
+                session.signal(json!({"_busy": false}));
+                if let Some(patch) = handled.patch {
+                    session.signal(patch);
+                }
+                self.bring_up_to_date();
+                return;
+            }
+        }
         let result = if self.allowed(&session.access) {
             self.act(&action.name, &Args::of(action))
         } else {
@@ -315,12 +355,6 @@ impl Server {
         if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("new_")) {
             if result.is_ok() {
                 let fresh = all_new_drafts(&*self.app);
-                reset["d"] = json!({draft: fresh.get(draft)});
-            }
-        }
-        if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("w_")) {
-            if result.is_ok() {
-                let fresh = all_drafts(&*self.app);
                 reset["d"] = json!({draft: fresh.get(draft)});
             }
         }
@@ -436,11 +470,18 @@ impl Server {
         let identity = self.app.identity();
         let admin = self.app.admin();
         let patch = (!patch.is_empty()).then(|| ServerMessage::signal(json!({"d": patch})));
+        let wallets = self.app.wallets();
         for session in sessions.iter() {
             let mut lines = patch
                 .as_ref()
                 .map(ServerMessage::to_line)
                 .unwrap_or_default();
+            // Before the page, whose forms are bound to them.
+            if let Some(wallets) = wallets.as_ref().filter(|_| self.allowed(&session.access)) {
+                if let Some(drafts) = wallets.signals(&mut lock(&session.wallet_drafts)) {
+                    lines.push_str(&ServerMessage::signal(drafts).to_line());
+                }
+            }
             let mut shown = lock(&session.shown);
             if shown.name != identity.name {
                 lines.push_str(&ServerMessage::from(self.metadata(&identity)).to_line());

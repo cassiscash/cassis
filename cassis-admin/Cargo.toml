@@ -11,6 +11,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 cassis-core = { workspace = true }
 cassis-networks = { workspace = true }
+hyperb-cassis-wallet = { workspace = true }
 futures = { workspace = true }
 hypereffect = { workspace = true }
 iroh = { workspace = true }

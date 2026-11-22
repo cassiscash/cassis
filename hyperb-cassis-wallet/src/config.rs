@@ -100,21 +100,28 @@ impl Entry {
         if esplora_url.is_none() && matches!(network.kind(), "arkade" | "bitcoin") {
             esplora_url = std::env::var("CASSIS_ESPLORA_URL").ok();
         }
-        Ok(NetworkSettings {
-            mnemonic,
-            dir: cassis_networks::network_dir(dir, network),
+        // Over `new`, as `cassis-networks` may have more networks built
+        // than this crate does, when another crate turns them on.
+        #[allow(unused_mut)]
+        let mut settings = NetworkSettings {
             esplora_url,
-            #[cfg(feature = "lightning")]
-            lnd: self.lnd.as_ref().map(|lnd| {
+            ..NetworkSettings::new(mnemonic, cassis_networks::network_dir(dir, network))
+        };
+        #[cfg(feature = "lightning")]
+        {
+            settings.lnd = self.lnd.as_ref().map(|lnd| {
                 cassis_networks::lnd::LndConfig::new(
                     lnd.rest_url.clone(),
                     lnd.tls_cert_path.clone(),
                     lnd.macaroon_path.clone(),
                 )
-            }),
-            #[cfg(feature = "bark-lightning")]
-            bark,
-        })
+            });
+        }
+        #[cfg(feature = "bark-lightning")]
+        {
+            settings.bark = bark;
+        }
+        Ok(settings)
     }
 }
 
@@ -161,7 +168,8 @@ impl ConfigFile {
             .try_into()
             .map_err(|e| format!("{} [{}]: {e}", self.path.display(), self.table))?;
         for id in networks.keys() {
-            NetworkId::parse(id).map_err(|e| format!("{} [{}]: {e}", self.path.display(), self.table))?;
+            NetworkId::parse(id)
+                .map_err(|e| format!("{} [{}]: {e}", self.path.display(), self.table))?;
         }
         Ok(networks)
     }
@@ -368,7 +376,10 @@ pub fn network_id(kind: &str, chain: &str, mint: &str, invite: &str) -> Result<N
                 chain => chain,
             };
             if !chains.contains(&chain) {
-                return Err(format!("{label} runs on {}, not {chain}", chains.join(", ")));
+                return Err(format!(
+                    "{label} runs on {}, not {chain}",
+                    chains.join(", ")
+                ));
             }
             let kind = if matches!(kind, "lnd" | "bark") {
                 "lightning"
@@ -398,7 +409,8 @@ mod tests {
     fn adding_keeps_the_rest_of_the_file() {
         let file = file("add", "# mine\nmnemonic = \"x\"\n");
         let id = NetworkId::parse("arkade").unwrap();
-        file.edit(|t| set(t, &id, &Fields::default(), false)).unwrap();
+        file.edit(|t| set(t, &id, &Fields::default(), false))
+            .unwrap();
         let mnemonic = file.read().unwrap()["arkade"].mnemonic.clone().unwrap();
         assert_eq!(mnemonic.split_whitespace().count(), 12);
         // saving again keeps the key
@@ -409,7 +421,10 @@ mod tests {
         file.edit(|t| set(t, &id, &fields, false)).unwrap();
         let entry = file.read().unwrap().remove("arkade").unwrap();
         assert_eq!(entry.mnemonic.as_deref(), Some(mnemonic.as_str()));
-        assert_eq!(entry.esplora_url.as_deref(), Some("https://esplora.example"));
+        assert_eq!(
+            entry.esplora_url.as_deref(),
+            Some("https://esplora.example")
+        );
         let text = std::fs::read_to_string(file.path()).unwrap();
         assert!(text.starts_with("# mine\nmnemonic"));
         file.edit(|t| remove(t, &id)).unwrap();
@@ -420,7 +435,9 @@ mod tests {
     fn an_invalid_edit_writes_nothing() {
         let file = file("bad", "");
         let id = NetworkId::parse("lightning").unwrap();
-        assert!(file.edit(|t| set(t, &id, &Fields::default(), false)).is_err());
+        assert!(file
+            .edit(|t| set(t, &id, &Fields::default(), false))
+            .is_err());
         assert!(file.read().unwrap().is_empty());
     }
 }

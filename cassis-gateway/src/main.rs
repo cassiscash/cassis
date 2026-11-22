@@ -14,14 +14,14 @@
 //! It also serves an admin interface for hyperb renderers (see
 //! [`cassis_gateway::admin`]).
 
-use cassis_admin::networks::Networks;
 use cassis_admin::{reexec, shutdown_signal, ConfigFile, Refresh, Server, RESTART_GRACE};
 use cassis_core::keys::generate_mnemonic;
-use cassis_gateway::admin::{GatewayAdmin, GatewayOpener};
+use cassis_gateway::admin::{GatewayAdmin, KINDS};
 use cassis_gateway::config::{template, Config};
 use cassis_gateway::db::Db;
 use cassis_gateway::{Gateway, GatewayConfig};
 use clap::Parser;
+use hyperb_cassis_wallet::WalletAdmin;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, info_span, warn};
@@ -68,16 +68,13 @@ async fn run(cli: Cli) -> Result<(), String> {
     // Networks are opened before the gateway starts, so that it can
     // resume its forwards on them. Forwards through one that does not
     // open wait for it.
-    let networks = Networks::new(
-        GatewayOpener {
-            dir: dir.clone(),
-            span: span.clone(),
-        },
+    let (wallets, opened) = WalletAdmin::open(
+        hyperb_cassis_wallet::ConfigFile::new(dir.join(cassis_admin::config::FILE), "networks"),
+        &dir,
         span.clone(),
-        // It holds funds like a router: keep its wallets in shape.
-        true,
-    );
-    let opened = networks.open_all(&config.networks).await;
+    )
+    .await?;
+    wallets.offer(&KINDS);
     if config.networks.is_empty() {
         warn!(
             "no networks in {}: add some under [networks], or from the admin interface",
@@ -92,7 +89,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         span,
     })
     .await?;
-    networks.attach(Arc::new(gateway.clone()));
+    wallets.attach(Arc::new(gateway.clone()));
     let relay = gateway.home_relay().await;
     info!(
         "serving as {} (relay {}); Ctrl-C to stop",
@@ -102,7 +99,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     println!("{}", gateway.peer_id());
 
     let refresh = Refresh::default();
-    let app = GatewayAdmin::new(gateway.clone(), file, networks, relay, refresh.clone());
+    let app = GatewayAdmin::new(gateway.clone(), file, wallets, relay);
     let server = Server::new(app, refresh);
     server.serve(keys.admin_endpoint_secret()).await;
 

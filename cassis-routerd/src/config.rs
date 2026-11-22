@@ -9,6 +9,7 @@
 //! # name = "My router"             # published as its profile; else its autoname
 //! nostr_relays = ["wss://nostr.wine"]  # where routes are announced
 //!
+//! # networks, with their wallets, as `hyperb-cassis-wallet` keeps them
 //! [networks."cashu::mint.example"]
 //! mnemonic = "twelve words ..."    # wallet on this network, 12 or 24 words, written when added
 //!
@@ -163,7 +164,9 @@ impl Config {
         for peer in &self.admin.peers {
             parse_secret(peer).map_err(|e| format!("admin.peers {peer}: {e}"))?;
         }
-        let networks = self.network_ids()?;
+        // A route may name a network that is not there (yet): it is not
+        // routed until it is, as when it does not open.
+        self.network_ids()?;
         for route in &self.routes {
             let (from, to) = (NetworkId::parse(&route.from)?, NetworkId::parse(&route.to)?);
             if from == to {
@@ -179,13 +182,6 @@ impl Config {
             });
             if same.count() > 1 {
                 return Err(format!("route {from} -> {to} is listed twice"));
-            }
-            for end in [&from, &to] {
-                if !networks.contains(end) {
-                    return Err(format!(
-                        "route {from} -> {to}: {end} is not under [networks]"
-                    ));
-                }
             }
         }
         Ok(())

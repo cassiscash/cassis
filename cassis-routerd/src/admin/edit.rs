@@ -2,13 +2,12 @@
 //! config document. Each edit leaves what its arguments do not name as
 //! it is, comments included.
 
-use cassis_admin::config::{child, implicit_table, put, put_text};
+use cassis_admin::config::{put, put_text};
 use cassis_admin::Args;
-use cassis_core::keys::generate_mnemonic;
 use cassis_core::NetworkId;
 use cassis_routerd::router::RouteOffer;
 use hypereffect::Value;
-use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike};
+use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 /// `name`, `nostr_relays`, `max_reservations`.
 pub fn settings(doc: &mut DocumentMut, args: &Args) -> Result<(), String> {
@@ -20,80 +19,6 @@ pub fn settings(doc: &mut DocumentMut, args: &Args) -> Result<(), String> {
     }
     put_number(root, "max_reservations", args.number("max_reservations")?)?;
     Ok(())
-}
-
-/// Adds the network `new_network_id` describes, with the fields of
-/// [`network`] and the backend its kind says.
-pub fn add_network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
-    if doc
-        .get("networks")
-        .and_then(Item::as_table_like)
-        .is_some_and(|networks| networks.contains_key(&id.0))
-    {
-        return Err(format!("{id} is added already"));
-    }
-    let mut args = Args(args.0.clone());
-    let kind = args.required("kind")?;
-    if matches!(kind.as_str(), "lnd" | "bark") {
-        args.0.insert("backend".into(), kind.into());
-    }
-    network(doc, id, &args)
-}
-
-/// Adds `id` if missing, with a fresh wallet mnemonic. Fields:
-/// `esplora_url`, `backend` (`lnd`, `bark` or `none`), and the `lnd_*`
-/// and `bark_*` fields of whichever backend the network has.
-pub fn network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
-    let networks = child(doc.as_table_mut(), "networks", implicit_table)?;
-    let network = child(networks, &id.0, toml_edit::table)?;
-    if !network.contains_key("mnemonic") {
-        put(network, "mnemonic", Some(generate_mnemonic().into()));
-    }
-    put_text(network, "esplora_url", args.text("esplora_url")?);
-    match args.text("backend")?.as_deref() {
-        None => {}
-        Some("" | "none") => {
-            network.remove("lnd");
-            network.remove("bark");
-        }
-        Some("lnd") => {
-            network.remove("bark");
-            child(network, "lnd", inline_table)?;
-        }
-        Some("bark") => {
-            network.remove("lnd");
-            child(network, "bark", inline_table)?;
-        }
-        Some(other) => return Err(format!("backend {other}: expected lnd, bark or none")),
-    }
-    if let Some(lnd) = network.get_mut("lnd").and_then(Item::as_table_like_mut) {
-        if let Some(url) = args.text("lnd_rest_url")? {
-            put(lnd, "rest_url", Some(url.into()));
-        }
-        put_text(lnd, "tls_cert_path", args.text("lnd_tls_cert_path")?);
-        put_text(lnd, "macaroon_path", args.text("lnd_macaroon_path")?);
-    }
-    if let Some(bark) = network.get_mut("bark").and_then(Item::as_table_like_mut) {
-        put_text(bark, "server_url", args.text("bark_server_url")?);
-        put_text(bark, "esplora_url", args.text("bark_esplora_url")?);
-    }
-    Ok(())
-}
-
-pub fn remove_network(doc: &mut DocumentMut, id: &NetworkId) -> Result<(), String> {
-    let routes = routes(doc)?;
-    if routes.iter().any(|route| {
-        route_end(route, "from") == Some(&id.0) || route_end(route, "to") == Some(&id.0)
-    }) {
-        return Err(format!("{id} has routes: remove them first"));
-    }
-    let removed = doc
-        .get_mut("networks")
-        .and_then(Item::as_table_like_mut)
-        .and_then(|networks| networks.remove(&id.0));
-    removed
-        .map(|_| ())
-        .ok_or_else(|| format!("{id} is not under [networks]"))
 }
 
 /// Adds `from -> to` if missing, at the default fees unless given.
@@ -174,10 +99,6 @@ fn find_route(
     })
 }
 
-fn inline_table() -> Item {
-    toml_edit::value(InlineTable::new())
-}
-
 fn put_number(
     table: &mut dyn TableLike,
     key: &str,
@@ -205,7 +126,6 @@ fn toml_int(n: u64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cassis_admin::networks::{new_network_id, ALL_KINDS};
     use hypereffect::{json, Action, Map};
 
     fn args(payload: Value) -> Args {
@@ -269,58 +189,5 @@ mod tests {
             doc.to_string(),
             "# about the file\n\n# relays\nnostr_relays = [\"wss://b\"]\nmnemonic = \"x\"\nname = \"r\"\n"
         );
-    }
-
-    #[test]
-    fn networks_and_backends() {
-        let mut doc = DocumentMut::new();
-        let lightning = id("lightning");
-        let lnd = json!({"backend": "lnd", "lnd_rest_url": "https://127.0.0.1:8080", "bark_server_url": "ignored"});
-        network(&mut doc, &lightning, &args(lnd)).unwrap();
-        let cashu = args(json!({"kind": "cashu", "mint": "https://mint.example/"}));
-        let cashu_id = new_network_id(&cashu, &ALL_KINDS).unwrap();
-        assert_eq!(cashu_id, id("cashu::mint.example"));
-        add_network(&mut doc, &cashu_id, &cashu).unwrap();
-        assert!(add_network(&mut doc, &cashu_id, &cashu).is_err());
-        // Each network gets a mnemonic of its own.
-        let text = doc.to_string();
-        let mnemonics: Vec<&str> = text
-            .lines()
-            .filter(|line| line.starts_with("mnemonic = "))
-            .collect();
-        assert_eq!(mnemonics.len(), 2);
-        assert_ne!(mnemonics[0], mnemonics[1]);
-        let rest: String = text
-            .lines()
-            .filter(|line| !line.starts_with("mnemonic = "))
-            .map(|line| format!("{line}\n"))
-            .collect();
-        assert_eq!(
-            rest,
-            "[networks.lightning]\nlnd = { rest_url = \"https://127.0.0.1:8080\" }\n\n[networks.\"cashu::mint.example\"]\n"
-        );
-        network(&mut doc, &lightning, &args(json!({"backend": "bark"}))).unwrap();
-        assert!(doc.to_string().contains("bark = {}"));
-        assert!(!doc.to_string().contains("lnd"));
-    }
-
-    #[test]
-    fn new_network_ids() {
-        let new = |payload| new_network_id(&args(payload), &ALL_KINDS);
-        if cfg!(feature = "arkade") {
-            assert_eq!(new(json!({"kind": "arkade"})), Ok(id("arkade")));
-            assert_eq!(
-                new(json!({"kind": "arkade", "chain": "mutinynet"})),
-                Ok(id("arkade::mutinynet"))
-            );
-            assert!(new(json!({"kind": "arkade", "chain": "regtest"})).is_err());
-        }
-        if cfg!(feature = "bark-lightning") {
-            assert_eq!(
-                new(json!({"kind": "bark", "chain": "signet"})),
-                Ok(id("lightning::signet"))
-            );
-        }
-        assert!(new(json!({"kind": "dogecoin"})).is_err());
     }
 }

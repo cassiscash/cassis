@@ -125,7 +125,9 @@ fn field(id: impl Into<String>, label: &str, path: &str) -> Node {
 fn fact(id: &str, label: &str, value: impl Into<String>) -> Node {
     column(id).gap("none").children([
         text(format!("{id}/label")).variant("caption").text(label),
-        text(format!("{id}/value")).variant("code").text(value.into()),
+        text(format!("{id}/value"))
+            .variant("code")
+            .text(value.into()),
     ])
 }
 
@@ -199,11 +201,9 @@ pub fn page(now: u64, state: &State, file: String) -> Vec<Node> {
                 .text(error.as_str()),
         );
     }
-    nodes.push(
-        text("hw/file")
-            .variant("caption")
-            .text(format!("Wallets are kept in {file}. Back it up: it holds the keys.")),
-    );
+    nodes.push(text("hw/file").variant("caption").text(format!(
+        "Wallets are kept in {file}. Back it up: it holds the keys."
+    )));
     for (id, entry) in &state.wanted {
         nodes.push(network_card(now, id, entry, state.slots.get(id)));
     }
@@ -212,11 +212,13 @@ pub fn page(now: u64, state: &State, file: String) -> Vec<Node> {
             nodes.push(
                 notice(format!("hw/{id}/closing"))
                     .variant("warning")
-                    .text(format!("{id} closes once its {count} payment(s) in flight settle.")),
+                    .text(format!(
+                        "{id} closes once its {count} payment(s) in flight settle."
+                    )),
             );
         }
     }
-    nodes.push(new_network());
+    nodes.push(new_network(&state.kinds));
     nodes
 }
 
@@ -275,8 +277,12 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
     let d = |form: &str, field: &str| format!("hw.{}.{field}", wallet_draft(id, form));
     let empty = |form: &str, field: &str| Some(format!("s.{}.trim() == ''", d(form, field)));
     let amount = |form: &str| {
-        field(el(&format!("{form}/amount_sat")), "Amount (sat)", &d(form, "amount_sat"))
-            .variant("number")
+        field(
+            el(&format!("{form}/amount_sat")),
+            "Amount (sat)",
+            &d(form, "amount_sat"),
+        )
+        .variant("number")
     };
 
     let mut nodes = Vec::new();
@@ -305,7 +311,12 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
         row(el("amounts")).gap("large").wrap(true).children(amounts),
         row(el("read")).children([
             text(el("read/when")).variant("caption").text(read),
-            act(el("refresh"), "Refresh", "wallet.refresh", json!({"id": id})),
+            act(
+                el("refresh"),
+                "Refresh",
+                "wallet.refresh",
+                json!({"id": id}),
+            ),
         ]),
     ]));
     if let Some(Err(error)) = &funds.balances {
@@ -332,7 +343,11 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
             Ok(message) => ("success", message),
             Err(error) => ("failure", error),
         };
-        nodes.push(notice(el("outcome")).variant(variant).text(message.as_str()));
+        nodes.push(
+            notice(el("outcome"))
+                .variant(variant)
+                .text(message.as_str()),
+        );
     }
     if let Some(output) = &funds.output {
         nodes.push(
@@ -340,8 +355,15 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
                 text(el("output/label"))
                     .variant("caption")
                     .text(format!("{}: copy it now, it is not kept", output.label)),
-                text(el("output/value")).variant("code").text(output.address.as_str()),
-                act(el("dismiss"), "Hide it", "wallet.dismiss", json!({"id": id})),
+                text(el("output/value"))
+                    .variant("code")
+                    .text(output.address.as_str()),
+                act(
+                    el("dismiss"),
+                    "Hide it",
+                    "wallet.dismiss",
+                    json!({"id": id}),
+                ),
             ]),
         );
     }
@@ -351,10 +373,19 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
     match &funds.addresses {
         Some(Ok(addresses)) => {
             for (i, address) in addresses.iter().enumerate() {
-                receive.push(fact(&el(&format!("address/{i}")), address.label, address.address.as_str()));
+                receive.push(fact(
+                    &el(&format!("address/{i}")),
+                    address.label,
+                    address.address.as_str(),
+                ));
             }
             if can.new_addresses && !addresses.is_empty() {
-                receive.push(act(el("address"), "New address", "wallet.address", json!({"id": id})));
+                receive.push(act(
+                    el("address"),
+                    "New address",
+                    "wallet.address",
+                    json!({"id": id}),
+                ));
             }
         }
         Some(Err(error)) => receive.extend([
@@ -367,7 +398,12 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
         None => {}
     }
     if let Some(deposit) = can.deposit {
-        receive.push(run("deposit", &format!("New {}", deposit.to_lowercase()), false, None));
+        receive.push(run(
+            "deposit",
+            &format!("New {}", deposit.to_lowercase()),
+            false,
+            None,
+        ));
     }
     if can.lightning {
         receive.push(row(el("invoice/form")).align("end").wrap(true).children([
@@ -398,14 +434,20 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
     }
     if can.lightning {
         send.extend([
-            field(el("pay/invoice"), "Lightning invoice", &d("pay", "invoice")).placeholder("lnbc…"),
+            field(el("pay/invoice"), "Lightning invoice", &d("pay", "invoice"))
+                .placeholder("lnbc…"),
             run("pay", "Pay", true, empty("pay", "invoice")),
         ]);
     }
     if let Some(issue) = can.issue {
         send.push(row(el("issue/form")).align("end").wrap(true).children([
             amount("issue"),
-            run("issue", &format!("Take out as {}", issue.to_lowercase()), true, None),
+            run(
+                "issue",
+                &format!("Take out as {}", issue.to_lowercase()),
+                true,
+                None,
+            ),
         ]));
     }
 
@@ -416,7 +458,10 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
         tabs(el("tabs"))
             .bind(format!("_hw_tab_{}", hash(id)))
             .children([
-                tab(el("tab/receive")).label("Deposit").children(receive).children(note),
+                tab(el("tab/receive"))
+                    .label("Deposit")
+                    .children(receive)
+                    .children(note),
                 tab(el("tab/send")).label("Withdraw").children(send),
                 tab(el("tab/details")).label("Details").children(details),
             ]),
@@ -443,14 +488,31 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
             nodes.push(fact(&el("can"), "The wallet can", abilities.join("; ")));
         }
     }
-    let summary = |label: &str, value: Option<String>| value.map(|value| (label.to_string(), value));
-    let path = |path: &Option<std::path::PathBuf>| path.as_ref().map(|path| path.display().to_string());
+    let summary =
+        |label: &str, value: Option<String>| value.map(|value| (label.to_string(), value));
+    let path =
+        |path: &Option<std::path::PathBuf>| path.as_ref().map(|path| path.display().to_string());
     let configured = [
         summary("Esplora URL", entry.esplora_url.clone()),
-        summary("LND REST URL", entry.lnd.as_ref().map(|lnd| lnd.rest_url.clone())),
-        summary("LND TLS certificate", entry.lnd.as_ref().and_then(|lnd| path(&lnd.tls_cert_path))),
-        summary("LND macaroon", entry.lnd.as_ref().and_then(|lnd| path(&lnd.macaroon_path))),
-        summary("Ark server (bark)", entry.bark.as_ref().map(|bark| bark.server_url.clone().unwrap_or("Second's".into()))),
+        summary(
+            "LND REST URL",
+            entry.lnd.as_ref().map(|lnd| lnd.rest_url.clone()),
+        ),
+        summary(
+            "LND TLS certificate",
+            entry.lnd.as_ref().and_then(|lnd| path(&lnd.tls_cert_path)),
+        ),
+        summary(
+            "LND macaroon",
+            entry.lnd.as_ref().and_then(|lnd| path(&lnd.macaroon_path)),
+        ),
+        summary(
+            "Ark server (bark)",
+            entry
+                .bark
+                .as_ref()
+                .map(|bark| bark.server_url.clone().unwrap_or("Second's".into())),
+        ),
     ];
     for (i, (label, value)) in configured.into_iter().flatten().enumerate() {
         nodes.push(fact(&el(&format!("config/{i}")), &label, value));
@@ -465,8 +527,18 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
         },
     ));
     nodes.push(match slot.reveal {
-        true => act(el("hide"), "Hide the mnemonic", "network.hide", json!({"id": id})),
-        false => act(el("reveal"), "Show the mnemonic", "network.reveal", json!({"id": id})),
+        true => act(
+            el("hide"),
+            "Hide the mnemonic",
+            "network.hide",
+            json!({"id": id}),
+        ),
+        false => act(
+            el("reveal"),
+            "Show the mnemonic",
+            "network.reveal",
+            json!({"id": id}),
+        ),
     });
     nodes.push(
         text(el("key/note"))
@@ -501,16 +573,26 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
             }
             _ => "",
         };
+        nodes.push(notice(el("confirm")).variant("warning").text(format!(
+            "Remove {id}? Its mnemonic is deleted from the config file.{funds}"
+        )));
         nodes.push(
-            notice(el("confirm"))
-                .variant("warning")
-                .text(format!("Remove {id}? Its mnemonic is deleted from the config file.{funds}")),
-        );
-        nodes.push(row(el("confirm/buttons")).children([
-            act(el("remove/confirm"), "Remove and delete its mnemonic", "network.remove.confirm", json!({"id": id}))
+            row(el("confirm/buttons")).children([
+                act(
+                    el("remove/confirm"),
+                    "Remove and delete its mnemonic",
+                    "network.remove.confirm",
+                    json!({"id": id}),
+                )
                 .variant("failure"),
-            act(el("remove/cancel"), "Keep it", "network.remove.cancel", json!({"id": id})),
-        ]));
+                act(
+                    el("remove/cancel"),
+                    "Keep it",
+                    "network.remove.cancel",
+                    json!({"id": id}),
+                ),
+            ]),
+        );
     } else {
         nodes.push(row(el("actions")).children(reopen).child(
             act(el("remove"), "Remove", "network.remove", json!({"id": id})).variant("failure"),
@@ -536,8 +618,12 @@ fn lnd_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<No
     vec![
         field(el("lnd_rest_url"), "LND REST URL", &d("lnd_rest_url"))
             .placeholder("https://127.0.0.1:8080"),
-        field(el("lnd_tls_cert_path"), "TLS certificate", &d("lnd_tls_cert_path"))
-            .placeholder("/path/to/tls.cert"),
+        field(
+            el("lnd_tls_cert_path"),
+            "TLS certificate",
+            &d("lnd_tls_cert_path"),
+        )
+        .placeholder("/path/to/tls.cert"),
         field(el("lnd_macaroon_path"), "Macaroon", &d("lnd_macaroon_path"))
             .placeholder("/path/to/admin.macaroon"),
     ]
@@ -547,15 +633,19 @@ fn bark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<N
     vec![
         field(el("bark_server_url"), "Ark server", &d("bark_server_url"))
             .placeholder("Second's server"),
-        field(el("bark_esplora_url"), "Esplora URL", &d("bark_esplora_url"))
-            .placeholder("the default one"),
+        field(
+            el("bark_esplora_url"),
+            "Esplora URL",
+            &d("bark_esplora_url"),
+        )
+        .placeholder("the default one"),
     ]
 }
 
 /// The picker of the kind of a network to add, then what that kind needs.
-fn new_network() -> Node {
+fn new_network(kinds: &[config::Kind]) -> Node {
     let kind_is = |kind: &str| format!("s.hw.new_network.kind == {}", quote(kind));
-    let picker = config::KINDS.iter().map(|(kind, label)| {
+    let picker = kinds.iter().map(|(kind, label)| {
         let chain = config::chains(kind).first().copied().unwrap_or_default();
         button(format!("hw/new/kind/{kind}"))
             .label(*label)
@@ -565,7 +655,7 @@ fn new_network() -> Node {
                 json!({"hw": {"new_network": {"kind": kind, "chain": chain}}}),
             ))
     });
-    let missing = config::KINDS
+    let missing = kinds
         .iter()
         .any(|(kind, _)| !cassis_networks::built(kind))
         .then(|| {
@@ -573,7 +663,7 @@ fn new_network() -> Node {
                 .variant("caption")
                 .text("Greyed out: not compiled into this build.")
         });
-    let details = config::KINDS.iter().map(|(kind, _)| {
+    let details = kinds.iter().map(|(kind, _)| {
         let el = |part: &str| format!("hw/new/{kind}/{part}");
         let d = |field: &str| format!("hw.new_network.{field}");
         let chains = config::chains(kind);
@@ -582,13 +672,21 @@ fn new_network() -> Node {
                 .label("Chain")
                 .variant("segmented")
                 .bind(d("chain"))
-                .options(options(chains.iter().map(|chain| (*chain, chain_label(chain)))))
+                .options(options(
+                    chains.iter().map(|chain| (*chain, chain_label(chain))),
+                ))
         });
         let fields: Vec<Node> = match *kind {
-            "cashu" => vec![field(el("mint"), "Mint URL", &d("mint")).placeholder("https://mint.example")],
-            "fedimint" => vec![field(el("invite"), "Invite code", &d("invite")).placeholder("fed1…")],
-            "arkade" | "bitcoin" => vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
-                .placeholder("the public one")],
+            "cashu" => {
+                vec![field(el("mint"), "Mint URL", &d("mint")).placeholder("https://mint.example")]
+            }
+            "fedimint" => {
+                vec![field(el("invite"), "Invite code", &d("invite")).placeholder("fed1…")]
+            }
+            "arkade" | "bitcoin" => {
+                vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
+                    .placeholder("the public one")]
+            }
             "lnd" => lnd_fields(&el, &d),
             "bark" => bark_fields(&el, &d),
             _ => Vec::new(),
@@ -600,9 +698,11 @@ fn new_network() -> Node {
     });
     card("hw/new")
         .title("Add a network")
-        .child(text("hw/new/note").variant("caption").text(
-            "A new wallet mnemonic is made for it and written to the config file.",
-        ))
+        .child(
+            text("hw/new/note")
+                .variant("caption")
+                .text("A new wallet mnemonic is made for it and written to the config file."),
+        )
         .child(row("hw/new/kinds").wrap(true).children(picker))
         .children(missing)
         .children(details)

@@ -9,7 +9,7 @@
 //! `cargo test -p cassis-gateway --test e2e -- --ignored`
 
 use async_trait::async_trait;
-use cassis_admin::networks::{NetworkConfig, Networks, Opened, Opener, Status};
+use cassis_admin::networks::{Daemon, NetworkConfig, Networks, Opened, Opener, Status};
 use cassis_admin::{App, Args, ConfigFile, Refresh};
 use cassis_core::keys::{generate_mnemonic, NodeKeys};
 use cassis_core::offline::{
@@ -38,6 +38,7 @@ use cassis_wallet::node::{
 };
 use cassis_wallet::{open_db, Node, NodeConfig};
 use futures::future::BoxFuture;
+use hyperb_cassis_wallet::{Host, WalletAdmin};
 use hypereffect::json;
 use hypereffect::vtree::text;
 use iroh_base::PublicKey;
@@ -230,11 +231,26 @@ impl Opener<NetworkConfig> for MockOpener {
     ) -> BoxFuture<'a, Result<Opened, String>> {
         Box::pin(async move {
             let network: Arc<dyn Network> = MockNetwork::new(8, &self.0);
-            Ok(Opened {
-                network,
-                wallet: None,
-            })
+            Ok(Opened { network })
         })
+    }
+}
+
+/// The gateway as what keeps its networks: its wallets do it the way
+/// [`Networks`] does, which opens the mock chain.
+struct AsDaemon(Gateway);
+
+impl Daemon for AsDaemon {
+    fn in_flight(&self, id: &NetworkId) -> usize {
+        Host::in_flight(&self.0, id)
+    }
+
+    fn add_network(&self, network: Arc<dyn Network>) {
+        self.0.opened(network);
+    }
+
+    fn remove_network(&self, id: &NetworkId) {
+        self.0.closed(id);
     }
 }
 
@@ -401,11 +417,16 @@ impl Setup {
 
     fn networks(&self) -> Arc<Networks<NetworkConfig>> {
         let networks = Networks::new(MockOpener(self.ledger.clone()), Span::none(), false);
-        networks.attach(Arc::new(self.gateway.clone()));
+        networks.attach(Arc::new(AsDaemon(self.gateway.clone())));
         networks
     }
 
-    fn gateway_admin(&self, networks: Arc<Networks<NetworkConfig>>) -> Arc<GatewayAdmin> {
+    /// The gateway's admin page, with wallets on no network: the mock
+    /// chain is not one they open.
+    async fn gateway_admin(&self) -> Arc<GatewayAdmin> {
+        let dir = temp_dir("gateway-wallets");
+        let file = hyperb_cassis_wallet::ConfigFile::new(dir.join("config.toml"), "networks");
+        let (wallets, _) = WalletAdmin::open(file, dir, Span::none()).await.unwrap();
         let template = format!(
             "mnemonic = \"{}\"\n[networks.\"{NETWORK}\"]\n",
             generate_mnemonic()
@@ -414,18 +435,12 @@ impl Setup {
             &temp_dir("gateway-admin"),
             &template,
         );
-        GatewayAdmin::new(
-            self.gateway.clone(),
-            file.unwrap(),
-            networks,
-            None,
-            Refresh::default(),
-        )
+        GatewayAdmin::new(self.gateway.clone(), file.unwrap(), wallets, None)
     }
 
     /// The tabs of the admin pages of the gateway and the server.
-    fn pages(&self) -> (String, String) {
-        let gateway = self.gateway_admin(self.networks());
+    async fn pages(&self) -> (String, String) {
+        let gateway = self.gateway_admin().await;
         let file = ConfigFile::load_or_create(&temp_dir("server-admin"), server_config::TEMPLATE);
         let server = PreimageAdmin::new(
             self.server.clone(),
@@ -700,7 +715,7 @@ async fn gateway_issues_invoices_for_an_offline_payee() {
 
     // The admin pages show the payment, and neither gives its preimage
     // away.
-    let (gateway_page, server_page) = setup.pages();
+    let (gateway_page, server_page) = setup.pages().await;
     for page in [&gateway_page, &server_page] {
         assert!(page.contains(&invoice.body.payment_hash.to_string()));
         assert!(page.contains(&payee.key().to_string()));
@@ -760,7 +775,7 @@ async fn networks_and_terms_change_while_running() {
 
     // Terms apply to what comes next, through the file, which refuses
     // nonsense.
-    let admin = setup.gateway_admin(networks.clone());
+    let admin = setup.gateway_admin().await;
     let set = |payload: hypereffect::Value| {
         admin
             .clone()

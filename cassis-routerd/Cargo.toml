@@ -5,20 +5,21 @@ edition.workspace = true
 
 [features]
 default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
-arkade = ["cassis-networks/arkade", "cassis-wallet/arkade"]
-bark-lightning = ["cassis-networks/bark-lightning", "cassis-wallet/bark-lightning"]
-bitcoin = ["cassis-networks/bitcoin", "cassis-wallet/bitcoin"]
-cashu = ["cassis-networks/cashu", "cassis-wallet/cashu"]
-fedimint = ["cassis-networks/fedimint", "cassis-wallet/fedimint"]
-lightning = ["cassis-networks/lightning", "cassis-wallet/lightning"]
-liquid = ["cassis-networks/liquid", "cassis-wallet/liquid"]
-rootstock = ["cassis-networks/rootstock", "cassis-wallet/rootstock"]
+arkade = ["cassis-networks/arkade", "cassis-wallet/arkade", "hyperb-cassis-wallet/arkade"]
+bark-lightning = ["cassis-networks/bark-lightning", "cassis-wallet/bark-lightning", "hyperb-cassis-wallet/bark-lightning"]
+bitcoin = ["cassis-networks/bitcoin", "cassis-wallet/bitcoin", "hyperb-cassis-wallet/bitcoin"]
+cashu = ["cassis-networks/cashu", "cassis-wallet/cashu", "hyperb-cassis-wallet/cashu"]
+fedimint = ["cassis-networks/fedimint", "cassis-wallet/fedimint", "hyperb-cassis-wallet/fedimint"]
+lightning = ["cassis-networks/lightning", "cassis-wallet/lightning", "hyperb-cassis-wallet/lightning"]
+liquid = ["cassis-networks/liquid", "cassis-wallet/liquid", "hyperb-cassis-wallet/liquid"]
+rootstock = ["cassis-networks/rootstock", "cassis-wallet/rootstock", "hyperb-cassis-wallet/rootstock"]
 
 [dependencies]
 cassis-admin = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
 cassis-wallet = { workspace = true }
+hyperb-cassis-wallet = { workspace = true }
 iroh-base = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }

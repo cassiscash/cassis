@@ -16,6 +16,7 @@ members = [
   "cassis-preimage-server",
   "cassis-gateway",
   "cassis-wasm",
+  "hyperb-cassis-wallet",
 ]
 resolver = "2"
 
@@ -36,7 +37,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 futures = "0.3.33"
 fs2 = "0.4"
 hmac = "0.12.1"
-hypereffect = "0.6.1"
+hypereffect = "0.6.3"
 iroh = "1.0.3"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 lightning-invoice = { version = "0.33.3", features = ["std"] }
@@ -114,6 +115,7 @@ cassis-bitcoin = { path = "networks/cassis-bitcoin" }
 cassis-rootstock = { path = "networks/cassis-rootstock" }
 cassis-liquid = { path = "networks/cassis-liquid" }
 cassis-lnd = { path = "networks/cassis-lnd" }
+hyperb-cassis-wallet = { path = "hyperb-cassis-wallet" }
 cassis-bark-lightning = { path = "networks/cassis-bark-lightning" }
 
 # Bark with hash-only lightning receives (preimage given later), from

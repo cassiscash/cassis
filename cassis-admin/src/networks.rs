@@ -4,35 +4,20 @@
 //! flight is left as it is until they settle, since they need it to
 //! claim or refund, and their tasks hold on to its wallet.
 //!
-//! Also here is what their pages share: the form adding a network
-//! ([`new_network`]) and its card ([`network_card`]), and for daemons
-//! whose networks are just a [`NetworkConfig`], its actions
-//! ([`Networks::act`]):
-//!
-//! | action           | payload                                                 |
-//! | ---------------- | ------------------------------------------------------- |
-//! | `network.add`    | `kind`, `chain`, `mint`, `invite`, `esplora_url`        |
-//! | `network.set`    | `id`, `esplora_url`                                     |
-//! | `network.remove` | `id`                                                    |
-//! | `network.open`   | `id`                                                    |
+//! For a daemon that only verifies payments on its networks; one that
+//! keeps wallets on them has them kept by `hyperb-cassis-wallet` instead.
 
-use crate::config::{child, implicit_table, put_text, ConfigFile, DaemonConfig};
-use crate::view::{act, field, options, quote, short_hash, submit};
-use crate::wallets::Wallets;
-use crate::{Args, Refresh};
-use cassis_core::keys::{generate_mnemonic, parse_wallet_mnemonic};
+use crate::Refresh;
+use cassis_core::keys::parse_wallet_mnemonic;
 use cassis_core::{Network, NetworkId};
-use cassis_networks::{NetworkSettings, Wallet};
+use cassis_networks::NetworkSettings;
 use futures::future::BoxFuture;
-use hypereffect::vtree::{badge, button, card, column, divider, notice, row, select, text, Node};
-use hypereffect::{cel, json, Handler, Map, Value};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::task::AbortHandle;
-use toml_edit::{DocumentMut, Item};
 use tracing::{info, warn, Instrument, Span};
 
 /// Attempts at reopening a network, whose previous wallet may take a
@@ -52,8 +37,6 @@ pub enum Status {
 /// What opening a network gives.
 pub struct Opened {
     pub network: Arc<dyn Network>,
-    /// Its wallet, for a daemon that moves funds on it.
-    pub wallet: Option<Wallet>,
 }
 
 /// How a daemon opens a network from its config `C`.
@@ -91,8 +74,6 @@ pub struct Networks<C> {
     upkeep: bool,
     daemon: OnceLock<Arc<dyn Daemon>>,
     slots: Mutex<BTreeMap<String, Slot<C>>>,
-    /// The wallets of the networks open.
-    pub wallets: Arc<Wallets>,
     /// Held by the one [`Networks::sync`] running.
     syncing: tokio::sync::Mutex<()>,
 }
@@ -105,7 +86,6 @@ impl<C: Clone + PartialEq + Send + Sync + 'static> Networks<C> {
             upkeep,
             daemon: OnceLock::new(),
             slots: Default::default(),
-            wallets: Default::default(),
             syncing: Default::default(),
         })
     }
@@ -124,9 +104,6 @@ impl<C: Clone + PartialEq + Send + Sync + 'static> Networks<C> {
             let (status, network) = match opened {
                 Ok(opened) => {
                     networks.push(opened.network.clone());
-                    if let Some(wallet) = opened.wallet {
-                        self.wallets.insert(id.clone(), wallet);
-                    }
                     (Status::Open, Some(opened.network))
                 }
                 Err(error) => {
@@ -243,9 +220,6 @@ impl<C: Clone + PartialEq + Send + Sync + 'static> Networks<C> {
             let (status, network, upkeep) = match self.open(id, config, reopen).await {
                 Ok(opened) => {
                     info!("opened {id}");
-                    if let Some(wallet) = opened.wallet {
-                        self.wallets.insert(id.clone(), wallet);
-                    }
                     if let Some(daemon) = self.daemon.get() {
                         daemon.add_network(opened.network.clone());
                     }
@@ -290,7 +264,6 @@ impl<C: Clone + PartialEq + Send + Sync + 'static> Networks<C> {
             }
             slot.network = None;
         }
-        self.wallets.remove(id);
         if let (Some(daemon), Ok(id)) = (self.daemon.get(), NetworkId::parse(id)) {
             daemon.remove_network(&id);
         }
@@ -390,446 +363,4 @@ impl NetworkConfig {
             ..NetworkSettings::new(mnemonic, cassis_networks::network_dir(dir, id))
         })
     }
-
-    /// The fields of its form.
-    pub fn values(&self) -> Value {
-        json!({"esplora_url": self.esplora_url.clone().unwrap_or_default()})
-    }
-}
-
-impl Networks<NetworkConfig> {
-    /// Do what the `network.*` action `name` says on `file`, whose
-    /// networks `wanted` gives, of the `kinds` this daemon takes.
-    pub fn act<T: DaemonConfig>(
-        self: &Arc<Self>,
-        name: &str,
-        args: &Args,
-        file: &ConfigFile<T>,
-        wanted: fn(&T) -> &BTreeMap<String, NetworkConfig>,
-        kinds: &[Kind],
-        refresh: &Refresh,
-    ) -> Result<String, String> {
-        let network = || NetworkId::parse(&args.required("id")?);
-        let (message, retry) = match name {
-            "network.add" => {
-                let id = new_network_id(args, kinds)?;
-                file.edit(|doc| {
-                    if has_network(doc, &id) {
-                        return Err(format!("{id} is added already"));
-                    }
-                    set_network(doc, &id, args)
-                })?;
-                (format!("{id} added, opening it"), None)
-            }
-            "network.set" => {
-                let id = network()?;
-                file.edit(|doc| set_network(doc, &id, args))?;
-                (format!("{id} saved"), None)
-            }
-            "network.remove" => {
-                let id = network()?;
-                file.edit(|doc| remove_network(doc, &id))?;
-                (format!("{id} removed"), None)
-            }
-            "network.open" => {
-                let id = network()?;
-                self.can_reopen(&id, wanted(&file.get()).contains_key(&id.0))?;
-                (format!("Opening {id}"), Some(id.0))
-            }
-            other => return Err(format!("unknown action {other}")),
-        };
-        self.sync_in_background(wanted(&file.get()).clone(), retry, refresh);
-        Ok(message)
-    }
-}
-
-fn has_network(doc: &DocumentMut, id: &NetworkId) -> bool {
-    doc.get("networks")
-        .and_then(Item::as_table_like)
-        .is_some_and(|networks| networks.contains_key(&id.0))
-}
-
-/// Adds `id` if missing, with a fresh wallet mnemonic. Fields:
-/// `esplora_url`.
-fn set_network(doc: &mut DocumentMut, id: &NetworkId, args: &Args) -> Result<(), String> {
-    let networks = child(doc.as_table_mut(), "networks", implicit_table)?;
-    let network = child(networks, &id.0, toml_edit::table)?;
-    if !network.contains_key("mnemonic") {
-        crate::config::put(network, "mnemonic", Some(generate_mnemonic().into()));
-    }
-    put_text(network, "esplora_url", args.text("esplora_url")?);
-    Ok(())
-}
-
-fn remove_network(doc: &mut DocumentMut, id: &NetworkId) -> Result<(), String> {
-    doc.get_mut("networks")
-        .and_then(Item::as_table_like_mut)
-        .and_then(|networks| networks.remove(&id.0))
-        .map(|_| ())
-        .ok_or_else(|| format!("{id} is not under [networks]"))
-}
-
-/// A kind of network to add: its name in `network.add`, and its label.
-pub type Kind = (&'static str, &'static str);
-
-/// Every kind of network.
-pub const ALL_KINDS: [Kind; 8] = [
-    ("arkade", "Arkade"),
-    ("cashu", "Cashu"),
-    ("liquid", "Liquid"),
-    ("lnd", "Lightning (LND)"),
-    ("bark", "Lightning (bark)"),
-    ("fedimint", "Fedimint"),
-    ("bitcoin", "Bitcoin"),
-    ("rootstock", "Rootstock"),
-];
-
-/// The kinds of network a gateway or a preimage server is on: those a
-/// payee can be paid on while offline.
-pub const OFFLINE_KINDS: [Kind; 6] = [
-    ("arkade", "Arkade"),
-    ("cashu", "Cashu"),
-    ("liquid", "Liquid"),
-    ("fedimint", "Fedimint"),
-    ("bitcoin", "Bitcoin"),
-    ("rootstock", "Rootstock"),
-];
-
-/// The chains a kind runs on, the first its default.
-pub fn chains(kind: &str) -> &'static [&'static str] {
-    match kind {
-        "arkade" => &["mainnet", "mutinynet"],
-        "bitcoin" => &["mainnet", "mutinynet", "regtest"],
-        "liquid" | "rootstock" => &["mainnet", "testnet"],
-        "lnd" | "bark" => &["mainnet", "signet", "mutinynet", "regtest"],
-        _ => &[],
-    }
-}
-
-/// The id of the network a `network.add` describes: `kind`, one of
-/// `kinds`, then `chain` (one of its [`chains`]), `mint` (a cashu mint's
-/// URL) or `invite` (a fedimint invite code).
-pub fn new_network_id(args: &Args, kinds: &[Kind]) -> Result<NetworkId, String> {
-    let kind = args.required("kind")?;
-    let (_, label) = kinds
-        .iter()
-        .find(|(name, _)| *name == kind)
-        .ok_or_else(|| {
-            let names: Vec<&str> = kinds.iter().map(|(name, _)| *name).collect();
-            format!("kind {kind}: expected one of {}", names.join(", "))
-        })?;
-    if !cassis_networks::built(&kind) {
-        return Err(format!("this build has no {label} support"));
-    }
-    let spec = match kind.as_str() {
-        "cashu" => {
-            let mint = args.required("mint")?;
-            let host = mint
-                .strip_prefix("https://")
-                .or_else(|| mint.strip_prefix("http://"))
-                .unwrap_or(&mint)
-                .trim_end_matches('/');
-            format!("cashu::{host}")
-        }
-        "fedimint" => format!("fedimint::{}", args.required("invite")?),
-        kind => {
-            let chains = chains(kind);
-            let chain = args.text("chain")?.filter(|chain| !chain.is_empty());
-            let chain = chain.as_deref().unwrap_or(chains[0]);
-            if !chains.contains(&chain) {
-                return Err(format!(
-                    "{label} runs on {}, not {chain}",
-                    chains.join(", ")
-                ));
-            }
-            let kind = if matches!(kind, "lnd" | "bark") {
-                "lightning"
-            } else {
-                kind
-            };
-            match chain {
-                "mainnet" => kind.to_string(),
-                chain => format!("{kind}::{chain}"),
-            }
-        }
-    };
-    NetworkId::parse(&spec)
-}
-
-/// The signal path segment of the draft of a network's form.
-pub fn network_draft(id: &str) -> String {
-    format!("n_{}", short_hash(id))
-}
-
-/// The draft of [`new_network`], empty.
-pub fn new_network_draft() -> (String, Value) {
-    (
-        "new_network".into(),
-        json!({
-            "kind": "",
-            "chain": "",
-            "mint": "",
-            "invite": "",
-            "esplora_url": "",
-            "lnd_rest_url": "",
-            "lnd_tls_cert_path": "",
-            "lnd_macaroon_path": "",
-            "bark_server_url": "",
-            "bark_esplora_url": "",
-        }),
-    )
-}
-
-/// The picker of a network's kind, among `kinds`, then what that kind
-/// needs.
-pub fn new_network(kinds: &[Kind]) -> Node {
-    let kind_is = |kind: &str| format!("s.d.new_network.kind == {}", quote(kind));
-    let picker = kinds.iter().map(|(kind, label)| {
-        let chain = chains(kind).first().copied().unwrap_or_default();
-        button(format!("network/new/kind/{kind}"))
-            .label(*label)
-            .variant(cel(format!("{} ? 'primary' : 'secondary'", kind_is(kind))))
-            .disabled(!cassis_networks::built(kind))
-            .on_press(Handler::patch(
-                json!({"d": {"new_network": {"kind": kind, "chain": chain}}}),
-            ))
-    });
-    let missing = kinds
-        .iter()
-        .any(|(kind, _)| !cassis_networks::built(kind))
-        .then(|| {
-            text("network/new/missing")
-                .variant("caption")
-                .text("Greyed out: not compiled into this build.")
-        });
-    let details = kinds.iter().map(|(kind, _)| {
-        let el = |part: &str| format!("network/new/{kind}/{part}");
-        let d = |field: &str| format!("d.new_network.{field}");
-        let chains = chains(kind);
-        let chain = (!chains.is_empty()).then(|| {
-            select(el("chain"))
-                .label("Chain")
-                .variant("segmented")
-                .bind(d("chain"))
-                .options(options(
-                    chains.iter().map(|chain| (*chain, chain_label(chain))),
-                ))
-        });
-        let fields: Vec<Node> = match *kind {
-            "cashu" => {
-                vec![field(el("mint"), "Mint URL", &d("mint")).placeholder("https://mint.example")]
-            }
-            "fedimint" => {
-                vec![field(el("invite"), "Invite code", &d("invite")).placeholder("fed1…")]
-            }
-            "arkade" | "bitcoin" => {
-                vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
-                    .placeholder("the public one")]
-            }
-            "lnd" => lnd_fields(&el, &d),
-            "bark" => bark_fields(&el, &d),
-            _ => Vec::new(),
-        };
-        column(format!("network/new/{kind}"))
-            .visible(cel(kind_is(kind)))
-            .children(chain)
-            .children(fields)
-    });
-    card("network/new")
-        .title("Add a network")
-        .child(row("network/new/kinds").wrap(true).children(picker))
-        .children(missing)
-        .children(details)
-        .child(submit(
-            "network/new/add",
-            "Add",
-            "network.add",
-            json!({"draft": "new_network"}),
-            "s.d.new_network.kind == '' \
-             || (s.d.new_network.kind == 'cashu' && s.d.new_network.mint.trim() == '') \
-             || (s.d.new_network.kind == 'fedimint' && s.d.new_network.invite.trim() == '')",
-        ))
-}
-
-fn chain_label(chain: &str) -> &str {
-    match chain {
-        "mainnet" => "Mainnet",
-        "mutinynet" => "Mutinynet",
-        "signet" => "Signet",
-        "testnet" => "Testnet",
-        "regtest" => "Regtest",
-        other => other,
-    }
-}
-
-/// The inputs of an LND node, under element ids from `el` and signal
-/// paths from `d`.
-pub fn lnd_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
-    vec![
-        field(el("lnd_rest_url"), "LND REST URL", &d("lnd_rest_url"))
-            .placeholder("https://127.0.0.1:8080"),
-        field(
-            el("lnd_tls_cert_path"),
-            "TLS certificate",
-            &d("lnd_tls_cert_path"),
-        )
-        .placeholder("/path/to/tls.cert"),
-        field(el("lnd_macaroon_path"), "Macaroon", &d("lnd_macaroon_path"))
-            .placeholder("/path/to/admin.macaroon"),
-    ]
-}
-
-/// The inputs of an Ark server for bark, like [`lnd_fields`].
-pub fn bark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
-    vec![
-        field(el("bark_server_url"), "Ark server", &d("bark_server_url"))
-            .placeholder("Second's server"),
-        field(
-            el("bark_esplora_url"),
-            "Esplora URL",
-            &d("bark_esplora_url"),
-        )
-        .placeholder("the default one"),
-    ]
-}
-
-/// The card of the network `id`.
-pub struct NetworkCard<'a> {
-    pub id: &'a str,
-    /// Its status, if the daemon has it yet.
-    pub status: Option<&'a Status>,
-    /// Whether it runs with the config asked for.
-    pub applied: bool,
-    /// What its payments in flight are called: `hop`, `payment`.
-    pub unit: &'a str,
-    /// The inputs of its form, whose draft is [`network_draft`].
-    pub fields: Vec<Node>,
-    pub wallet: Vec<Node>,
-}
-
-pub fn network_card(network: NetworkCard) -> Node {
-    let NetworkCard {
-        id,
-        status,
-        applied,
-        unit,
-        fields,
-        wallet,
-    } = network;
-    let el = |part: &str| format!("network/{id}/{part}");
-    let (variant, status_text) = match status {
-        None | Some(Status::Opening) => ("info", "opening…".to_string()),
-        Some(Status::Open) if !applied => ("info", "applying changes…".to_string()),
-        Some(Status::Open) => ("success", "open".to_string()),
-        Some(Status::Failed(error)) => ("failure", format!("failed to open: {error}")),
-        Some(Status::Waiting(count)) => (
-            "warning",
-            format!("open, changes apply once its {count} {unit}(s) in flight settle"),
-        ),
-    };
-    let reopen = match status {
-        Some(Status::Failed(_)) => Some("Retry"),
-        Some(Status::Open) => Some("Reopen"),
-        _ => None,
-    }
-    .map(|label| act(el("open"), label, "network.open", json!({"id": id})));
-    let save = (!fields.is_empty()).then(|| {
-        submit(
-            el("save"),
-            "Save",
-            "network.set",
-            json!({"draft": network_draft(id), "id": id}),
-            "false",
-        )
-    });
-    let settings = (!fields.is_empty()).then(|| divider(el("divider")));
-    card(format!("network/{id}"))
-        .title(id)
-        .child(badge(el("status")).variant(variant).text(status_text))
-        .children(wallet)
-        .children(settings)
-        .children(fields)
-        .child(row(el("actions")).children(save).children(reopen).child(
-            act(el("remove"), "Remove", "network.remove", json!({"id": id})).variant("failure"),
-        ))
-}
-
-/// The inputs of a [`NetworkConfig`] of the network `id`.
-pub fn config_fields(id: &str) -> Vec<Node> {
-    let kind = id.split_once("::").map_or(id, |(kind, _)| kind);
-    match kind {
-        "arkade" | "bitcoin" => vec![field(
-            format!("network/{id}/esplora_url"),
-            "Esplora URL",
-            &format!("d.{}.esplora_url", network_draft(id)),
-        )
-        .placeholder("the public one")],
-        _ => Vec::new(),
-    }
-}
-
-/// The cards of a daemon's [`NetworkConfig`]s, as it has them, showing
-/// their wallets if they have any at unix time `now`, then the networks
-/// removed from them that are still open for the payments through them.
-pub fn config_cards(
-    networks: &Networks<NetworkConfig>,
-    wanted: &BTreeMap<String, NetworkConfig>,
-    unit: &str,
-    now: u64,
-) -> (Vec<Node>, Vec<Node>) {
-    let slots = networks.slots();
-    let cards = wanted
-        .iter()
-        .map(|(id, config)| {
-            let slot = slots.get(id);
-            let wallet = networks
-                .wallets
-                .get(id)
-                .map(|(can, funds)| crate::wallets::view(now, id, &can, &funds))
-                .unwrap_or_default();
-            network_card(NetworkCard {
-                id,
-                status: slot.map(|slot| &slot.status),
-                applied: slot.is_some_and(|slot| slot.config == *config),
-                unit,
-                fields: config_fields(id),
-                wallet,
-            })
-        })
-        .collect();
-    let closing = slots
-        .iter()
-        .filter_map(|(id, slot)| {
-            let Status::Waiting(count) = &slot.status else {
-                return None;
-            };
-            (!wanted.contains_key(id)).then(|| closing_notice(id, *count, unit))
-        })
-        .collect();
-    (closing, cards)
-}
-
-/// Says the network `id`, removed from the config, is still open.
-pub fn closing_notice(id: &str, count: usize, unit: &str) -> Node {
-    notice(format!("network/{id}/closing"))
-        .variant("warning")
-        .text(format!(
-            "{id} closes once its {count} {unit}(s) in flight settle."
-        ))
-}
-
-/// The drafts of a daemon's [`NetworkConfig`]s, with their wallets' if
-/// `wallets`.
-pub fn config_drafts(
-    wanted: &BTreeMap<String, NetworkConfig>,
-    wallets: bool,
-) -> Map<String, Value> {
-    let mut drafts = Map::new();
-    for (id, config) in wanted {
-        drafts.insert(network_draft(id), config.values());
-        if wallets {
-            drafts.extend(crate::wallets::drafts(id));
-        }
-    }
-    drafts
 }

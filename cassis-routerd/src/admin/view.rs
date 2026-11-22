@@ -4,28 +4,22 @@
 //! form edits is in its draft, the signal `d.<draft>` (see [`drafts`]).
 
 use super::Nostr;
-use crate::config::{Config, NetworkConfig, RouteConfig};
-use cassis_admin::networks::{
-    bark_fields, closing_notice, lnd_fields, network_card as card_of, network_draft, new_network,
-    new_network_draft, NetworkCard, Status, ALL_KINDS,
-};
+use crate::config::{Config, RouteConfig};
 use cassis_admin::view::{act, ago, fact, field, number, options, short_hash, submit};
-use cassis_admin::wallets::{self, Funds};
 use cassis_core::routing::{route_d_tag, ANNOUNCEMENT_MAX_AGE_SECS};
 use cassis_core::NetworkId;
 use cassis_core::OperationId;
-use cassis_networks::Can;
 use cassis_routerd::db::{Hop, HopState};
 use cassis_wallet::stored::StoredFailReason;
 use hypereffect::vtree::{badge, card, checkbox, column, list, row, select, tab, text, Node};
-use hypereffect::{cel, json, Map, Value};
+use hypereffect::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the page shows, besides the config.
 pub struct Context<'a> {
     pub config: &'a Config,
-    /// The networks the daemon has.
-    pub networks: BTreeMap<String, Network>,
+    /// The page of the wallets, which keep the networks.
+    pub wallets: Vec<Node>,
     /// The name the router goes by: its own, else its autoname.
     pub name: String,
     pub autoname: String,
@@ -37,16 +31,6 @@ pub struct Context<'a> {
     pub nostr: &'a Nostr,
     /// Unix seconds.
     pub now: u64,
-}
-
-/// One network as the daemon has it.
-pub struct Network {
-    /// The config it was opened, or last tried, with.
-    pub config: NetworkConfig,
-    pub status: Status,
-    /// What its wallet can do, while open.
-    pub can: Option<Can>,
-    pub funds: Funds,
 }
 
 /// The hops the router routed.
@@ -94,35 +78,10 @@ pub fn drafts(config: &Config) -> Map<String, Value> {
             "max_reservations": config.max_reservations,
         }),
     );
-    for (id, network) in &config.networks {
-        drafts.insert(network_draft(id), network_values(network));
-        drafts.extend(wallets::drafts(id));
-    }
     for route in &config.routes {
         drafts.insert(route_draft(&route.from, &route.to), route_values(route));
     }
     drafts
-}
-
-fn network_values(network: &NetworkConfig) -> Value {
-    let text = |value: &Option<String>| value.clone().unwrap_or_default();
-    let path = |value: &Option<std::path::PathBuf>| {
-        value
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default()
-    };
-    let lnd = network.lnd.as_ref();
-    let bark = network.bark.as_ref();
-    json!({
-        "esplora_url": text(&network.esplora_url),
-        "backend": if lnd.is_some() { "lnd" } else if bark.is_some() { "bark" } else { "none" },
-        "lnd_rest_url": lnd.map(|lnd| lnd.rest_url.clone()).unwrap_or_default(),
-        "lnd_tls_cert_path": path(&lnd.and_then(|lnd| lnd.tls_cert_path.clone())),
-        "lnd_macaroon_path": path(&lnd.and_then(|lnd| lnd.macaroon_path.clone())),
-        "bark_server_url": text(&bark.and_then(|bark| bark.server_url.clone())),
-        "bark_esplora_url": text(&bark.and_then(|bark| bark.esplora_url.clone())),
-    })
 }
 
 fn route_values(route: &RouteConfig) -> Value {
@@ -141,8 +100,6 @@ pub fn new_drafts(config: &Config) -> Map<String, Value> {
     let to = ids.next().cloned().unwrap_or_default();
     let base = NetworkId::parse(&from).map_or(0, |id| id.default_base_fee_msat());
     let mut drafts = Map::new();
-    let (name, draft) = new_network_draft();
-    drafts.insert(name, draft);
     drafts.insert(
         "new_route".into(),
         json!({
@@ -249,74 +206,9 @@ fn overview(ctx: &Context) -> Node {
 }
 
 fn networks(ctx: &Context) -> Node {
-    let cards = ctx
-        .config
-        .networks
-        .iter()
-        .map(|(id, network)| network_card(ctx, id, network));
-    // Removed from the config, still open for the hops through them.
-    let closing = ctx.networks.iter().filter_map(|(id, network)| {
-        let Status::Waiting(hops) = &network.status else {
-            return None;
-        };
-        (!ctx.config.networks.contains_key(id)).then(|| closing_notice(id, *hops, "hop"))
-    });
     tab("tab/networks")
         .label("Networks")
-        .children(closing)
-        .children([
-            list("networks")
-                .empty("No networks yet: add one below.")
-                .children(cards),
-            new_network(&ALL_KINDS),
-        ])
-}
-
-fn network_card(ctx: &Context, id: &str, network: &NetworkConfig) -> Node {
-    let draft = network_draft(id);
-    let d = |field: &str| format!("d.{draft}.{field}");
-    let el = |part: &str| format!("network/{id}/{part}");
-    let kind = id.split_once("::").map_or(id, |(kind, _)| kind);
-    let opened = ctx.networks.get(id);
-    let fields: Vec<Node> = match kind {
-        "arkade" | "bitcoin" => vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
-            .placeholder("the public one")],
-        "lightning" => {
-            let backend = |name: &str| cel(format!("s.d.{draft}.backend == '{name}'"));
-            vec![
-                select(el("backend"))
-                    .label("Through")
-                    .variant("segmented")
-                    .bind(d("backend"))
-                    .options(options([("lnd", "LND"), ("bark", "Bark")])),
-                column(el("lnd"))
-                    .visible(backend("lnd"))
-                    .children(lnd_fields(&el, &d)),
-                column(el("bark"))
-                    .visible(backend("bark"))
-                    .children(bark_fields(&el, &d)),
-            ]
-        }
-        _ => Vec::new(),
-    };
-    let wallet = opened
-        .and_then(|opened| {
-            Some(wallets::view(
-                ctx.now,
-                id,
-                opened.can.as_ref()?,
-                &opened.funds,
-            ))
-        })
-        .unwrap_or_default();
-    card_of(NetworkCard {
-        id,
-        status: opened.map(|opened| &opened.status),
-        applied: opened.is_some_and(|opened| opened.config == *network),
-        unit: "hop",
-        fields,
-        wallet,
-    })
+        .children(ctx.wallets.clone())
 }
 
 fn routes(ctx: &Context) -> Node {

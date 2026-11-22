@@ -22,6 +22,20 @@ What the page does:
 
 ## Using it
 
+It lives in the [cassis](https://github.com/andunieee/cassis) repository,
+next to the crates it builds on, so take it from there at the same commit as
+the other cassis crates you use:
+
+```toml
+cassis-core = { git = "https://github.com/andunieee/cassis", rev = "<commit>", default-features = false, features = ["node"] }
+hyperb-cassis-wallet = { git = "https://github.com/andunieee/cassis", rev = "<commit>", features = ["cashu"] }
+```
+
+Turn on in it the network features you turn on in `cassis-networks` or
+`cassis-wallet`: it refuses Lightning networks (LND, bark) it was not built
+for. The Cassis daemons
+(`cassis-routerd`, `cassis-gateway`) serve it through `cassis-admin`.
+
 The crate brings no transport: the host keeps its session and page.
 
 ```rust
@@ -29,6 +43,7 @@ let file = ConfigFile::new(home.join("config.toml"), "networks");
 let (wallets, networks) = WalletAdmin::open(file, &home, span).await?;
 // start what pays and gets paid with `networks`, then:
 wallets.attach(host); // a `Host`: gets networks opened and closed later
+wallets.offer(&["arkade", "cashu"]); // optional: the kinds the page adds, else all
 
 // per session:
 //   send  wallets.signals(&mut drafts)   (the forms' drafts, before the page)

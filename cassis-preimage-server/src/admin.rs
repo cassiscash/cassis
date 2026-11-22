@@ -50,7 +50,6 @@ impl Opener<NetworkConfig> for PreimageOpener {
             let settings = config.settings(id, &self.dir)?;
             Ok(Opened {
                 network: cassis_networks::open(id, &settings, &self.span).await?,
-                wallet: None,
             })
         })
     }

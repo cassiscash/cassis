@@ -1,9 +1,11 @@
 //! `cassis-routerd`: a Cassis router daemon. It does what
 //! `<data dir>/config.toml` says (see [`config`]), following it as it
-//! changes: opens the networks listed there (see [`networks`]), routes and announces the hops listed there, deletes its
-//! announcements of anything else, and keeps its wallets in shape
-//! (refreshing coins before they expire, and the like). Each
-//! network is compiled in by the cargo feature of the same name.
+//! changes: opens the networks listed there with their wallets (kept by
+//! [`hyperb_cassis_wallet`], see [`networks`]), routes and announces the
+//! hops listed there, deletes its announcements of anything else, and
+//! keeps its wallets in shape (refreshing coins before they expire, and
+//! the like). Each network is compiled in by the cargo feature of the
+//! same name.
 //!
 //! It also serves an [`admin`] interface for hyperb renderers, which
 //! edits the config and runs the daemon's actions.
@@ -38,9 +40,11 @@ use cassis_routerd::router::Router;
 use cassis_wallet::{Node, NodeConfig};
 use clap::Parser;
 use config::Config;
-use networks::{Networks, RouterDaemon, RouterOpener};
+use hyperb_cassis_wallet::{ConfigFile, WalletAdmin};
+use networks::RouterHost;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tracing::{info, info_span, warn};
 
 #[derive(Parser)]
@@ -79,15 +83,12 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     // Networks are opened before the node starts, so that it can resume
     // its hops on them.
-    let networks = Networks::new(
-        RouterOpener {
-            dir: dir.clone(),
-            span: span.clone(),
-        },
+    let (wallets, opened) = WalletAdmin::open(
+        ConfigFile::new(dir.join(config::FILE), "networks"),
+        &dir,
         span.clone(),
-        true,
-    );
-    let opened = networks.open_all(&config.networks).await;
+    )
+    .await?;
     if config.networks.is_empty() {
         warn!(
             "no networks in {}: add some under [networks], or from the admin interface",
@@ -107,7 +108,11 @@ async fn run(cli: Cli) -> Result<(), String> {
     )
     .await?;
     let router = Router::start(node.clone(), db)?;
-    networks.attach(Arc::new(RouterDaemon(router.clone())));
+    let changed = Arc::new(Notify::new());
+    wallets.attach(Arc::new(RouterHost {
+        router: router.clone(),
+        changed: changed.clone(),
+    }));
 
     let policy = config.routing_policy()?;
     if policy.routes.is_empty() {
@@ -121,10 +126,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         node.node_pubkey().to_hex()
     );
     let refresh = Refresh::default();
-    let admin = Admin::new(dir, router, networks, config, refresh.clone());
+    let admin = Admin::new(dir, router, wallets, config, refresh.clone());
     let server = Server::new(admin.clone(), refresh);
     server.serve(admin_secret).await;
     admin.keep_checking_relays();
+    admin.announce_when_networks_change(changed);
 
     let restart = tokio::select! {
         _ = shutdown_signal() => false,

@@ -5,18 +5,19 @@ edition.workspace = true
 
 [features]
 default = ["arkade", "bitcoin", "cashu", "fedimint", "liquid", "rootstock"]
-arkade = ["cassis-networks/arkade", "cassis-wallet/arkade"]
-bitcoin = ["cassis-networks/bitcoin", "cassis-wallet/bitcoin"]
-cashu = ["cassis-networks/cashu", "cassis-wallet/cashu"]
-fedimint = ["cassis-networks/fedimint", "cassis-wallet/fedimint"]
-liquid = ["cassis-networks/liquid", "cassis-wallet/liquid"]
-rootstock = ["cassis-networks/rootstock", "cassis-wallet/rootstock"]
+arkade = ["cassis-networks/arkade", "cassis-wallet/arkade", "hyperb-cassis-wallet/arkade"]
+bitcoin = ["cassis-networks/bitcoin", "cassis-wallet/bitcoin", "hyperb-cassis-wallet/bitcoin"]
+cashu = ["cassis-networks/cashu", "cassis-wallet/cashu", "hyperb-cassis-wallet/cashu"]
+fedimint = ["cassis-networks/fedimint", "cassis-wallet/fedimint", "hyperb-cassis-wallet/fedimint"]
+liquid = ["cassis-networks/liquid", "cassis-wallet/liquid", "hyperb-cassis-wallet/liquid"]
+rootstock = ["cassis-networks/rootstock", "cassis-wallet/rootstock", "hyperb-cassis-wallet/rootstock"]
 
 [dependencies]
 cassis-admin = { workspace = true }
 cassis-core = { workspace = true, features = ["node"] }
 cassis-networks = { workspace = true }
 cassis-wallet = { workspace = true }
+hyperb-cassis-wallet = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 hypereffect = { workspace = true }

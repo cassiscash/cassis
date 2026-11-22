@@ -7,8 +7,7 @@
 //! | ---------------------- | ------------------------------------------------------- |
 //! | `terms.set`            | `max_final_timeout_secs`, `max_authorization_secs`, `default_invoice_expiry_secs`, `forward_slack_secs`, `final_slack_secs` |
 //! | `authorization.forget` | `id`                                                    |
-//! | `network.*`            | see [`cassis_admin::networks`]                          |
-//! | `wallet.*`             | see [`cassis_admin::wallets`]                           |
+//! | `network.*`, `wallet.*` | see [`hyperb_cassis_wallet`]                           |
 //!
 //! Changes are written to the config and apply at once: a network with
 //! payments in flight closes or reopens once they settle.
@@ -17,98 +16,75 @@ use crate::config::Config;
 use crate::db::{HandledDelegation, PayeeHtlc, PayeeOutcome};
 use crate::{Gateway, INTERRUPTED_FUNDING};
 use cassis_admin::config::{child, put};
-use cassis_admin::networks::{
-    config_cards, config_drafts, new_network, new_network_draft, Daemon, NetworkConfig, Networks,
-    Opened, Opener, OFFLINE_KINDS,
-};
 use cassis_admin::view::{act, ago, fact, number, sat, span, stat, submit, until};
-use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity, Refresh};
+use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity};
 use cassis_core::offline::PayeeGatewayReceiveAuthorization;
 use cassis_core::routing::{autohue, autoname};
 use cassis_core::{unix_now, Bytes32, Network, NetworkId, XOnlyPubKey};
-use futures::future::BoxFuture;
+use hyperb_cassis_wallet::{Host, WalletAdmin};
 use hypereffect::vtree::{badge, card, column, list, notice, row, tab, text, Node};
 use hypereffect::{json, Map, Value};
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use toml_edit::DocumentMut;
-use tracing::{info, warn, Span};
+use tracing::{info, warn};
 
 /// The most forwards a tab lists, newest first.
 const LISTED: usize = 100;
 
-/// Opens a network with the key its config gives, its wallet under
-/// `dir`.
-pub struct GatewayOpener {
-    pub dir: PathBuf,
-    pub span: Span,
-}
+/// The kinds of network a gateway is on (see
+/// [`hyperb_cassis_wallet::config::KINDS`]): those a payee can be paid on
+/// while offline.
+pub const KINDS: [&str; 6] = [
+    "arkade",
+    "cashu",
+    "liquid",
+    "fedimint",
+    "bitcoin",
+    "rootstock",
+];
 
-impl Opener<NetworkConfig> for GatewayOpener {
-    fn open<'a>(
-        &'a self,
-        id: &'a NetworkId,
-        config: &'a NetworkConfig,
-    ) -> BoxFuture<'a, Result<Opened, String>> {
-        Box::pin(async move {
-            let settings = config.settings(id, &self.dir)?;
-            let (network, wallet) = cassis_networks::open_wallet(id, &settings, &self.span).await?;
-            Ok(Opened {
-                network,
-                wallet: Some(wallet),
-            })
-        })
-    }
-}
-
-impl Daemon for Gateway {
-    fn in_flight(&self, id: &NetworkId) -> usize {
-        Gateway::in_flight(self, id)
-    }
-
-    fn add_network(&self, network: Arc<dyn Network>) {
+impl Host for Gateway {
+    fn opened(&self, network: Arc<dyn Network>) {
         Gateway::add_network(self, network);
     }
 
-    fn remove_network(&self, id: &NetworkId) {
+    fn closed(&self, id: &NetworkId) {
         Gateway::remove_network(self, id);
+    }
+
+    fn in_flight(&self, id: &NetworkId) -> usize {
+        Gateway::in_flight(self, id)
     }
 }
 
 pub struct GatewayAdmin {
     gateway: Gateway,
     file: ConfigFile<Config>,
-    networks: Arc<Networks<NetworkConfig>>,
+    wallets: Arc<WalletAdmin>,
     relay: Option<String>,
-    refresh: Refresh,
 }
 
 impl GatewayAdmin {
-    /// The interface of `gateway`, over its `file` and the `networks` it
-    /// has. `relay` is its home relay.
+    /// The interface of `gateway`, over its `file` and the `wallets` that
+    /// keep its networks. `relay` is its home relay.
     pub fn new(
         gateway: Gateway,
         file: ConfigFile<Config>,
-        networks: Arc<Networks<NetworkConfig>>,
+        wallets: Arc<WalletAdmin>,
         relay: Option<String>,
-        refresh: Refresh,
     ) -> Arc<Self> {
         Arc::new(Self {
             gateway,
             file,
-            networks,
+            wallets,
             relay,
-            refresh,
         })
     }
 
     /// Run as the config says now.
     fn apply(&self) {
-        let config = self.file.get();
-        self.gateway.set_policy(config.terms);
-        self.networks
-            .sync_in_background(config.networks, None, &self.refresh);
+        self.gateway.set_policy(self.file.get().terms);
     }
 
     fn key(&self) -> XOnlyPubKey {
@@ -191,9 +167,7 @@ impl GatewayAdmin {
             .children([identity, activity])
     }
 
-    fn networks(&self, now: u64) -> Node {
-        let config = self.file.get();
-        let (closing, cards) = config_cards(&self.networks, &config.networks, "payment", now);
+    fn networks(&self) -> Node {
         tab("tab/networks")
             .label("Networks")
             .child(text("networks/help").variant("caption").text(
@@ -202,13 +176,7 @@ impl GatewayAdmin {
                  through it settle, which waits for payees to claim or for their HTLCs to \
                  expire.",
             ))
-            .children(closing)
-            .children([
-                list("networks")
-                    .empty("No networks yet: add one below.")
-                    .children(cards),
-                new_network(&OFFLINE_KINDS),
-            ])
+            .children(self.wallets.view())
     }
 
     fn forwards(&self, forwards: &[PayeeHtlc], now: u64) -> Node {
@@ -323,7 +291,7 @@ impl App for GatewayAdmin {
     fn drafts(&self) -> Map<String, Value> {
         let config = self.file.get();
         let terms = config.terms;
-        let mut drafts = config_drafts(&config.networks, true);
+        let mut drafts = Map::new();
         drafts.insert(
             "terms".into(),
             json!({
@@ -337,17 +305,13 @@ impl App for GatewayAdmin {
         drafts
     }
 
-    fn new_drafts(&self) -> Map<String, Value> {
-        Map::from_iter([new_network_draft()])
-    }
-
     fn tabs(&self, access: Node) -> Vec<Node> {
         let now = unix_now();
         let mut forwards = self.listed("forwards", self.gateway.payee_htlcs());
         forwards.sort_by_key(|forward| std::cmp::Reverse(forward.created_at));
         vec![
             self.overview(&forwards, now),
-            self.networks(now),
+            self.networks(),
             self.forwards(&forwards, now),
             self.authorizations(now),
             access,
@@ -368,27 +332,17 @@ impl App for GatewayAdmin {
                 self.apply();
                 Ok("Terms saved".into())
             }
-            name if name.starts_with("network.") => self.networks.act(
-                name,
-                args,
-                &self.file,
-                |config: &Config| &config.networks,
-                &OFFLINE_KINDS,
-                &self.refresh,
-            ),
-            name if name.starts_with("wallet.") => {
-                self.networks.wallets.act(name, args, &self.refresh)
-            }
             other => Err(format!("unknown action {other}")),
         }
     }
 
-    fn tick(self: Arc<Self>, pages_open: bool) {
-        self.file.reload_if_modified();
-        // Also picks up changes left waiting for payments to settle.
-        self.apply();
-        if pages_open {
-            self.networks.wallets.keep_fresh(&self.refresh);
+    fn wallets(&self) -> Option<Arc<WalletAdmin>> {
+        Some(self.wallets.clone())
+    }
+
+    fn tick(self: Arc<Self>, _pages_open: bool) {
+        if self.file.reload_if_modified() {
+            self.apply();
         }
     }
 }
