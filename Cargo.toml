@@ -31,7 +31,7 @@ bitcoin = "0.32.102"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
 bip39 = "2.2.2"
 chacha20 = "0.9.1"
-cdk = { version = "0.17.3", features = ["wallet"] }
+cdk = { git = "https://github.com/cashubtc/cdk", rev = "e133ed83e095f7d490478c2330bb1cf0e1617efa", features = ["wallet"] }
 clap = { version = "4.6.6", features = ["derive"] }
 futures = "0.3.33"
 fs2 = "0.4"

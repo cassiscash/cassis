@@ -6,7 +6,7 @@ use cdk::dhke::blind_message;
 use cdk::nuts::nut00::{BlindedMessage, Proof};
 use cdk::nuts::nut01::SecretKey;
 use cdk::nuts::nut02::Id as KeysetId;
-use cdk::nuts::nut10::{Secret as Nut10Secret, SpendingConditions};
+use cdk::nuts::nut10::SpendingConditions;
 use cdk::nuts::nut14::HTLCWitness;
 use cdk::nuts::{Conditions, SigFlag, Witness};
 use cdk::secp256k1::hashes::Hash as _;
@@ -107,8 +107,7 @@ pub fn htlc_outputs(
         .filter(|bit| amount_sat & (1 << bit) != 0)
         .map(|bit| {
             let amount = Amount::from(1u64 << bit);
-            let nut10: Nut10Secret = conditions.clone().into();
-            let secret: Secret = nut10.try_into().map_err(NetworkError::invalid)?;
+            let secret = Secret::try_from(conditions.clone()).map_err(NetworkError::invalid)?;
             let (blinded, r) =
                 blind_message(&secret.to_bytes(), None).map_err(NetworkError::invalid)?;
             Ok((
@@ -173,11 +172,10 @@ mod tests {
             Some(conditions),
         )
         .unwrap();
-        let nut10: Nut10Secret = spending.into();
         Proof {
             amount: Amount::from(1),
             keyset_id: KeysetId::from_str("009a1f293253e41e").unwrap(),
-            secret: nut10.try_into().unwrap(),
+            secret: Secret::try_from(spending).unwrap(),
             c: SecretKey::generate().public_key(),
             witness: None,
             dleq: None,
