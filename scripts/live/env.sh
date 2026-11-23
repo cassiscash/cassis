@@ -20,6 +20,8 @@ M1="cashu::127.0.0.1:3338"
 M2="cashu::127.0.0.1:3339"
 MM="$MUTINYNET_CASHU"
 R="rootstock::testnet"
+C="citrea::testnet"
+SN="starknet-wbtc::sepolia"
 A="$MUTINYNET_ARKADE"
 AL="arkade::127.0.0.1:7070"
 # Our federation, known once it ran DKG (scripts/live/fedimint.sh).
@@ -111,9 +113,11 @@ start_daemon() {
 ADMIN_JS='
 function fail(message) { throw new Error(message); }
 // Send an action and wait for its outcome: failures only show on the page.
+// The wallets (`network.*`, `wallet.*`) report under `hw/`.
 function act(name, payload) {
+  const result = /^(network|wallet)\./.test(name) ? "hw/result" : "result";
   action(name, payload);
-  const notice = wait(m => m.kind == "element" && m.id == "result").element.attrs;
+  const notice = wait(m => m.kind == "element" && m.id == result).element.attrs;
   if (notice.variant == "failure") fail(name + ": " + notice.text);
   return notice.text;
 }
@@ -129,7 +133,7 @@ function until(check, secs) {
 }
 // The text of the element under a network, if it is there.
 function under(id, part) {
-  const found = element("network/" + id + "/" + part);
+  const found = element("hw/" + id + "/" + part);
   return found ? found.attrs : undefined;
 }
 // Wait for the wallet of a network to be done, returning its last outcome.

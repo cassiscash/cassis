@@ -37,6 +37,8 @@ router_networks() {
     r5) echo "$A $AL" ;;
     r6) echo "$M2 $MM" ;;
     r7) echo "$AL $M2" ;;
+    r8) echo "$M1 $C" ;;
+    r9) echo "$C $SN" ;;
     *) echo "$1: not in router_networks" >&2; return 1 ;;
   esac
 }
@@ -66,6 +68,23 @@ TOML
   )
 }
 
+# Add <network> to router <name> through its admin interface, unless its
+# config already has it: `network.add` takes the network as the kind and
+# chain, mint or invite code its form asks for.
+network_add() {
+  local name="$1" id="$2" kind param="" chain="" mint="" invite=""
+  kind="${id%%::*}"
+  [[ "$id" == *::* ]] && param="${id#*::}"
+  grep -qF "[networks.\"$id\"]" "$LIVE/nodes/$name/config.toml" && return 0
+  grep -qxF "[networks.$id]" "$LIVE/nodes/$name/config.toml" && return 0
+  case "$kind" in
+    cashu) mint="$param" ;;
+    fedimint) invite="$param" ;;
+    *) chain="$param" ;;
+  esac
+  admin_act "$name" network.add "{\"draft\":\"new_network\",\"kind\":\"$kind\",\"chain\":\"$chain\",\"mint\":\"$mint\",\"invite\":\"$invite\"}"
+}
+
 route() {
   local name="$1" first second from to
   read -r first second <<< "$(router_networks "$name")"
@@ -73,7 +92,7 @@ route() {
   write_config "$name"
   start_daemon "$name" "$CASSIS_ROUTERD" --data-dir
   for network in "$first" "$second"; do
-    admin_act "$name" network.set "{\"id\":\"$network\"}"
+    network_add "$name" "$network"
   done
   for ends in "$first $second" "$second $first"; do
     read -r from to <<< "$ends"
