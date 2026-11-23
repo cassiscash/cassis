@@ -82,8 +82,8 @@ pub const TESTNET_WATERFALLS_URL: &str = "https://waterfalls.liquidwebwallet.org
 /// Liquid blocks land about every minute.
 pub const BLOCK_TIME_SECS: u64 = 60;
 /// Fee rate in sats/kilo-vbyte for lockups, claims and refunds
-/// (0.2 sat/vbyte — Liquid is cheap).
-const FEE_RATE_SATS_KVB: f32 = 200.0;
+/// (0.1 sat/vbyte — Liquid is cheap).
+const FEE_RATE_SATS_KVB: f32 = 100.0;
 /// Non-final nSequence so the tx's nLockTime (CLTV) is enforced.
 /// Also the BIP-125 boundary: any input sequence *below* this value
 /// signals replace-by-fee, which the 0-conf trust model forbids.
@@ -1154,8 +1154,8 @@ mod tests {
 
     #[test]
     fn min_lock_covers_the_claim_fee_and_dust() {
-        // A 394 vbyte claim at 0.2 sat/vbyte, plus 435 sats of dust.
-        assert_eq!(min_lock_sats(&test_pubkey(0xaa)), 79 + 435);
+        // A 394 vbyte claim at 0.1 sat/vbyte, plus 435 sats of dust.
+        assert_eq!(min_lock_sats(&test_pubkey(0xaa)), 40 + 435);
     }
 
     #[test]
