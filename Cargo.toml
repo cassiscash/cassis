@@ -120,5 +120,5 @@ cassis-bark-lightning = { path = "networks/cassis-bark-lightning" }
 
 # Bark with hash-only lightning receives (preimage given later), from
 # our fork of https://gitlab.com/ark-bitcoin/bark.
-bark-wallet = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "7d735a7382c15c1e530c6d85ebe0f96519843332", default-features = false, features = ["sqlite", "native", "rand", "tls-webpki-roots"] }
-bark-bitcoin-ext = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "7d735a7382c15c1e530c6d85ebe0f96519843332" }
+bark-wallet = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "441f19d2f2794370536f65a758f06dae8a086eff", default-features = false, features = ["sqlite", "native", "rand", "tls-webpki-roots"] }
+bark-bitcoin-ext = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "441f19d2f2794370536f65a758f06dae8a086eff" }
