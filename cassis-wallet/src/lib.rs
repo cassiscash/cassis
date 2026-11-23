@@ -14,5 +14,5 @@ pub mod home;
 pub mod node;
 pub mod stored;
 
-pub use home::{open_db, routine_checks, Home};
+pub use home::{Home, open_db, routine_checks};
 pub use node::{Node, NodeConfig};

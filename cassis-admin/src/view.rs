@@ -6,9 +6,9 @@
 
 use crate::{Access, AdminConfig, Identity};
 use hypereffect::vtree::{
-    badge, button, card, checkbox, column, input, list, notice, row, tabs, text, Node,
+    Node, badge, button, card, checkbox, column, input, list, notice, row, tabs, text,
 };
-use hypereffect::{cel, json, Handler, Value};
+use hypereffect::{Handler, Value, cel, json};
 use sha2::{Digest, Sha256};
 
 /// A button sending `name` with `payload`, disabled while an action of
@@ -165,11 +165,13 @@ pub(crate) fn page(
             .title("Saved, applies on restart")
             .text("Restarting will move the admin interface.")
     });
-    vec![column("page")
-        .child(header)
-        .children(flash_notice(flash))
-        .children(pending)
-        .child(tabs("tabs").bind("_tab").children(children))]
+    vec![
+        column("page")
+            .child(header)
+            .children(flash_notice(flash))
+            .children(pending)
+            .child(tabs("tabs").bind("_tab").children(children)),
+    ]
 }
 
 /// The page of a session not let in.
@@ -182,20 +184,22 @@ pub(crate) fn locked(
         Access::Local => "",
         Access::Peer(key) => key.as_str(),
     };
-    vec![column("page")
-        .child(title(identity))
-        .children(flash_notice(flash))
-        .children([
-            notice("locked")
-                .variant("warning")
-                .title("Not let in")
-                .text(format!(
-                    "This {} does not know your key. Open the pairing link it prints on its \
+    vec![
+        column("page")
+            .child(title(identity))
+            .children(flash_notice(flash))
+            .children([
+                notice("locked")
+                    .variant("warning")
+                    .title("Not let in")
+                    .text(format!(
+                        "This {} does not know your key. Open the pairing link it prints on its \
                      console, or add your key from its admin page on its own machine.",
-                    identity.what
-                )),
-            fact("locked/key", "Your key", key),
-        ])]
+                        identity.what
+                    )),
+                fact("locked/key", "Your key", key),
+            ]),
+    ]
 }
 
 /// What the Access tab shows.

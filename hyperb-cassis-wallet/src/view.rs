@@ -5,13 +5,13 @@
 
 use crate::args::Args;
 use crate::config::{self, Entry, Fields};
-use crate::{abilities, Funds, Slot, State, Status};
+use crate::{Funds, Slot, State, Status, abilities};
 use cassis_core::NetworkId;
 use cassis_networks::Can;
 use hypereffect::vtree::{
-    badge, button, card, column, divider, input, notice, row, select, tab, tabs, text, Node,
+    Node, badge, button, card, column, divider, input, notice, row, select, tab, tabs, text,
 };
-use hypereffect::{cel, json, Handler, Value};
+use hypereffect::{Handler, Value, cel, json};
 
 /// A short stable id for what cannot go in a signal path as it is.
 fn hash(text: &str) -> String {
@@ -68,7 +68,7 @@ pub fn entry_draft(entry: &Entry) -> Value {
 }
 
 /// The drafts of the forms of `id`'s wallet, empty.
-pub fn wallet_drafts(id: &str) -> impl Iterator<Item = (String, Value)> {
+pub fn wallet_drafts(id: &str) -> impl Iterator<Item = (String, Value)> + use<> {
     let forms = [
         ("send", json!({"to": "", "amount_sat": null})),
         ("issue", json!({"amount_sat": null})),
@@ -606,8 +606,10 @@ fn edit_fields(id: &str, entry: &Entry) -> Vec<Node> {
     let el = |part: &str| format!("hw/{id}/details/{part}");
     let d = |field: &str| format!("hw.{}.{field}", network_draft(id));
     match id.split_once("::").map_or(id, |(kind, _)| kind) {
-        "arkade" | "bitcoin" => vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
-            .placeholder("the public one")],
+        "arkade" | "bitcoin" => vec![
+            field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
+                .placeholder("the public one"),
+        ],
         "lightning" if entry.bark.is_some() => bark_fields(&el, &d),
         "lightning" => lnd_fields(&el, &d),
         _ => Vec::new(),
@@ -684,8 +686,10 @@ fn new_network(kinds: &[config::Kind]) -> Node {
                 vec![field(el("invite"), "Invite code", &d("invite")).placeholder("fed1…")]
             }
             "arkade" | "bitcoin" => {
-                vec![field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
-                    .placeholder("the public one")]
+                vec![
+                    field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
+                        .placeholder("the public one"),
+                ]
             }
             "lnd" => lnd_fields(&el, &d),
             "bark" => bark_fields(&el, &d),

@@ -59,11 +59,11 @@ pub mod config;
 mod view;
 
 use args::Args;
-use cassis_core::{unix_now, Network, NetworkId};
+use cassis_core::{Network, NetworkId, unix_now};
 use cassis_networks::{Address, Balance, Can, Op, Wallet};
 pub use config::{ConfigFile, Entry};
 use hypereffect::vtree::Node;
-use hypereffect::{json, Action, Value};
+use hypereffect::{Action, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
-use tracing::{info, warn, Instrument, Span};
+use tracing::{Instrument, Span, info, warn};
 
 /// How often the balances of the wallets are read while a page is open.
 const FUNDS_INTERVAL: u64 = 60;
@@ -635,11 +635,11 @@ impl WalletAdmin {
     }
 
     fn wait(&self, id: &str, payments: usize) {
-        if let Some(slot) = self.state().slots.get_mut(id) {
-            if slot.status != Status::Waiting(payments) {
-                info!("{id}: changes wait for {payments} payment(s) in flight");
-                slot.status = Status::Waiting(payments);
-            }
+        if let Some(slot) = self.state().slots.get_mut(id)
+            && slot.status != Status::Waiting(payments)
+        {
+            info!("{id}: changes wait for {payments} payment(s) in flight");
+            slot.status = Status::Waiting(payments);
         }
     }
 

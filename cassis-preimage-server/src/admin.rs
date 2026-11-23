@@ -6,21 +6,21 @@
 //! the config file only, and applied as it changes; it has no actions
 //! beyond what every daemon has.
 
-use crate::config::{fill_mnemonics, Config};
-use crate::db::Payment;
 use crate::PreimageServer;
+use crate::config::{Config, fill_mnemonics};
+use crate::db::Payment;
 use cassis_admin::networks::{Daemon, NetworkConfig, Networks, Opened, Opener};
 use cassis_admin::view::{ago, fact, sat, stat, until};
 use cassis_admin::{AdminConfig, AdminEdit, App, Args, ConfigFile, Identity, Refresh};
 use cassis_core::routing::{autohue, autoname};
-use cassis_core::{unix_now, Bytes32, Network, NetworkId, XOnlyPubKey};
+use cassis_core::{Bytes32, Network, NetworkId, XOnlyPubKey, unix_now};
 use cassis_wallet::stored;
 use futures::future::BoxFuture;
-use hypereffect::vtree::{badge, card, column, list, notice, row, tab, text, Node};
+use hypereffect::vtree::{Node, badge, card, column, list, notice, row, tab, text};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{warn, Span};
+use tracing::{Span, warn};
 
 /// The most payments a tab lists, newest first.
 const LISTED: usize = 100;

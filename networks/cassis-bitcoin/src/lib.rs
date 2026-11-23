@@ -49,8 +49,8 @@
 
 use async_trait::async_trait;
 use bitcoin::absolute;
-use bitcoin::hashes::ripemd160;
 use bitcoin::hashes::Hash;
+use bitcoin::hashes::ripemd160;
 use bitcoin::key::Keypair;
 use bitcoin::key::Secp256k1;
 use bitcoin::key::TapTweak;
@@ -63,14 +63,14 @@ use bitcoin::sighash::{SighashCache, TapSighashType};
 use bitcoin::taproot::{LeafVersion, TapLeafHash, TaprootBuilder};
 use bitcoin::transaction::Version;
 use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-use cassis_core::keys::{bip86_key, Mnemonic};
+use cassis_core::keys::{Mnemonic, bip86_key};
 use cassis_core::{
-    sats_for_msat, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
-    OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, MSAT_PER_SAT, Network, NetworkError, NetworkId,
+    OutgoingState, XOnlyPubKey, sats_for_msat,
 };
 use std::str::FromStr;
 use std::time::Duration;
-use tracing::{debug, info, Span};
+use tracing::{Span, debug, info};
 
 pub const MAINNET_ESPLORA_URL: &str = "https://mempool.space/api";
 pub const MUTINYNET_ESPLORA_URL: &str = "https://mutinynet.com/api";
@@ -904,12 +904,12 @@ impl BitcoinAdapter {
         preimage: Option<Bytes32>,
         destination: Address,
     ) -> Result<bitcoin::Txid, NetworkError> {
-        if let Some(preimage) = &preimage {
-            if !options.matches_preimage(preimage) {
-                return Err(NetworkError::Invalid(
-                    "preimage does not match the HTLC payment hash".into(),
-                ));
-            }
+        if let Some(preimage) = &preimage
+            && !options.matches_preimage(preimage)
+        {
+            return Err(NetworkError::Invalid(
+                "preimage does not match the HTLC payment hash".into(),
+            ));
         }
         let verify_secp = Secp256k1::verification_only();
         let spk = options.taproot_spk(&verify_secp);

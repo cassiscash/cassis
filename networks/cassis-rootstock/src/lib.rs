@@ -29,15 +29,15 @@ use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::http::reqwest::Url;
 use async_trait::async_trait;
-use cassis_core::keys::{bip44_key, Mnemonic};
+use cassis_core::keys::{Mnemonic, bip44_key};
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
-    OutgoingState, PubKey,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId, OutgoingState,
+    PubKey, unix_now,
 };
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn, Span};
+use tracing::{Span, debug, info, warn};
 
 sol! {
     #[derive(Debug)]
@@ -499,7 +499,7 @@ impl RootstockAdapter {
     fn claim_target(&self) -> InvoiceTarget {
         InvoiceTarget::Rootstock {
             network: self.id.clone(),
-            target: self.claim_pubkey.clone(),
+            target: self.claim_pubkey,
         }
     }
 
@@ -622,7 +622,7 @@ impl Network for RootstockAdapter {
         match self.outcome(htlc, &swap).await {
             Ok(OutgoingState::Claimed(_)) => return Ok(()),
             Ok(OutgoingState::Refunded) => {
-                return Err(NetworkError::invalid("the lock was refunded"))
+                return Err(NetworkError::invalid("the lock was refunded"));
             }
             Ok(OutgoingState::Pending) | Err(_) => {}
         }
@@ -679,7 +679,7 @@ impl Network for RootstockAdapter {
         match self.outcome(htlc, &swap).await {
             Ok(OutgoingState::Refunded) => return Ok(()),
             Ok(OutgoingState::Claimed(_)) => {
-                return Err(NetworkError::invalid("the lock was claimed"))
+                return Err(NetworkError::invalid("the lock was claimed"));
             }
             Ok(OutgoingState::Pending) | Err(_) => {}
         }

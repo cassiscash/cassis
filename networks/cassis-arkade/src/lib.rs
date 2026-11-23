@@ -38,51 +38,51 @@ use ark_client::InMemorySwapStorage;
 use ark_client::OfflineClient;
 use ark_client::OfflineClientConfig;
 use ark_client::SqliteContractStore;
-use ark_core::contract::{SpendPath, SpendPathKind};
-use ark_core::intent::{self, IntentMessage};
-use ark_core::send::build_offchain_transactions;
-use ark_core::send::sign_ark_transaction;
-use ark_core::send::sign_checkpoint_transaction;
-use ark_core::send::OffchainTransactions;
-use ark_core::send::SendReceiver;
-use ark_core::send::VtxoInput;
-use ark_core::server::GetVtxosRequestFilter;
-use ark_core::server::VirtualTxOutPoint;
-pub use ark_core::vhtlc::{VhtlcOptions, VhtlcScript};
 use ark_core::ArkAddress;
 use ark_core::ArkNote;
 use ark_core::Asset;
 use ark_core::BoardingOutput;
 use ark_core::VTXO_CONDITION_KEY;
+use ark_core::contract::{SpendPath, SpendPathKind};
+use ark_core::intent::{self, IntentMessage};
+use ark_core::send::OffchainTransactions;
+use ark_core::send::SendReceiver;
+use ark_core::send::VtxoInput;
+use ark_core::send::build_offchain_transactions;
+use ark_core::send::sign_ark_transaction;
+use ark_core::send::sign_checkpoint_transaction;
+use ark_core::server::GetVtxosRequestFilter;
+use ark_core::server::VirtualTxOutPoint;
+pub use ark_core::vhtlc::{VhtlcOptions, VhtlcScript};
 use async_trait::async_trait;
-use bitcoin::absolute;
-use bitcoin::consensus::Decodable;
-use bitcoin::hashes::ripemd160;
-use bitcoin::hashes::Hash;
-use bitcoin::key::Keypair;
-use bitcoin::key::Secp256k1;
-use bitcoin::psbt;
-use bitcoin::relative;
-use bitcoin::secp256k1::schnorr;
-use bitcoin::secp256k1::Message;
-use bitcoin::taproot::LeafVersion;
 use bitcoin::Sequence;
 use bitcoin::TxOut;
 use bitcoin::VarInt;
 use bitcoin::XOnlyPublicKey;
-use cassis_core::keys::{bip86_key, Mnemonic};
+use bitcoin::absolute;
+use bitcoin::consensus::Decodable;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::ripemd160;
+use bitcoin::key::Keypair;
+use bitcoin::key::Secp256k1;
+use bitcoin::psbt;
+use bitcoin::relative;
+use bitcoin::secp256k1::Message;
+use bitcoin::secp256k1::schnorr;
+use bitcoin::taproot::LeafVersion;
+use cassis_core::keys::{Mnemonic, bip86_key};
 use cassis_core::{
-    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
-    NetworkId, OutgoingState, XOnlyPubKey, MSAT_PER_SAT,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, MSAT_PER_SAT, Network, NetworkError, NetworkId,
+    OutgoingState, XOnlyPubKey, sats_for_msat, unix_now,
 };
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::{debug, info, Span};
+use tracing::{Span, debug, info};
 
 /// Public mainnet operator. Serves gRPC + REST on 443.
 pub const MAINNET_SERVER_URL: &str = "https://arkade.computer";
@@ -470,7 +470,7 @@ impl ArkadeAdapter {
             (None, other) => {
                 return Err(format!(
                     "arkade operator {server_url} is on {other}: it needs an esplora URL"
-                ))
+                ));
             }
         };
         let secp = Secp256k1::new();
@@ -718,7 +718,8 @@ impl ArkadeAdapter {
         &mut psbt::Input,
         Message,
     ) -> Result<Vec<(schnorr::Signature, XOnlyPublicKey)>, ark_core::Error>
-           + Clone {
+    + Clone
+    + use<> {
         let keypair = self.keypair;
         let preimage = preimage.copied();
         move |input: &mut psbt::Input,
@@ -758,10 +759,10 @@ impl ArkadeAdapter {
         outputs: &[SendReceiver],
         change_address: &ArkAddress,
         sign_fn: impl Fn(
-                &mut psbt::Input,
-                Message,
-            ) -> Result<Vec<(schnorr::Signature, XOnlyPublicKey)>, ark_core::Error>
-            + Clone,
+            &mut psbt::Input,
+            Message,
+        ) -> Result<Vec<(schnorr::Signature, XOnlyPublicKey)>, ark_core::Error>
+        + Clone,
     ) -> Result<bitcoin::Txid, NetworkError> {
         let server_info = self
             .client

@@ -1,9 +1,9 @@
 //! Settlement: drive every journaled HTLC to its end.
 
-use super::{db_error, Node};
+use super::{Node, db_error};
 use crate::db::{Invoice, InvoiceState, PendingPayment, PendingPaymentHash};
 use cassis_core::network::{Htlc, OutgoingHtlcs, OutgoingState};
-use cassis_core::{unix_now, Bytes32, NetworkId};
+use cassis_core::{Bytes32, NetworkId, unix_now};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -101,7 +101,7 @@ impl Node {
 pub async fn settle_outgoing<T: OutgoingHtlcs + ?Sized>(network: &T, htlc: &Htlc) -> Outcome {
     match network.check_outgoing(htlc).await {
         Ok(OutgoingState::Claimed(preimage)) if htlc.payment_hash.matches_preimage(&preimage) => {
-            return Outcome::Claimed(preimage)
+            return Outcome::Claimed(preimage);
         }
         Ok(OutgoingState::Claimed(_)) => {
             warn!("{} reported a wrong preimage", network.network_id());

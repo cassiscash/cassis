@@ -32,14 +32,14 @@
 //! # peers = ["<64 hex>"]           # iroh keys of renderers let in
 //! ```
 
-use cassis_admin::config::write_private;
 pub use cassis_admin::AdminConfig;
-use cassis_core::keys::{generate_mnemonic, NodeKeys};
-use cassis_core::routing::DEFAULT_NOSTR_RELAYS;
+use cassis_admin::config::write_private;
 use cassis_core::NetworkId;
+use cassis_core::keys::{NodeKeys, generate_mnemonic};
+use cassis_core::routing::DEFAULT_NOSTR_RELAYS;
 use cassis_routerd::router::{RouteOffer, RoutingPolicy};
-use cassis_wallet::config::parse_secret;
 pub use cassis_wallet::config::NetworkConfig;
+use cassis_wallet::config::parse_secret;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -319,13 +319,13 @@ fn warn_if_readable_by_others(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            if metadata.permissions().mode() & 0o077 != 0 {
-                tracing::warn!(
-                    "{} holds secrets but others can read it: chmod 600 it",
-                    path.display()
-                );
-            }
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            tracing::warn!(
+                "{} holds secrets but others can read it: chmod 600 it",
+                path.display()
+            );
         }
     }
 }

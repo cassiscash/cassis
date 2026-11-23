@@ -9,13 +9,13 @@
 //! as the process runs, so reconnecting with the same pair shows the
 //! order again. A flow without an `id` gets an order of its own.
 
-use cassis_core::{unix_now, Invoice};
-use cassis_wallet::db::{InvoiceHash, InvoiceState};
+use cassis_core::{Invoice, unix_now};
 use cassis_wallet::Node;
+use cassis_wallet::db::{InvoiceHash, InvoiceState};
 use hypereffect::message::{encode_line, parse_line};
 use hypereffect::vtree::{self, button, card, column, input, list, notice, text};
-use hypereffect::{json, Action, Handler, Metadata, RendererMessage, ServerMessage};
-use iroh::endpoint::{presets, RecvStream, SendStream};
+use hypereffect::{Action, Handler, Metadata, RendererMessage, ServerMessage, json};
+use iroh::endpoint::{RecvStream, SendStream, presets};
 use iroh::{Endpoint, SecretKey};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

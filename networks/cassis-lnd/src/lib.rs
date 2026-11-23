@@ -11,22 +11,22 @@
 //!   failure means the funds are back.
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
-    OutgoingState, MSAT_PER_SAT,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, MSAT_PER_SAT, Network, NetworkError, NetworkId,
+    OutgoingState, unix_now,
 };
 use lightning_invoice::Bolt11Invoice;
-use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-use tracing::{debug, info, warn, Span};
+use tracing::{Span, debug, info, warn};
 
 const SEND_TIMEOUT_SECS: i32 = 60;
 /// Block interval used to turn expiries into CLTV deltas: 30s on

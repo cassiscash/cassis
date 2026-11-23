@@ -43,12 +43,12 @@ pub use config::{AdminConfig, AdminEdit, AdminSection, ConfigFile, DaemonConfig}
 
 use hyperb_cassis_wallet::{Drafts, WalletAdmin, Watching};
 use hypereffect::vtree::{self, Node};
-use hypereffect::{json, Action, Map, Metadata, RendererMessage, ServerMessage, Value};
+use hypereffect::{Action, Map, Metadata, RendererMessage, ServerMessage, Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tracing::{info, warn};
 
 /// How often open pages are brought up to date.
@@ -331,15 +331,15 @@ impl Server {
 
     fn on_action(self: &Arc<Self>, session: &Arc<Session>, action: &Action) {
         // The wallets show what their actions did in their own page.
-        if self.allowed(&session.access) {
-            if let Some(handled) = self.app.wallets().and_then(|wallets| wallets.act(action)) {
-                session.signal(json!({"_busy": false}));
-                if let Some(patch) = handled.patch {
-                    session.signal(patch);
-                }
-                self.bring_up_to_date();
-                return;
+        if self.allowed(&session.access)
+            && let Some(handled) = self.app.wallets().and_then(|wallets| wallets.act(action))
+        {
+            session.signal(json!({"_busy": false}));
+            if let Some(patch) = handled.patch {
+                session.signal(patch);
             }
+            self.bring_up_to_date();
+            return;
         }
         let result = if self.allowed(&session.access) {
             self.act(&action.name, &Args::of(action))
@@ -352,11 +352,11 @@ impl Server {
         }
         let mut reset = json!({"_busy": false});
         // A form that added or moved something is emptied for the next one.
-        if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("new_")) {
-            if result.is_ok() {
-                let fresh = all_new_drafts(&*self.app);
-                reset["d"] = json!({draft: fresh.get(draft)});
-            }
+        if let Some(draft) = Args::draft(action).filter(|draft| draft.starts_with("new_"))
+            && result.is_ok()
+        {
+            let fresh = all_new_drafts(&*self.app);
+            reset["d"] = json!({draft: fresh.get(draft)});
         }
         session.signal(reset);
         lock(&session.shown).flash = Some(result);
@@ -477,10 +477,10 @@ impl Server {
                 .map(ServerMessage::to_line)
                 .unwrap_or_default();
             // Before the page, whose forms are bound to them.
-            if let Some(wallets) = wallets.as_ref().filter(|_| self.allowed(&session.access)) {
-                if let Some(drafts) = wallets.signals(&mut lock(&session.wallet_drafts)) {
-                    lines.push_str(&ServerMessage::signal(drafts).to_line());
-                }
+            if let Some(wallets) = wallets.as_ref().filter(|_| self.allowed(&session.access))
+                && let Some(drafts) = wallets.signals(&mut lock(&session.wallet_drafts))
+            {
+                lines.push_str(&ServerMessage::signal(drafts).to_line());
             }
             let mut shown = lock(&session.shown);
             if shown.name != identity.name {
@@ -521,7 +521,7 @@ fn new_secret() -> String {
 pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut term) = signal(SignalKind::terminate()) {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}

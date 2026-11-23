@@ -1,9 +1,9 @@
 //! Peer-to-peer transport over iroh: one bidirectional stream per
 //! request, carrying one JSON [`Request`] and one JSON [`Response`].
 
-use crate::protocol::{Request, Response, ALPN};
+use crate::protocol::{ALPN, Request, Response};
 use futures::future::BoxFuture;
-use iroh::endpoint::{presets, Connection};
+use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl, SecretKey};
 use std::str::FromStr;
 use std::sync::Arc;

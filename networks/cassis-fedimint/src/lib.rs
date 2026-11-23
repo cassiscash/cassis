@@ -21,11 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::{Hash, sha256};
 use cassis_core::keys::Mnemonic;
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
-    OutgoingState, XOnlyPubKey,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId, OutgoingState,
+    XOnlyPubKey, unix_now,
 };
 use fedimint_client::{Client, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
@@ -34,15 +34,15 @@ use fedimint_core::core::OperationId as FedimintOperationId;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleRegistry;
-use fedimint_core::{secp256k1, Amount, OutPoint, TransactionId};
+use fedimint_core::{Amount, OutPoint, TransactionId, secp256k1};
 use fedimint_derive_secret::DerivableSecret;
 use fedimint_eventlog::EventLogId;
+use fedimint_lnv2_client::LightningClientModule;
 use fedimint_lnv2_client::common::contracts::{OutgoingContract, PaymentImage};
 use fedimint_lnv2_client::htlc::HtlcError as LnHtlcError;
-use fedimint_lnv2_client::LightningClientModule;
 use fedimint_mintv2_client::{ECash, MintClientInit, MintClientModule};
 use fedimint_walletv2_client::{FinalSendOperationState, WalletClientInit, WalletClientModule};
-use tracing::{info, Span};
+use tracing::{Span, info};
 
 /// Salt of fedimint's own BIP39 root secret
 /// (`Bip39RootSecretStrategy`), which the federation id is added to
@@ -540,7 +540,7 @@ impl Network for FedimintAdapter {
             Err(LnHtlcError::NotExpired(blocks)) => {
                 return Err(NetworkError::network(format!(
                     "contract expires in {blocks} more blocks"
-                )))
+                )));
             }
             // Gone: refunded by an earlier attempt of ours, or claimed.
             Err(LnHtlcError::ContractNotFound) => Self::refund_operation(outpoint),

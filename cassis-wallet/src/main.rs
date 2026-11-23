@@ -25,23 +25,23 @@ mod order_demo;
 mod wallets;
 
 use cassis_core::offline::{
-    endpoint_public_key, PayeeGatewayReceiveAuthorization, DEFAULT_MIN_FINAL_TIMEOUT_SECS,
+    DEFAULT_MIN_FINAL_TIMEOUT_SECS, PayeeGatewayReceiveAuthorization, endpoint_public_key,
 };
 use cassis_core::protocol::{GatewayInvoiceFor, Request, Response};
 use cassis_core::routing::{self, DEFAULT_NOSTR_RELAYS, TEST_NOSTR_RELAYS};
 use cassis_core::transport::{PeerAddr, Transport};
-use cassis_core::{unix_now, Bytes32, Invoice, NetworkId};
+use cassis_core::{Bytes32, Invoice, NetworkId, unix_now};
 use cassis_wallet::db::{Direction, InvoiceHash, InvoiceState};
 use cassis_wallet::node::{
-    authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
-    DEFAULT_MAX_ROUTES,
+    DEFAULT_MAX_ROUTES, OfflineEndpoints, authorize_gateway, create_gateway_invoice,
+    redeem_offline_payments,
 };
 use cassis_wallet::{Home, Node, NodeConfig};
 use clap::{Parser, Subcommand};
 use iroh_base::PublicKey;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{info_span, Span};
+use tracing::{Span, info_span};
 
 #[derive(Parser)]
 #[command(name = "cassis-wallet", about = "Cassis wallet: pay and receive")]
@@ -331,20 +331,20 @@ async fn run(cli: Cli) -> Result<(), String> {
                             config.insert("esplora_url", esplora.as_str().into());
                         }
                         table.insert("bark", toml_edit::value(config));
-                    } else if network.kind() == "lightning" {
-                        if let Some(rest_url) = &lnd_rest_url {
-                            let mut config = toml_edit::InlineTable::new();
-                            config.insert("rest_url", rest_url.as_str().into());
-                            for (key, path) in [
-                                ("tls_cert_path", &lnd_tls_cert),
-                                ("macaroon_path", &lnd_macaroon),
-                            ] {
-                                if let Some(path) = path {
-                                    config.insert(key, path.display().to_string().into());
-                                }
+                    } else if network.kind() == "lightning"
+                        && let Some(rest_url) = &lnd_rest_url
+                    {
+                        let mut config = toml_edit::InlineTable::new();
+                        config.insert("rest_url", rest_url.as_str().into());
+                        for (key, path) in [
+                            ("tls_cert_path", &lnd_tls_cert),
+                            ("macaroon_path", &lnd_macaroon),
+                        ] {
+                            if let Some(path) = path {
+                                config.insert(key, path.display().to_string().into());
                             }
-                            table.insert("lnd", toml_edit::value(config));
                         }
+                        table.insert("lnd", toml_edit::value(config));
                     }
                     Ok(())
                 })?;
@@ -493,7 +493,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let invoice = match answer? {
                 Response::GatewayInvoice(Ok(invoice)) => invoice,
                 Response::GatewayInvoice(Err(reason)) | Response::Error(reason) => {
-                    return Err(format!("gateway refused: {reason}"))
+                    return Err(format!("gateway refused: {reason}"));
                 }
                 other => return Err(format!("unexpected answer from gateway: {other:?}")),
             };
@@ -560,7 +560,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                             hop.error
                         );
                     }
-                    return Err(failure.message.into());
+                    return Err(failure.message);
                 }
             }
         }
@@ -828,7 +828,7 @@ async fn redeem_from(
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     for (preimage_server, networks) in servers {
-        let id = preimage_server.id.clone();
+        let id = preimage_server.id;
         let opened = match home.open_networks(&networks, span).await {
             Ok(opened) => opened,
             Err(error) => {

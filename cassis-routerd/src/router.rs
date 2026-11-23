@@ -12,10 +12,10 @@ use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId};
 use cassis_core::protocol::{Discard, Execute, FailReason, Prepare, Request, Response, Settle};
 use cassis_core::routing::{self, RouteAnnouncement};
 use cassis_core::transport::Handler;
-use cassis_core::{unix_now, Bytes32, OperationId};
-use cassis_wallet::node::{settle_outgoing, verify_incoming, Outcome, Unverified, INLINE_WAIT};
-use cassis_wallet::stored::StoredFailReason;
+use cassis_core::{Bytes32, OperationId, unix_now};
 use cassis_wallet::Node;
+use cassis_wallet::node::{INLINE_WAIT, Outcome, Unverified, settle_outgoing, verify_incoming};
+use cassis_wallet::stored::StoredFailReason;
 use iroh_base::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -484,10 +484,8 @@ impl Router {
             Ok(hop) => hop.is_some(),
             Err(error) => return Response::Error(error),
         };
-        if !known {
-            if let Err(error) = self.start_hop(execute.clone(), peer).await {
-                return Response::Error(error);
-            }
+        if !known && let Err(error) = self.start_hop(execute.clone(), peer).await {
+            return Response::Error(error);
         }
         // Answer right away when forwarding is quick.
         let deadline = tokio::time::Instant::now() + INLINE_WAIT;
@@ -773,7 +771,7 @@ impl Router {
             let ids: Vec<OperationId> = reservations
                 .iter()
                 .filter(|(_, reservation)| reservation.expires_at <= now)
-                .map(|(id, _)| id.clone())
+                .map(|(id, _)| *id)
                 .collect();
             ids.iter()
                 .filter_map(|id| reservations.remove(id))
@@ -788,13 +786,13 @@ impl Router {
 
     /// Release what `network` set up to receive `payment_hash`.
     async fn release(&self, network: &NetworkId, payment_hash: Bytes32) {
-        if let Ok(opened) = self.node().network(network) {
-            if let Err(error) = opened.cancel_receive(payment_hash).await {
-                warn!(
-                    "releasing reservation {} on {network}: {error}",
-                    payment_hash.short()
-                );
-            }
+        if let Ok(opened) = self.node().network(network)
+            && let Err(error) = opened.cancel_receive(payment_hash).await
+        {
+            warn!(
+                "releasing reservation {} on {network}: {error}",
+                payment_hash.short()
+            );
         }
     }
 
@@ -924,7 +922,7 @@ impl Router {
                     }
                 }
                 Outcome::Refunded => {
-                    return self.fail(&hop, FailReason::PreimageNotReceived, true).await
+                    return self.fail(&hop, FailReason::PreimageNotReceived, true).await;
                 }
             }
         }

@@ -12,7 +12,7 @@ use crate::offline::GatewayDestination;
 use crate::primitives::{Bytes32, PubKey, XOnlyPubKey};
 use async_trait::async_trait;
 use serde::ser::SerializeStruct;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt;
@@ -855,7 +855,7 @@ pub trait Network: Send + Sync {
 
     /// Claim a verified incoming HTLC by revealing `preimage`.
     async fn claim_incoming_htlc(&self, htlc: &Htlc, preimage: Bytes32)
-        -> Result<(), NetworkError>;
+    -> Result<(), NetworkError>;
 
     /// Lock at least `amount_msat` to `target` behind `payment_hash`,
     /// refundable no earlier than `expiry`. Returns once the receiver

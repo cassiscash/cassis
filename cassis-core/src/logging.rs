@@ -1,11 +1,11 @@
 use std::fmt::Write;
 
 use tracing::{Event, Subscriber};
-use tracing_subscriber::fmt::{format::Writer, FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, format::Writer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::{LookupSpan, SpanRef};
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";

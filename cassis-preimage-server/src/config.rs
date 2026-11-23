@@ -17,8 +17,8 @@
 use cassis_admin::config::put;
 use cassis_admin::networks::NetworkConfig;
 use cassis_admin::{AdminSection, ConfigFile, DaemonConfig};
-use cassis_core::keys::generate_mnemonic;
 use cassis_core::NetworkId;
+use cassis_core::keys::generate_mnemonic;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 

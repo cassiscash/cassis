@@ -36,14 +36,14 @@ use std::time::Duration;
 use tracing::{Instrument, Span};
 
 pub use offline::{
-    authorize_gateway, create_gateway_invoice, redeem_offline_payments, OfflineEndpoints,
-    RedeemReport,
+    OfflineEndpoints, RedeemReport, authorize_gateway, create_gateway_invoice,
+    redeem_offline_payments,
 };
 pub use payee::{build_invoice, create_invoice};
-pub use payer::{FailedHop, HopError, PayFailure, PayPhase, PayReport, DEFAULT_MAX_ROUTES};
+pub use payer::{DEFAULT_MAX_ROUTES, FailedHop, HopError, PayFailure, PayPhase, PayReport};
 pub use releaser::{PreimageReleaser, Released};
-pub use settle::{settle_outgoing, Outcome};
-pub use verify::{verify_incoming, Unverified};
+pub use settle::{Outcome, settle_outgoing};
+pub use verify::{Unverified, verify_incoming};
 
 /// How long COMMIT works before answering [`Response::Pending`] instead
 /// of the outcome.

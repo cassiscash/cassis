@@ -18,8 +18,8 @@
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
 //! ```
 
-use cassis_core::keys::{generate_mnemonic, parse_wallet_mnemonic};
 use cassis_core::NetworkId;
+use cassis_core::keys::{generate_mnemonic, parse_wallet_mnemonic};
 use cassis_networks::NetworkSettings;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -435,9 +435,10 @@ mod tests {
     fn an_invalid_edit_writes_nothing() {
         let file = file("bad", "");
         let id = NetworkId::parse("lightning").unwrap();
-        assert!(file
-            .edit(|t| set(t, &id, &Fields::default(), false))
-            .is_err());
+        assert!(
+            file.edit(|t| set(t, &id, &Fields::default(), false))
+                .is_err()
+        );
         assert!(file.read().unwrap().is_empty());
     }
 }

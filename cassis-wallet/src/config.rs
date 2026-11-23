@@ -25,8 +25,8 @@
 //! bark `lightning`, fedimint's own root secret on `fedimint`. Back this
 //! file up, or the mnemonics.
 
-use cassis_core::keys::{generate_mnemonic, parse_wallet_mnemonic, Mnemonic, NodeKeys};
 use cassis_core::NetworkId;
+use cassis_core::keys::{Mnemonic, NodeKeys, generate_mnemonic, parse_wallet_mnemonic};
 use cassis_networks::NetworkSettings;
 use serde::Deserialize;
 use std::collections::BTreeMap;

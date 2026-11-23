@@ -2,8 +2,8 @@
 //! config document. Each edit leaves what its arguments do not name as
 //! it is, comments included.
 
-use cassis_admin::config::{put, put_text};
 use cassis_admin::Args;
+use cassis_admin::config::{put, put_text};
 use cassis_core::NetworkId;
 use cassis_routerd::router::RouteOffer;
 use hypereffect::Value;
@@ -126,7 +126,7 @@ fn toml_int(n: u64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypereffect::{json, Action, Map};
+    use hypereffect::{Action, Map, json};
 
     fn args(payload: Value) -> Args {
         Args::of(&Action {

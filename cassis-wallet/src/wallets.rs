@@ -6,7 +6,7 @@
 #[allow(unused_imports)]
 use cassis_core::NetworkId;
 #[allow(unused_imports)]
-use cassis_wallet::{routine_checks, Home};
+use cassis_wallet::{Home, routine_checks};
 use clap::Subcommand;
 use tracing::Span;
 

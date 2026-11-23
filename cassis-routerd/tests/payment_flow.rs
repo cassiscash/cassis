@@ -5,17 +5,17 @@
 //! `cargo test -p cassis-routerd --test payment_flow -- --ignored`
 
 use async_trait::async_trait;
-use cassis_core::keys::{generate_mnemonic, NodeKeys};
+use cassis_core::keys::{NodeKeys, generate_mnemonic};
 use cassis_core::offline::endpoint_public_key;
 use cassis_core::protocol::{InvoiceReceiver, Metadata};
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
-    OutgoingState, XOnlyPubKey,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId, OutgoingState,
+    XOnlyPubKey, unix_now,
 };
 use cassis_routerd::db::{Db as RouterDb, HopState};
 use cassis_routerd::router::{RouteOffer, Router, RoutingPolicy};
 use cassis_wallet::db::{PendingPaymentHash, TransactionHash};
-use cassis_wallet::{open_db, Node, NodeConfig};
+use cassis_wallet::{Node, NodeConfig, open_db};
 use ritualistic::server::{CustomRelay, RelayInternals};
 use ritualistic::{Event, Filter};
 use std::collections::HashMap;
@@ -348,11 +348,13 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .and_then(|report| report.into_result())
         .unwrap_err();
     assert!(error.contains("invalid invoice signature"), "{error}");
-    assert!(!payer
-        .db()
-        .pending_payments()
-        .contains(PendingPaymentHash(tampered.body.payment_hash.0))
-        .unwrap());
+    assert!(
+        !payer
+            .db()
+            .pending_payments()
+            .contains(PendingPaymentHash(tampered.body.payment_hash.0))
+            .unwrap()
+    );
 
     // The endpoint named for the payee does not know the invoice: it
     // refuses at PREPARE, before anything is funded.
@@ -375,11 +377,13 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .and_then(|report| report.into_result())
         .unwrap_err();
     assert!(error.contains("payee refused: unknown invoice"), "{error}");
-    assert!(!payer
-        .db()
-        .pending_payments()
-        .contains(PendingPaymentHash(misdirected.body.payment_hash.0))
-        .unwrap());
+    assert!(
+        !payer
+            .db()
+            .pending_payments()
+            .contains(PendingPaymentHash(misdirected.body.payment_hash.0))
+            .unwrap()
+    );
 
     // The payer locks to a key the payee does not claim with: PREPARE
     // passes, COMMIT fails after funding, and both funded HTLCs stay
@@ -406,27 +410,33 @@ async fn payment_crosses_a_router_and_failures_stay_refundable() {
         .and_then(|report| report.into_result())
         .unwrap_err();
     assert!(error.contains("payee did not claim"), "{error}");
-    assert!(payer
-        .db()
-        .pending_payments()
-        .contains(PendingPaymentHash(unreachable.body.payment_hash.0))
-        .unwrap());
+    assert!(
+        payer
+            .db()
+            .pending_payments()
+            .contains(PendingPaymentHash(unreachable.body.payment_hash.0))
+            .unwrap()
+    );
     let forwarded = router
         .db()
         .hops()
         .by_payment_hash(unreachable.body.payment_hash.0)
         .unwrap();
-    assert!(forwarded
-        .iter()
-        .any(|hop| hop.state == HopState::Forwarded && hop.outgoing.is_some()));
+    assert!(
+        forwarded
+            .iter()
+            .any(|hop| hop.state == HopState::Forwarded && hop.outgoing.is_some())
+    );
     assert_eq!(router.db().hops().by_in_flight(true).unwrap().len(), 1);
     // Nothing is refunded before the expiry.
     router.settle_once().await;
     payer.settle_once().await;
-    assert!(chain_b
-        .0
-        .lock()
-        .unwrap()
-        .values()
-        .all(|lock| lock.state != LockState::Refunded));
+    assert!(
+        chain_b
+            .0
+            .lock()
+            .unwrap()
+            .values()
+            .all(|lock| lock.state != LockState::Refunded)
+    );
 }

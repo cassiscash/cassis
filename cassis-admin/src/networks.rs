@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::task::AbortHandle;
-use tracing::{info, warn, Instrument, Span};
+use tracing::{Instrument, Span, info, warn};
 
 /// Attempts at reopening a network, whose previous wallet may take a
 /// moment to let go of its files.
@@ -270,11 +270,11 @@ impl<C: Clone + PartialEq + Send + Sync + 'static> Networks<C> {
     }
 
     fn wait(&self, id: &str, payments: usize) {
-        if let Some(slot) = self.slots().get_mut(id) {
-            if slot.status != Status::Waiting(payments) {
-                info!("{id}: changes wait for {payments} payment(s) in flight");
-                slot.status = Status::Waiting(payments);
-            }
+        if let Some(slot) = self.slots().get_mut(id)
+            && slot.status != Status::Waiting(payments)
+        {
+            info!("{id}: changes wait for {payments} payment(s) in flight");
+            slot.status = Status::Waiting(payments);
         }
     }
 

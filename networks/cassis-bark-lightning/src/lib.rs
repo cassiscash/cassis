@@ -36,14 +36,14 @@ use bark::{Config, OpenWalletArgs, Wallet, WalletSeed};
 use bitcoin_ext::BlockDelta;
 use cassis_core::keys::Mnemonic;
 use cassis_core::{
-    unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId,
-    OutgoingState, MSAT_PER_SAT,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, MSAT_PER_SAT, Network, NetworkError, NetworkId,
+    OutgoingState, unix_now,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
-use tracing::{debug, info, Span};
+use tracing::{Span, debug, info};
 
 /// Where a bark wallet finds its Ark server and the chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]

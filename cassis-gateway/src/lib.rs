@@ -37,22 +37,22 @@ use crate::db::{
 };
 use cassis_core::network::{Htlc, InvoiceTarget, Network, NetworkId, OutgoingState};
 use cassis_core::offline::{
-    endpoint_public_key, GatewayDestination, GatewayMetadata, GatewayTerms,
-    PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind,
+    GatewayDestination, GatewayMetadata, GatewayTerms, PayeeGatewayReceiveAuthorization,
+    PayeeGatewayReceiveAuthorizationKind, endpoint_public_key,
 };
 use cassis_core::protocol::{
     Commit, GatewayInvoiceFor, GatewayInvoiceRequest, Invoice, InvoiceBody, InvoiceNetwork,
     Metadata, PreimageRelease, PreparePayee, Request, Response,
 };
 use cassis_core::transport::{Handler, PeerAddr, Transport};
-use cassis_core::{unix_now, Bytes32};
+use cassis_core::{Bytes32, unix_now};
 use cassis_wallet::node::verify_incoming;
 use iroh_base::PublicKey;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{error, info, warn, Instrument, Span};
+use tracing::{Instrument, Span, error, info, warn};
 
 /// Why an HTLC to a payee left mid-funding by a restart failed: whether
 /// it exists is unknown.
@@ -496,7 +496,7 @@ impl Gateway {
         let issuance = match self.0.transport.request(&preimage_server, &issue).await? {
             Response::PreimageIssued(Ok(issuance)) => issuance,
             Response::PreimageIssued(Err(reason)) | Response::Error(reason) => {
-                return Err(format!("preimage server refused: {reason}"))
+                return Err(format!("preimage server refused: {reason}"));
             }
             other => return Err(format!("unexpected answer from preimage server: {other:?}")),
         };
@@ -962,13 +962,13 @@ impl Gateway {
                 Ok(Response::PreimageReleased(Ok(preimage)))
                     if hash.matches_preimage(&preimage) =>
                 {
-                    return Ok(preimage)
+                    return Ok(preimage);
                 }
                 Ok(Response::PreimageReleased(Ok(_))) => {
-                    return Err("preimage server released a wrong preimage".into())
+                    return Err("preimage server released a wrong preimage".into());
                 }
                 Ok(Response::PreimageReleased(Err(reason))) => {
-                    return Err(format!("preimage server refused: {reason}"))
+                    return Err(format!("preimage server refused: {reason}"));
                 }
                 Ok(Response::Pending) => {}
                 Ok(other) => warn!("unexpected answer from preimage server: {other:?}"),
@@ -997,7 +997,7 @@ impl Gateway {
             match incoming.claim_incoming_htlc(&incoming_htlc, preimage).await {
                 Ok(()) => break,
                 Err(error) if unix_now() >= incoming_htlc.expiry => {
-                    return Err(format!("claim failed before the HTLC expired: {error}"))
+                    return Err(format!("claim failed before the HTLC expired: {error}"));
                 }
                 Err(error) => {
                     warn!("claiming {}: {error}; retrying", short(htlc));

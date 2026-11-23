@@ -29,8 +29,8 @@
 use crate::GatewayPolicy;
 use cassis_admin::networks::NetworkConfig;
 use cassis_admin::{AdminSection, DaemonConfig};
-use cassis_core::keys::NodeKeys;
 use cassis_core::NetworkId;
+use cassis_core::keys::NodeKeys;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 

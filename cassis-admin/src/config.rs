@@ -8,8 +8,8 @@
 //! ```
 
 use hypereffect::Value;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -397,12 +397,13 @@ mod tests {
         file.edit_admin(&AdminEdit::RemovePeer(key.clone()))
             .unwrap();
         assert!(file.edit_admin(&AdminEdit::RemovePeer(key)).is_err());
-        assert!(file
-            .edit_admin(&AdminEdit::Set {
+        assert!(
+            file.edit_admin(&AdminEdit::Set {
                 listen: Some("0.0.0.0:2".into()),
                 iroh: None
             })
-            .is_err());
+            .is_err()
+        );
         assert_eq!(admin().listen, "127.0.0.1:2");
 
         // Edits by hand: bad ones are ignored, until fixed.

@@ -34,7 +34,7 @@ mod config;
 mod networks;
 
 use admin::Admin;
-use cassis_admin::{reexec, shutdown_signal, Refresh, Server, RESTART_GRACE};
+use cassis_admin::{RESTART_GRACE, Refresh, Server, reexec, shutdown_signal};
 use cassis_routerd::db::Db;
 use cassis_routerd::router::Router;
 use cassis_wallet::{Node, NodeConfig};

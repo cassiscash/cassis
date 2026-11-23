@@ -1,6 +1,6 @@
 //! Payee role: issue invoices, vet PREPARE, claim on COMMIT.
 
-use super::{db_error, verify_incoming, Node, INLINE_WAIT};
+use super::{INLINE_WAIT, Node, db_error, verify_incoming};
 use crate::db::{
     Db, Direction, Invoice as StoredInvoice, InvoiceHash, InvoiceState, Transaction,
     TransactionHash,
@@ -11,7 +11,7 @@ use cassis_core::network::{Htlc, HtlcReceiver, InvoiceTarget, NetworkId};
 use cassis_core::protocol::{
     Commit, Invoice, InvoiceBody, InvoiceNetwork, Metadata, PreparePayee, Response,
 };
-use cassis_core::{unix_now, Bytes32};
+use cassis_core::{Bytes32, unix_now};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};

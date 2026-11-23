@@ -1,8 +1,8 @@
 //! Receiving invoices the node keeps no record of.
 
 use async_trait::async_trait;
-use cassis_core::protocol::{Commit, PreparePayee};
 use cassis_core::Bytes32;
+use cassis_core::protocol::{Commit, PreparePayee};
 
 /// What a [`PreimageReleaser`] lets a COMMIT claim.
 #[derive(Clone, Debug, PartialEq, Eq)]

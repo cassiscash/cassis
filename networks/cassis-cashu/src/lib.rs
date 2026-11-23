@@ -27,16 +27,16 @@
 //! what recovers them.
 
 mod htlc;
-pub use htlc::{sign_refund, HtlcTerms};
+pub use htlc::{HtlcTerms, sign_refund};
 mod wallet;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use cassis_core::keys::{bip32_key, Mnemonic, HARDENED};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use cassis_core::keys::{HARDENED, Mnemonic, bip32_key};
 use cassis_core::{
-    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
-    NetworkId, OutgoingState, XOnlyPubKey,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError, NetworkId, OutgoingState,
+    XOnlyPubKey, sats_for_msat, unix_now,
 };
 use cdk::amount::{FeeAndAmounts, SplitTarget};
 use cdk::dhke::{blind_message, unblind_message};
@@ -53,14 +53,14 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{info, Span};
+use tracing::{Span, info};
 use wallet::{PendingOutput, PendingSwap, Wallet};
 
+pub use cdk::Amount;
 pub use cdk::nuts::nut00::Proof;
 pub use cdk::nuts::nut01::PublicKey;
 pub use cdk::nuts::nut02::Id as KeysetId;
 pub use cdk::secret::Secret;
-pub use cdk::Amount;
 
 /// Per-output blinding data of a swap: `(secret, r, amount)`.
 type Blinding = (Secret, cdk::nuts::nut01::SecretKey, Amount);
@@ -228,10 +228,10 @@ impl CashuAdapter {
 
     async fn keysets(&self) -> Result<Vec<KeySetInfo>, NetworkError> {
         let mut cached = self.keysets.lock().await;
-        if let Some((fetched, keysets)) = cached.as_ref() {
-            if fetched.elapsed() < KEYSETS_TTL {
-                return Ok(keysets.clone());
-            }
+        if let Some((fetched, keysets)) = cached.as_ref()
+            && fetched.elapsed() < KEYSETS_TTL
+        {
+            return Ok(keysets.clone());
         }
         let response = self
             .client
@@ -827,13 +827,13 @@ pub async fn verify_htlc_proofs(
             ));
         };
         fee_ppk = fee_ppk.saturating_add(keyset.input_fee_ppk);
-        if !keys.contains_key(&proof.keyset_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = keys.entry(proof.keyset_id) {
             let fetched = mint
                 .get_mint_keyset(proof.keyset_id)
                 .await
                 .map_err(network_error)?
                 .keys;
-            keys.insert(proof.keyset_id, fetched);
+            e.insert(fetched);
         }
         let key = keys[&proof.keyset_id]
             .amount_key(proof.amount)

@@ -1,6 +1,6 @@
 //! Payer role: route, PREPARE, fund, EXECUTE, COMMIT.
 
-use super::{db_error, Node};
+use super::{Node, db_error};
 use crate::db::{Direction, PendingPayment, PendingPaymentHash, Transaction, TransactionHash};
 use cassis_core::network::{Htlc, HtlcRequest, NetworkId};
 use cassis_core::offline::endpoint_public_key;
@@ -9,7 +9,7 @@ use cassis_core::protocol::{
 };
 use cassis_core::routing::{self, RouteAnnouncement};
 use cassis_core::transport::PeerAddr;
-use cassis_core::{unix_now, Bytes32, OperationId, XOnlyPubKey};
+use cassis_core::{Bytes32, OperationId, XOnlyPubKey, unix_now};
 use futures::future::join_all;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -148,7 +148,7 @@ impl Node {
                             Ok(report)
                         }
                         None => Err(error),
-                    }
+                    };
                 }
             };
             let node = match &report.outcome {
@@ -422,7 +422,7 @@ impl Node {
         for (i, hop) in hops.iter().enumerate() {
             let execute = Execute {
                 payment_hash: hash,
-                operation_id: hop.prepare.operation_id.clone(),
+                operation_id: hop.prepare.operation_id,
                 incoming_descriptor: descriptor,
                 outgoing_target: targets[i + 1].clone(),
             };
@@ -470,7 +470,7 @@ impl Node {
                     route,
                     locked("payee answered with a wrong preimage".into()),
                     None,
-                ))
+                ));
             }
             other => {
                 return Ok(PayReport::failed(
@@ -478,7 +478,7 @@ impl Node {
                     route,
                     locked(format!("payee did not claim: {}", unexpected(other))),
                     None,
-                ))
+                ));
             }
         };
         self.complete_payment(hash, from, &first, preimage)?;
@@ -488,7 +488,7 @@ impl Node {
         // the preimage downstream.
         join_all(hops.iter().map(|hop| {
             let settle = Request::Settle(Settle {
-                operation_id: hop.prepare.operation_id.clone(),
+                operation_id: hop.prepare.operation_id,
                 preimage,
             });
             async move {
@@ -604,7 +604,7 @@ impl Node {
         join_all(hops.iter().map(|hop| {
             let discard = Request::Discard(Discard {
                 payment_hash: hop.prepare.payment_hash,
-                operation_id: hop.prepare.operation_id.clone(),
+                operation_id: hop.prepare.operation_id,
             });
             async move {
                 let _ = self.0.transport.request(&hop.peer, &discard).await;

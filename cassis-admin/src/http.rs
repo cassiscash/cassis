@@ -6,12 +6,12 @@
 //! name, so that web pages cannot reach it by rebinding theirs.
 
 use crate::{Access, Server, Session};
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use futures::stream::{self, Stream};
 use hypereffect::RendererMessage;
 use std::collections::HashMap;
@@ -141,10 +141,10 @@ impl Http {
         tokio::spawn(async move {
             tokio::time::sleep(STREAM_WAIT).await;
             let mut sessions = http.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            if sessions.get(&waiting).is_some_and(|p| p.lines.is_some()) {
-                if let Some(pending) = sessions.remove(&waiting) {
-                    http.server.close(&pending.session);
-                }
+            if sessions.get(&waiting).is_some_and(|p| p.lines.is_some())
+                && let Some(pending) = sessions.remove(&waiting)
+            {
+                http.server.close(&pending.session);
             }
         });
         ([(SESSION, id)], "").into_response()

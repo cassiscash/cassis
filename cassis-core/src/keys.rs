@@ -170,8 +170,7 @@ pub fn generate_mnemonic() -> String {
 mod tests {
     use super::*;
 
-    const MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     #[test]
     fn rejects_non_twelve_word_mnemonics() {

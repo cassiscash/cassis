@@ -666,9 +666,13 @@ mod tests {
         tampered.description = Some("coffee".into());
         assert!(tampered.verify().is_err());
         // Without one, any description does.
-        assert!(signed(PayeeGatewayReceiveAuthorizationKind::Single, None).allows_description(None));
-        assert!(signed(PayeeGatewayReceiveAuthorizationKind::Single, None)
-            .allows_description(Some("coffee")));
+        assert!(
+            signed(PayeeGatewayReceiveAuthorizationKind::Single, None).allows_description(None)
+        );
+        assert!(
+            signed(PayeeGatewayReceiveAuthorizationKind::Single, None)
+                .allows_description(Some("coffee"))
+        );
     }
 
     #[test]

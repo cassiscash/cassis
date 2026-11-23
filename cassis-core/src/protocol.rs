@@ -25,16 +25,16 @@
 
 use crate::network::{Htlc, HtlcDescriptor, InvoiceTarget, NetworkId};
 use crate::offline::{
-    endpoint_public_key, PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind,
-    PreimageIssuance, Signature,
+    PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind, PreimageIssuance,
+    Signature, endpoint_public_key,
 };
 use crate::primitives::{Bytes32, OperationId};
 use crate::signing::SigningMessage;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use iroh_base::PublicKey;
 use serde::ser::SerializeStruct;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -1196,9 +1196,11 @@ mod tests {
             }}"#
         ))
         .unwrap();
-        assert!(decoded
-            .target_for(&NetworkId("cashu::localhost".into()))
-            .is_some());
+        assert!(
+            decoded
+                .target_for(&NetworkId("cashu::localhost".into()))
+                .is_some()
+        );
         assert!(decoded.body.metadata.is_none());
         assert!(decoded.body.iroh_relay.is_none());
         assert!(matches!(decoded.receiver, InvoiceReceiver::Direct(_)));
@@ -1401,10 +1403,12 @@ mod tests {
         }
         assert!(other_payee.verify().is_err());
         other_payee.sign_as_payee(&[11; 32]).unwrap();
-        assert!(other_payee
-            .verify()
-            .unwrap_err()
-            .contains("signature by the gateway"));
+        assert!(
+            other_payee
+                .verify()
+                .unwrap_err()
+                .contains("signature by the gateway")
+        );
         let mut tampered = invoice;
         tampered.body.amount_msat += 1;
         assert!(tampered.verify().is_err());

@@ -14,10 +14,10 @@
 //! It also serves an admin interface for hyperb renderers (see
 //! [`cassis_gateway::admin`]).
 
-use cassis_admin::{reexec, shutdown_signal, ConfigFile, Refresh, Server, RESTART_GRACE};
+use cassis_admin::{ConfigFile, RESTART_GRACE, Refresh, Server, reexec, shutdown_signal};
 use cassis_core::keys::generate_mnemonic;
 use cassis_gateway::admin::{GatewayAdmin, KINDS};
-use cassis_gateway::config::{template, Config};
+use cassis_gateway::config::{Config, template};
 use cassis_gateway::db::Db;
 use cassis_gateway::{Gateway, GatewayConfig};
 use clap::Parser;

@@ -2,6 +2,7 @@
 
 use crate::{Blinding, PublicKey};
 use cassis_core::{Bytes32, NetworkError};
+use cdk::Amount;
 use cdk::dhke::blind_message;
 use cdk::nuts::nut00::{BlindedMessage, Proof};
 use cdk::nuts::nut01::SecretKey;
@@ -11,7 +12,6 @@ use cdk::nuts::nut14::HTLCWitness;
 use cdk::nuts::{Conditions, SigFlag, Witness};
 use cdk::secp256k1::hashes::Hash as _;
 use cdk::secret::Secret;
-use cdk::Amount;
 
 /// What a NUT-14 HTLC proof is locked to.
 #[derive(Clone, Debug, PartialEq, Eq)]

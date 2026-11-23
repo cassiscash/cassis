@@ -13,16 +13,16 @@ use crate::config::{self, WalletConfig};
 use crate::db::Db;
 use cassis_core::keys::{Mnemonic, NodeKeys};
 use cassis_core::{Network, NetworkId};
+use cassis_networks::NetworkSettings;
 #[cfg(feature = "arkade")]
 use cassis_networks::arkade;
 #[cfg(feature = "bark-lightning")]
 use cassis_networks::bark_lightning;
 #[cfg(feature = "cashu")]
 use cassis_networks::cashu;
-use cassis_networks::NetworkSettings;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{warn, Span};
+use tracing::{Span, warn};
 
 /// The wallet database of the node living in `dir`, readable by its
 /// owner only.

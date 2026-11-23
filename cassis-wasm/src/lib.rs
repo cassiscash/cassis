@@ -17,9 +17,9 @@
 //! TypeScript section below).
 
 use cassis_core::protocol::{Invoice, Request, Response};
-use cassis_core::{unix_now, NetworkId};
+use cassis_core::{NetworkId, unix_now};
 use futures::lock::Mutex;
-use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl, SecretKey};
 use n0_future::time::timeout;
 use std::rc::Rc;

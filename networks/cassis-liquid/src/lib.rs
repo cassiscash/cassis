@@ -37,20 +37,20 @@ pub use lwk_wollet::elements;
 use async_trait::async_trait;
 use cassis_core::keys::Mnemonic;
 use cassis_core::{
-    sats_for_msat, unix_now, Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, Network, NetworkError,
-    NetworkId, OutgoingState, PubKey, MSAT_PER_SAT,
+    Bytes32, Htlc, HtlcDescriptor, InvoiceTarget, MSAT_PER_SAT, Network, NetworkError, NetworkId,
+    OutgoingState, PubKey, sats_for_msat, unix_now,
 };
 use lwk_common::Signer as LwkSigner;
 use lwk_signer::SwSigner;
-use lwk_wollet::clients::asyncr::EsploraClient;
 use lwk_wollet::clients::EsploraClientBuilder;
+use lwk_wollet::clients::asyncr::EsploraClient;
+use lwk_wollet::elements::bitcoin::PublicKey as BtcPublicKey;
 use lwk_wollet::elements::bitcoin::bip32::{DerivationPath, Fingerprint};
+use lwk_wollet::elements::bitcoin::hashes::Hash;
 use lwk_wollet::elements::bitcoin::hashes::ripemd160;
 use lwk_wollet::elements::bitcoin::hashes::sha256;
-use lwk_wollet::elements::bitcoin::hashes::Hash;
 use lwk_wollet::elements::bitcoin::hex::FromHex as _;
 use lwk_wollet::elements::bitcoin::secp256k1;
-use lwk_wollet::elements::bitcoin::PublicKey as BtcPublicKey;
 use lwk_wollet::elements::confidential::{
     Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor,
 };
@@ -70,7 +70,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn, Span};
+use tracing::{Span, debug, info, warn};
 
 /// Blockstream esplora for Liquid mainnet.
 pub const MAINNET_ESPLORA_URL: &str = "https://blockstream.info/liquid/api";
@@ -286,9 +286,9 @@ impl HtlcSpec {
     pub fn max_weight_to_satisfy(&self, with_preimage: bool) -> usize {
         let script_len = self.witness_script.len();
         let mut witness_len = 1; // item count
-                                 // On claims: the 32-byte preimage (hashed by
-                                 // the claim branch) plus a 1-byte OP_TRUE
-                                 // selector; on refunds an empty push only.
+        // On claims: the 32-byte preimage (hashed by
+        // the claim branch) plus a 1-byte OP_TRUE
+        // selector; on refunds an empty push only.
         witness_len += if with_preimage { 1 + 32 + 1 } else { 1 };
         witness_len += 1 + 73; // der sig + sighash byte
         witness_len += varint_len(script_len) + script_len;
@@ -1123,8 +1123,7 @@ mod tests {
     use super::*;
     use lwk_wollet::elements::bitcoin::hex::DisplayHex as _;
 
-    const TEST_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn test_pubkey(fill: u8) -> BtcPublicKey {
         let secp = secp256k1::Secp256k1::new();

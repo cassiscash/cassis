@@ -19,14 +19,14 @@ use crate::stored::stored_metadata;
 use cassis_core::keys::NodeKeys;
 use cassis_core::network::{Htlc, Network, NetworkError, NetworkId};
 use cassis_core::offline::{
-    endpoint_public_key, GatewayDestination, PayeeGatewayReceiveAuthorization,
-    PayeeGatewayReceiveAuthorizationKind, PreimageIssuance,
+    GatewayDestination, PayeeGatewayReceiveAuthorization, PayeeGatewayReceiveAuthorizationKind,
+    PreimageIssuance, endpoint_public_key,
 };
 use cassis_core::protocol::{
     GatewayInvoiceRequest, Invoice, InvoiceReceiver, Metadata, ReceivedPayment, Request, Response,
 };
 use cassis_core::transport::{PeerAddr, Transport};
-use cassis_core::{unix_now, Bytes32};
+use cassis_core::{Bytes32, unix_now};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -178,7 +178,7 @@ async fn issue(
     {
         Response::PreimageIssued(Ok(issuance)) => issuance,
         Response::PreimageIssued(Err(reason)) | Response::Error(reason) => {
-            return Err(format!("preimage server refused: {reason}"))
+            return Err(format!("preimage server refused: {reason}"));
         }
         other => return Err(format!("unexpected answer from preimage server: {other:?}")),
     };
@@ -197,7 +197,7 @@ async fn issue(
     let invoice = match transport.request(&endpoints.gateway, &request).await? {
         Response::GatewayInvoice(Ok(invoice)) => invoice,
         Response::GatewayInvoice(Err(reason)) | Response::Error(reason) => {
-            return Err(format!("gateway refused: {reason}"))
+            return Err(format!("gateway refused: {reason}"));
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     };
@@ -278,7 +278,7 @@ pub async fn authorize_gateway(
     match answer {
         Response::GatewayAuthorized(Ok(())) => {}
         Response::GatewayAuthorized(Err(reason)) | Response::Error(reason) => {
-            return Err(format!("gateway refused: {reason}"))
+            return Err(format!("gateway refused: {reason}"));
         }
         other => return Err(format!("unexpected answer from gateway: {other:?}")),
     }
@@ -332,7 +332,7 @@ pub async fn redeem_offline_payments(
     let payments = match answer {
         Response::PreimagePayments(Ok(payments)) => payments,
         Response::PreimagePayments(Err(reason)) | Response::Error(reason) => {
-            return Err(format!("preimage server: {reason}"))
+            return Err(format!("preimage server: {reason}"));
         }
         other => return Err(format!("unexpected answer from preimage server: {other:?}")),
     };
