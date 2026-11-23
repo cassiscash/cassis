@@ -53,6 +53,30 @@ pub enum Command {
         #[command(subcommand)]
         command: ChainCommand,
     },
+    /// cBTC account on Citrea.
+    #[cfg(feature = "citrea")]
+    Citrea {
+        #[arg(long, default_value = "citrea")]
+        network: String,
+        #[command(subcommand)]
+        command: ChainCommand,
+    },
+    /// WBTC account on Starknet, paying fees in STRK.
+    #[cfg(feature = "starknet-wbtc")]
+    StarknetWbtc {
+        #[arg(long, default_value = "starknet-wbtc")]
+        network: String,
+        #[command(subcommand)]
+        command: ChainCommand,
+    },
+    /// WBTC account on Solana, paying fees in SOL.
+    #[cfg(feature = "solana-wbtc")]
+    SolanaWbtc {
+        #[arg(long, default_value = "solana-wbtc")]
+        network: String,
+        #[command(subcommand)]
+        command: ChainCommand,
+    },
     /// Bark wallet of a `lightning` network enabled with `--bark`.
     #[cfg(feature = "bark-lightning")]
     Bark {
@@ -302,6 +326,65 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             routine_checks(&wallet).await;
             match command {
                 ChainCommand::Balance => println!("{} msat", wallet.balance_msat().await?),
+                ChainCommand::Address => println!("{}", wallet.address()),
+                ChainCommand::Send { to, amount_msat } => {
+                    println!("{}", wallet.transfer(&to, amount_msat).await?)
+                }
+            }
+        }
+        #[cfg(feature = "citrea")]
+        Command::Citrea { network, command } => {
+            let network = kind(&network, "citrea")?;
+            let wallet = cassis_networks::citrea::CitreaAdapter::open(
+                network.clone(),
+                &home.mnemonic(&network)?,
+                span,
+            )?;
+            routine_checks(&wallet).await;
+            match command {
+                ChainCommand::Balance => println!("{} msat", wallet.balance_msat().await?),
+                ChainCommand::Address => println!("{}", wallet.address()),
+                ChainCommand::Send { to, amount_msat } => {
+                    println!("{}", wallet.transfer(&to, amount_msat).await?)
+                }
+            }
+        }
+        #[cfg(feature = "starknet-wbtc")]
+        Command::StarknetWbtc { network, command } => {
+            let network = kind(&network, "starknet-wbtc")?;
+            let wallet = cassis_networks::starknet_wbtc::StarknetWbtcAdapter::open(
+                network.clone(),
+                &home.mnemonic(&network)?,
+                span,
+            )?;
+            routine_checks(&wallet).await;
+            match command {
+                ChainCommand::Balance => println!(
+                    "{} msat ({} fri of STRK for fees)",
+                    wallet.balance_msat().await?,
+                    wallet.fee_balance_fri().await?
+                ),
+                ChainCommand::Address => println!("{}", wallet.address()),
+                ChainCommand::Send { to, amount_msat } => {
+                    println!("{}", wallet.transfer(&to, amount_msat).await?)
+                }
+            }
+        }
+        #[cfg(feature = "solana-wbtc")]
+        Command::SolanaWbtc { network, command } => {
+            let network = kind(&network, "solana-wbtc")?;
+            let wallet = cassis_networks::solana_wbtc::SolanaWbtcAdapter::open(
+                network.clone(),
+                &home.mnemonic(&network)?,
+                span,
+            )?;
+            routine_checks(&wallet).await;
+            match command {
+                ChainCommand::Balance => println!(
+                    "{} msat ({} lamports of SOL for fees)",
+                    wallet.balance_msat().await?,
+                    wallet.fee_balance_lamports().await?
+                ),
                 ChainCommand::Address => println!("{}", wallet.address()),
                 ChainCommand::Send { to, amount_msat } => {
                     println!("{}", wallet.transfer(&to, amount_msat).await?)

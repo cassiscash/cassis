@@ -21,9 +21,11 @@
 //! enabled, and derives its keys from it the way that network's wallets
 //! do (see each adapter in `networks/`): BIP86 taproot on `bitcoin` and
 //! `arkade`, BIP84 under SLIP-44 coin type 1776 and SLIP-77 on `liquid`,
-//! BIP44 under RSK's coin type on `rootstock`, bark's own seed on a
-//! bark `lightning`, fedimint's own root secret on `fedimint`. Back this
-//! file up, or the mnemonics.
+//! BIP44 under RSK's coin type on `rootstock`, BIP44 under Ethereum's on
+//! `citrea`, a Stark key ground from BIP44 under Starknet's on
+//! `starknet-wbtc`, SLIP-10 under Solana's on `solana-wbtc`, bark's own
+//! seed on a bark `lightning`, fedimint's own root secret on `fedimint`.
+//! Back this file up, or the mnemonics.
 
 use cassis_core::NetworkId;
 use cassis_core::keys::{Mnemonic, NodeKeys, generate_mnemonic, parse_wallet_mnemonic};

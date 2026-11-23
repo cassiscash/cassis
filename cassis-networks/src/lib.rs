@@ -18,6 +18,8 @@ pub use cassis_bark_lightning as bark_lightning;
 pub use cassis_bitcoin as bitcoin;
 #[cfg(feature = "cashu")]
 pub use cassis_cashu as cashu;
+#[cfg(feature = "citrea")]
+pub use cassis_citrea as citrea;
 #[cfg(feature = "fedimint")]
 pub use cassis_fedimint as fedimint;
 #[cfg(feature = "liquid")]
@@ -26,6 +28,10 @@ pub use cassis_liquid as liquid;
 pub use cassis_lnd as lnd;
 #[cfg(feature = "rootstock")]
 pub use cassis_rootstock as rootstock;
+#[cfg(feature = "solana-wbtc")]
+pub use cassis_solana_wbtc as solana_wbtc;
+#[cfg(feature = "starknet-wbtc")]
+pub use cassis_starknet_wbtc as starknet_wbtc;
 
 /// Everything needed to open one network besides its id.
 #[derive(Clone)]
@@ -89,10 +95,13 @@ pub fn built(kind: &str) -> bool {
         "bark" => cfg!(feature = "bark-lightning"),
         "bitcoin" => cfg!(feature = "bitcoin"),
         "cashu" => cfg!(feature = "cashu"),
+        "citrea" => cfg!(feature = "citrea"),
         "fedimint" => cfg!(feature = "fedimint"),
         "liquid" => cfg!(feature = "liquid"),
         "lnd" => cfg!(feature = "lightning"),
         "rootstock" => cfg!(feature = "rootstock"),
+        "solana-wbtc" => cfg!(feature = "solana-wbtc"),
+        "starknet-wbtc" => cfg!(feature = "starknet-wbtc"),
         _ => false,
     }
 }
@@ -164,6 +173,21 @@ pub async fn open_wallet(
         "rootstock" => with_wallet(
             cassis_rootstock::RootstockAdapter::open(network.clone(), mnemonic, span)?,
             Wallet::Rootstock,
+        ),
+        #[cfg(feature = "citrea")]
+        "citrea" => with_wallet(
+            cassis_citrea::CitreaAdapter::open(network.clone(), mnemonic, span)?,
+            Wallet::Citrea,
+        ),
+        #[cfg(feature = "starknet-wbtc")]
+        "starknet-wbtc" => with_wallet(
+            cassis_starknet_wbtc::StarknetWbtcAdapter::open(network.clone(), mnemonic, span)?,
+            Wallet::StarknetWbtc,
+        ),
+        #[cfg(feature = "solana-wbtc")]
+        "solana-wbtc" => with_wallet(
+            cassis_solana_wbtc::SolanaWbtcAdapter::open(network.clone(), mnemonic, span)?,
+            Wallet::SolanaWbtc,
         ),
         #[cfg(feature = "fedimint")]
         "fedimint" => with_wallet(

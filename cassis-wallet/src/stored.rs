@@ -9,9 +9,11 @@ use cassis_core::offline::{
     Signature,
 };
 use cassis_core::protocol::{FailReason, InvoiceNetwork, Metadata};
-use cassis_core::{Bytes32, NetworkId, PubKey, XOnlyPubKey};
+use cassis_core::{Bytes32, Ed25519PubKey, NetworkId, PubKey, StarknetAddress, XOnlyPubKey};
 use iroh_base::PublicKey;
 use std::convert::Infallible;
+
+pub mod v1;
 
 /// A compressed secp256k1 public key: its parity byte and X coordinate.
 /// Stored as exactly 33 bytes, since serde and orangedb know arrays only
@@ -89,6 +91,27 @@ pub enum StoredDescriptor {
     Lightning {
         target: String,
     },
+    Citrea {
+        amount_wei: u128,
+        refund_address: String,
+        sequence: u64,
+        refund_after: u64,
+        target: StoredPubKey,
+    },
+    StarknetWbtc {
+        amount_sat: u64,
+        refund_address: [u8; 32],
+        sequence: u64,
+        refund_after: u64,
+        target: [u8; 32],
+    },
+    SolanaWbtc {
+        amount_sat: u64,
+        refund_address: [u8; 32],
+        sequence: u64,
+        refund_after: u64,
+        target: [u8; 32],
+    },
 }
 
 /// An [`Htlc`].
@@ -141,6 +164,18 @@ pub enum StoredInvoiceTarget<L = String> {
     Lightning {
         network: String,
         invoice: L,
+    },
+    Citrea {
+        network: String,
+        target: StoredPubKey,
+    },
+    StarknetWbtc {
+        network: String,
+        target: [u8; 32],
+    },
+    SolanaWbtc {
+        network: String,
+        target: [u8; 32],
     },
 }
 
@@ -222,6 +257,10 @@ fn x_only(bytes: [u8; 32]) -> Result<XOnlyPubKey, String> {
     XOnlyPubKey::from_bytes(bytes).map_err(|_| corrupt("x-only key"))
 }
 
+fn starknet_address(bytes: [u8; 32]) -> Result<StarknetAddress, String> {
+    StarknetAddress::from_bytes(bytes).map_err(|_| corrupt("Starknet address"))
+}
+
 pub fn endpoint_key(bytes: &[u8; 32]) -> Result<PublicKey, String> {
     PublicKey::from_bytes(bytes).map_err(|_| corrupt("endpoint key"))
 }
@@ -256,6 +295,18 @@ impl<L: StoredLightning> From<&InvoiceTarget<L>> for StoredInvoiceTarget<L::Stor
             InvoiceTarget::Lightning { network, invoice } => Self::Lightning {
                 network: network.0.clone(),
                 invoice: invoice.store(),
+            },
+            InvoiceTarget::Citrea { network, target } => Self::Citrea {
+                network: network.0.clone(),
+                target: target.into(),
+            },
+            InvoiceTarget::StarknetWbtc { network, target } => Self::StarknetWbtc {
+                network: network.0.clone(),
+                target: target.0,
+            },
+            InvoiceTarget::SolanaWbtc { network, target } => Self::SolanaWbtc {
+                network: network.0.clone(),
+                target: target.0,
             },
         }
     }
@@ -294,6 +345,18 @@ impl<L: StoredLightning> TryFrom<&StoredInvoiceTarget<L::Stored>> for InvoiceTar
                 network: NetworkId(network.clone()),
                 invoice: L::load(invoice),
             },
+            StoredInvoiceTarget::Citrea { network, target } => Self::Citrea {
+                network: NetworkId(network.clone()),
+                target: target.try_into()?,
+            },
+            StoredInvoiceTarget::StarknetWbtc { network, target } => Self::StarknetWbtc {
+                network: NetworkId(network.clone()),
+                target: starknet_address(*target)?,
+            },
+            StoredInvoiceTarget::SolanaWbtc { network, target } => Self::SolanaWbtc {
+                network: NetworkId(network.clone()),
+                target: Ed25519PubKey(*target),
+            },
         })
     }
 }
@@ -307,7 +370,10 @@ impl<L> StoredInvoiceTarget<L> {
             | Self::Bitcoin { network, .. }
             | Self::Liquid { network, .. }
             | Self::Rootstock { network, .. }
-            | Self::Lightning { network, .. } => network,
+            | Self::Lightning { network, .. }
+            | Self::Citrea { network, .. }
+            | Self::StarknetWbtc { network, .. }
+            | Self::SolanaWbtc { network, .. } => network,
         }
     }
 }
@@ -383,6 +449,45 @@ impl From<&HtlcDescriptor> for StoredDescriptor {
                 target: target.0,
             },
             HtlcDescriptor::Lightning { target } => Self::Lightning { target },
+            HtlcDescriptor::Citrea {
+                amount_wei,
+                refund_address,
+                sequence,
+                refund_after,
+                target,
+            } => Self::Citrea {
+                amount_wei,
+                refund_address,
+                sequence,
+                refund_after,
+                target: (&target).into(),
+            },
+            HtlcDescriptor::StarknetWbtc {
+                amount_sat,
+                refund_address,
+                sequence,
+                refund_after,
+                target,
+            } => Self::StarknetWbtc {
+                amount_sat,
+                refund_address: refund_address.0,
+                sequence,
+                refund_after,
+                target: target.0,
+            },
+            HtlcDescriptor::SolanaWbtc {
+                amount_sat,
+                refund_address,
+                sequence,
+                refund_after,
+                target,
+            } => Self::SolanaWbtc {
+                amount_sat,
+                refund_address: refund_address.0,
+                sequence,
+                refund_after,
+                target: target.0,
+            },
         }
     }
 }
@@ -460,6 +565,45 @@ impl TryFrom<&StoredDescriptor> for HtlcDescriptor {
                 target: x_only(target)?,
             },
             StoredDescriptor::Lightning { target } => Self::Lightning { target },
+            StoredDescriptor::Citrea {
+                amount_wei,
+                refund_address,
+                sequence,
+                refund_after,
+                target,
+            } => Self::Citrea {
+                amount_wei,
+                refund_address,
+                sequence,
+                refund_after,
+                target: (&target).try_into()?,
+            },
+            StoredDescriptor::StarknetWbtc {
+                amount_sat,
+                refund_address,
+                sequence,
+                refund_after,
+                target,
+            } => Self::StarknetWbtc {
+                amount_sat,
+                refund_address: starknet_address(refund_address)?,
+                sequence,
+                refund_after,
+                target: starknet_address(target)?,
+            },
+            StoredDescriptor::SolanaWbtc {
+                amount_sat,
+                refund_address,
+                sequence,
+                refund_after,
+                target,
+            } => Self::SolanaWbtc {
+                amount_sat,
+                refund_address: Ed25519PubKey(refund_address),
+                sequence,
+                refund_after,
+                target: Ed25519PubKey(target),
+            },
         })
     }
 }

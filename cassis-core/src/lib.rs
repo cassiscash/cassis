@@ -31,6 +31,7 @@ pub use network::{
     Network, NetworkError, NetworkId, OutgoingHtlcs, OutgoingState, network_span,
 };
 pub use primitives::{
-    Bytes32, MSAT_PER_SAT, OperationId, PubKey, XOnlyPubKey, sats_for_msat, unix_now,
+    Bytes32, Ed25519PubKey, MSAT_PER_SAT, OperationId, PubKey, StarknetAddress, XOnlyPubKey,
+    sats_for_msat, unix_now,
 };
 pub use protocol::{Invoice, InvoiceBody, InvoiceReceiver};

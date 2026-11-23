@@ -88,8 +88,9 @@ impl SigningMessage {
     }
 
     /// What an HTLC is locked to: the network, then tag `0` and a
-    /// 32-byte x-only key, tag `1` and a 33-byte compressed key, or tag
-    /// `2` and a BOLT11 string.
+    /// 32-byte x-only key, tag `1` and a 33-byte compressed key, tag `2`
+    /// and a BOLT11 string, tag `3` and a 32-byte Ed25519 key, or tag `4`
+    /// and a 32-byte big-endian Starknet address.
     pub fn invoice_target<L: LightningTarget>(&mut self, target: &InvoiceTarget<L>) -> &mut Self {
         self.str(&target.network().0);
         match target {
@@ -97,10 +98,12 @@ impl SigningMessage {
             | InvoiceTarget::Fedimint { target, .. }
             | InvoiceTarget::Arkade { target, .. }
             | InvoiceTarget::Bitcoin { target, .. } => self.u8(0).raw(&target.0),
-            InvoiceTarget::Liquid { target, .. } | InvoiceTarget::Rootstock { target, .. } => {
-                self.u8(1).raw(target.as_bytes())
-            }
+            InvoiceTarget::Liquid { target, .. }
+            | InvoiceTarget::Rootstock { target, .. }
+            | InvoiceTarget::Citrea { target, .. } => self.u8(1).raw(target.as_bytes()),
             InvoiceTarget::Lightning { invoice, .. } => self.u8(2).str(invoice.invoice()),
+            InvoiceTarget::SolanaWbtc { target, .. } => self.u8(3).raw(target.as_bytes()),
+            InvoiceTarget::StarknetWbtc { target, .. } => self.u8(4).raw(target.as_bytes()),
         }
     }
 

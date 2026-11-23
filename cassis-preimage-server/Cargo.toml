@@ -4,13 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["arkade", "bitcoin", "cashu", "fedimint", "liquid", "rootstock"]
+default = ["arkade", "bitcoin", "cashu", "fedimint", "liquid", "rootstock", "citrea", "solana-wbtc", "starknet-wbtc"]
 arkade = ["cassis-networks/arkade"]
 bitcoin = ["cassis-networks/bitcoin"]
 cashu = ["cassis-networks/cashu"]
 fedimint = ["cassis-networks/fedimint"]
 liquid = ["cassis-networks/liquid"]
 rootstock = ["cassis-networks/rootstock"]
+citrea = ["cassis-networks/citrea"]
+solana-wbtc = ["cassis-networks/solana-wbtc"]
+starknet-wbtc = ["cassis-networks/starknet-wbtc"]
 
 [dependencies]
 cassis-admin = { workspace = true }

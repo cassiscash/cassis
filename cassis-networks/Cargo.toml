@@ -10,10 +10,13 @@ arkade = ["dep:cassis-arkade"]
 bark-lightning = ["dep:cassis-bark-lightning"]
 bitcoin = ["dep:cassis-bitcoin"]
 cashu = ["dep:cassis-cashu"]
+citrea = ["dep:cassis-citrea"]
 fedimint = ["dep:cassis-fedimint"]
 lightning = ["dep:cassis-lnd"]
 liquid = ["dep:cassis-liquid"]
 rootstock = ["dep:cassis-rootstock"]
+solana-wbtc = ["dep:cassis-solana-wbtc"]
+starknet-wbtc = ["dep:cassis-starknet-wbtc"]
 
 [dependencies]
 cassis-core = { workspace = true }
@@ -23,7 +26,10 @@ cassis-arkade = { workspace = true, optional = true }
 cassis-bark-lightning = { workspace = true, optional = true }
 cassis-bitcoin = { workspace = true, optional = true }
 cassis-cashu = { workspace = true, optional = true }
+cassis-citrea = { workspace = true, optional = true }
 cassis-fedimint = { workspace = true, optional = true }
 cassis-liquid = { workspace = true, optional = true }
 cassis-lnd = { workspace = true, optional = true }
 cassis-rootstock = { workspace = true, optional = true }
+cassis-solana-wbtc = { workspace = true, optional = true }
+cassis-starknet-wbtc = { workspace = true, optional = true }

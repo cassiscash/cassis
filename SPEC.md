@@ -71,8 +71,10 @@ section lists, with these rules:
 | Tag    | Value                                                  | Networks                         |
 |--------|--------------------------------------------------------|----------------------------------|
 | `0x00` | 32 bytes: x-only secp256k1 key                         | Cashu, Fedimint, Arkade, Bitcoin |
-| `0x01` | 33 bytes: compressed secp256k1 key                     | Liquid, Rootstock                |
+| `0x01` | 33 bytes: compressed secp256k1 key                     | Liquid, Rootstock, Citrea        |
 | `0x02` | `str`: a BOLT11 hold invoice                           | Lightning                        |
+| `0x03` | 32 bytes: Ed25519 key (a Solana address)               | WBTC on Solana                   |
+| `0x04` | 32 bytes: big-endian Starknet account address          | WBTC on Starknet                 |
 
 Every message starts with its **domain**, written as a `str`. The
 domain names the statement and its version, so a signature over one
@@ -237,6 +239,9 @@ verify it.
 - Bitcoin
 - Liquid
 - Rootstock
+- Citrea
+- WBTC on Starknet
+- WBTC on Solana
 - Arkade
 - Cashu
 - Fedimint

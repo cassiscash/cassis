@@ -46,7 +46,26 @@ pub use db::Db;
 
 #[orangedb::schema]
 pub mod db {
+    use super::db_v1;
     use cassis_wallet::stored::StoredDescriptor;
+
+    /// Payments, whose stored descriptors gained the variants of new
+    /// networks.
+    #[migrate]
+    fn payment_from_v1(old: db_v1::Payment) -> orangedb::Result<Payment> {
+        Ok(Payment {
+            payment_hash: PaymentHash(old.payment_hash.0),
+            payee: old.payee,
+            network: old.network,
+            amount_msat: old.amount_msat,
+            expiry: old.expiry,
+            descriptor: old.descriptor.into(),
+            preimage: old.preimage,
+            metadata: old.metadata,
+            released_at: old.released_at,
+        })
+    }
+
     /// An HTLC a gateway funded to a payee, which the server verified
     /// before releasing its preimage: what the payee needs to claim it.
     #[entity]
@@ -64,6 +83,30 @@ pub mod db {
         pub descriptor: StoredDescriptor,
         pub preimage: [u8; 32],
         /// The invoice's metadata, if any.
+        pub metadata: Option<Vec<u8>>,
+        pub released_at: u64,
+    }
+}
+
+/// The schema before Citrea, WBTC on Starknet and WBTC on Solana, whose
+/// stored descriptors [`db`] migrates from. Frozen: only what decides how
+/// rows are stored, and the indexes orangedb needs.
+#[orangedb::schema]
+pub mod db_v1 {
+    use cassis_wallet::stored::v1::StoredDescriptor;
+
+    #[entity]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Payment {
+        #[id([u8; 32])]
+        pub payment_hash: PaymentHash,
+        #[index]
+        pub payee: [u8; 32],
+        pub network: String,
+        pub amount_msat: u64,
+        pub expiry: u64,
+        pub descriptor: StoredDescriptor,
+        pub preimage: [u8; 32],
         pub metadata: Option<Vec<u8>>,
         pub released_at: u64,
     }

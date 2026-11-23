@@ -319,7 +319,7 @@ pub fn remove(networks: &mut Table, id: &NetworkId) -> Result<(), String> {
 pub type Kind = (&'static str, &'static str);
 
 /// Every kind of network.
-pub const KINDS: [Kind; 8] = [
+pub const KINDS: [Kind; 11] = [
     ("arkade", "Arkade"),
     ("cashu", "Cashu"),
     ("liquid", "Liquid"),
@@ -328,6 +328,9 @@ pub const KINDS: [Kind; 8] = [
     ("fedimint", "Fedimint"),
     ("bitcoin", "Bitcoin"),
     ("rootstock", "Rootstock"),
+    ("citrea", "Citrea"),
+    ("starknet-wbtc", "WBTC on Starknet"),
+    ("solana-wbtc", "WBTC on Solana"),
 ];
 
 /// The chains a kind runs on, the first its default.
@@ -335,7 +338,9 @@ pub fn chains(kind: &str) -> &'static [&'static str] {
     match kind {
         "arkade" => &["mainnet", "mutinynet"],
         "bitcoin" => &["mainnet", "mutinynet", "regtest"],
-        "liquid" | "rootstock" => &["mainnet", "testnet"],
+        "liquid" | "rootstock" | "citrea" => &["mainnet", "testnet"],
+        "starknet-wbtc" => &["mainnet", "sepolia"],
+        "solana-wbtc" => &["mainnet"],
         "lnd" | "bark" => &["mainnet", "signet", "mutinynet", "regtest"],
         _ => &[],
     }

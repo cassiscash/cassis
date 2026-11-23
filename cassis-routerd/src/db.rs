@@ -8,7 +8,38 @@ pub use db_schema::*;
 
 #[orangedb::schema]
 pub mod db_schema {
+    use super::v1;
     use cassis_wallet::stored::{StoredFailReason, StoredHtlc, StoredInvoiceTarget};
+
+    /// Hops, whose stored HTLCs and targets gained the variants of new
+    /// networks.
+    #[migrate]
+    fn hop_from_v1(old: v1::Hop) -> orangedb::Result<Hop> {
+        Ok(Hop {
+            operation_id: HopId(old.operation_id.0),
+            owner: old.owner,
+            payment_hash: old.payment_hash,
+            incoming_network: old.incoming_network,
+            incoming: old.incoming.into(),
+            outgoing_network: old.outgoing_network,
+            outgoing_amount_msat: old.outgoing_amount_msat,
+            outgoing_expiry: old.outgoing_expiry,
+            outgoing_target: old.outgoing_target.into(),
+            outgoing: old.outgoing.map(Into::into),
+            preimage: old.preimage,
+            state: match old.state {
+                v1::HopState::Verifying => HopState::Verifying,
+                v1::HopState::Funding => HopState::Funding,
+                v1::HopState::Forwarded => HopState::Forwarded,
+                v1::HopState::Settled => HopState::Settled,
+                v1::HopState::Failed { reason } => HopState::Failed {
+                    reason: reason.into(),
+                },
+            },
+            created_at: old.created_at,
+            ended_at: old.ended_at,
+        })
+    }
 
     /// Where a hop is.
     #[embed]
@@ -75,5 +106,44 @@ pub mod db_schema {
                 .amount_msat
                 .saturating_sub(self.outgoing_amount_msat)
         }
+    }
+}
+
+/// The schema before Citrea, WBTC on Starknet and WBTC on Solana, whose
+/// stored HTLCs and targets [`db_schema`] migrates from. Frozen: only
+/// what decides how rows are stored, and the indexes orangedb needs.
+#[orangedb::schema]
+pub mod v1 {
+    use cassis_wallet::stored::v1::{StoredFailReason, StoredHtlc, StoredInvoiceTarget};
+
+    #[embed]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum HopState {
+        Verifying,
+        Funding,
+        Forwarded,
+        Settled,
+        Failed { reason: StoredFailReason },
+    }
+
+    #[entity]
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Hop {
+        #[id([u8; 16])]
+        pub operation_id: HopId,
+        pub owner: [u8; 32],
+        #[index]
+        pub payment_hash: [u8; 32],
+        pub incoming_network: String,
+        pub incoming: StoredHtlc,
+        pub outgoing_network: String,
+        pub outgoing_amount_msat: u64,
+        pub outgoing_expiry: u64,
+        pub outgoing_target: StoredInvoiceTarget,
+        pub outgoing: Option<StoredHtlc>,
+        pub preimage: Option<[u8; 32]>,
+        pub state: HopState,
+        pub created_at: u64,
+        pub ended_at: Option<u64>,
     }
 }

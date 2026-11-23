@@ -35,13 +35,16 @@ const LISTED: usize = 100;
 /// The kinds of network a gateway is on (see
 /// [`hyperb_cassis_wallet::config::KINDS`]): those a payee can be paid on
 /// while offline.
-pub const KINDS: [&str; 6] = [
+pub const KINDS: [&str; 9] = [
     "arkade",
     "cashu",
     "liquid",
     "fedimint",
     "bitcoin",
     "rootstock",
+    "citrea",
+    "starknet-wbtc",
+    "solana-wbtc",
 ];
 
 impl Host for Gateway {

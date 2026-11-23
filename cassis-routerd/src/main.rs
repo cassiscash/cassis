@@ -25,7 +25,10 @@
     feature = "fedimint",
     feature = "lightning",
     feature = "liquid",
-    feature = "rootstock"
+    feature = "rootstock",
+    feature = "citrea",
+    feature = "solana-wbtc",
+    feature = "starknet-wbtc"
 )))]
 compile_error!("cassis-routerd needs at least one network feature, e.g. `--features cashu`");
 

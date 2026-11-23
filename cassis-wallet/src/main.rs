@@ -17,7 +17,10 @@
     feature = "fedimint",
     feature = "lightning",
     feature = "liquid",
-    feature = "rootstock"
+    feature = "rootstock",
+    feature = "citrea",
+    feature = "solana-wbtc",
+    feature = "starknet-wbtc"
 )))]
 compile_error!("cassis-wallet needs at least one network feature, e.g. `--features cashu`");
 

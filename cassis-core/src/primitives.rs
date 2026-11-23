@@ -135,6 +135,115 @@ impl<'de> Deserialize<'de> for PubKey {
     }
 }
 
+/// Ed25519 public key that is a Solana address, written in base58 like
+/// Solana's own tools write it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Ed25519PubKey(pub [u8; 32]);
+
+impl Ed25519PubKey {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for Ed25519PubKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&bs58::encode(self.0).into_string())
+    }
+}
+
+impl std::str::FromStr for Ed25519PubKey {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = bs58::decode(value.trim())
+            .into_vec()
+            .map_err(|e| format!("expected a base58 key: {e}"))?;
+        Ok(Self(bytes.try_into().map_err(|bytes: Vec<u8>| {
+            format!("expected a 32-byte key, got {} bytes", bytes.len())
+        })?))
+    }
+}
+
+impl Serialize for Ed25519PubKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ed25519PubKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Address of a Starknet contract (an account): a field element, below
+/// the Starknet prime, as 32 big-endian bytes. Written `0x` and 64 hex
+/// digits, and read with or without leading zeros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StarknetAddress(pub [u8; 32]);
+
+/// The Starknet prime, `2^251 + 17 * 2^192 + 1`, big-endian.
+const STARKNET_PRIME: [u8; 32] = {
+    let mut prime = [0u8; 32];
+    prime[0] = 0x08;
+    prime[7] = 0x11;
+    prime[31] = 0x01;
+    prime
+};
+
+impl StarknetAddress {
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, String> {
+        if bytes >= STARKNET_PRIME {
+            return Err("not a Starknet field element".into());
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for StarknetAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{}", lowercase_hex::encode(self.0))
+    }
+}
+
+impl std::str::FromStr for StarknetAddress {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let digits = value.strip_prefix("0x").unwrap_or(value);
+        if digits.is_empty() || digits.len() > 64 {
+            return Err("expected a Starknet address of up to 64 hex digits".into());
+        }
+        let padded = format!("{digits:0>64}");
+        let mut bytes = [0u8; 32];
+        lowercase_hex::decode_to_slice(padded.to_ascii_lowercase(), &mut bytes)
+            .map_err(|e| format!("expected a hex Starknet address: {e}"))?;
+        Self::from_bytes(bytes)
+    }
+}
+
+impl Serialize for StarknetAddress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for StarknetAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Opaque identifier of one protocol attempt (a PREPARE reservation, a
 /// COMMIT). Payment hashes identify payment intent; operation ids
 /// identify attempts.

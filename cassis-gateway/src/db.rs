@@ -15,8 +15,45 @@ pub use db_schema::*;
 
 #[orangedb::schema]
 pub mod db_schema {
+    use super::v1;
     use cassis_core::network::NetworkId;
     use cassis_wallet::stored::{StoredHtlc, StoredPayeeGatewayReceiveAuthorization};
+
+    // Rows whose stored authorizations and HTLCs gained the variants of
+    // new networks.
+
+    #[migrate]
+    fn handled_delegation_from_v1(
+        old: v1::HandledDelegation,
+    ) -> orangedb::Result<HandledDelegation> {
+        Ok(HandledDelegation {
+            authorization_id: HandledDelegationId(old.authorization_id.0),
+            payee: old.payee,
+            authorization: old.authorization.into(),
+            preimage_server_relay: old.preimage_server_relay,
+            registered_at: old.registered_at,
+        })
+    }
+
+    #[migrate]
+    fn payee_htlc_from_v1(old: v1::PayeeHtlc) -> orangedb::Result<PayeeHtlc> {
+        Ok(PayeeHtlc {
+            payment_hash: PayeeHtlcHash(old.payment_hash.0),
+            incoming_network: old.incoming_network,
+            incoming: old.incoming.into(),
+            claim_by: old.claim_by,
+            network: old.network,
+            htlc: old.htlc.map(Into::into),
+            outcome: old.outcome.map(|outcome| match outcome {
+                v1::PayeeOutcome::Claimed => PayeeOutcome::Claimed,
+                v1::PayeeOutcome::Refunded => PayeeOutcome::Refunded,
+            }),
+            preimage: old.preimage,
+            settled: old.settled,
+            failed: old.failed,
+            created_at: old.created_at,
+        })
+    }
 
     /// A standing authorization a payee gave this gateway.
     #[entity]
@@ -82,5 +119,54 @@ pub mod db_schema {
             let claiming = !self.settled && self.failed.is_none();
             claiming || (self.htlc.is_some() && self.outcome.is_none())
         }
+    }
+}
+
+/// The schema before Citrea, WBTC on Starknet and WBTC on Solana, whose
+/// stored authorizations and HTLCs [`db_schema`] migrates from. Frozen:
+/// only what decides how rows are stored, and the indexes orangedb
+/// needs.
+#[orangedb::schema]
+pub mod v1 {
+    use cassis_core::network::NetworkId;
+    use cassis_wallet::stored::v1::{StoredHtlc, StoredPayeeGatewayReceiveAuthorization};
+
+    #[entity]
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct HandledDelegation {
+        #[id([u8; 32])]
+        pub authorization_id: HandledDelegationId,
+        #[index]
+        pub payee: [u8; 32],
+        pub authorization: StoredPayeeGatewayReceiveAuthorization,
+        pub preimage_server_relay: Option<String>,
+        pub registered_at: u64,
+    }
+
+    #[embed]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PayeeOutcome {
+        Claimed,
+        Refunded,
+    }
+
+    #[entity]
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct PayeeHtlc {
+        #[id([u8; 32])]
+        pub payment_hash: PayeeHtlcHash,
+        #[fingerprint = "network_id"]
+        pub incoming_network: NetworkId,
+        pub incoming: StoredHtlc,
+        pub claim_by: u64,
+        #[fingerprint = "network_id"]
+        pub network: NetworkId,
+        pub htlc: Option<StoredHtlc>,
+        pub outcome: Option<PayeeOutcome>,
+        pub preimage: Option<[u8; 32]>,
+        #[index]
+        pub settled: bool,
+        pub failed: Option<String>,
+        pub created_at: u64,
     }
 }

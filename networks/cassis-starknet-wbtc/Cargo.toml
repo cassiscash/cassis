@@ -1,0 +1,16 @@
+[package]
+name = "cassis-starknet-wbtc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+cassis-core = { workspace = true }
+# Grinds the BIP44 key into a Stark curve key (EIP-2645).
+num-bigint = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+starknet-rust = { workspace = true }
+starknet-rust-crypto = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }

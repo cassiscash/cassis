@@ -11,7 +11,7 @@ name = "cassis-wallet"
 path = "src/main.rs"
 
 [features]
-default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock"]
+default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock", "citrea", "solana-wbtc", "starknet-wbtc"]
 arkade = ["cassis-networks/arkade"]
 bark-lightning = ["cassis-networks/bark-lightning"]
 bitcoin = ["cassis-networks/bitcoin"]
@@ -20,6 +20,9 @@ fedimint = ["cassis-networks/fedimint"]
 lightning = ["cassis-networks/lightning"]
 liquid = ["cassis-networks/liquid"]
 rootstock = ["cassis-networks/rootstock"]
+citrea = ["cassis-networks/citrea"]
+solana-wbtc = ["cassis-networks/solana-wbtc"]
+starknet-wbtc = ["cassis-networks/starknet-wbtc"]
 
 [dependencies]
 async-trait = { workspace = true }

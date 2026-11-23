@@ -9,7 +9,7 @@
 //! node (see `cassis-wallet`).
 
 use crate::offline::GatewayDestination;
-use crate::primitives::{Bytes32, PubKey, XOnlyPubKey};
+use crate::primitives::{Bytes32, Ed25519PubKey, PubKey, StarknetAddress, XOnlyPubKey};
 use async_trait::async_trait;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -30,6 +30,9 @@ use std::time::Duration;
 ///   `http`, everything else `https`)
 /// * `bitcoin`, `bitcoin::mutinynet`, `bitcoin::regtest`
 /// * `rootstock`, `rootstock::testnet`
+/// * `citrea`, `citrea::testnet` — cBTC on Citrea (its testnet4 chain)
+/// * `starknet-wbtc`, `starknet-wbtc::sepolia` — WBTC on Starknet
+/// * `solana-wbtc` — WBTC on Solana
 /// * `lightning`, or `lightning::signet`, `lightning::mutinynet`,
 ///   `lightning::regtest` — Lightning on a test chain
 ///
@@ -74,7 +77,9 @@ impl NetworkId {
                 }
                 return Ok(Self(spec.to_string()));
             }
-            "liquid" | "rootstock" => &["testnet"],
+            "liquid" | "rootstock" | "citrea" => &["testnet"],
+            "starknet-wbtc" => &["sepolia"],
+            "solana-wbtc" => &[],
             "bitcoin" => &["mutinynet", "regtest"],
             "lightning" => &["signet", "mutinynet", "regtest"],
             other => return Err(format!("unsupported network kind '{other}'")),
@@ -142,6 +147,11 @@ impl NetworkId {
             "liquid" => 10 * MINUTE,
             // ~30s blocks, with some variance.
             "rootstock" => 20 * MINUTE,
+            // Blocks every few seconds from a single sequencer, refunds
+            // timed by block timestamps.
+            "citrea" | "starknet-wbtc" => 10 * MINUTE,
+            // Sub-second slots, refunds timed by the cluster clock.
+            "solana-wbtc" => 5 * MINUTE,
             // The hold invoice must be settled before its CLTV, counted
             // in bitcoin blocks, runs out.
             "lightning" => 60 * MINUTE,
@@ -177,6 +187,9 @@ impl NetworkId {
             // Timelocks assume the fastest block cadence, so the refund
             // of an HTLC lasting two hours opens up to an hour late.
             "rootstock" => 60 * MINUTE,
+            // The refund opens by block timestamps, which follow the wall
+            // clock, and is one transaction.
+            "citrea" | "starknet-wbtc" | "solana-wbtc" => 10 * MINUTE,
             // The payment's CLTV counts bitcoin blocks, which can come
             // late.
             "lightning" => 60 * MINUTE,
@@ -193,6 +206,8 @@ impl NetworkId {
             "bitcoin" => 500 * SAT,
             "liquid" => 2 * SAT,
             "rootstock" => 100 * SAT,
+            "citrea" => 20 * SAT,
+            "starknet-wbtc" | "solana-wbtc" => 50 * SAT,
             "lightning" => 2 * SAT,
             "cashu" | "fedimint" | "arkade" => 0,
             _ => 0,
@@ -226,8 +241,9 @@ impl fmt::Display for NetworkId {
 /// [`crate::offline::GatewayDestination`]).
 ///
 /// Crosses the wire as `{"network": <id>, "target": {<kind of key>: <key>}}`:
-/// `{"XOnlyPubKey": <hex>}`, `{"PubKey": <hex>}` or
-/// `{"LightningInvoice": <BOLT11>}`, which must be the network's kind.
+/// `{"XOnlyPubKey": <hex>}`, `{"PubKey": <hex>}`, `{"Ed25519PubKey":
+/// <base58>}`, `{"StarknetAddress": <0x hex>}` or `{"LightningInvoice":
+/// <BOLT11>}`, which must be the network's kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvoiceTarget<L = String> {
     Cashu {
@@ -257,6 +273,18 @@ pub enum InvoiceTarget<L = String> {
     Lightning {
         network: NetworkId,
         invoice: L,
+    },
+    Citrea {
+        network: NetworkId,
+        target: PubKey,
+    },
+    StarknetWbtc {
+        network: NetworkId,
+        target: StarknetAddress,
+    },
+    SolanaWbtc {
+        network: NetworkId,
+        target: Ed25519PubKey,
     },
 }
 
@@ -305,6 +333,16 @@ impl<L: LightningTarget> InvoiceTarget<L> {
                 .parse::<PubKey>()
                 .map_err(|_| format!("{network} pays to a full public key"))
         };
+        let ed25519 = || {
+            target
+                .parse::<Ed25519PubKey>()
+                .map_err(|e| format!("{network} pays to a Solana address: {e}"))
+        };
+        let starknet = || {
+            target
+                .parse::<StarknetAddress>()
+                .map_err(|e| format!("{network} pays to a Starknet address: {e}"))
+        };
         Ok(match network.kind() {
             "cashu" => Self::Cashu {
                 target: x_only()?,
@@ -330,6 +368,18 @@ impl<L: LightningTarget> InvoiceTarget<L> {
                 target: full()?,
                 network,
             },
+            "citrea" => Self::Citrea {
+                target: full()?,
+                network,
+            },
+            "starknet-wbtc" => Self::StarknetWbtc {
+                target: starknet()?,
+                network,
+            },
+            "solana-wbtc" => Self::SolanaWbtc {
+                target: ed25519()?,
+                network,
+            },
             "lightning" => Self::Lightning {
                 invoice: L::from_invoice(&network, target.to_string())?,
                 network,
@@ -345,7 +395,9 @@ impl<L: LightningTarget> InvoiceTarget<L> {
             | Self::Fedimint { .. }
             | Self::Arkade { .. }
             | Self::Bitcoin { .. } => "XOnlyPubKey",
-            Self::Liquid { .. } | Self::Rootstock { .. } => "PubKey",
+            Self::Liquid { .. } | Self::Rootstock { .. } | Self::Citrea { .. } => "PubKey",
+            Self::StarknetWbtc { .. } => "StarknetAddress",
+            Self::SolanaWbtc { .. } => "Ed25519PubKey",
             Self::Lightning { .. } => "LightningInvoice",
         }
     }
@@ -357,7 +409,11 @@ impl<L: LightningTarget> InvoiceTarget<L> {
             | Self::Fedimint { target, .. }
             | Self::Arkade { target, .. }
             | Self::Bitcoin { target, .. } => target.to_hex(),
-            Self::Liquid { target, .. } | Self::Rootstock { target, .. } => target.to_hex(),
+            Self::Liquid { target, .. }
+            | Self::Rootstock { target, .. }
+            | Self::Citrea { target, .. } => target.to_hex(),
+            Self::StarknetWbtc { target, .. } => target.to_string(),
+            Self::SolanaWbtc { target, .. } => target.to_string(),
             Self::Lightning { invoice, .. } => invoice.invoice().to_string(),
         }
     }
@@ -372,6 +428,9 @@ impl<L> InvoiceTarget<L> {
             | Self::Bitcoin { network, .. }
             | Self::Liquid { network, .. }
             | Self::Rootstock { network, .. }
+            | Self::Citrea { network, .. }
+            | Self::StarknetWbtc { network, .. }
+            | Self::SolanaWbtc { network, .. }
             | Self::Lightning { network, .. } => network,
         }
     }
@@ -388,6 +447,11 @@ impl<L> InvoiceTarget<L> {
             Self::Bitcoin { network, target } => InvoiceTarget::Bitcoin { network, target },
             Self::Liquid { network, target } => InvoiceTarget::Liquid { network, target },
             Self::Rootstock { network, target } => InvoiceTarget::Rootstock { network, target },
+            Self::Citrea { network, target } => InvoiceTarget::Citrea { network, target },
+            Self::StarknetWbtc { network, target } => {
+                InvoiceTarget::StarknetWbtc { network, target }
+            }
+            Self::SolanaWbtc { network, target } => InvoiceTarget::SolanaWbtc { network, target },
             Self::Lightning { network, invoice } => lightning(network, invoice)?,
         })
     }
@@ -551,6 +615,36 @@ pub enum HtlcDescriptor {
     /// A payment of the `target` BOLT11 hold invoice; LND tracks it by
     /// hash.
     Lightning { target: String },
+    /// Escrow in atomiq's `EscrowManager` on Citrea (see `cassis-citrea`),
+    /// funded by `refund_address` in cBTC. Refund opens after the unix
+    /// timestamp `refund_after`.
+    Citrea {
+        amount_wei: u128,
+        refund_address: String,
+        sequence: u64,
+        refund_after: u64,
+        target: PubKey,
+    },
+    /// Escrow of WBTC in atomiq's escrow manager on Starknet (see
+    /// `cassis-starknet-wbtc`), funded by `refund_address`. Refund opens
+    /// after the unix timestamp `refund_after`.
+    StarknetWbtc {
+        amount_sat: u64,
+        refund_address: StarknetAddress,
+        sequence: u64,
+        refund_after: u64,
+        target: StarknetAddress,
+    },
+    /// Escrow of WBTC in atomiq's swap program on Solana (see
+    /// `cassis-solana-wbtc`), funded by `refund_address`. Refund opens
+    /// after the unix timestamp `refund_after`.
+    SolanaWbtc {
+        amount_sat: u64,
+        refund_address: Ed25519PubKey,
+        sequence: u64,
+        refund_after: u64,
+        target: Ed25519PubKey,
+    },
 }
 
 impl HtlcDescriptor {
@@ -564,7 +658,15 @@ impl HtlcDescriptor {
                 target == claim
             }
             (Self::Liquid { target, .. }, InvoiceTarget::Liquid { target: claim, .. })
-            | (Self::Rootstock { target, .. }, InvoiceTarget::Rootstock { target: claim, .. }) => {
+            | (Self::Rootstock { target, .. }, InvoiceTarget::Rootstock { target: claim, .. })
+            | (Self::Citrea { target, .. }, InvoiceTarget::Citrea { target: claim, .. }) => {
+                target == claim
+            }
+            (
+                Self::StarknetWbtc { target, .. },
+                InvoiceTarget::StarknetWbtc { target: claim, .. },
+            ) => target == claim,
+            (Self::SolanaWbtc { target, .. }, InvoiceTarget::SolanaWbtc { target: claim, .. }) => {
                 target == claim
             }
             (Self::Lightning { target }, InvoiceTarget::Lightning { invoice, .. }) => {
@@ -965,6 +1067,11 @@ mod tests {
             "bitcoin::regtest",
             "rootstock",
             "rootstock::testnet",
+            "citrea",
+            "citrea::testnet",
+            "starknet-wbtc",
+            "starknet-wbtc::sepolia",
+            "solana-wbtc",
             "lightning",
             "lightning::mutinynet",
         ] {
@@ -985,6 +1092,8 @@ mod tests {
             "arkade::https://operator.example.com",
             "bitcoin::testnet",
             "lightning::testnet",
+            "citrea::sepolia",
+            "solana-wbtc::devnet",
             "mystery",
         ] {
             assert!(NetworkId::parse(spec).is_err(), "{spec} should be rejected");

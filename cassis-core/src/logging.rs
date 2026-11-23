@@ -24,6 +24,9 @@ const OUR_CRATES: &[&str] = &[
     "cassis_liquid",
     "cassis_lnd",
     "cassis_rootstock",
+    "cassis_citrea",
+    "cassis_solana_wbtc",
+    "cassis_starknet_wbtc",
 ];
 
 pub fn init_logging() {

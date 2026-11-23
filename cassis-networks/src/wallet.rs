@@ -26,6 +26,8 @@ pub enum Wallet {
     Bitcoin(Arc<cassis_bitcoin::BitcoinAdapter>),
     #[cfg(feature = "cashu")]
     Cashu(Arc<cassis_cashu::CashuAdapter>),
+    #[cfg(feature = "citrea")]
+    Citrea(Arc<cassis_citrea::CitreaAdapter>),
     #[cfg(feature = "fedimint")]
     Fedimint(Arc<cassis_fedimint::FedimintAdapter>),
     #[cfg(feature = "liquid")]
@@ -34,6 +36,10 @@ pub enum Wallet {
     Lnd(Arc<cassis_lnd::LndAdapter>),
     #[cfg(feature = "rootstock")]
     Rootstock(Arc<cassis_rootstock::RootstockAdapter>),
+    #[cfg(feature = "solana-wbtc")]
+    SolanaWbtc(Arc<cassis_solana_wbtc::SolanaWbtcAdapter>),
+    #[cfg(feature = "starknet-wbtc")]
+    StarknetWbtc(Arc<cassis_starknet_wbtc::StarknetWbtcAdapter>),
 }
 
 /// An amount the wallet holds.
@@ -217,6 +223,28 @@ impl Wallet {
                 send: Some("Rootstock address"),
                 ..Can::default()
             },
+            #[cfg(feature = "citrea")]
+            Wallet::Citrea(_) => Can {
+                send: Some("Citrea address"),
+                ..Can::default()
+            },
+            #[cfg(feature = "solana-wbtc")]
+            Wallet::SolanaWbtc(_) => Can {
+                send: Some("Solana address"),
+                note: Some(
+                    "WBTC on Solana. Fees and rent are paid in SOL, which the address must hold.",
+                ),
+                ..Can::default()
+            },
+            #[cfg(feature = "starknet-wbtc")]
+            Wallet::StarknetWbtc(_) => Can {
+                send: Some("Starknet address"),
+                note: Some(
+                    "WBTC on Starknet. Fees are paid in STRK, which the address must hold; the \
+                     account is deployed from it before its first transaction.",
+                ),
+                ..Can::default()
+            },
         }
     }
 
@@ -260,6 +288,12 @@ impl Wallet {
             ],
             #[cfg(feature = "rootstock")]
             Wallet::Rootstock(ref w) => spendable(w.balance_msat().await?),
+            #[cfg(feature = "citrea")]
+            Wallet::Citrea(ref w) => spendable(w.balance_msat().await?),
+            #[cfg(feature = "solana-wbtc")]
+            Wallet::SolanaWbtc(ref w) => spendable(w.balance_msat().await?),
+            #[cfg(feature = "starknet-wbtc")]
+            Wallet::StarknetWbtc(ref w) => spendable(w.balance_msat().await?),
         })
     }
 
@@ -302,6 +336,12 @@ impl Wallet {
             )],
             #[cfg(feature = "rootstock")]
             Wallet::Rootstock(ref w) => vec![address("Rootstock", w.address().to_string())],
+            #[cfg(feature = "citrea")]
+            Wallet::Citrea(ref w) => vec![address("Citrea", w.address().to_string())],
+            #[cfg(feature = "solana-wbtc")]
+            Wallet::SolanaWbtc(ref w) => vec![address("Solana", w.address().to_string())],
+            #[cfg(feature = "starknet-wbtc")]
+            Wallet::StarknetWbtc(ref w) => vec![address("Starknet", w.address().to_string())],
         })
     }
 
@@ -442,6 +482,21 @@ impl Wallet {
             }
             #[cfg(feature = "rootstock")]
             (Wallet::Rootstock(w), Op::Send { to, amount_sat }) => {
+                let txid = w.transfer(&to, msat(amount_sat)).await?;
+                Ok(Done::said(format!("Sent {} in {txid}", sats(amount_sat))))
+            }
+            #[cfg(feature = "citrea")]
+            (Wallet::Citrea(w), Op::Send { to, amount_sat }) => {
+                let txid = w.transfer(&to, msat(amount_sat)).await?;
+                Ok(Done::said(format!("Sent {} in {txid}", sats(amount_sat))))
+            }
+            #[cfg(feature = "solana-wbtc")]
+            (Wallet::SolanaWbtc(w), Op::Send { to, amount_sat }) => {
+                let txid = w.transfer(&to, msat(amount_sat)).await?;
+                Ok(Done::said(format!("Sent {} in {txid}", sats(amount_sat))))
+            }
+            #[cfg(feature = "starknet-wbtc")]
+            (Wallet::StarknetWbtc(w), Op::Send { to, amount_sat }) => {
                 let txid = w.transfer(&to, msat(amount_sat)).await?;
                 Ok(Done::said(format!("Sent {} in {txid}", sats(amount_sat))))
             }
