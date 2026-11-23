@@ -26,44 +26,44 @@ edition = "2021"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 base64 = "0.22.1"
 bitcoin = "0.32.102"
-axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
 bip39 = "2.2.2"
 chacha20 = "0.9.1"
 cdk = { git = "https://github.com/cashubtc/cdk", rev = "e133ed83e095f7d490478c2330bb1cf0e1617efa", features = ["wallet"] }
-clap = { version = "4.6.6", features = ["derive"] }
-futures = "0.3.33"
-fs2 = "0.4"
+clap = { version = "4.6.9", features = ["derive"] }
+futures = "0.3.34"
+fs2 = "0.4.3"
 hmac = "0.12.1"
 hypereffect = "0.6.3"
 iroh = "1.0.3"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 lightning-invoice = { version = "0.33.3", features = ["std"] }
 lowercase-hex = "0.1.1"
-lwk_common = "0.19"
-lwk_signer = "0.19"
-lwk_wollet = { version = "0.19", default-features = false, features = ["esplora"] }
+lwk_common = "0.19.0"
+lwk_signer = "0.19.0"
+lwk_wollet = { version = "0.19.0", default-features = false, features = ["esplora"] }
 orangedb = "0.3.0"
-postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+postcard = { version = "1.2.0", default-features = false, features = ["alloc"] }
 rand = "0.8.7"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 ritualistic = "0.2.4"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "aws_lc_rs"] }
-secp256k1 = { version = "0.31", features = ["std"] }
+secp256k1 = { version = "0.31.1", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 sha2 = "0.10.9"
 thiserror = "1.0.69"
-tokio = "1.53.1"
+tokio = "1.54.1"
 toml = "0.8.23"
 toml_edit = "0.22.27"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
-alloy = { version = "2.4", default-features = false, features = [
+alloy = { version = "2.6.1", default-features = false, features = [
   "std",
   "reqwest",
   "reqwest-rustls-tls",
@@ -79,14 +79,14 @@ alloy = { version = "2.4", default-features = false, features = [
 ] }
 # `sqlite` persists the SDK contract store (VHTLC rows), so they
 # survive restarts; it enables both sqlx and rusqlite upstream.
-ark-client = { version = "0.12", default-features = false, features = [
+ark-client = { version = "0.12.1", default-features = false, features = [
   "sqlite",
   "tls-webpki-roots",
 ] }
-ark-core = "0.12"
-ark-grpc = { version = "0.12", default-features = false, features = ["tls-webpki-roots"] }
-ark-bdk-wallet = "0.12"
-esplora-client = { version = "0.10", features = ["async-https"] }
+ark-core = "0.12.1"
+ark-grpc = { version = "0.12.1", default-features = false, features = ["tls-webpki-roots"] }
+ark-bdk-wallet = "0.12.1"
+esplora-client = { version = "0.10.0", features = ["async-https"] }
 
 # PR #8913 (direct_htlc branch): raw HTLC/PTLC client API on LNv2
 # OutgoingContract — the surface the fedimint adapter's

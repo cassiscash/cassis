@@ -27,7 +27,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio_with_wasm = { version = "0.8", features = ["rt", "sync", "time", "macros"] }
+tokio_with_wasm = { version = "0.8.8", features = ["rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -36,7 +36,7 @@ iroh = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = "0.3"
+js-sys = "0.3.107"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

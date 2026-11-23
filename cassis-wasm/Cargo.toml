@@ -15,9 +15,9 @@ crate-type = ["cdylib", "rlib"]
 cassis-core = { workspace = true }
 futures = { workspace = true }
 iroh = { workspace = true }
-js-sys = "0.3"
-n0-future = "0.3"
+js-sys = "0.3.107"
+n0-future = "0.3.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
-wasm-bindgen = "=0.2.128"
-wasm-bindgen-futures = "0.4"
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4.80"
