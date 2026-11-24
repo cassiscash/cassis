@@ -77,21 +77,23 @@ pub enum Command {
         #[command(subcommand)]
         command: ChainCommand,
     },
-    /// Bark wallet of a `lightning` network enabled with `--bark`.
+    /// Bark lightning wallet of a `lightning` network enabled with
+    /// `--bark-lightning`.
     #[cfg(feature = "bark-lightning")]
-    Bark {
+    BarkLightning {
         #[arg(long, default_value = "lightning")]
         network: String,
         #[command(subcommand)]
-        command: BarkCommand,
+        command: BarkLightningCommand,
     },
-    /// Spark wallet of a `lightning` network enabled with `--spark`.
+    /// Spark lightning wallet of a `lightning` network enabled with
+    /// `--spark-lightning`.
     #[cfg(feature = "spark-lightning")]
-    Spark {
+    SparkLightning {
         #[arg(long, default_value = "lightning")]
         network: String,
         #[command(subcommand)]
-        command: SparkCommand,
+        command: SparkLightningCommand,
     },
     /// Ecash wallet in one federation.
     #[cfg(feature = "fedimint")]
@@ -155,7 +157,7 @@ pub enum ArkadeCommand {
 }
 
 #[derive(Subcommand)]
-pub enum SparkCommand {
+pub enum SparkLightningCommand {
     Balance,
     /// Spark address, and the bitcoin address to deposit to.
     Address,
@@ -174,7 +176,7 @@ pub enum SparkCommand {
 }
 
 #[derive(Subcommand)]
-pub enum BarkCommand {
+pub enum BarkLightningCommand {
     Balance,
     /// Ark address to receive VTXOs at.
     Address,
@@ -318,15 +320,15 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             }
         }
         #[cfg(feature = "bark-lightning")]
-        Command::Bark { network, command } => {
+        Command::BarkLightning { network, command } => {
             let network = kind(&network, "lightning")?;
-            let wallet = home.open_bark(&network, span).await?;
+            let wallet = home.open_bark_lightning(&network, span).await?;
             let error = |e: cassis_core::NetworkError| e.to_string();
             match command {
-                BarkCommand::Balance => {
+                BarkLightningCommand::Balance => {
                     println!("{} sat", wallet.spendable_sats().await.map_err(error)?)
                 }
-                BarkCommand::Address => println!(
+                BarkLightningCommand::Address => println!(
                     "{}",
                     wallet
                         .wallet()
@@ -334,7 +336,7 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
                         .await
                         .map_err(|e| format!("{e:#}"))?
                 ),
-                BarkCommand::Invoice { amount_sat } => {
+                BarkLightningCommand::Invoice { amount_sat } => {
                     let invoice = wallet.funding_invoice(amount_sat).await.map_err(error)?;
                     println!("{invoice}");
                     wallet.claim_funding(&invoice).await.map_err(error)?;
@@ -343,25 +345,25 @@ pub async fn run(home: &Home, command: Command, span: &Span) -> Result<(), Strin
             }
         }
         #[cfg(feature = "spark-lightning")]
-        Command::Spark { network, command } => {
+        Command::SparkLightning { network, command } => {
             let network = kind(&network, "lightning")?;
-            let wallet = home.open_spark(&network, span).await?;
+            let wallet = home.open_spark_lightning(&network, span).await?;
             let error = |e: cassis_core::NetworkError| e.to_string();
             match command {
-                SparkCommand::Balance => {
+                SparkLightningCommand::Balance => {
                     println!("{} sat", wallet.balance_sats().await.map_err(error)?)
                 }
-                SparkCommand::Address => {
+                SparkLightningCommand::Address => {
                     let (spark, bitcoin) = wallet.addresses().await.map_err(error)?;
                     println!("spark:   {spark}\nbitcoin: {bitcoin}");
                 }
-                SparkCommand::Invoice { amount_sat } => {
+                SparkLightningCommand::Invoice { amount_sat } => {
                     let invoice = wallet.funding_invoice(amount_sat).await.map_err(error)?;
                     println!("{invoice}");
                     wallet.claim_funding(&invoice).await.map_err(error)?;
                     println!("received {amount_sat} sat");
                 }
-                SparkCommand::Send { to, amount_sat } => {
+                SparkLightningCommand::Send { to, amount_sat } => {
                     println!("{}", wallet.send(&to, amount_sat).await.map_err(error)?)
                 }
             }

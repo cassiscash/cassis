@@ -115,17 +115,20 @@ impl Home {
         Ok(settings)
     }
 
-    /// The bark wallet of `network`, which must go through an Ark server
-    /// (`bark` in its config).
+    /// The bark-lightning wallet of `network`, which must go through an
+    /// Ark server (`bark-lightning` in its config).
     #[cfg(feature = "bark-lightning")]
-    pub async fn open_bark(
+    pub async fn open_bark_lightning(
         &self,
         network: &NetworkId,
         span: &Span,
     ) -> Result<bark_lightning::BarkLightningAdapter, String> {
         let settings = self.settings(network)?;
-        let config = settings.bark.ok_or_else(|| {
-            format!("{network} goes through LND here: enable it with --bark to use bark")
+        let config = settings.bark_lightning.ok_or_else(|| {
+            format!(
+                "{network} goes through LND here: enable it with --bark-lightning to use \
+                 bark-lightning"
+            )
         })?;
         let adapter = bark_lightning::BarkLightningAdapter::open(
             network.clone(),
@@ -139,17 +142,20 @@ impl Home {
         Ok(adapter)
     }
 
-    /// The Spark wallet of `network`, which must go through one (`spark`
-    /// in its config).
+    /// The Spark lightning wallet of `network`, which must go through one
+    /// (`spark-lightning` in its config).
     #[cfg(feature = "spark-lightning")]
-    pub async fn open_spark(
+    pub async fn open_spark_lightning(
         &self,
         network: &NetworkId,
         span: &Span,
     ) -> Result<spark_lightning::SparkLightningAdapter, String> {
         let settings = self.settings(network)?;
-        let config = settings.spark.ok_or_else(|| {
-            format!("{network} does not go through spark here: enable it with --spark")
+        let config = settings.spark_lightning.ok_or_else(|| {
+            format!(
+                "{network} does not go through spark-lightning here: enable it with \
+                 --spark-lightning"
+            )
         })?;
         let adapter = spark_lightning::SparkLightningAdapter::open(
             network.clone(),
@@ -225,7 +231,8 @@ impl Home {
 
 /// The upkeep a long-running node would do now and then (see
 /// [`Network::maintain`]: settling arkade boarding deposits, refreshing
-/// VTXOs before the operator may sweep them, syncing bark and spark), done once
+/// VTXOs before the operator may sweep them, syncing bark-lightning and
+/// spark-lightning), done once
 /// whenever the wallet opens `network`, before any command uses it. A
 /// failure only warns: the command may still work.
 pub async fn routine_checks(network: &dyn Network) {

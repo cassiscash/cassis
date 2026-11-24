@@ -47,7 +47,7 @@ use tracing::{Span, debug, info};
 
 /// What a Spark wallet needs besides its keys.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SparkConfig {
+pub struct SparkLightningConfig {
     /// Breez API key, which mainnet requires; see
     /// <https://breez.technology/request-api-key/>.
     pub api_key: Option<String>,
@@ -93,7 +93,7 @@ impl SparkLightningAdapter {
         id: NetworkId,
         mnemonic: &Mnemonic,
         datadir: &Path,
-        config: &SparkConfig,
+        config: &SparkLightningConfig,
         span: &Span,
     ) -> Result<Self, String> {
         let network = match id.param() {

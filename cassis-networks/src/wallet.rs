@@ -21,7 +21,7 @@ pub enum Wallet {
     #[cfg(feature = "arkade")]
     Arkade(Arc<cassis_arkade::ArkadeAdapter>),
     #[cfg(feature = "bark-lightning")]
-    Bark(Arc<cassis_bark_lightning::BarkLightningAdapter>),
+    BarkLightning(Arc<cassis_bark_lightning::BarkLightningAdapter>),
     #[cfg(feature = "bitcoin")]
     Bitcoin(Arc<cassis_bitcoin::BitcoinAdapter>),
     #[cfg(feature = "cashu")]
@@ -39,7 +39,7 @@ pub enum Wallet {
     #[cfg(feature = "solana-wbtc")]
     SolanaWbtc(Arc<cassis_solana_wbtc::SolanaWbtcAdapter>),
     #[cfg(feature = "spark-lightning")]
-    Spark(Arc<cassis_spark_lightning::SparkLightningAdapter>),
+    SparkLightning(Arc<cassis_spark_lightning::SparkLightningAdapter>),
     #[cfg(feature = "starknet-wbtc")]
     StarknetWbtc(Arc<cassis_starknet_wbtc::StarknetWbtcAdapter>),
 }
@@ -177,7 +177,7 @@ impl Wallet {
                 ..Can::default()
             },
             #[cfg(feature = "bark-lightning")]
-            Wallet::Bark(_) => Can {
+            Wallet::BarkLightning(_) => Can {
                 send: Some("Ark or bitcoin address"),
                 lightning: true,
                 new_addresses: true,
@@ -239,7 +239,7 @@ impl Wallet {
                 ..Can::default()
             },
             #[cfg(feature = "spark-lightning")]
-            Wallet::Spark(_) => Can {
+            Wallet::SparkLightning(_) => Can {
                 send: Some("Spark or bitcoin address"),
                 lightning: true,
                 note: Some(
@@ -265,7 +265,7 @@ impl Wallet {
             #[cfg(feature = "arkade")]
             Wallet::Arkade(ref w) => spendable(w.balance_msat().await.map_err(|e| e.to_string())?),
             #[cfg(feature = "bark-lightning")]
-            Wallet::Bark(ref w) => {
+            Wallet::BarkLightning(ref w) => {
                 let (spendable, other) = w.balance_sats().await.map_err(|e| e.to_string())?;
                 vec![
                     Balance {
@@ -304,7 +304,7 @@ impl Wallet {
             #[cfg(feature = "solana-wbtc")]
             Wallet::SolanaWbtc(ref w) => spendable(w.balance_msat().await?),
             #[cfg(feature = "spark-lightning")]
-            Wallet::Spark(ref w) => {
+            Wallet::SparkLightning(ref w) => {
                 spendable(w.balance_sats().await.map_err(|e| e.to_string())? * MSAT_PER_SAT)
             }
             #[cfg(feature = "starknet-wbtc")]
@@ -327,7 +327,7 @@ impl Wallet {
                 ]
             }
             #[cfg(feature = "bark-lightning")]
-            Wallet::Bark(ref w) => {
+            Wallet::BarkLightning(ref w) => {
                 vec![address(
                     "Ark",
                     w.new_address().await.map_err(|e| e.to_string())?,
@@ -356,7 +356,7 @@ impl Wallet {
             #[cfg(feature = "solana-wbtc")]
             Wallet::SolanaWbtc(ref w) => vec![address("Solana", w.address().to_string())],
             #[cfg(feature = "spark-lightning")]
-            Wallet::Spark(ref w) => {
+            Wallet::SparkLightning(ref w) => {
                 let (spark, bitcoin) = w.addresses().await.map_err(|e| e.to_string())?;
                 vec![
                     address("Spark", spark),
@@ -396,7 +396,7 @@ impl Wallet {
                 }
             }
             #[cfg(feature = "bark-lightning")]
-            (Wallet::Bark(w), op) => {
+            (Wallet::BarkLightning(w), op) => {
                 let error = |e: cassis_core::NetworkError| e.to_string();
                 match op {
                     Op::Send { to, amount_sat } => Ok(Done::said(
@@ -519,7 +519,7 @@ impl Wallet {
                 Ok(Done::said(format!("Sent {} in {txid}", sats(amount_sat))))
             }
             #[cfg(feature = "spark-lightning")]
-            (Wallet::Spark(w), op) => {
+            (Wallet::SparkLightning(w), op) => {
                 let error = |e: cassis_core::NetworkError| e.to_string();
                 match op {
                     Op::Send { to, amount_sat } => {

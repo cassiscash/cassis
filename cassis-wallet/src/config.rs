@@ -14,8 +14,8 @@
 //!
 //! [networks.lightning]
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
-//! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
-//! # or: spark = {}                 # Spark wallet; { api_key } on mainnet
+//! # or: bark-lightning = {}       # Second's server, or { server_url, esplora_url }
+//! # or: spark-lightning = {}      # Spark wallet; { api_key } on mainnet
 //! ```
 //!
 //! Every network has a BIP39 mnemonic of its own, written when it is
@@ -25,8 +25,8 @@
 //! BIP44 under RSK's coin type on `rootstock`, BIP44 under Ethereum's on
 //! `citrea`, a Stark key ground from BIP44 under Starknet's on
 //! `starknet-wbtc`, SLIP-10 under Solana's on `solana-wbtc`, bark's own
-//! seed on a bark `lightning`, Breez's Spark keys on a spark `lightning`,
-//! fedimint's own root secret on `fedimint`.
+//! seed on a bark-lightning `lightning`, Breez's Spark keys on a
+//! spark-lightning `lightning`, fedimint's own root secret on `fedimint`.
 //! Back this file up, or the mnemonics.
 
 use cassis_core::NetworkId;
@@ -58,10 +58,13 @@ pub struct NetworkConfig {
     pub esplora_url: Option<String>,
     /// The LND node of a `lightning` network.
     pub lnd: Option<LndConfig>,
-    /// The Ark server of a `lightning` network going through bark.
-    pub bark: Option<BarkConfig>,
-    /// A `lightning` network going through a Spark wallet.
-    pub spark: Option<SparkConfig>,
+    /// The Ark server of a `lightning` network going through
+    /// bark-lightning.
+    #[serde(rename = "bark-lightning")]
+    pub bark_lightning: Option<BarkLightningConfig>,
+    /// A `lightning` network going through a Spark lightning wallet.
+    #[serde(rename = "spark-lightning")]
+    pub spark_lightning: Option<SparkLightningConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -76,7 +79,7 @@ pub struct LndConfig {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(not(feature = "bark-lightning"), allow(dead_code))]
-pub struct BarkConfig {
+pub struct BarkLightningConfig {
     /// Second's server for mainnet and signet when unset.
     pub server_url: Option<String>,
     pub esplora_url: Option<String>,
@@ -85,7 +88,7 @@ pub struct BarkConfig {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(not(feature = "spark-lightning"), allow(dead_code))]
-pub struct SparkConfig {
+pub struct SparkLightningConfig {
     /// Breez API key, which mainnet requires.
     pub api_key: Option<String>,
 }
@@ -156,25 +159,30 @@ impl NetworkConfig {
             return Err(format!("{network}: this build has no LND support"));
         }
         #[cfg(not(feature = "bark-lightning"))]
-        if self.bark.is_some() {
-            return Err(format!("{network}: this build has no bark support"));
+        if self.bark_lightning.is_some() {
+            return Err(format!(
+                "{network}: this build has no bark-lightning support"
+            ));
         }
         #[cfg(not(feature = "spark-lightning"))]
-        if self.spark.is_some() {
-            return Err(format!("{network}: this build has no spark support"));
+        if self.spark_lightning.is_some() {
+            return Err(format!(
+                "{network}: this build has no spark-lightning support"
+            ));
         }
         #[cfg(feature = "bark-lightning")]
-        let bark = match &self.bark {
+        let bark_lightning = match &self.bark_lightning {
             None => None,
-            Some(bark) => {
-                let default = cassis_networks::bark_lightning::BarkConfig::default_for(network);
-                Some(cassis_networks::bark_lightning::BarkConfig {
-                    server_url: bark
+            Some(bark_lightning) => {
+                let default =
+                    cassis_networks::bark_lightning::BarkLightningConfig::default_for(network);
+                Some(cassis_networks::bark_lightning::BarkLightningConfig {
+                    server_url: bark_lightning
                         .server_url
                         .clone()
                         .or_else(|| default.as_ref().map(|d| d.server_url.clone()))
                         .ok_or_else(|| format!("{network} has no default Ark server"))?,
-                    esplora_url: bark
+                    esplora_url: bark_lightning
                         .esplora_url
                         .clone()
                         .or_else(|| default.as_ref().map(|d| d.esplora_url.clone()))
@@ -195,14 +203,13 @@ impl NetworkConfig {
                 )
             }),
             #[cfg(feature = "bark-lightning")]
-            bark,
+            bark_lightning,
             #[cfg(feature = "spark-lightning")]
-            spark: self
-                .spark
-                .as_ref()
-                .map(|spark| cassis_networks::spark_lightning::SparkConfig {
-                    api_key: spark.api_key.clone(),
-                }),
+            spark_lightning: self.spark_lightning.as_ref().map(|spark_lightning| {
+                cassis_networks::spark_lightning::SparkLightningConfig {
+                    api_key: spark_lightning.api_key.clone(),
+                }
+            }),
         })
     }
 }

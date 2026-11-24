@@ -47,16 +47,16 @@ pub struct NetworkSettings {
     /// Chain API instead of the public one, for `arkade` and `bitcoin`
     /// (regtest has none).
     pub esplora_url: Option<String>,
-    /// The LND node a `lightning` network goes through, unless `bark` or
-    /// `spark`.
+    /// The LND node a `lightning` network goes through, unless
+    /// `bark-lightning` or `spark-lightning`.
     #[cfg(feature = "lightning")]
     pub lnd: Option<cassis_lnd::LndConfig>,
     /// The Ark server a `lightning` network goes through instead of LND.
     #[cfg(feature = "bark-lightning")]
-    pub bark: Option<cassis_bark_lightning::BarkConfig>,
+    pub bark_lightning: Option<cassis_bark_lightning::BarkLightningConfig>,
     /// The Spark wallet a `lightning` network goes through instead of LND.
     #[cfg(feature = "spark-lightning")]
-    pub spark: Option<cassis_spark_lightning::SparkConfig>,
+    pub spark_lightning: Option<cassis_spark_lightning::SparkLightningConfig>,
 }
 
 impl NetworkSettings {
@@ -70,9 +70,9 @@ impl NetworkSettings {
             #[cfg(feature = "lightning")]
             lnd: None,
             #[cfg(feature = "bark-lightning")]
-            bark: None,
+            bark_lightning: None,
             #[cfg(feature = "spark-lightning")]
-            spark: None,
+            spark_lightning: None,
         }
     }
 }
@@ -95,12 +95,13 @@ pub fn network_dir(root: &Path, network: &NetworkId) -> PathBuf {
 }
 
 /// Whether this build has the kind of network named `kind`: a network
-/// kind, or `lnd`, `bark` or `spark` for the ways of being on `lightning`.
+/// kind, or `lnd`, `bark-lightning` or `spark-lightning` for the ways of
+/// being on `lightning`.
 #[allow(clippy::match_like_matches_macro)]
 pub fn built(kind: &str) -> bool {
     match kind {
         "arkade" => cfg!(feature = "arkade"),
-        "bark" => cfg!(feature = "bark-lightning"),
+        "bark-lightning" => cfg!(feature = "bark-lightning"),
         "bitcoin" => cfg!(feature = "bitcoin"),
         "cashu" => cfg!(feature = "cashu"),
         "citrea" => cfg!(feature = "citrea"),
@@ -109,7 +110,7 @@ pub fn built(kind: &str) -> bool {
         "lnd" => cfg!(feature = "lightning"),
         "rootstock" => cfg!(feature = "rootstock"),
         "solana-wbtc" => cfg!(feature = "solana-wbtc"),
-        "spark" => cfg!(feature = "spark-lightning"),
+        "spark-lightning" => cfg!(feature = "spark-lightning"),
         "starknet-wbtc" => cfg!(feature = "starknet-wbtc"),
         _ => false,
     }
@@ -214,8 +215,9 @@ pub async fn open_wallet(
     Ok((opened, wallet))
 }
 
-/// A `lightning` network goes through bark when it has an Ark server,
-/// through Spark when it has a Spark wallet, else through LND.
+/// A `lightning` network goes through bark-lightning when it has an Ark
+/// server, through spark-lightning when it has a Spark wallet, else
+/// through LND.
 #[cfg(any(
     feature = "lightning",
     feature = "bark-lightning",
@@ -228,45 +230,44 @@ async fn open_lightning(
     span: &Span,
 ) -> Result<(Arc<dyn Network>, Wallet), String> {
     #[cfg(feature = "bark-lightning")]
-    if let Some(bark) = &settings.bark {
+    if let Some(bark_lightning) = &settings.bark_lightning {
         return Ok(with_wallet(
             cassis_bark_lightning::BarkLightningAdapter::open(
                 network.clone(),
                 &settings.mnemonic,
                 &settings.dir,
-                bark,
+                bark_lightning,
                 span,
             )
             .await?,
-            Wallet::Bark,
+            Wallet::BarkLightning,
         ));
     }
     #[cfg(feature = "spark-lightning")]
-    if let Some(spark) = &settings.spark {
+    if let Some(spark_lightning) = &settings.spark_lightning {
         return Ok(with_wallet(
             cassis_spark_lightning::SparkLightningAdapter::open(
                 network.clone(),
                 &settings.mnemonic,
                 &settings.dir,
-                spark,
+                spark_lightning,
                 span,
             )
             .await?,
-            Wallet::Spark,
+            Wallet::SparkLightning,
         ));
     }
     #[cfg(feature = "lightning")]
     {
-        let lnd = settings
-            .lnd
-            .clone()
-            .ok_or("lightning needs an LND node, an Ark server (bark) or spark")?;
+        let lnd = settings.lnd.clone().ok_or(
+            "lightning needs an LND node, an Ark server (bark-lightning) or spark-lightning",
+        )?;
         return Ok(with_wallet(
             cassis_lnd::LndAdapter::open(network.clone(), lnd, span).await?,
             Wallet::Lnd,
         ));
     }
     Err(format!(
-        "{network} needs an Ark server or spark: this build has no LND support"
+        "{network} needs an Ark server or spark-lightning: this build has no LND support"
     ))
 }

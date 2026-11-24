@@ -32,7 +32,7 @@ hyperb-cassis-wallet = { git = "https://github.com/andunieee/cassis", rev = "<co
 ```
 
 Turn on in it the network features you turn on in `cassis-networks` or
-`cassis-wallet`: it refuses Lightning networks (LND, bark) it was not built
+`cassis-wallet`: it refuses Lightning networks (LND, bark-lightning) it was not built
 for. The Cassis daemons
 (`cassis-routerd`, `cassis-gateway`) serve it through `cassis-admin`.
 

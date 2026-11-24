@@ -552,7 +552,7 @@ impl Network for LndAdapter {
             return Err(NetworkError::invalid("lightning HTLCs pay an invoice"));
         };
         let invoice = parse_invoice(payment_request, payment_hash)?;
-        // Receivers in whole sats (bark) round the amount up.
+        // Receivers in whole sats (bark-lightning) round the amount up.
         let invoice_msat = invoice.amount_milli_satoshis().unwrap_or(0);
         if invoice_msat < amount_msat || invoice_msat > amount_msat.next_multiple_of(MSAT_PER_SAT) {
             return Err(NetworkError::invalid(format!(

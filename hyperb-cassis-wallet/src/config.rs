@@ -15,8 +15,8 @@
 //! [networks.lightning]
 //! mnemonic = "twelve words ..."
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
-//! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
-//! # or: spark = {}                 # Spark wallet; { api_key } on mainnet
+//! # or: bark-lightning = {}       # Second's server, or { server_url, esplora_url }
+//! # or: spark-lightning = {}      # Spark wallet; { api_key } on mainnet
 //! ```
 
 use cassis_core::NetworkId;
@@ -37,10 +37,13 @@ pub struct Entry {
     pub esplora_url: Option<String>,
     /// The LND node of a `lightning` network.
     pub lnd: Option<Lnd>,
-    /// The Ark server of a `lightning` network going through bark.
-    pub bark: Option<Bark>,
-    /// A `lightning` network going through a Spark wallet.
-    pub spark: Option<Spark>,
+    /// The Ark server of a `lightning` network going through
+    /// bark-lightning.
+    #[serde(rename = "bark-lightning")]
+    pub bark_lightning: Option<BarkLightning>,
+    /// A `lightning` network going through a Spark lightning wallet.
+    #[serde(rename = "spark-lightning")]
+    pub spark_lightning: Option<SparkLightning>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -53,7 +56,7 @@ pub struct Lnd {
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[cfg_attr(not(feature = "bark-lightning"), allow(dead_code))]
-pub struct Bark {
+pub struct BarkLightning {
     /// Second's server for mainnet and signet when unset.
     pub server_url: Option<String>,
     pub esplora_url: Option<String>,
@@ -61,7 +64,7 @@ pub struct Bark {
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[cfg_attr(not(feature = "spark-lightning"), allow(dead_code))]
-pub struct Spark {
+pub struct SparkLightning {
     /// Breez API key, which mainnet requires.
     pub api_key: Option<String>,
 }
@@ -84,25 +87,30 @@ impl Entry {
             return Err(format!("{network}: this build has no LND support"));
         }
         #[cfg(not(feature = "bark-lightning"))]
-        if self.bark.is_some() {
-            return Err(format!("{network}: this build has no bark support"));
+        if self.bark_lightning.is_some() {
+            return Err(format!(
+                "{network}: this build has no bark-lightning support"
+            ));
         }
         #[cfg(not(feature = "spark-lightning"))]
-        if self.spark.is_some() {
-            return Err(format!("{network}: this build has no spark support"));
+        if self.spark_lightning.is_some() {
+            return Err(format!(
+                "{network}: this build has no spark-lightning support"
+            ));
         }
         #[cfg(feature = "bark-lightning")]
-        let bark = match &self.bark {
+        let bark_lightning = match &self.bark_lightning {
             None => None,
-            Some(bark) => {
-                let default = cassis_networks::bark_lightning::BarkConfig::default_for(network);
-                Some(cassis_networks::bark_lightning::BarkConfig {
-                    server_url: bark
+            Some(bark_lightning) => {
+                let default =
+                    cassis_networks::bark_lightning::BarkLightningConfig::default_for(network);
+                Some(cassis_networks::bark_lightning::BarkLightningConfig {
+                    server_url: bark_lightning
                         .server_url
                         .clone()
                         .or_else(|| default.as_ref().map(|d| d.server_url.clone()))
                         .ok_or_else(|| format!("{network} has no default Ark server"))?,
-                    esplora_url: bark
+                    esplora_url: bark_lightning
                         .esplora_url
                         .clone()
                         .or_else(|| default.as_ref().map(|d| d.esplora_url.clone()))
@@ -133,16 +141,15 @@ impl Entry {
         }
         #[cfg(feature = "bark-lightning")]
         {
-            settings.bark = bark;
+            settings.bark_lightning = bark_lightning;
         }
         #[cfg(feature = "spark-lightning")]
         {
-            settings.spark =
-                self.spark
-                    .as_ref()
-                    .map(|spark| cassis_networks::spark_lightning::SparkConfig {
-                        api_key: spark.api_key.clone(),
-                    });
+            settings.spark_lightning = self.spark_lightning.as_ref().map(|spark_lightning| {
+                cassis_networks::spark_lightning::SparkLightningConfig {
+                    api_key: spark_lightning.api_key.clone(),
+                }
+            });
         }
         Ok(settings)
     }
@@ -262,9 +269,9 @@ pub struct Fields {
     pub lnd_rest_url: String,
     pub lnd_tls_cert_path: String,
     pub lnd_macaroon_path: String,
-    pub bark_server_url: String,
-    pub bark_esplora_url: String,
-    pub spark_api_key: String,
+    pub bark_lightning_server_url: String,
+    pub bark_lightning_esplora_url: String,
+    pub spark_lightning_api_key: String,
 }
 
 fn put(table: &mut Table, key: &str, text: &str) {
@@ -290,8 +297,8 @@ fn inline(pairs: &[(&str, &str)]) -> Item {
 
 /// Write what `fields` say into the table of `id`, adding the network
 /// with a fresh wallet key if it is missing. The way a `lightning`
-/// network goes (`lnd`, `bark` or `spark`) is `via`, else that of its
-/// entry.
+/// network goes (`lnd`, `bark-lightning` or `spark-lightning`) is `via`,
+/// else that of its entry.
 pub fn set(
     networks: &mut Table,
     id: &NetworkId,
@@ -302,28 +309,31 @@ pub fn set(
     if !table.contains_key("mnemonic") {
         table.insert("mnemonic", toml_edit::value(generate_mnemonic()));
     }
-    let via = via.unwrap_or(if table.contains_key("bark") {
-        "bark"
-    } else if table.contains_key("spark") {
-        "spark"
+    let via = via.unwrap_or(if table.contains_key("bark-lightning") {
+        "bark-lightning"
+    } else if table.contains_key("spark-lightning") {
+        "spark-lightning"
     } else {
         "lnd"
     });
     match id.kind() {
         "arkade" | "bitcoin" => put(table, "esplora_url", &fields.esplora_url),
-        "lightning" if via == "spark" => {
+        "lightning" if via == "spark-lightning" => {
             table.remove("lnd");
-            table.remove("bark");
-            table.insert("spark", inline(&[("api_key", &fields.spark_api_key)]));
-        }
-        "lightning" if via == "bark" => {
-            table.remove("lnd");
-            table.remove("spark");
+            table.remove("bark-lightning");
             table.insert(
-                "bark",
+                "spark-lightning",
+                inline(&[("api_key", &fields.spark_lightning_api_key)]),
+            );
+        }
+        "lightning" if via == "bark-lightning" => {
+            table.remove("lnd");
+            table.remove("spark-lightning");
+            table.insert(
+                "bark-lightning",
                 inline(&[
-                    ("server_url", &fields.bark_server_url),
-                    ("esplora_url", &fields.bark_esplora_url),
+                    ("server_url", &fields.bark_lightning_server_url),
+                    ("esplora_url", &fields.bark_lightning_esplora_url),
                 ]),
             );
         }
@@ -362,8 +372,8 @@ pub const KINDS: [Kind; 12] = [
     ("cashu", "Cashu"),
     ("liquid", "Liquid"),
     ("lnd", "Lightning (LND)"),
-    ("bark", "Lightning (bark)"),
-    ("spark", "Lightning (Spark)"),
+    ("bark-lightning", "Lightning (bark-lightning)"),
+    ("spark-lightning", "Lightning (spark-lightning)"),
     ("fedimint", "Fedimint"),
     ("bitcoin", "Bitcoin"),
     ("rootstock", "Rootstock"),
@@ -380,8 +390,8 @@ pub fn chains(kind: &str) -> &'static [&'static str] {
         "liquid" | "rootstock" | "citrea" => &["mainnet", "testnet"],
         "starknet-wbtc" => &["mainnet", "sepolia"],
         "solana-wbtc" => &["mainnet"],
-        "lnd" | "bark" => &["mainnet", "signet", "mutinynet", "regtest"],
-        "spark" => &["mainnet", "regtest"],
+        "lnd" | "bark-lightning" => &["mainnet", "signet", "mutinynet", "regtest"],
+        "spark-lightning" => &["mainnet", "regtest"],
         _ => &[],
     }
 }
@@ -426,7 +436,7 @@ pub fn network_id(kind: &str, chain: &str, mint: &str, invite: &str) -> Result<N
                     chains.join(", ")
                 ));
             }
-            let kind = if matches!(kind, "lnd" | "bark" | "spark") {
+            let kind = if matches!(kind, "lnd" | "bark-lightning" | "spark-lightning") {
                 "lightning"
             } else {
                 kind

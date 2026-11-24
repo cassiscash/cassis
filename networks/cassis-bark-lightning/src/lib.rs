@@ -47,7 +47,7 @@ use tracing::{Span, debug, info};
 
 /// Where a bark wallet finds its Ark server and the chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BarkConfig {
+pub struct BarkLightningConfig {
     /// The Ark server, e.g. `https://ark.second.tech`.
     pub server_url: String,
     /// An Esplora API for the server's chain, e.g.
@@ -55,7 +55,7 @@ pub struct BarkConfig {
     pub esplora_url: String,
 }
 
-impl BarkConfig {
+impl BarkLightningConfig {
     /// Second's public server and an Esplora for `network`'s chain, if
     /// it has them.
     pub fn default_for(network: &NetworkId) -> Option<Self> {
@@ -106,7 +106,7 @@ impl BarkLightningAdapter {
         id: NetworkId,
         mnemonic: &Mnemonic,
         datadir: &Path,
-        config: &BarkConfig,
+        config: &BarkLightningConfig,
         span: &Span,
     ) -> Result<Self, String> {
         let (network, block_secs) = match id.param() {

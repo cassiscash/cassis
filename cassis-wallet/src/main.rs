@@ -96,24 +96,24 @@ enum Command {
         lnd_tls_cert: Option<PathBuf>,
         #[arg(long)]
         lnd_macaroon: Option<PathBuf>,
-        /// Go through a bark wallet at an Ark server instead of LND, when
-        /// enabling `lightning`: Second's server for mainnet and signet,
-        /// unless `--bark-server` names another.
+        /// Go through a bark-lightning wallet at an Ark server instead of
+        /// LND, when enabling `lightning`: Second's server for mainnet and
+        /// signet, unless `--bark-lightning-server` names another.
         #[arg(long)]
-        bark: bool,
-        /// Ark server URL, with `--bark`.
-        #[arg(long, value_name = "URL", requires = "bark")]
-        bark_server: Option<String>,
-        /// Esplora API of the Ark server's chain, with `--bark`.
-        #[arg(long, value_name = "URL", requires = "bark")]
-        bark_esplora: Option<String>,
-        /// Go through a Spark wallet (Breez's SDK) instead of LND, when
-        /// enabling `lightning` or `lightning::regtest`.
-        #[arg(long, conflicts_with = "bark")]
-        spark: bool,
-        /// Breez API key, with `--spark`; mainnet requires one.
-        #[arg(long, value_name = "KEY", requires = "spark")]
-        spark_api_key: Option<String>,
+        bark_lightning: bool,
+        /// Ark server URL, with `--bark-lightning`.
+        #[arg(long, value_name = "URL", requires = "bark_lightning")]
+        bark_lightning_server: Option<String>,
+        /// Esplora API of the Ark server's chain, with `--bark-lightning`.
+        #[arg(long, value_name = "URL", requires = "bark_lightning")]
+        bark_lightning_esplora: Option<String>,
+        /// Go through a spark-lightning wallet (Breez's SDK) instead of
+        /// LND, when enabling `lightning` or `lightning::regtest`.
+        #[arg(long, conflicts_with = "bark_lightning")]
+        spark_lightning: bool,
+        /// Breez API key, with `--spark-lightning`; mainnet requires one.
+        #[arg(long, value_name = "KEY", requires = "spark_lightning")]
+        spark_lightning_api_key: Option<String>,
         /// Chain API of `arkade` and `bitcoin` networks, instead of the
         /// public one.
         #[arg(long, value_name = "URL")]
@@ -322,11 +322,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             lnd_rest_url,
             lnd_tls_cert,
             lnd_macaroon,
-            bark,
-            bark_server,
-            bark_esplora,
-            spark,
-            spark_api_key,
+            bark_lightning,
+            bark_lightning_server,
+            bark_lightning_esplora,
+            spark_lightning,
+            spark_lightning_api_key,
             esplora_url,
         } => {
             for spec in &networks {
@@ -335,21 +335,21 @@ async fn run(cli: Cli) -> Result<(), String> {
                     if let Some(url) = &esplora_url {
                         table.insert("esplora_url", toml_edit::value(url.as_str()));
                     }
-                    if network.kind() == "lightning" && bark {
+                    if network.kind() == "lightning" && bark_lightning {
                         let mut config = toml_edit::InlineTable::new();
-                        if let Some(server) = &bark_server {
+                        if let Some(server) = &bark_lightning_server {
                             config.insert("server_url", server.as_str().into());
                         }
-                        if let Some(esplora) = &bark_esplora {
+                        if let Some(esplora) = &bark_lightning_esplora {
                             config.insert("esplora_url", esplora.as_str().into());
                         }
-                        table.insert("bark", toml_edit::value(config));
-                    } else if network.kind() == "lightning" && spark {
+                        table.insert("bark-lightning", toml_edit::value(config));
+                    } else if network.kind() == "lightning" && spark_lightning {
                         let mut config = toml_edit::InlineTable::new();
-                        if let Some(key) = &spark_api_key {
+                        if let Some(key) = &spark_lightning_api_key {
                             config.insert("api_key", key.as_str().into());
                         }
-                        table.insert("spark", toml_edit::value(config));
+                        table.insert("spark-lightning", toml_edit::value(config));
                     } else if network.kind() == "lightning"
                         && let Some(rest_url) = &lnd_rest_url
                     {

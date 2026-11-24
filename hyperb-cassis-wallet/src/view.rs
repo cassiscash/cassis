@@ -43,9 +43,9 @@ pub fn new_network_draft() -> (String, Value) {
             "lnd_rest_url": "",
             "lnd_tls_cert_path": "",
             "lnd_macaroon_path": "",
-            "bark_server_url": "",
-            "bark_esplora_url": "",
-            "spark_api_key": "",
+            "bark_lightning_server_url": "",
+            "bark_lightning_esplora_url": "",
+            "spark_lightning_api_key": "",
         }),
     )
 }
@@ -57,16 +57,16 @@ pub fn entry_draft(entry: &Entry) -> Value {
             .unwrap_or_default()
     };
     let lnd = entry.lnd.as_ref();
-    let bark = entry.bark.as_ref();
-    let spark = entry.spark.as_ref();
+    let bark_lightning = entry.bark_lightning.as_ref();
+    let spark_lightning = entry.spark_lightning.as_ref();
     json!({
         "esplora_url": entry.esplora_url.clone().unwrap_or_default(),
         "lnd_rest_url": lnd.map(|lnd| lnd.rest_url.clone()).unwrap_or_default(),
         "lnd_tls_cert_path": lnd.map(|lnd| path(&lnd.tls_cert_path)).unwrap_or_default(),
         "lnd_macaroon_path": lnd.map(|lnd| path(&lnd.macaroon_path)).unwrap_or_default(),
-        "bark_server_url": bark.and_then(|bark| bark.server_url.clone()).unwrap_or_default(),
-        "bark_esplora_url": bark.and_then(|bark| bark.esplora_url.clone()).unwrap_or_default(),
-        "spark_api_key": spark.and_then(|spark| spark.api_key.clone()).unwrap_or_default(),
+        "bark_lightning_server_url": bark_lightning.and_then(|bark_lightning| bark_lightning.server_url.clone()).unwrap_or_default(),
+        "bark_lightning_esplora_url": bark_lightning.and_then(|bark_lightning| bark_lightning.esplora_url.clone()).unwrap_or_default(),
+        "spark_lightning_api_key": spark_lightning.and_then(|spark_lightning| spark_lightning.api_key.clone()).unwrap_or_default(),
     })
 }
 
@@ -91,9 +91,9 @@ pub fn fields(args: &Args) -> Fields {
         lnd_rest_url: args.text("lnd_rest_url"),
         lnd_tls_cert_path: args.text("lnd_tls_cert_path"),
         lnd_macaroon_path: args.text("lnd_macaroon_path"),
-        bark_server_url: args.text("bark_server_url"),
-        bark_esplora_url: args.text("bark_esplora_url"),
-        spark_api_key: args.text("spark_api_key"),
+        bark_lightning_server_url: args.text("bark_lightning_server_url"),
+        bark_lightning_esplora_url: args.text("bark_lightning_esplora_url"),
+        spark_lightning_api_key: args.text("spark_lightning_api_key"),
     }
 }
 
@@ -511,16 +511,18 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
             entry.lnd.as_ref().and_then(|lnd| path(&lnd.macaroon_path)),
         ),
         summary(
-            "Ark server (bark)",
-            entry
-                .bark
-                .as_ref()
-                .map(|bark| bark.server_url.clone().unwrap_or("Second's".into())),
+            "Ark server (bark-lightning)",
+            entry.bark_lightning.as_ref().map(|bark_lightning| {
+                bark_lightning
+                    .server_url
+                    .clone()
+                    .unwrap_or("Second's".into())
+            }),
         ),
         summary(
-            "Spark wallet",
-            entry.spark.as_ref().map(|spark| {
-                if spark.api_key.is_some() {
+            "Spark lightning wallet",
+            entry.spark_lightning.as_ref().map(|spark_lightning| {
+                if spark_lightning.api_key.is_some() {
                     "with a Breez API key".into()
                 } else {
                     "no Breez API key".into()
@@ -624,8 +626,8 @@ fn edit_fields(id: &str, entry: &Entry) -> Vec<Node> {
             field(el("esplora_url"), "Esplora URL", &d("esplora_url"))
                 .placeholder("the public one"),
         ],
-        "lightning" if entry.bark.is_some() => bark_fields(&el, &d),
-        "lightning" if entry.spark.is_some() => spark_fields(&el, &d),
+        "lightning" if entry.bark_lightning.is_some() => bark_lightning_fields(&el, &d),
+        "lightning" if entry.spark_lightning.is_some() => spark_lightning_fields(&el, &d),
         "lightning" => lnd_fields(&el, &d),
         _ => Vec::new(),
     }
@@ -646,23 +648,31 @@ fn lnd_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<No
     ]
 }
 
-fn bark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
+fn bark_lightning_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
     vec![
-        field(el("bark_server_url"), "Ark server", &d("bark_server_url"))
-            .placeholder("Second's server"),
         field(
-            el("bark_esplora_url"),
+            el("bark_lightning_server_url"),
+            "Ark server",
+            &d("bark_lightning_server_url"),
+        )
+        .placeholder("Second's server"),
+        field(
+            el("bark_lightning_esplora_url"),
             "Esplora URL",
-            &d("bark_esplora_url"),
+            &d("bark_lightning_esplora_url"),
         )
         .placeholder("the default one"),
     ]
 }
 
-fn spark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
+fn spark_lightning_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
     vec![
-        field(el("spark_api_key"), "Breez API key", &d("spark_api_key"))
-            .placeholder("required on mainnet"),
+        field(
+            el("spark_lightning_api_key"),
+            "Breez API key",
+            &d("spark_lightning_api_key"),
+        )
+        .placeholder("required on mainnet"),
     ]
 }
 
@@ -714,8 +724,8 @@ fn new_network(kinds: &[config::Kind]) -> Node {
                 ]
             }
             "lnd" => lnd_fields(&el, &d),
-            "bark" => bark_fields(&el, &d),
-            "spark" => spark_fields(&el, &d),
+            "bark-lightning" => bark_lightning_fields(&el, &d),
+            "spark-lightning" => spark_lightning_fields(&el, &d),
             _ => Vec::new(),
         };
         column(format!("hw/new/{kind}"))
