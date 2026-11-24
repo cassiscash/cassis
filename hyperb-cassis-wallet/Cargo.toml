@@ -18,8 +18,9 @@ liquid = ["cassis-networks/liquid"]
 rootstock = ["cassis-networks/rootstock"]
 citrea = ["cassis-networks/citrea"]
 solana-wbtc = ["cassis-networks/solana-wbtc"]
+spark-lightning = ["cassis-networks/spark-lightning"]
 starknet-wbtc = ["cassis-networks/starknet-wbtc"]
-all = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock", "citrea", "solana-wbtc", "starknet-wbtc"]
+all = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock", "citrea", "solana-wbtc", "spark-lightning", "starknet-wbtc"]
 
 [dependencies]
 cassis-core = { workspace = true, features = ["node"] }

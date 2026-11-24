@@ -12,6 +12,7 @@ members = [
   "networks/cassis-liquid",
   "networks/cassis-lnd",
   "networks/cassis-bark-lightning",
+  "networks/cassis-spark-lightning",
   "cassis-networks",
   "cassis-admin",
   "cassis-routerd",
@@ -132,8 +133,12 @@ cassis-liquid = { path = "networks/cassis-liquid" }
 cassis-lnd = { path = "networks/cassis-lnd" }
 hyperb-cassis-wallet = { path = "hyperb-cassis-wallet" }
 cassis-bark-lightning = { path = "networks/cassis-bark-lightning" }
+cassis-spark-lightning = { path = "networks/cassis-spark-lightning" }
 
 # Bark with hash-only lightning receives (preimage given later), from
 # our fork of https://gitlab.com/ark-bitcoin/bark.
 bark-wallet = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "441f19d2f2794370536f65a758f06dae8a086eff", default-features = false, features = ["sqlite", "native", "rand", "tls-webpki-roots"] }
 bark-bitcoin-ext = { git = "https://github.com/cassiscash/bark-hold-preimage", rev = "441f19d2f2794370536f65a758f06dae8a086eff" }
+
+# Breez's Spark SDK, with hash-only lightning receives (HODL invoices).
+breez-sdk-spark = { git = "https://github.com/breez/spark-sdk", tag = "0.28.6", features = ["sqlite"] }

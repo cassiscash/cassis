@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock", "citrea", "solana-wbtc", "starknet-wbtc"]
+default = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock", "citrea", "solana-wbtc", "spark-lightning", "starknet-wbtc"]
 arkade = ["cassis-networks/arkade", "cassis-wallet/arkade", "hyperb-cassis-wallet/arkade"]
 bark-lightning = ["cassis-networks/bark-lightning", "cassis-wallet/bark-lightning", "hyperb-cassis-wallet/bark-lightning"]
 bitcoin = ["cassis-networks/bitcoin", "cassis-wallet/bitcoin", "hyperb-cassis-wallet/bitcoin"]
@@ -15,6 +15,7 @@ liquid = ["cassis-networks/liquid", "cassis-wallet/liquid", "hyperb-cassis-walle
 rootstock = ["cassis-networks/rootstock", "cassis-wallet/rootstock", "hyperb-cassis-wallet/rootstock"]
 citrea = ["cassis-networks/citrea", "cassis-wallet/citrea", "hyperb-cassis-wallet/citrea"]
 solana-wbtc = ["cassis-networks/solana-wbtc", "cassis-wallet/solana-wbtc", "hyperb-cassis-wallet/solana-wbtc"]
+spark-lightning = ["cassis-networks/spark-lightning", "cassis-wallet/spark-lightning", "hyperb-cassis-wallet/spark-lightning"]
 starknet-wbtc = ["cassis-networks/starknet-wbtc", "cassis-wallet/starknet-wbtc", "hyperb-cassis-wallet/starknet-wbtc"]
 
 [dependencies]

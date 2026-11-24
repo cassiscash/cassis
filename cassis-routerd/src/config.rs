@@ -17,6 +17,7 @@
 //! mnemonic = "twelve words ..."
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
+//! # or: spark = {}                 # Spark wallet; { api_key } on mainnet
 //!
 //! [[routes]]
 //! from = "cashu::mint.example"

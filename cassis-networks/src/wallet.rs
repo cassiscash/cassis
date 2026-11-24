@@ -38,6 +38,8 @@ pub enum Wallet {
     Rootstock(Arc<cassis_rootstock::RootstockAdapter>),
     #[cfg(feature = "solana-wbtc")]
     SolanaWbtc(Arc<cassis_solana_wbtc::SolanaWbtcAdapter>),
+    #[cfg(feature = "spark-lightning")]
+    Spark(Arc<cassis_spark_lightning::SparkLightningAdapter>),
     #[cfg(feature = "starknet-wbtc")]
     StarknetWbtc(Arc<cassis_starknet_wbtc::StarknetWbtcAdapter>),
 }
@@ -236,6 +238,15 @@ impl Wallet {
                 ),
                 ..Can::default()
             },
+            #[cfg(feature = "spark-lightning")]
+            Wallet::Spark(_) => Can {
+                send: Some("Spark or bitcoin address"),
+                lightning: true,
+                note: Some(
+                    "Coins sent to the bitcoin address are spendable once confirmed and claimed.",
+                ),
+                ..Can::default()
+            },
             #[cfg(feature = "starknet-wbtc")]
             Wallet::StarknetWbtc(_) => Can {
                 send: Some("Starknet address"),
@@ -292,6 +303,10 @@ impl Wallet {
             Wallet::Citrea(ref w) => spendable(w.balance_msat().await?),
             #[cfg(feature = "solana-wbtc")]
             Wallet::SolanaWbtc(ref w) => spendable(w.balance_msat().await?),
+            #[cfg(feature = "spark-lightning")]
+            Wallet::Spark(ref w) => {
+                spendable(w.balance_sats().await.map_err(|e| e.to_string())? * MSAT_PER_SAT)
+            }
             #[cfg(feature = "starknet-wbtc")]
             Wallet::StarknetWbtc(ref w) => spendable(w.balance_msat().await?),
         })
@@ -340,6 +355,14 @@ impl Wallet {
             Wallet::Citrea(ref w) => vec![address("Citrea", w.address().to_string())],
             #[cfg(feature = "solana-wbtc")]
             Wallet::SolanaWbtc(ref w) => vec![address("Solana", w.address().to_string())],
+            #[cfg(feature = "spark-lightning")]
+            Wallet::Spark(ref w) => {
+                let (spark, bitcoin) = w.addresses().await.map_err(|e| e.to_string())?;
+                vec![
+                    address("Spark", spark),
+                    address("Bitcoin (deposit)", bitcoin),
+                ]
+            }
             #[cfg(feature = "starknet-wbtc")]
             Wallet::StarknetWbtc(ref w) => vec![address("Starknet", w.address().to_string())],
         })
@@ -494,6 +517,34 @@ impl Wallet {
             (Wallet::SolanaWbtc(w), Op::Send { to, amount_sat }) => {
                 let txid = w.transfer(&to, msat(amount_sat)).await?;
                 Ok(Done::said(format!("Sent {} in {txid}", sats(amount_sat))))
+            }
+            #[cfg(feature = "spark-lightning")]
+            (Wallet::Spark(w), op) => {
+                let error = |e: cassis_core::NetworkError| e.to_string();
+                match op {
+                    Op::Send { to, amount_sat } => {
+                        let id = w.send(&to, amount_sat).await.map_err(error)?;
+                        Ok(Done::said(format!("Sent {} as {id}", sats(amount_sat))))
+                    }
+                    Op::Invoice { amount_sat } => {
+                        let invoice = w.funding_invoice(amount_sat).await.map_err(error)?;
+                        let w = w.clone();
+                        let paid = invoice.clone();
+                        Ok(Done::said("Invoice created: waiting for it to be paid")
+                            .with("Lightning invoice", invoice)
+                            .then(async move {
+                                w.claim_funding(&paid).await.map_err(error)?;
+                                Ok(format!("Received {}", sats(amount_sat)))
+                            }))
+                    }
+                    Op::Pay { invoice } => Ok(Done::said(
+                        match w.pay_invoice(&invoice).await.map_err(error)? {
+                            cassis_spark_lightning::PaymentStatus::Completed => "Paid the invoice",
+                            _ => "Paying the invoice: still in flight",
+                        },
+                    )),
+                    _ => unsupported(),
+                }
             }
             #[cfg(feature = "starknet-wbtc")]
             (Wallet::StarknetWbtc(w), Op::Send { to, amount_sat }) => {

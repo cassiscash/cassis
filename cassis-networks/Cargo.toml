@@ -16,6 +16,7 @@ lightning = ["dep:cassis-lnd"]
 liquid = ["dep:cassis-liquid"]
 rootstock = ["dep:cassis-rootstock"]
 solana-wbtc = ["dep:cassis-solana-wbtc"]
+spark-lightning = ["dep:cassis-spark-lightning"]
 starknet-wbtc = ["dep:cassis-starknet-wbtc"]
 
 [dependencies]
@@ -32,4 +33,5 @@ cassis-liquid = { workspace = true, optional = true }
 cassis-lnd = { workspace = true, optional = true }
 cassis-rootstock = { workspace = true, optional = true }
 cassis-solana-wbtc = { workspace = true, optional = true }
+cassis-spark-lightning = { workspace = true, optional = true }
 cassis-starknet-wbtc = { workspace = true, optional = true }

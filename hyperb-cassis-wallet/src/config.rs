@@ -16,6 +16,7 @@
 //! mnemonic = "twelve words ..."
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
+//! # or: spark = {}                 # Spark wallet; { api_key } on mainnet
 //! ```
 
 use cassis_core::NetworkId;
@@ -38,6 +39,8 @@ pub struct Entry {
     pub lnd: Option<Lnd>,
     /// The Ark server of a `lightning` network going through bark.
     pub bark: Option<Bark>,
+    /// A `lightning` network going through a Spark wallet.
+    pub spark: Option<Spark>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -54,6 +57,13 @@ pub struct Bark {
     /// Second's server for mainnet and signet when unset.
     pub server_url: Option<String>,
     pub esplora_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[cfg_attr(not(feature = "spark-lightning"), allow(dead_code))]
+pub struct Spark {
+    /// Breez API key, which mainnet requires.
+    pub api_key: Option<String>,
 }
 
 impl Entry {
@@ -76,6 +86,10 @@ impl Entry {
         #[cfg(not(feature = "bark-lightning"))]
         if self.bark.is_some() {
             return Err(format!("{network}: this build has no bark support"));
+        }
+        #[cfg(not(feature = "spark-lightning"))]
+        if self.spark.is_some() {
+            return Err(format!("{network}: this build has no spark support"));
         }
         #[cfg(feature = "bark-lightning")]
         let bark = match &self.bark {
@@ -120,6 +134,15 @@ impl Entry {
         #[cfg(feature = "bark-lightning")]
         {
             settings.bark = bark;
+        }
+        #[cfg(feature = "spark-lightning")]
+        {
+            settings.spark =
+                self.spark
+                    .as_ref()
+                    .map(|spark| cassis_networks::spark_lightning::SparkConfig {
+                        api_key: spark.api_key.clone(),
+                    });
         }
         Ok(settings)
     }
@@ -241,6 +264,7 @@ pub struct Fields {
     pub lnd_macaroon_path: String,
     pub bark_server_url: String,
     pub bark_esplora_url: String,
+    pub spark_api_key: String,
 }
 
 fn put(table: &mut Table, key: &str, text: &str) {
@@ -265,22 +289,36 @@ fn inline(pairs: &[(&str, &str)]) -> Item {
 }
 
 /// Write what `fields` say into the table of `id`, adding the network
-/// with a fresh wallet key if it is missing. The kind of a `lightning`
-/// network (LND or bark) is that of its entry, or `bark` if `bark`.
+/// with a fresh wallet key if it is missing. The way a `lightning`
+/// network goes (`lnd`, `bark` or `spark`) is `via`, else that of its
+/// entry.
 pub fn set(
     networks: &mut Table,
     id: &NetworkId,
     fields: &Fields,
-    bark: bool,
+    via: Option<&str>,
 ) -> Result<(), String> {
     let table = child(networks, &id.0, toml_edit::table)?;
     if !table.contains_key("mnemonic") {
         table.insert("mnemonic", toml_edit::value(generate_mnemonic()));
     }
+    let via = via.unwrap_or(if table.contains_key("bark") {
+        "bark"
+    } else if table.contains_key("spark") {
+        "spark"
+    } else {
+        "lnd"
+    });
     match id.kind() {
         "arkade" | "bitcoin" => put(table, "esplora_url", &fields.esplora_url),
-        "lightning" if bark || table.contains_key("bark") => {
+        "lightning" if via == "spark" => {
             table.remove("lnd");
+            table.remove("bark");
+            table.insert("spark", inline(&[("api_key", &fields.spark_api_key)]));
+        }
+        "lightning" if via == "bark" => {
+            table.remove("lnd");
+            table.remove("spark");
             table.insert(
                 "bark",
                 inline(&[
@@ -319,12 +357,13 @@ pub fn remove(networks: &mut Table, id: &NetworkId) -> Result<(), String> {
 pub type Kind = (&'static str, &'static str);
 
 /// Every kind of network.
-pub const KINDS: [Kind; 11] = [
+pub const KINDS: [Kind; 12] = [
     ("arkade", "Arkade"),
     ("cashu", "Cashu"),
     ("liquid", "Liquid"),
     ("lnd", "Lightning (LND)"),
     ("bark", "Lightning (bark)"),
+    ("spark", "Lightning (Spark)"),
     ("fedimint", "Fedimint"),
     ("bitcoin", "Bitcoin"),
     ("rootstock", "Rootstock"),
@@ -342,6 +381,7 @@ pub fn chains(kind: &str) -> &'static [&'static str] {
         "starknet-wbtc" => &["mainnet", "sepolia"],
         "solana-wbtc" => &["mainnet"],
         "lnd" | "bark" => &["mainnet", "signet", "mutinynet", "regtest"],
+        "spark" => &["mainnet", "regtest"],
         _ => &[],
     }
 }
@@ -386,7 +426,7 @@ pub fn network_id(kind: &str, chain: &str, mint: &str, invite: &str) -> Result<N
                     chains.join(", ")
                 ));
             }
-            let kind = if matches!(kind, "lnd" | "bark") {
+            let kind = if matches!(kind, "lnd" | "bark" | "spark") {
                 "lightning"
             } else {
                 kind
@@ -414,7 +454,7 @@ mod tests {
     fn adding_keeps_the_rest_of_the_file() {
         let file = file("add", "# mine\nmnemonic = \"x\"\n");
         let id = NetworkId::parse("arkade").unwrap();
-        file.edit(|t| set(t, &id, &Fields::default(), false))
+        file.edit(|t| set(t, &id, &Fields::default(), None))
             .unwrap();
         let mnemonic = file.read().unwrap()["arkade"].mnemonic.clone().unwrap();
         assert_eq!(mnemonic.split_whitespace().count(), 12);
@@ -423,7 +463,7 @@ mod tests {
             esplora_url: "https://esplora.example".into(),
             ..Fields::default()
         };
-        file.edit(|t| set(t, &id, &fields, false)).unwrap();
+        file.edit(|t| set(t, &id, &fields, None)).unwrap();
         let entry = file.read().unwrap().remove("arkade").unwrap();
         assert_eq!(entry.mnemonic.as_deref(), Some(mnemonic.as_str()));
         assert_eq!(
@@ -441,7 +481,7 @@ mod tests {
         let file = file("bad", "");
         let id = NetworkId::parse("lightning").unwrap();
         assert!(
-            file.edit(|t| set(t, &id, &Fields::default(), false))
+            file.edit(|t| set(t, &id, &Fields::default(), None))
                 .is_err()
         );
         assert!(file.read().unwrap().is_empty());

@@ -28,6 +28,7 @@
     feature = "rootstock",
     feature = "citrea",
     feature = "solana-wbtc",
+    feature = "spark-lightning",
     feature = "starknet-wbtc"
 )))]
 compile_error!("cassis-routerd needs at least one network feature, e.g. `--features cashu`");

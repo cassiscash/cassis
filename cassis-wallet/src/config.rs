@@ -15,6 +15,7 @@
 //! [networks.lightning]
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark = {}                  # Second's server, or { server_url, esplora_url }
+//! # or: spark = {}                 # Spark wallet; { api_key } on mainnet
 //! ```
 //!
 //! Every network has a BIP39 mnemonic of its own, written when it is
@@ -24,7 +25,8 @@
 //! BIP44 under RSK's coin type on `rootstock`, BIP44 under Ethereum's on
 //! `citrea`, a Stark key ground from BIP44 under Starknet's on
 //! `starknet-wbtc`, SLIP-10 under Solana's on `solana-wbtc`, bark's own
-//! seed on a bark `lightning`, fedimint's own root secret on `fedimint`.
+//! seed on a bark `lightning`, Breez's Spark keys on a spark `lightning`,
+//! fedimint's own root secret on `fedimint`.
 //! Back this file up, or the mnemonics.
 
 use cassis_core::NetworkId;
@@ -58,6 +60,8 @@ pub struct NetworkConfig {
     pub lnd: Option<LndConfig>,
     /// The Ark server of a `lightning` network going through bark.
     pub bark: Option<BarkConfig>,
+    /// A `lightning` network going through a Spark wallet.
+    pub spark: Option<SparkConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -76,6 +80,14 @@ pub struct BarkConfig {
     /// Second's server for mainnet and signet when unset.
     pub server_url: Option<String>,
     pub esplora_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(feature = "spark-lightning"), allow(dead_code))]
+pub struct SparkConfig {
+    /// Breez API key, which mainnet requires.
+    pub api_key: Option<String>,
 }
 
 impl WalletConfig {
@@ -147,6 +159,10 @@ impl NetworkConfig {
         if self.bark.is_some() {
             return Err(format!("{network}: this build has no bark support"));
         }
+        #[cfg(not(feature = "spark-lightning"))]
+        if self.spark.is_some() {
+            return Err(format!("{network}: this build has no spark support"));
+        }
         #[cfg(feature = "bark-lightning")]
         let bark = match &self.bark {
             None => None,
@@ -180,6 +196,13 @@ impl NetworkConfig {
             }),
             #[cfg(feature = "bark-lightning")]
             bark,
+            #[cfg(feature = "spark-lightning")]
+            spark: self
+                .spark
+                .as_ref()
+                .map(|spark| cassis_networks::spark_lightning::SparkConfig {
+                    api_key: spark.api_key.clone(),
+                }),
         })
     }
 }

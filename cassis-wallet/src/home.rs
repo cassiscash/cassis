@@ -20,6 +20,8 @@ use cassis_networks::arkade;
 use cassis_networks::bark_lightning;
 #[cfg(feature = "cashu")]
 use cassis_networks::cashu;
+#[cfg(feature = "spark-lightning")]
+use cassis_networks::spark_lightning;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{Span, warn};
@@ -137,6 +139,30 @@ impl Home {
         Ok(adapter)
     }
 
+    /// The Spark wallet of `network`, which must go through one (`spark`
+    /// in its config).
+    #[cfg(feature = "spark-lightning")]
+    pub async fn open_spark(
+        &self,
+        network: &NetworkId,
+        span: &Span,
+    ) -> Result<spark_lightning::SparkLightningAdapter, String> {
+        let settings = self.settings(network)?;
+        let config = settings.spark.ok_or_else(|| {
+            format!("{network} does not go through spark here: enable it with --spark")
+        })?;
+        let adapter = spark_lightning::SparkLightningAdapter::open(
+            network.clone(),
+            &settings.mnemonic,
+            &settings.dir,
+            &config,
+            span,
+        )
+        .await?;
+        routine_checks(&adapter).await;
+        Ok(adapter)
+    }
+
     /// The arkade wallet of `network`.
     #[cfg(feature = "arkade")]
     pub async fn open_arkade(
@@ -199,7 +225,7 @@ impl Home {
 
 /// The upkeep a long-running node would do now and then (see
 /// [`Network::maintain`]: settling arkade boarding deposits, refreshing
-/// VTXOs before the operator may sweep them, syncing bark), done once
+/// VTXOs before the operator may sweep them, syncing bark and spark), done once
 /// whenever the wallet opens `network`, before any command uses it. A
 /// failure only warns: the command may still work.
 pub async fn routine_checks(network: &dyn Network) {

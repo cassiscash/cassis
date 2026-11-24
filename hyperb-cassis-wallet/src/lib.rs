@@ -346,9 +346,9 @@ impl WalletAdmin {
                     return Err(format!("{id} is added already"));
                 }
                 let fields = view::fields(args);
-                let bark = args.text("kind") == "bark";
+                let kind = args.text("kind");
                 self.file
-                    .edit(|networks| config::set(networks, &id, &fields, bark))?;
+                    .edit(|networks| config::set(networks, &id, &fields, Some(&kind)))?;
                 self.reconcile_in_background(None);
                 Ok(format!("{id} added, opening it"))
             }
@@ -359,7 +359,7 @@ impl WalletAdmin {
                     if !networks.contains_key(&id.0) {
                         return Err(format!("{id} is not in the config file"));
                     }
-                    config::set(networks, &id, &fields, false)
+                    config::set(networks, &id, &fields, None)
                 })?;
                 self.reconcile_in_background(None);
                 Ok(format!("{id} saved"))

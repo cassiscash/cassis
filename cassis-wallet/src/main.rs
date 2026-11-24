@@ -20,6 +20,7 @@
     feature = "rootstock",
     feature = "citrea",
     feature = "solana-wbtc",
+    feature = "spark-lightning",
     feature = "starknet-wbtc"
 )))]
 compile_error!("cassis-wallet needs at least one network feature, e.g. `--features cashu`");
@@ -106,6 +107,13 @@ enum Command {
         /// Esplora API of the Ark server's chain, with `--bark`.
         #[arg(long, value_name = "URL", requires = "bark")]
         bark_esplora: Option<String>,
+        /// Go through a Spark wallet (Breez's SDK) instead of LND, when
+        /// enabling `lightning` or `lightning::regtest`.
+        #[arg(long, conflicts_with = "bark")]
+        spark: bool,
+        /// Breez API key, with `--spark`; mainnet requires one.
+        #[arg(long, value_name = "KEY", requires = "spark")]
+        spark_api_key: Option<String>,
         /// Chain API of `arkade` and `bitcoin` networks, instead of the
         /// public one.
         #[arg(long, value_name = "URL")]
@@ -317,6 +325,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             bark,
             bark_server,
             bark_esplora,
+            spark,
+            spark_api_key,
             esplora_url,
         } => {
             for spec in &networks {
@@ -334,6 +344,12 @@ async fn run(cli: Cli) -> Result<(), String> {
                             config.insert("esplora_url", esplora.as_str().into());
                         }
                         table.insert("bark", toml_edit::value(config));
+                    } else if network.kind() == "lightning" && spark {
+                        let mut config = toml_edit::InlineTable::new();
+                        if let Some(key) = &spark_api_key {
+                            config.insert("api_key", key.as_str().into());
+                        }
+                        table.insert("spark", toml_edit::value(config));
                     } else if network.kind() == "lightning"
                         && let Some(rest_url) = &lnd_rest_url
                     {

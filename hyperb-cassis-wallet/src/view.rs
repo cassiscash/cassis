@@ -45,6 +45,7 @@ pub fn new_network_draft() -> (String, Value) {
             "lnd_macaroon_path": "",
             "bark_server_url": "",
             "bark_esplora_url": "",
+            "spark_api_key": "",
         }),
     )
 }
@@ -57,6 +58,7 @@ pub fn entry_draft(entry: &Entry) -> Value {
     };
     let lnd = entry.lnd.as_ref();
     let bark = entry.bark.as_ref();
+    let spark = entry.spark.as_ref();
     json!({
         "esplora_url": entry.esplora_url.clone().unwrap_or_default(),
         "lnd_rest_url": lnd.map(|lnd| lnd.rest_url.clone()).unwrap_or_default(),
@@ -64,6 +66,7 @@ pub fn entry_draft(entry: &Entry) -> Value {
         "lnd_macaroon_path": lnd.map(|lnd| path(&lnd.macaroon_path)).unwrap_or_default(),
         "bark_server_url": bark.and_then(|bark| bark.server_url.clone()).unwrap_or_default(),
         "bark_esplora_url": bark.and_then(|bark| bark.esplora_url.clone()).unwrap_or_default(),
+        "spark_api_key": spark.and_then(|spark| spark.api_key.clone()).unwrap_or_default(),
     })
 }
 
@@ -90,6 +93,7 @@ pub fn fields(args: &Args) -> Fields {
         lnd_macaroon_path: args.text("lnd_macaroon_path"),
         bark_server_url: args.text("bark_server_url"),
         bark_esplora_url: args.text("bark_esplora_url"),
+        spark_api_key: args.text("spark_api_key"),
     }
 }
 
@@ -513,6 +517,16 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
                 .as_ref()
                 .map(|bark| bark.server_url.clone().unwrap_or("Second's".into())),
         ),
+        summary(
+            "Spark wallet",
+            entry.spark.as_ref().map(|spark| {
+                if spark.api_key.is_some() {
+                    "with a Breez API key".into()
+                } else {
+                    "no Breez API key".into()
+                }
+            }),
+        ),
     ];
     for (i, (label, value)) in configured.into_iter().flatten().enumerate() {
         nodes.push(fact(&el(&format!("config/{i}")), &label, value));
@@ -611,6 +625,7 @@ fn edit_fields(id: &str, entry: &Entry) -> Vec<Node> {
                 .placeholder("the public one"),
         ],
         "lightning" if entry.bark.is_some() => bark_fields(&el, &d),
+        "lightning" if entry.spark.is_some() => spark_fields(&el, &d),
         "lightning" => lnd_fields(&el, &d),
         _ => Vec::new(),
     }
@@ -641,6 +656,13 @@ fn bark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<N
             &d("bark_esplora_url"),
         )
         .placeholder("the default one"),
+    ]
+}
+
+fn spark_fields(el: &dyn Fn(&str) -> String, d: &dyn Fn(&str) -> String) -> Vec<Node> {
+    vec![
+        field(el("spark_api_key"), "Breez API key", &d("spark_api_key"))
+            .placeholder("required on mainnet"),
     ]
 }
 
@@ -693,6 +715,7 @@ fn new_network(kinds: &[config::Kind]) -> Node {
             }
             "lnd" => lnd_fields(&el, &d),
             "bark" => bark_fields(&el, &d),
+            "spark" => spark_fields(&el, &d),
             _ => Vec::new(),
         };
         column(format!("hw/new/{kind}"))
