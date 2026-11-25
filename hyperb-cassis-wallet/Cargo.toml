@@ -23,7 +23,7 @@ starknet-wbtc = ["cassis-networks/starknet-wbtc"]
 all = ["arkade", "bark-lightning", "bitcoin", "cashu", "fedimint", "lightning", "liquid", "rootstock", "citrea", "solana-wbtc", "spark-lightning", "starknet-wbtc"]
 
 [dependencies]
-cassis-core = { workspace = true, features = ["node"] }
+cassis-core = { workspace = true }
 cassis-networks = { workspace = true }
 hypereffect = { workspace = true }
 serde = { workspace = true }

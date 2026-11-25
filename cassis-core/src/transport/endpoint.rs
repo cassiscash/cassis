@@ -1,6 +1,6 @@
-//! Peer-to-peer transport over iroh: one bidirectional stream per
-//! request, carrying one JSON [`Request`] and one JSON [`Response`].
+//! The iroh endpoint nodes talk over.
 
+use super::PeerAddr;
 use crate::protocol::{ALPN, Request, Response};
 use futures::future::BoxFuture;
 use iroh::endpoint::{Connection, presets};
@@ -15,14 +15,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// wait), but PREPARE asks the wallets, which may be slow backends.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-
-/// Where to reach a peer: its iroh endpoint id plus, optionally, its
-/// home relay.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PeerAddr {
-    pub id: PublicKey,
-    pub relay: Option<String>,
-}
 
 impl PeerAddr {
     fn endpoint_addr(&self) -> Result<EndpointAddr, String> {

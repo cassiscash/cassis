@@ -9,9 +9,9 @@
 //! * [`offline`] — receiving while offline: the payee's authorization
 //!   of a gateway and a preimage server, and their signed statements.
 //! * [`signing`] — the canonical bytes every signature covers.
-//! * [`transport`] (feature `node`, on by default) — the iroh transport
-//!   nodes talk over. Without it the crate stays light enough for
-//!   network crates and wasm. Paying and receiving is `cassis-wallet`'s,
+//! * [`transport`] — peer addresses, and (feature `node`, on by
+//!   default) the iroh transport nodes talk over. Without the feature
+//!   the crate stays light enough for network crates and wasm. Paying and receiving is `cassis-wallet`'s,
 //!   routing `cassis-routerd`'s.
 
 pub mod keys;
@@ -22,8 +22,6 @@ mod primitives;
 pub mod protocol;
 pub mod routing;
 pub mod signing;
-
-#[cfg(feature = "node")]
 pub mod transport;
 
 pub use network::{
