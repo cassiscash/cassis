@@ -45,7 +45,7 @@ clap = { version = "4.6.9", features = ["derive"] }
 futures = "0.3.34"
 fs2 = "0.4.3"
 hmac = "0.12.1"
-hypereffect = "0.6.3"
+hypereffect = "0.7.0"
 iroh = "1.0.3"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 lightning-invoice = { version = "0.33.3", features = ["std"] }

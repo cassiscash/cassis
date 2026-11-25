@@ -56,4 +56,4 @@ See the docs at the top of `src/lib.rs` for the list of actions, which carry
 what they act on in their payload and can be sent from anywhere
 (`hypb action <address> wallet.send --payload '{"id":…,"to":…,"amount_sat":…}'`).
 
-Elements are `hw/…` and signals live under `hw`; it needs hypereffect 0.6.
+Elements are `hw/…` and signals live under `hw`; it needs hypereffect 0.7.

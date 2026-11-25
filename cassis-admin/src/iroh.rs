@@ -46,7 +46,7 @@ async fn session(server: Arc<Server>, incoming: iroh::endpoint::Incoming) -> Res
     let mut lines = BufReader::new(recv).lines();
     let params = match lines.next_line().await.map_err(|e| e.to_string())? {
         Some(line) => match RendererMessage::parse(&line) {
-            Ok(RendererMessage::Hello { params }) => params,
+            Ok(RendererMessage::Hello(hello)) => crate::hello_params(&hello),
             _ => return Err("the session does not start with a hello".into()),
         },
         None => return Ok(()),

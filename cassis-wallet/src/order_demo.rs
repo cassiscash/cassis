@@ -17,7 +17,7 @@ use hypereffect::vtree::{self, button, card, column, input, list, notice, text};
 use hypereffect::{Action, Handler, Metadata, RendererMessage, ServerMessage, json};
 use iroh::endpoint::{RecvStream, SendStream, presets};
 use iroh::{Endpoint, SecretKey};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -128,7 +128,13 @@ async fn serve_flow(
     let mut lines = BufReader::new(recv).lines();
     let params = match lines.next_line().await.map_err(|e| e.to_string())? {
         Some(line) => match RendererMessage::parse(&line) {
-            Ok(RendererMessage::Hello { params }) => params,
+            Ok(RendererMessage::Hello(hello)) => hello
+                .get("params")
+                .and_then(|params| {
+                    hypereffect::serde_json::from_value::<BTreeMap<String, String>>(params.clone())
+                        .ok()
+                })
+                .unwrap_or_default(),
             _ => return Err("the flow does not start with a hello".into()),
         },
         None => return Ok(()),
@@ -178,7 +184,7 @@ async fn serve_flow(
         }
         match RendererMessage::parse(&line) {
             Ok(RendererMessage::Action(action)) => flow.on_action(&action).await?,
-            Ok(RendererMessage::Hello { .. }) => warn!("ignoring a second hello"),
+            Ok(RendererMessage::Hello(_)) => warn!("ignoring a second hello"),
             Err(error) => warn!("ignoring message: {error}"),
         }
     }

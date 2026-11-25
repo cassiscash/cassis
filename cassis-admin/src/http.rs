@@ -119,9 +119,10 @@ impl Http {
         else {
             return refuse(StatusCode::UNAUTHORIZED, "missing or bad hyperb-key");
         };
-        let Ok(RendererMessage::Hello { params }) = RendererMessage::parse(line.trim_end()) else {
+        let Ok(RendererMessage::Hello(hello)) = RendererMessage::parse(line.trim_end()) else {
             return refuse(StatusCode::BAD_REQUEST, "expected a hello");
         };
+        let params = crate::hello_params(&hello);
         let (out, lines) = mpsc::unbounded_channel();
         let session = self.server.open(Access::Local, &params, out);
         let id = crate::new_secret();

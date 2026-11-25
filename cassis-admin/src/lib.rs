@@ -173,6 +173,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The members hyperb defines in the `hello`: its `params`, read as
+/// strings. A `params` that is not an object of strings counts as none.
+pub(crate) fn hello_params(hello: &Map<String, Value>) -> BTreeMap<String, String> {
+    hello
+        .get("params")
+        .and_then(|params| hypereffect::serde_json::from_value(params.clone()).ok())
+        .unwrap_or_default()
+}
+
 impl Server {
     /// An interface over `app`, whose pages `refresh` brings up to date.
     pub fn new(app: Arc<dyn App>, refresh: Refresh) -> Arc<Self> {
@@ -324,7 +333,7 @@ impl Server {
     fn receive(self: &Arc<Self>, session: &Arc<Session>, line: &str) {
         match RendererMessage::parse(line) {
             Ok(RendererMessage::Action(action)) => self.on_action(session, &action),
-            Ok(RendererMessage::Hello { .. }) => warn!("admin: ignoring a second hello"),
+            Ok(RendererMessage::Hello(_)) => warn!("admin: ignoring a second hello"),
             Err(error) => warn!("admin: ignoring a message: {error}"),
         }
     }
