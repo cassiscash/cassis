@@ -99,10 +99,11 @@ const TESTNET_PROPAGATION_WAIT_SECS: u64 = 5;
 /// and output witnesses; less the value (24) and nonce (32) commitment
 /// bytes the discount drops, times 4.
 const CLAIM_TX_WEIGHT: usize = 218 * 4 + 8 - (24 + 32) * 4;
-/// Dust threshold of the explicit P2WSH lockup output under the relay
-/// policy Elements keeps from Bitcoin Core: (78-byte output + 67-byte
-/// spend) at 3 sat/vbyte.
-const LOCKUP_DUST_SATS: u64 = (78 + 67) * 3;
+/// Dust threshold of the explicit P2WSH lockup output under Elements'
+/// `DUST_RELAY_TX_FEE` of 0.1 sat/vbyte (ELIP-201): (78-byte output +
+/// 67-byte spend) at 0.1 sat/vbyte, rounded up as `GetDustThreshold`
+/// does.
+const LOCKUP_DUST_SATS: u64 = (78 + 67).div_ceil(10);
 
 /// Derivation path of the HTLC claim key (see crate docs).
 const CLAIM_KEY_PATH: &str = "m/1037'/0";
@@ -1154,8 +1155,9 @@ mod tests {
 
     #[test]
     fn min_lock_covers_the_claim_fee_and_dust() {
-        // A 394 vbyte claim at 0.1 sat/vbyte, plus 435 sats of dust.
-        assert_eq!(min_lock_sats(&test_pubkey(0xaa)), 40 + 435);
+        // A 394 vbyte claim at 0.1 sat/vbyte, plus 15 sats of dust
+        // (145 bytes at 0.1 sat/vbyte, rounded up).
+        assert_eq!(min_lock_sats(&test_pubkey(0xaa)), 40 + 15);
     }
 
     #[test]
