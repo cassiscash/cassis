@@ -75,6 +75,12 @@ fn api_error(error: impl std::fmt::Display) -> NetworkError {
     NetworkError::network(format!("LND: {error}"))
 }
 
+/// Room for routing fees on a send of `amount_msat`, the same
+/// `fee_limit_msat` a payment to LND carries.
+fn send_fee_limit_msat(amount_msat: u64) -> u64 {
+    (amount_msat / 100).max(1_000)
+}
+
 #[derive(Deserialize)]
 struct GetInfoResponse {
     identity_pubkey: String,
@@ -562,7 +568,7 @@ impl Network for LndAdapter {
         let cltv_limit = expiry.saturating_sub(unix_now()) / secs_per_block(&self.id);
         let request = SendPaymentRequest {
             payment_request,
-            fee_limit_msat: (amount_msat / 100).max(1_000).to_string(),
+            fee_limit_msat: send_fee_limit_msat(amount_msat).to_string(),
             timeout_seconds: SEND_TIMEOUT_SECS,
             cltv_limit: i32::try_from(cltv_limit).map_err(NetworkError::invalid)?,
             // The first update tells that LND took the payment.
@@ -665,9 +671,11 @@ impl Network for LndAdapter {
 
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
         let available = self.channel_balance_msat().await?;
-        if available < amount_msat {
+        let needed = amount_msat.saturating_add(send_fee_limit_msat(amount_msat));
+        if available < needed {
             return Err(NetworkError::invalid(format!(
-                "need {amount_msat} msat of outbound liquidity, channels hold {available} msat"
+                "need {needed} msat of outbound liquidity for the payment and its fees, \
+                 channels hold {available} msat"
             )));
         }
         Ok(())

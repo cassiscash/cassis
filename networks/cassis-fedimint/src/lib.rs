@@ -555,10 +555,19 @@ impl Network for FedimintAdapter {
     }
 
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
+        let amount = Amount::from_msats(amount_msat);
+        let fee = self
+            .ln()?
+            .send_fee_quote(amount)
+            .await
+            .map_err(|e| NetworkError::network(format!("fee quote: {e}")))?
+            .total()
+            .get_bitcoin();
+        let needed = amount_msat.saturating_add(fee.msats);
         let balance = self.balance_msat().await.map_err(NetworkError::network)?;
-        if balance < amount_msat {
+        if balance < needed {
             return Err(NetworkError::invalid(format!(
-                "need {amount_msat} msat, wallet has {balance} msat"
+                "need {needed} msat with the federation's fee, wallet has {balance} msat"
             )));
         }
         Ok(())
