@@ -119,8 +119,14 @@ enum Command {
         #[arg(long, value_name = "URL")]
         esplora_url: Option<String>,
     },
-    /// Remove networks, and their mnemonics, from this wallet's config.
+    /// Stop using networks, keeping them and their mnemonics in this
+    /// wallet's config (`disabled = true`) until enabled again.
     Disable {
+        #[arg(required = true)]
+        networks: Vec<String>,
+    },
+    /// Remove networks, and their mnemonics, from this wallet's config.
+    Remove {
         #[arg(required = true)]
         networks: Vec<String>,
     },
@@ -332,6 +338,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             for spec in &networks {
                 let network = NetworkId::parse(spec)?;
                 home.enable(&network, |table| {
+                    table.remove("disabled");
                     if let Some(url) = &esplora_url {
                         table.insert("esplora_url", toml_edit::value(url.as_str()));
                     }
@@ -372,11 +379,18 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Command::Disable { networks } => {
+            let disable = networks
+                .iter()
+                .map(|spec| NetworkId::parse(spec))
+                .collect::<Result<Vec<_>, _>>()?;
+            home.disable(&disable)?;
+        }
+        Command::Remove { networks } => {
             let remove = networks
                 .iter()
                 .map(|spec| NetworkId::parse(spec))
                 .collect::<Result<Vec<_>, _>>()?;
-            home.disable(&remove)?;
+            home.remove(&remove)?;
         }
         Command::Sync => {
             let networks = home

@@ -1,6 +1,6 @@
 //! `<home>/config.toml`: the wallet's keys and its networks. Written with
 //! a fresh mnemonic and no networks on first use, then edited by
-//! `enable` and `disable`, which keep its comments.
+//! `enable`, `disable` and `remove`, which keep its comments.
 //!
 //! ```toml
 //! mnemonic = "twelve words ..."    # the node's identity keys derive from it
@@ -16,6 +16,10 @@
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark-lightning = {}       # Second's server, or { server_url, esplora_url }
 //! # or: spark-lightning = {}      # Spark wallet; { api_key } on mainnet
+//!
+//! [networks.liquid]
+//! mnemonic = "twelve words ..."
+//! disabled = true                  # kept, with its wallet, but not used until enabled
 //! ```
 //!
 //! Every network has a BIP39 mnemonic of its own, written when it is
@@ -65,6 +69,9 @@ pub struct NetworkConfig {
     /// A `lightning` network going through a Spark lightning wallet.
     #[serde(rename = "spark-lightning")]
     pub spark_lightning: Option<SparkLightningConfig>,
+    /// Not used, until enabled again: the wallet and its mnemonic stay.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -118,7 +125,9 @@ impl WalletConfig {
     fn parse(text: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         config.keys()?;
-        config.network_ids()?;
+        for spec in config.networks.keys() {
+            NetworkId::parse(spec)?;
+        }
         Ok(config)
     }
 
@@ -126,17 +135,25 @@ impl WalletConfig {
         NodeKeys::from_mnemonic(&self.mnemonic).map_err(|e| e.to_string())
     }
 
+    /// The networks the wallet uses: not the disabled ones.
     pub fn network_ids(&self) -> Result<Vec<NetworkId>, String> {
         self.networks
-            .keys()
-            .map(|spec| NetworkId::parse(spec))
+            .iter()
+            .filter(|(_, config)| !config.disabled)
+            .map(|(spec, _)| NetworkId::parse(spec))
             .collect()
     }
 
     pub fn network(&self, network: &NetworkId) -> Result<&NetworkConfig, String> {
-        self.networks
-            .get(&network.0)
-            .ok_or_else(|| format!("{network} is not enabled; see `cassis-wallet enable`"))
+        match self.networks.get(&network.0) {
+            Some(config) if config.disabled => {
+                Err(format!("{network} is disabled; see `cassis-wallet enable`"))
+            }
+            Some(config) => Ok(config),
+            None => Err(format!(
+                "{network} is not enabled; see `cassis-wallet enable`"
+            )),
+        }
     }
 }
 
@@ -288,8 +305,8 @@ pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
 
 fn template(mnemonic: &str) -> String {
     format!(
-        r#"# cassis-wallet config, also edited by `enable` and `disable`, which
-# keep comments. The node's identity derives from the mnemonic; every
+        r#"# cassis-wallet config, also edited by `enable`, `disable` and `remove`,
+# which keep comments. The node's identity derives from the mnemonic; every
 # network has a mnemonic of its own below. Back this file up: it controls
 # the wallet's funds.
 mnemonic = "{mnemonic}"

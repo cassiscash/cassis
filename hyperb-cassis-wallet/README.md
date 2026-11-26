@@ -14,6 +14,9 @@ What the page does:
   comments included, is left alone. Removing asks first, since the mnemonic goes.
 - **Keep them open**: networks are opened, closed and reopened as the file
   changes (also by hand), with the upkeep each network needs.
+- **Disable and enable them**: `disabled = true` on a network keeps it in
+  the file, mnemonic included, but closes it (once its payments in flight
+  settle) until it is enabled again.
 - **See the internals** of each: kind, status, what its wallet can do, its
   settings, and its mnemonic (on request).
 - **Deposit**: deposit addresses, new addresses, peg-in addresses, Lightning

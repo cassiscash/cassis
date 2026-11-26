@@ -230,6 +230,13 @@ fn network_card(now: u64, id: &str, entry: &Entry, slot: Option<&Slot>) -> Node 
     let el = |part: &str| format!("hw/{id}/{part}");
     let status = slot.map(|slot| &slot.status);
     let (variant, status_text) = match status {
+        Some(Status::Waiting(count)) if entry.disabled => (
+            "warning",
+            format!("disabled, closes once its {count} payment(s) in flight settle"),
+        ),
+        Some(Status::Disabled) | None if entry.disabled => ("neutral", "disabled".to_string()),
+        Some(Status::Disabled) => ("info", "enabling…".to_string()),
+        Some(Status::Open) if entry.disabled => ("info", "disabling…".to_string()),
         None | Some(Status::Opening) => ("info", "opening…".to_string()),
         Some(Status::Open) if slot.is_some_and(|slot| slot.entry != *entry) => {
             ("info", "applying changes…".to_string())
@@ -474,8 +481,8 @@ fn wallet_card(now: u64, id: &str, can: Can, funds: &Funds, details: Vec<Node>) 
 }
 
 /// The internals of a network: where it is, what its wallet can do, what
-/// it is configured with and its key, and the buttons that reopen and
-/// remove it.
+/// it is configured with and its key, and the buttons that reopen,
+/// disable or enable, and remove it.
 fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
     let el = |part: &str| format!("hw/{id}/details/{part}");
     let network = NetworkId::parse(id).ok();
@@ -580,7 +587,17 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
         Status::Open => Some("Reopen"),
         _ => None,
     }
+    .filter(|_| !entry.disabled)
     .map(|label| act(el("open"), label, "network.open", json!({"id": id})));
+    let toggle = match entry.disabled {
+        true => act(el("enable"), "Enable", "network.enable", json!({"id": id})),
+        false => act(
+            el("disable"),
+            "Disable",
+            "network.disable",
+            json!({"id": id}),
+        ),
+    };
     nodes.push(divider(el("divider/actions")));
     if slot.confirm_remove {
         let funds = match &slot.funds.balances {
@@ -610,7 +627,7 @@ fn details(id: &str, entry: &Entry, slot: &Slot) -> Vec<Node> {
             ]),
         );
     } else {
-        nodes.push(row(el("actions")).children(reopen).child(
+        nodes.push(row(el("actions")).children(reopen).child(toggle).child(
             act(el("remove"), "Remove", "network.remove", json!({"id": id})).variant("failure"),
         ));
     }

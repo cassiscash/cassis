@@ -17,6 +17,10 @@
 //! lnd = { rest_url = "https://127.0.0.1:8080", tls_cert_path = "...", macaroon_path = "..." }
 //! # or: bark-lightning = {}       # Second's server, or { server_url, esplora_url }
 //! # or: spark-lightning = {}      # Spark wallet; { api_key } on mainnet
+//!
+//! [networks.liquid]
+//! mnemonic = "twelve words ..."
+//! disabled = true                  # kept, with its wallet, but not opened
 //! ```
 
 use cassis_core::NetworkId;
@@ -44,6 +48,9 @@ pub struct Entry {
     /// A `lightning` network going through a Spark lightning wallet.
     #[serde(rename = "spark-lightning")]
     pub spark_lightning: Option<SparkLightning>,
+    /// Not opened, until enabled again: the wallet and its key stay.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -355,6 +362,19 @@ pub fn set(
     Ok(())
 }
 
+/// Disable `id`, or enable it again.
+pub fn set_disabled(networks: &mut Table, id: &NetworkId, disabled: bool) -> Result<(), String> {
+    let table = networks
+        .get_mut(&id.0)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| format!("{id} is not in the config file"))?;
+    match disabled {
+        true => table.insert("disabled", toml_edit::value(true)),
+        false => table.remove("disabled"),
+    };
+    Ok(())
+}
+
 /// Remove `id`, and its wallet key with it.
 pub fn remove(networks: &mut Table, id: &NetworkId) -> Result<(), String> {
     networks
@@ -482,6 +502,10 @@ mod tests {
         );
         let text = std::fs::read_to_string(file.path()).unwrap();
         assert!(text.starts_with("# mine\nmnemonic"));
+        file.edit(|t| set_disabled(t, &id, true)).unwrap();
+        assert!(file.read().unwrap()["arkade"].disabled);
+        file.edit(|t| set_disabled(t, &id, false)).unwrap();
+        assert_eq!(file.read().unwrap().remove("arkade").unwrap(), entry);
         file.edit(|t| remove(t, &id)).unwrap();
         assert!(file.read().unwrap().is_empty());
     }

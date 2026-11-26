@@ -34,6 +34,8 @@
 //! | `network.add`            | `draft`: `new_network`                   |
 //! | `network.set`            | `id`, `draft`                            |
 //! | `network.open`           | `id`                                     |
+//! | `network.disable`        | `id` (closes it, keeping its mnemonic)   |
+//! | `network.enable`         | `id`                                     |
 //! | `network.remove`         | `id` (asks to confirm)                   |
 //! | `network.remove.confirm` | `id`                                     |
 //! | `network.remove.cancel`  | `id`                                     |
@@ -104,6 +106,8 @@ pub enum Status {
     Failed(String),
     /// Changes wait for this many payments in flight to settle.
     Waiting(usize),
+    /// Not opened, as the config file says.
+    Disabled,
 }
 
 /// What is known of a network's wallet.
@@ -366,11 +370,24 @@ impl WalletAdmin {
             }
             "network.open" => {
                 let id = id()?;
-                if !self.state().wanted.contains_key(&id.0) {
-                    return Err(format!("{id} is not in the config file"));
+                match self.state().wanted.get(&id.0) {
+                    None => return Err(format!("{id} is not in the config file")),
+                    Some(entry) if entry.disabled => return Err(format!("{id} is disabled")),
+                    Some(_) => {}
                 }
                 self.reconcile_in_background(Some(id.0.clone()));
                 Ok(format!("Opening {id}"))
+            }
+            "network.disable" | "network.enable" => {
+                let id = id()?;
+                let disabled = name == "network.disable";
+                self.file
+                    .edit(|networks| config::set_disabled(networks, &id, disabled))?;
+                self.reconcile_in_background(None);
+                Ok(match disabled {
+                    true => format!("{id} disabled, closing it"),
+                    false => format!("{id} enabled, opening it"),
+                })
             }
             "network.remove" => {
                 let id = id()?;
@@ -532,6 +549,10 @@ impl WalletAdmin {
         }
 
         for (id, entry) in &wanted {
+            if entry.disabled {
+                changed |= self.disable(id, entry);
+                continue;
+            }
             let reopen = {
                 let mut state = self.state();
                 match state.slots.get_mut(id) {
@@ -632,6 +653,42 @@ impl WalletAdmin {
         if let (Some(host), Ok(id)) = (self.host.get(), NetworkId::parse(id)) {
             host.closed(&id);
         }
+    }
+
+    /// Keep `id` closed, as disabled with `entry`, closing it once
+    /// nothing is in flight through it. Whether anything changed.
+    fn disable(&self, id: &str, entry: &Entry) -> bool {
+        let open = match self.state().slots.get(id) {
+            Some(slot) if slot.status == Status::Disabled && slot.entry == *entry => return false,
+            Some(slot) => slot.network.is_some(),
+            None => false,
+        };
+        if open {
+            match self.in_flight(id) {
+                0 => {
+                    self.close(id);
+                    info!("closed {id}, disabled");
+                }
+                payments => {
+                    self.wait(id, payments);
+                    return true;
+                }
+            }
+        }
+        let mut state = self.state();
+        match state.slots.get_mut(id) {
+            Some(slot) => {
+                slot.entry = entry.clone();
+                slot.status = Status::Disabled;
+                slot.funds = Funds::default();
+            }
+            None => {
+                state
+                    .slots
+                    .insert(id.to_string(), Slot::new(entry.clone(), Status::Disabled));
+            }
+        }
+        true
     }
 
     fn wait(&self, id: &str, payments: usize) {

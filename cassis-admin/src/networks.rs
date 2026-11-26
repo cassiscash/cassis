@@ -348,11 +348,17 @@ pub struct NetworkConfig {
     pub mnemonic: Option<String>,
     /// Chain API of `arkade` and `bitcoin`, instead of the public one.
     pub esplora_url: Option<String>,
+    /// Not opened, until enabled again: the wallet and its key stay.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 impl NetworkConfig {
     /// What opening `id` takes, its wallet under `dir`.
     pub fn settings(&self, id: &NetworkId, dir: &Path) -> Result<NetworkSettings, String> {
+        if self.disabled {
+            return Err(format!("{id} is disabled"));
+        }
         let words = self
             .mnemonic
             .as_deref()

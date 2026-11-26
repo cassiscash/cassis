@@ -81,8 +81,24 @@ impl Home {
         Ok(())
     }
 
-    /// Remove `networks` from the config. Their mnemonics go with them.
+    /// Mark `networks` disabled in the config: kept, mnemonics included,
+    /// but not used until enabled again.
     pub fn disable(&mut self, networks: &[NetworkId]) -> Result<(), String> {
+        self.config = config::edit(&self.dir, |doc| {
+            for network in networks {
+                doc.get_mut("networks")
+                    .and_then(|n| n.get_mut(&network.0))
+                    .and_then(|n| n.as_table_like_mut())
+                    .ok_or_else(|| format!("{network} is not enabled"))?
+                    .insert("disabled", toml_edit::value(true));
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Remove `networks` from the config. Their mnemonics go with them.
+    pub fn remove(&mut self, networks: &[NetworkId]) -> Result<(), String> {
         self.config = config::edit(&self.dir, |doc| {
             if let Some(table) = doc.get_mut("networks").and_then(|n| n.as_table_mut()) {
                 for network in networks {
