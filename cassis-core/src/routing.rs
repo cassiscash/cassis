@@ -19,7 +19,7 @@ use ritualistic::{
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 use std::time::Duration;
 // The real `tokio` on native targets and a JS shim on wasm32.
 use tokio_with_wasm::alias as tokio;
@@ -420,68 +420,131 @@ pub async fn delete_announcements(
     accepted
 }
 
-/// Cheapest chain of hops carrying `amount_msat` from `from` to `to`.
-/// Empty when `from == to`. Hops of routers in `skip` (e.g. ones that
-/// failed an earlier attempt), and hops that would forward less than
-/// their `min_htlc_msat`, are never used.
+/// One announced hop: a router's route from one network to another.
+/// Routers announce each direction once, so this names the hop.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HopId {
+    pub node_pubkey: XOnlyPubKey,
+    pub from: NetworkId,
+    pub to: NetworkId,
+}
+
+impl RouteAnnouncement {
+    /// The hop this announces.
+    pub fn id(&self) -> HopId {
+        HopId {
+            node_pubkey: self.node_pubkey,
+            from: self.from.clone(),
+            to: self.to.clone(),
+        }
+    }
+}
+
+/// Most partial routes [`find_routes`] looks at, so a large graph
+/// cannot make it run for long.
+const MAX_ROUTE_EXPANSIONS: usize = 10_000;
+
+/// The `n` cheapest chains of hops carrying `amount_msat` from `from`
+/// to `to`, cheapest first. A single empty route when `from == to`.
+///
+/// Hops in `skip_hops`, and every hop of the routers in
+/// `skip_routers` (e.g. ones that failed an earlier attempt), are left
+/// out as if never announced. So are hops that would forward less than
+/// their `min_htlc_msat`. No route passes a network or a router twice:
+/// a router can only hold one hop per payment hash.
 ///
 /// Searches backwards from the destination, where the amount is known,
 /// so every hop's fee is computed on the amount it actually forwards.
-pub fn find_route(
+/// Adding a hop never makes a route cheaper, so routes come out of the
+/// search in order of cost.
+pub fn find_routes(
     announcements: &[RouteAnnouncement],
     from: &NetworkId,
     to: &NetworkId,
     amount_msat: u64,
-    skip: &HashSet<XOnlyPubKey>,
-) -> Result<Vec<RouteAnnouncement>, String> {
+    n: usize,
+    skip_hops: &HashSet<HopId>,
+    skip_routers: &HashSet<XOnlyPubKey>,
+) -> Result<Vec<Vec<RouteAnnouncement>>, String> {
     if from == to {
-        return Ok(Vec::new());
+        return Ok(vec![Vec::new()]);
     }
-    // Amount needed when entering a network to get `amount_msat` to
-    // `to`, and the hop taken from there.
-    let mut needed: HashMap<&NetworkId, u64> = HashMap::from([(to, amount_msat)]);
-    let mut next_hop: HashMap<&NetworkId, &RouteAnnouncement> = HashMap::new();
-    let mut queue = BinaryHeap::from([Reverse((amount_msat, to))]);
+    let hops: Vec<&RouteAnnouncement> = announcements
+        .iter()
+        .filter(|hop| !skip_routers.contains(&hop.node_pubkey) && !skip_hops.contains(&hop.id()))
+        .collect();
+    /// The end of a route, from the network `at` to `to`: the amount
+    /// needed when entering `at`, and its hops backwards.
+    struct Partial<'a> {
+        needed: u64,
+        at: &'a NetworkId,
+        hops: Vec<&'a RouteAnnouncement>,
+    }
+    let mut partials = vec![Partial {
+        needed: amount_msat,
+        at: to,
+        hops: Vec::new(),
+    }];
+    // Cheapest first, then fewest hops, then first found.
+    let mut queue = BinaryHeap::from([Reverse((amount_msat, 0, 0))]);
+    let mut routes = Vec::new();
     // Whether a hop was left out only for the amount being too small.
     let mut too_small = false;
-    while let Some(Reverse((amount, network))) = queue.pop() {
-        if needed.get(network).is_some_and(|best| amount > *best) {
+    let mut expansions = 0;
+    while let Some(Reverse((_, _, index))) = queue.pop() {
+        if routes.len() >= n || expansions >= MAX_ROUTE_EXPANSIONS {
+            break;
+        }
+        expansions += 1;
+        let partial = &partials[index];
+        if partial.at == from {
+            routes.push(
+                partial
+                    .hops
+                    .iter()
+                    .rev()
+                    .map(|hop| (*hop).clone())
+                    .collect(),
+            );
             continue;
         }
-        if network == from {
-            let mut route = Vec::new();
-            let mut at = from;
-            while at != to {
-                let hop = next_hop[at];
-                route.push(hop.clone());
-                at = &hop.to;
+        let (needed, at) = (partial.needed, partial.at);
+        let mut extended = Vec::new();
+        for hop in hops.iter().filter(|hop| hop.to == *at) {
+            let visited = hop.from == *to
+                || partial
+                    .hops
+                    .iter()
+                    .any(|h| h.from == hop.from || h.node_pubkey == hop.node_pubkey);
+            if visited {
+                continue;
             }
-            let mut nodes: Vec<_> = route.iter().map(|hop| hop.node_pubkey).collect();
-            nodes.sort_by_key(|key| *key.as_bytes());
-            nodes.dedup();
-            if nodes.len() != route.len() {
-                // A router can only hold one hop per payment hash.
-                return Err("cheapest route passes the same router twice".into());
-            }
-            return Ok(route);
-        }
-        for hop in announcements
-            .iter()
-            .filter(|hop| hop.to == *network && !skip.contains(&hop.node_pubkey))
-        {
-            if amount < hop.min_htlc_msat {
+            if needed < hop.min_htlc_msat {
                 too_small = true;
                 continue;
             }
-            let Some(upstream) = amount.checked_add(hop.fee_msat(amount)) else {
+            let Some(upstream) = needed.checked_add(hop.fee_msat(needed)) else {
                 continue;
             };
-            if needed.get(&hop.from).is_none_or(|best| upstream < *best) {
-                needed.insert(&hop.from, upstream);
-                next_hop.insert(&hop.from, hop);
-                queue.push(Reverse((upstream, &hop.from)));
-            }
+            let mut route = partial.hops.clone();
+            route.push(*hop);
+            extended.push(Partial {
+                needed: upstream,
+                at: &hop.from,
+                hops: route,
+            });
         }
+        for partial in extended {
+            queue.push(Reverse((
+                partial.needed,
+                partial.hops.len(),
+                partials.len(),
+            )));
+            partials.push(partial);
+        }
+    }
+    if !routes.is_empty() || n == 0 {
+        return Ok(routes);
     }
     Err(if too_small {
         format!("no route from {from} to {to} for {amount_msat} msat: some hops need more")
@@ -635,14 +698,36 @@ mod tests {
         to: &str,
         skip: &[u8],
     ) -> Result<Vec<u8>, String> {
-        find_route(
+        routes(graph, from, to, 1, &HashSet::new(), skip).map(|mut routes| routes.remove(0))
+    }
+
+    /// The routers of the `n` cheapest routes, by their key's first byte.
+    fn routes(
+        graph: &[RouteAnnouncement],
+        from: &str,
+        to: &str,
+        n: usize,
+        skip_hops: &HashSet<HopId>,
+        skip_routers: &[u8],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        find_routes(
             graph,
             &NetworkId(from.into()),
             &NetworkId(to.into()),
             1_000_000,
-            &skip.iter().map(|node| XOnlyPubKey([*node; 32])).collect(),
+            n,
+            skip_hops,
+            &skip_routers
+                .iter()
+                .map(|node| XOnlyPubKey([*node; 32]))
+                .collect(),
         )
-        .map(|hops| hops.iter().map(|hop| hop.node_pubkey.0[0]).collect())
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|hops| hops.iter().map(|hop| hop.node_pubkey.0[0]).collect())
+                .collect()
+        })
     }
 
     #[test]
@@ -734,11 +819,13 @@ mod tests {
         ];
         // 1_000_000 msat clears hop 3's minimum.
         assert_eq!(route_skipping(&graph, "a", "c", &[1]).unwrap(), vec![2, 3]);
-        let tiny = find_route(
+        let tiny = find_routes(
             &graph[1..],
             &NetworkId("a".into()),
             &NetworkId("c".into()),
             1_000,
+            1,
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert!(tiny.unwrap_err().contains("some hops need more"));
@@ -752,6 +839,78 @@ mod tests {
             hop(1, "c", "d", 0, 0),
         ];
         assert!(route(&graph, "a", "d").is_err());
+    }
+
+    #[test]
+    fn avoids_the_same_router_twice_when_another_route_exists() {
+        let graph = [
+            hop(1, "a", "b", 0, 0),
+            hop(2, "b", "c", 0, 0),
+            hop(1, "c", "d", 0, 0),
+            hop(3, "c", "d", 100, 0),
+        ];
+        assert_eq!(route(&graph, "a", "d").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn lists_routes_cheapest_first() {
+        let graph = [
+            hop(1, "a", "c", 300, 0),
+            hop(2, "a", "b", 100, 0),
+            hop(3, "b", "c", 100, 0),
+            hop(4, "a", "c", 1_000, 0),
+            hop(5, "b", "c", 150, 0),
+        ];
+        let none = HashSet::new();
+        assert_eq!(
+            routes(&graph, "a", "c", 10, &none, &[]).unwrap(),
+            vec![vec![2, 3], vec![2, 5], vec![1], vec![4]]
+        );
+        assert_eq!(
+            routes(&graph, "a", "c", 2, &none, &[]).unwrap(),
+            vec![vec![2, 3], vec![2, 5]]
+        );
+        assert!(routes(&graph, "a", "c", 0, &none, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn skips_single_hops_or_whole_routers() {
+        let graph = [
+            hop(1, "a", "b", 0, 0),
+            hop(1, "b", "c", 0, 0),
+            hop(2, "a", "c", 100, 0),
+            hop(3, "a", "b", 50, 0),
+        ];
+        let none = HashSet::new();
+        // Router 1 cannot take both hops; one of them can go.
+        assert_eq!(
+            routes(&graph, "a", "c", 10, &none, &[]).unwrap(),
+            vec![vec![3, 1], vec![2]]
+        );
+        let one_hop = HashSet::from([graph[1].id()]);
+        assert_eq!(
+            routes(&graph, "a", "c", 10, &one_hop, &[]).unwrap(),
+            vec![vec![2]]
+        );
+        assert_eq!(
+            routes(&graph, "a", "c", 10, &none, &[1]).unwrap(),
+            vec![vec![2]]
+        );
+        assert!(routes(&graph, "a", "c", 10, &none, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn never_passes_a_network_twice() {
+        let graph = [
+            hop(1, "a", "b", 0, 0),
+            hop(2, "b", "c", 0, 0),
+            hop(3, "c", "b", 0, 0),
+            hop(4, "b", "d", 0, 0),
+        ];
+        assert_eq!(
+            routes(&graph, "a", "d", 10, &HashSet::new(), &[]).unwrap(),
+            vec![vec![1, 4]]
+        );
     }
 
     #[test]

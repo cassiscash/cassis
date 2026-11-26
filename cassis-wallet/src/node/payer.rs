@@ -7,7 +7,7 @@ use cassis_core::offline::endpoint_public_key;
 use cassis_core::protocol::{
     Commit, Discard, Execute, FailReason, Invoice, Prepare, PreparePayee, Request, Response, Settle,
 };
-use cassis_core::routing::{self, RouteAnnouncement};
+use cassis_core::routing::{self, HopId, RouteAnnouncement, RoutePlan};
 use cassis_core::transport::PeerAddr;
 use cassis_core::{Bytes32, OperationId, XOnlyPubKey, unix_now};
 use futures::future::join_all;
@@ -119,6 +119,125 @@ impl PayReport {
     }
 }
 
+/// A way to pay an invoice, as [`Node::find_routes`] finds them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayRoute {
+    /// The hops to the payee's network: none when it is paid directly.
+    pub hops: Vec<RouteAnnouncement>,
+    /// The network of the invoice the route ends at.
+    pub network: NetworkId,
+    /// The amounts and expiries of its legs, planned when it was found.
+    pub plan: RoutePlan,
+}
+
+impl PayRoute {
+    /// What paying over the route costs, fees included.
+    pub fn cost_msat(&self) -> u64 {
+        self.plan.amounts[0]
+    }
+
+    /// Whether the route pays `invoice` from `from`.
+    fn check(&self, invoice: &Invoice, from: &NetworkId) -> Result<(), String> {
+        if invoice.target_for(&self.network).is_none() {
+            return Err(format!("the invoice does not accept {}", self.network));
+        }
+        let mut at = from;
+        for hop in &self.hops {
+            if hop.from != *at {
+                return Err(format!(
+                    "the route does not lead from {from} to {}",
+                    self.network
+                ));
+            }
+            at = &hop.to;
+        }
+        if *at != self.network {
+            return Err(format!(
+                "the route does not lead from {from} to {}",
+                self.network
+            ));
+        }
+        let routers: HashSet<_> = self.hops.iter().map(|hop| hop.node_pubkey).collect();
+        if routers.len() != self.hops.len() {
+            // A router can only hold one hop per payment hash.
+            return Err("the route passes the same router twice".into());
+        }
+        Ok(())
+    }
+}
+
+/// The direct way to pay `invoice`, when it accepts `from`.
+fn direct_route(invoice: &Invoice, from: &NetworkId) -> Result<Option<PayRoute>, String> {
+    if invoice.target_for(from).is_none() {
+        return Ok(None);
+    }
+    let plan = routing::plan_route(
+        &[],
+        invoice.body.amount_msat,
+        invoice.incoming_delta_for(from),
+        unix_now(),
+    )?;
+    Ok(Some(PayRoute {
+        hops: Vec::new(),
+        network: from.clone(),
+        plan,
+    }))
+}
+
+/// The `n` cheapest routes over `announcements` from `from` to any
+/// network of `invoice`, cheapest first. `Err` when there is none.
+fn invoice_routes(
+    invoice: &Invoice,
+    from: &NetworkId,
+    announcements: &[RouteAnnouncement],
+    n: usize,
+    skip_hops: &HashSet<HopId>,
+    skip_routers: &HashSet<XOnlyPubKey>,
+) -> Result<Vec<PayRoute>, String> {
+    let amount_msat = invoice.body.amount_msat;
+    let mut routes = Vec::new();
+    // Why no route was found to each network, or could not be planned.
+    let mut errors = Vec::new();
+    for entry in &invoice.body.networks {
+        let network = entry.target.network();
+        let found = match routing::find_routes(
+            announcements,
+            from,
+            network,
+            amount_msat,
+            n,
+            skip_hops,
+            skip_routers,
+        ) {
+            Ok(found) => found,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        for hops in found {
+            let delta = invoice.incoming_delta_for(network);
+            match routing::plan_route(&hops, amount_msat, delta, unix_now()) {
+                Ok(plan) => routes.push(PayRoute {
+                    hops,
+                    network: network.clone(),
+                    plan,
+                }),
+                Err(error) => errors.push(format!("route to {network}: {error}")),
+            }
+        }
+    }
+    routes.sort_by_key(PayRoute::cost_msat);
+    routes.truncate(n);
+    if routes.is_empty() && n > 0 {
+        return Err(match errors.as_slice() {
+            [error] => error.clone(),
+            _ => format!("no route from {from} to any network of the invoice"),
+        });
+    }
+    Ok(routes)
+}
+
 impl Node {
     /// [`Node::pay`] over up to `max_routes` routes: when an attempt
     /// fails at PREPARE because of a hop, the next one routes around
@@ -134,10 +253,23 @@ impl Node {
         relays: &[String],
         max_routes: usize,
     ) -> Result<PayReport, String> {
+        if let Some(paid) = self.check_payable(invoice)? {
+            return Ok(paid);
+        }
+        if let Some(direct) = direct_route(invoice, from)? {
+            return self.pay_with_route(invoice, from, &direct).await;
+        }
+        // Every attempt routes over the same announcements.
+        let announcements = routing::fetch_announcements(relays).await?;
         let mut skip = HashSet::new();
         let mut last: Option<PayReport> = None;
         for attempt in 1..=max_routes.max(1) {
-            let report = match self.pay(invoice, from, relays, &skip).await {
+            let report =
+                match invoice_routes(invoice, from, &announcements, 1, &HashSet::new(), &skip) {
+                    Ok(routes) => self.pay_with_route(invoice, from, &routes[0]).await,
+                    Err(error) => Err(error),
+                };
+            let report = match report {
                 Ok(report) => report,
                 // Typically no route is left once failed hops are
                 // skipped: the last failure says more.
@@ -171,11 +303,53 @@ impl Node {
         Ok(last.expect("at least one attempt ran"))
     }
 
-    /// Pay `invoice` from this node's `from` network, routing through
-    /// routers announced on `relays` when the invoice is not payable on
-    /// `from` directly. Routers in `skip` are not routed through: a
+    /// Pay `invoice` from this node's `from` network over the cheapest
+    /// of [`Node::find_routes`], skipping the routers in `skip`: a
     /// caller whose attempt failed at a hop retries with that hop's
-    /// [`FailedHop::node`] added.
+    /// [`FailedHop::node`] added. See [`Node::pay_with_route`].
+    pub async fn pay(
+        &self,
+        invoice: &Invoice,
+        from: &NetworkId,
+        relays: &[String],
+        skip: &HashSet<XOnlyPubKey>,
+    ) -> Result<PayReport, String> {
+        if let Some(paid) = self.check_payable(invoice)? {
+            return Ok(paid);
+        }
+        let routes = self
+            .find_routes(invoice, from, relays, 1, &HashSet::new(), skip)
+            .await?;
+        self.pay_with_route(invoice, from, &routes[0]).await
+    }
+
+    /// The `n` cheapest ways to pay `invoice` from this node's `from`
+    /// network, cheapest first: the direct one alone when the invoice
+    /// accepts `from`, else routes through the routers announced on
+    /// `relays` to any network it accepts. Hops in `skip_hops` and every
+    /// hop of the routers in `skip_routers` are left out (see
+    /// [`routing::find_routes`]).
+    ///
+    /// `Err` when there is none, saying why.
+    pub async fn find_routes(
+        &self,
+        invoice: &Invoice,
+        from: &NetworkId,
+        relays: &[String],
+        n: usize,
+        skip_hops: &HashSet<HopId>,
+        skip_routers: &HashSet<XOnlyPubKey>,
+    ) -> Result<Vec<PayRoute>, String> {
+        if let Some(direct) = direct_route(invoice, from)? {
+            return Ok(vec![direct]);
+        }
+        let announcements = routing::fetch_announcements(relays).await?;
+        invoice_routes(invoice, from, &announcements, n, skip_hops, skip_routers)
+    }
+
+    /// Pay `invoice` from this node's `from` network over `route`, as
+    /// [`Node::find_routes`] found it. Its legs are planned again from
+    /// now, so the route can be paid a while after it was found.
     ///
     /// `Err` is a payment that could not start. Otherwise the report
     /// holds the route attempted and the preimage, or what failed.
@@ -188,59 +362,26 @@ impl Node {
     /// Hops and the payee may wait for their incoming HTLC to become
     /// final (to confirm, on Bitcoin), so this can take as long as the
     /// route's timelocks allow.
-    pub async fn pay(
+    pub async fn pay_with_route(
         &self,
         invoice: &Invoice,
         from: &NetworkId,
-        relays: &[String],
-        skip: &HashSet<XOnlyPubKey>,
+        route: &PayRoute,
     ) -> Result<PayReport, String> {
         let hash = invoice.body.payment_hash;
         let _busy = self
             .busy(format!("pay:{hash}"))
             .ok_or("this invoice is already being paid")?;
-        invoice.verify()?;
-        // The payee and payer journals both key on the payment hash, so
-        // a wallet cannot be both ends of one payment: claiming would
-        // record the incoming transaction only after the outgoing one was
-        // already journaled, or the other way around.
-        if invoice.receiver.payee() == &endpoint_public_key(&self.keys().iroh) {
-            return Err("this wallet issued the invoice and cannot pay itself".into());
+        if let Some(paid) = self.check_payable(invoice)? {
+            return Ok(paid);
         }
-        if invoice.body.amount_msat == 0 {
-            return Err("invoice amount is zero".into());
-        }
-        if invoice.body.expires_at <= unix_now() {
-            return Err("invoice expired".into());
-        }
-        if let Some(previous) = self
-            .db()
-            .transactions()
-            .get(TransactionHash(hash.0))
-            .map_err(db_error)?
-        {
-            return match previous.direction {
-                Direction::Outgoing => Ok(PayReport::paid(Vec::new(), Bytes32(previous.preimage))),
-                Direction::Incoming => Err("this wallet was paid this invoice".into()),
-            };
-        }
-        if let Some(previous) = self
-            .db()
-            .pending_payments()
-            .get(PendingPaymentHash(hash.0))
-            .map_err(db_error)?
-        {
-            return Err(format!(
-                "an earlier attempt is still locked until {}",
-                previous.htlc.expiry
-            ));
-        }
+        route.check(invoice, from)?;
         let funder = self.funder(from);
         let sender = match funder {
             Some(_) => None,
             None => Some(self.network(from)?),
         };
-        let (route, payee_network) = self.choose_route(invoice, from, relays, skip).await?;
+        let (route, payee_network) = (route.hops.clone(), route.network.clone());
         let payee_target = invoice
             .target_for(&payee_network)
             .cloned()
@@ -525,55 +666,50 @@ impl Node {
             .map_err(db_error)
     }
 
-    /// The invoice network to pay and the route there: direct when the
-    /// invoice accepts `from`, else the cheapest announced route to any
-    /// network it accepts.
-    async fn choose_route(
-        &self,
-        invoice: &Invoice,
-        from: &NetworkId,
-        relays: &[String],
-        skip: &HashSet<XOnlyPubKey>,
-    ) -> Result<(Vec<RouteAnnouncement>, NetworkId), String> {
-        if invoice.target_for(from).is_some() {
-            return Ok((Vec::new(), from.clone()));
+    /// Whether `invoice` can be paid by this wallet: `Some` report when
+    /// it already paid it.
+    fn check_payable(&self, invoice: &Invoice) -> Result<Option<PayReport>, String> {
+        let hash = invoice.body.payment_hash;
+        invoice.verify()?;
+        // The payee and payer journals both key on the payment hash, so
+        // a wallet cannot be both ends of one payment: claiming would
+        // record the incoming transaction only after the outgoing one was
+        // already journaled, or the other way around.
+        if invoice.receiver.payee() == &endpoint_public_key(&self.keys().iroh) {
+            return Err("this wallet issued the invoice and cannot pay itself".into());
         }
-        let announcements = routing::fetch_announcements(relays).await?;
-        // Why the last route found could not be planned, if any was.
-        let mut unplannable = None;
-        invoice
-            .body
-            .networks
-            .iter()
-            .filter_map(|entry| {
-                let route = routing::find_route(
-                    &announcements,
-                    from,
-                    entry.target.network(),
-                    invoice.body.amount_msat,
-                    skip,
-                )
-                .ok()?;
-                // Fails when a leg runs longer than its receiver accepts.
-                let plan = routing::plan_route(
-                    &route,
-                    invoice.body.amount_msat,
-                    invoice.incoming_delta_for(entry.target.network()),
-                    unix_now(),
-                )
-                .map_err(|error| {
-                    unplannable = Some(format!("route to {}: {error}", entry.target.network()))
-                })
-                .ok()?;
-                Some((plan.amounts[0], route, entry.target.network().clone()))
-            })
-            .min_by_key(|(cost, _, _)| *cost)
-            .map(|(_, route, network)| (route, network))
-            .ok_or_else(|| {
-                unplannable.unwrap_or_else(|| {
-                    format!("no route from {from} to any network of the invoice")
-                })
-            })
+        if invoice.body.amount_msat == 0 {
+            return Err("invoice amount is zero".into());
+        }
+        if invoice.body.expires_at <= unix_now() {
+            return Err("invoice expired".into());
+        }
+        if let Some(previous) = self
+            .db()
+            .transactions()
+            .get(TransactionHash(hash.0))
+            .map_err(db_error)?
+        {
+            return match previous.direction {
+                Direction::Outgoing => Ok(Some(PayReport::paid(
+                    Vec::new(),
+                    Bytes32(previous.preimage),
+                ))),
+                Direction::Incoming => Err("this wallet was paid this invoice".into()),
+            };
+        }
+        if let Some(previous) = self
+            .db()
+            .pending_payments()
+            .get(PendingPaymentHash(hash.0))
+            .map_err(db_error)?
+        {
+            return Err(format!(
+                "an earlier attempt is still locked until {}",
+                previous.htlc.expiry
+            ));
+        }
+        Ok(None)
     }
 
     /// Send `request` to `peer` again and again while it answers

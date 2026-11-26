@@ -604,13 +604,16 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => {
             let announcements = routing::fetch_announcements(&relays).await?;
             let to = NetworkId::parse(&to)?;
-            let route = routing::find_route(
+            let route = routing::find_routes(
                 &announcements,
                 &NetworkId::parse(&from)?,
                 &to,
                 amount_msat,
+                1,
                 &Default::default(),
-            )?;
+                &Default::default(),
+            )?
+            .remove(0);
             let plan = routing::plan_route(
                 &route,
                 amount_msat,
