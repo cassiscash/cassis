@@ -103,7 +103,7 @@ const CLAIM_TX_WEIGHT: usize = 218 * 4 + 8 - (24 + 32) * 4;
 /// `DUST_RELAY_TX_FEE` of 0.1 sat/vbyte (ELIP-201): (78-byte output +
 /// 67-byte spend) at 0.1 sat/vbyte, rounded up as `GetDustThreshold`
 /// does.
-const LOCKUP_DUST_SATS: u64 = (78 + 67).div_ceil(10);
+const LOCKUP_DUST_SATS: u64 = (78_u64 + 67).div_ceil(10);
 
 /// Derivation path of the HTLC claim key (see crate docs).
 const CLAIM_KEY_PATH: &str = "m/1037'/0";
@@ -1098,7 +1098,9 @@ impl Network for LiquidAdapter {
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
         let needed = sats_for_msat(amount_msat);
         let available = self.lbtc_balance_sat().await?;
-        let address = self.next_wallet_address().await?;
+        // The lockup is an explicit output; a confidential address would
+        // be rejected by `add_explicit_recipient`.
+        let address = self.next_wallet_address().await?.to_unconfidential();
         let wollet = self.wollet.lock().await;
         wollet
             .tx_builder()
