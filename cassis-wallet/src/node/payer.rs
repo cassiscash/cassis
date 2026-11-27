@@ -626,19 +626,25 @@ impl Node {
         info!("paid {}: preimage {preimage}", hash.short());
 
         // Let every hop claim right away instead of waiting to observe
-        // the preimage downstream.
-        join_all(hops.iter().map(|hop| {
-            let settle = Request::Settle(Settle {
-                operation_id: hop.prepare.operation_id,
-                preimage,
-            });
-            async move {
-                if let Err(error) = self.0.transport.request(&hop.peer, &settle).await {
-                    warn!("could not tell a hop the preimage: {error}");
+        // the preimage downstream. They are told in the background: the
+        // payment is done once the payee answered with the preimage, and
+        // a slow hop must not hold up the payer or its journal.
+        let transport = self.0.transport.clone();
+        self.spawn(async move {
+            join_all(hops.iter().map(|hop| {
+                let settle = Request::Settle(Settle {
+                    operation_id: hop.prepare.operation_id,
+                    preimage,
+                });
+                let (transport, peer) = (transport.clone(), hop.peer.clone());
+                async move {
+                    if let Err(error) = transport.request(&peer, &settle).await {
+                        warn!("could not tell a hop the preimage: {error}");
+                    }
                 }
-            }
-        }))
-        .await;
+            }))
+            .await;
+        });
         Ok(PayReport::paid(route, preimage))
     }
 
