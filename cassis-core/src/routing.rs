@@ -93,6 +93,13 @@ impl RouteAnnouncement {
         fee_msat(self.fee_base_msat, self.fee_ppm, amount_msat)
     }
 
+    /// Expected seconds this hop adds to a payment: its outgoing HTLC is
+    /// funded on `to`, and the next party waits for it there. Wallets add
+    /// it over the route to estimate how long paying will take.
+    pub fn expected_wait_secs(&self) -> u64 {
+        self.to.expected_wait_secs()
+    }
+
     /// The `name` in the node's kind-0 metadata, if it published one.
     pub async fn name(&self) -> Option<String> {
         let pool = ritualistic::Network::new();
@@ -770,6 +777,14 @@ mod tests {
     #[test]
     fn same_network_needs_no_hops() {
         assert_eq!(route(&[], "a", "a").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn hop_wait_follows_its_outgoing_network() {
+        let to_rootstock = hop(1, "cashu::localhost", "rootstock::testnet", 0, 0);
+        assert_eq!(to_rootstock.expected_wait_secs(), 60);
+        let to_cashu = hop(2, "rootstock::testnet", "cashu::localhost", 0, 0);
+        assert_eq!(to_cashu.expected_wait_secs(), 2);
     }
 
     #[test]

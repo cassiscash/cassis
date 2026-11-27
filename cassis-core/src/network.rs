@@ -197,6 +197,47 @@ impl NetworkId {
         }
     }
 
+    /// Typical seconds one hop on this network adds to a payment on the
+    /// happy path, for estimating how long a route will take. Wallets
+    /// add it up hop by hop and show the total to the payer; it is an
+    /// average, not a bound.
+    ///
+    /// Unlike [`NetworkId::default_incoming_delta`], this is not a
+    /// safety margin: it says what waiting usually costs, not what a
+    /// router must reserve before its incoming HTLC can be refunded.
+    pub fn expected_wait_secs(&self) -> u64 {
+        const MINUTE: u64 = 60;
+        match self.kind() {
+            // One request to the mint, usually answered at once.
+            "cashu" => 2,
+            // The federation's consensus and ecash issuance.
+            "fedimint" => 10,
+            // An offchain claim co-signed by the operator, often batched.
+            "arkade" => 15,
+            // The lockup must confirm before the receiver relies on it.
+            "bitcoin" => match self.param() {
+                // Mutinynet's blocks come every 30 seconds.
+                Some("mutinynet") => 30,
+                // Regtest mines on demand.
+                Some("regtest") => 1,
+                _ => 10 * MINUTE,
+            },
+            // Zero-conf coverage on mainnet, a propagation pause on
+            // testnet; either way well under a block.
+            "liquid" => 10,
+            // A receipt, about one block.
+            "rootstock" => MINUTE,
+            // A few seconds per block from a single sequencer.
+            "citrea" | "starknet-wbtc" => 5,
+            // Sub-second slots.
+            "solana-wbtc" => 2,
+            // One hold-invoice round trip.
+            "lightning" => 3,
+            // Unknown kinds: the most cautious of the above.
+            _ => MINUTE,
+        }
+    }
+
     /// The base fee a hop receiving on this network charges by default,
     /// in msat. The router's operator can override it per route.
     pub fn default_base_fee_msat(&self) -> u64 {
@@ -1102,5 +1143,22 @@ mod tests {
         assert_eq!(fee("lightning"), 2_000);
         assert_eq!(fee("fedimint::fed1q"), 0);
         assert_eq!(fee("arkade::mutinynet"), 0);
+    }
+
+    #[test]
+    fn expected_wait_uses_the_kind_and_chain() {
+        let wait = |id: &str| NetworkId(id.into()).expected_wait_secs();
+        assert_eq!(wait("cashu::localhost"), 2);
+        assert_eq!(wait("fedimint::fed1q"), 10);
+        assert_eq!(wait("arkade::mutinynet"), 15);
+        assert_eq!(wait("bitcoin"), 600);
+        assert_eq!(wait("bitcoin::mutinynet"), 30);
+        assert_eq!(wait("bitcoin::regtest"), 1);
+        assert_eq!(wait("liquid::testnet"), 10);
+        assert_eq!(wait("rootstock"), 60);
+        assert_eq!(wait("citrea"), 5);
+        assert_eq!(wait("starknet-wbtc"), 5);
+        assert_eq!(wait("solana-wbtc"), 2);
+        assert_eq!(wait("lightning"), 3);
     }
 }

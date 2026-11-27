@@ -170,6 +170,15 @@ pub fn default_incoming_delta(network: &str) -> Result<u32, JsValue> {
     Ok(id.default_incoming_delta() as u32)
 }
 
+/// Typical seconds one hop on `network` adds to a payment on the happy
+/// path (see [`NetworkId::expected_wait_secs`]). Wallets add it over a
+/// route's hops to estimate how long paying will take.
+#[wasm_bindgen(js_name = expectedHopWait)]
+pub fn expected_hop_wait(network: &str) -> Result<u32, JsValue> {
+    let id = NetworkId::parse(network).map_err(js_error)?;
+    Ok(id.expected_wait_secs() as u32)
+}
+
 /// The `cassis-hop` ALPN, as a string.
 #[wasm_bindgen(js_name = hopAlpn)]
 pub fn hop_alpn() -> String {
