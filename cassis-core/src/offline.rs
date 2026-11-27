@@ -730,8 +730,11 @@ mod tests {
         );
         let mismatched = json.replace("\"liquid\"", "\"bitcoin\"");
         assert!(serde_json::from_str::<GatewayDestination>(&mismatched).is_err());
-        let mistagged = json.replace("\"PubKey\"", "\"XOnlyPubKey\"");
-        assert!(serde_json::from_str::<GatewayDestination>(&mistagged).is_err());
+        let tagged = format!(
+            r#"{{"network":"liquid","target":{{"PubKey":"{}"}}}}"#,
+            full.to_hex()
+        );
+        assert!(serde_json::from_str::<GatewayDestination>(&tagged).is_err());
     }
 
     #[test]

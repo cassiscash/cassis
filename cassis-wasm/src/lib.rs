@@ -43,10 +43,6 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 const TS_TYPES: &'static str = r#"
 /** Canonical network id: `arkade`, `arkade::mutinynet`, `arkade::<host>`, ... */
 export type NetworkId = string;
-export type HtlcTarget =
-  | { XOnlyPubKey: string }
-  | { PubKey: string }
-  | { LightningInvoice: string };
 export type HtlcDescriptor =
   | {
       Arkade: {
@@ -61,7 +57,10 @@ export type HtlcDescriptor =
   | { [kind: string]: unknown };
 export interface InvoiceNetwork {
   network: NetworkId;
-  target: HtlcTarget;
+  /** The claim key in the network's own format: hex for x-only and
+   * compressed keys, base58 for Solana, `0x`-hex for Starknet, or a
+   * BOLT11 hold invoice. */
+  target: string;
   incoming_delta_secs?: number;
 }
 export interface Invoice {

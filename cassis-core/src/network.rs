@@ -13,7 +13,6 @@ use crate::primitives::{Bytes32, Ed25519PubKey, PubKey, StarknetAddress, XOnlyPu
 use async_trait::async_trait;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
@@ -240,10 +239,10 @@ impl fmt::Display for NetworkId {
 /// [`Infallible`] where Lightning cannot be paid (see
 /// [`crate::offline::GatewayDestination`]).
 ///
-/// Crosses the wire as `{"network": <id>, "target": {<kind of key>: <key>}}`:
-/// `{"XOnlyPubKey": <hex>}`, `{"PubKey": <hex>}`, `{"Ed25519PubKey":
-/// <base58>}`, `{"StarknetAddress": <0x hex>}` or `{"LightningInvoice":
-/// <BOLT11>}`, which must be the network's kind.
+/// Crosses the wire as `{"network": <id>, "target": <key>}`: the key in
+/// the network's own format — hex for x-only and compressed keys,
+/// base58 for Solana, `0x`-hex for Starknet, or a BOLT11 hold invoice
+/// for Lightning.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvoiceTarget<L = String> {
     Cashu {
@@ -388,20 +387,6 @@ impl<L: LightningTarget> InvoiceTarget<L> {
         })
     }
 
-    /// The kind of key the target is, as it is tagged on the wire.
-    fn tag(&self) -> &'static str {
-        match self {
-            Self::Cashu { .. }
-            | Self::Fedimint { .. }
-            | Self::Arkade { .. }
-            | Self::Bitcoin { .. } => "XOnlyPubKey",
-            Self::Liquid { .. } | Self::Rootstock { .. } | Self::Citrea { .. } => "PubKey",
-            Self::StarknetWbtc { .. } => "StarknetAddress",
-            Self::SolanaWbtc { .. } => "Ed25519PubKey",
-            Self::Lightning { .. } => "LightningInvoice",
-        }
-    }
-
     /// The target [`InvoiceTarget::parse`] reads back.
     pub fn target_string(&self) -> String {
         match self {
@@ -470,39 +455,11 @@ impl From<GatewayDestination> for InvoiceTarget {
     }
 }
 
-impl<L: LightningTarget> InvoiceTarget<L> {
-    /// The wire `target`: a one-entry map from [`InvoiceTarget::tag`] to
-    /// [`InvoiceTarget::target_string`].
-    pub(crate) fn tagged_target(&self) -> [(&'static str, String); 1] {
-        [(self.tag(), self.target_string())]
-    }
-
-    /// Read back what [`InvoiceTarget::tagged_target`] wrote.
-    pub(crate) fn from_tagged(
-        network: NetworkId,
-        target: BTreeMap<String, String>,
-    ) -> Result<Self, String> {
-        let mut entries = target.into_iter();
-        let (Some((tag, target)), None) = (entries.next(), entries.next()) else {
-            return Err("a target names exactly one kind of key".into());
-        };
-        let parsed = Self::parse(network, &target)?;
-        if parsed.tag() != tag {
-            return Err(format!(
-                "{} pays to a {}, not a {tag}",
-                parsed.network(),
-                parsed.tag()
-            ));
-        }
-        Ok(parsed)
-    }
-}
-
 impl<L: LightningTarget> Serialize for InvoiceTarget<L> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut target = serializer.serialize_struct("InvoiceTarget", 2)?;
         target.serialize_field("network", self.network())?;
-        target.serialize_field("target", &BTreeMap::from(self.tagged_target()))?;
+        target.serialize_field("target", &self.target_string())?;
         target.end()
     }
 }
@@ -522,10 +479,10 @@ impl<'de, L: LightningTarget> Deserialize<'de> for InvoiceTarget<L> {
                 let network = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-                let target = seq
+                let target: String = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                InvoiceTarget::from_tagged(network, target).map_err(de::Error::custom)
+                InvoiceTarget::parse(network, &target).map_err(de::Error::custom)
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -534,7 +491,7 @@ impl<'de, L: LightningTarget> Deserialize<'de> for InvoiceTarget<L> {
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "network" => network = Some(map.next_value()?),
-                        "target" => target = Some(map.next_value()?),
+                        "target" => target = Some(map.next_value::<String>()?),
                         _ => {
                             map.next_value::<de::IgnoredAny>()?;
                         }
@@ -542,7 +499,7 @@ impl<'de, L: LightningTarget> Deserialize<'de> for InvoiceTarget<L> {
                 }
                 let network = network.ok_or_else(|| de::Error::missing_field("network"))?;
                 let target = target.ok_or_else(|| de::Error::missing_field("target"))?;
-                InvoiceTarget::from_tagged(network, target).map_err(de::Error::custom)
+                InvoiceTarget::parse(network, &target).map_err(de::Error::custom)
             }
         }
 

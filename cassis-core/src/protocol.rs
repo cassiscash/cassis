@@ -35,11 +35,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use iroh_base::PublicKey;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::collections::BTreeMap;
 use std::fmt;
 
 /// Protocol identifier negotiated on every connection.
-pub const ALPN: &[u8] = b"cassis-hop/9";
+pub const ALPN: &[u8] = b"cassis-hop/10";
 
 /// Most bytes [`Metadata`] may hold.
 pub const MAX_METADATA_BYTES: usize = 128 * 1024;
@@ -221,8 +220,9 @@ impl InvoiceReceiver {
 
 /// One network an invoice can be paid on.
 ///
-/// Crosses the wire as its [`InvoiceTarget`], plus
-/// `incoming_delta_secs` when set.
+/// Crosses the wire as JSON: `network`, the target as a bare string in
+/// that network's own key format (hex, base58, or a BOLT11 invoice),
+/// then `incoming_delta_secs` when set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceNetwork {
     pub target: InvoiceTarget,
@@ -237,7 +237,7 @@ impl Serialize for InvoiceNetwork {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut entry = serializer.serialize_struct("InvoiceNetwork", 3)?;
         entry.serialize_field("network", self.target.network())?;
-        entry.serialize_field("target", &BTreeMap::from(self.target.tagged_target()))?;
+        entry.serialize_field("target", &self.target.target_string())?;
         optional_field(&mut entry, "incoming_delta_secs", &self.incoming_delta_secs)?;
         entry.end()
     }
@@ -261,7 +261,7 @@ impl<'de> Deserialize<'de> for InvoiceNetwork {
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "network" => network = Some(map.next_value()?),
-                        "target" => target = Some(map.next_value()?),
+                        "target" => target = Some(map.next_value::<String>()?),
                         "incoming_delta_secs" => incoming_delta_secs = map.next_value()?,
                         _ => {
                             map.next_value::<de::IgnoredAny>()?;
@@ -271,8 +271,7 @@ impl<'de> Deserialize<'de> for InvoiceNetwork {
                 let network = network.ok_or_else(|| de::Error::missing_field("network"))?;
                 let target = target.ok_or_else(|| de::Error::missing_field("target"))?;
                 Ok(InvoiceNetwork {
-                    target: InvoiceTarget::from_tagged(network, target)
-                        .map_err(de::Error::custom)?,
+                    target: InvoiceTarget::parse(network, &target).map_err(de::Error::custom)?,
                     incoming_delta_secs,
                 })
             }
@@ -1140,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn invoice_networks_keep_their_wire_bytes() {
+    fn invoice_networks_cross_the_wire_flat() {
         let mut entry = body().networks.remove(0);
         let key = ritualistic::SecretKey::from_bytes([3; 32])
             .unwrap()
@@ -1148,7 +1147,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&entry).unwrap(),
             format!(
-                r#"{{"network":"cashu::localhost","target":{{"XOnlyPubKey":"{}"}}}}"#,
+                r#"{{"network":"cashu::localhost","target":"{}"}}"#,
                 key.to_hex()
             )
         );
@@ -1156,11 +1155,11 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&entry).unwrap(),
             format!(
-                r#"{{"network":"cashu::localhost","target":{{"XOnlyPubKey":"{}"}},"incoming_delta_secs":60}}"#,
+                r#"{{"network":"cashu::localhost","target":"{}","incoming_delta_secs":60}}"#,
                 key.to_hex()
             )
         );
-        let lightning = r#"{"network":"lightning","target":{"LightningInvoice":"lnbc1"}}"#;
+        let lightning = r#"{"network":"lightning","target":"lnbc1"}"#;
         let decoded: InvoiceNetwork = serde_json::from_str(lightning).unwrap();
         assert_eq!(
             decoded.target,
@@ -1170,13 +1169,18 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_string(&decoded).unwrap(), lightning);
-        let mismatched = r#"{"network":"cashu::localhost","target":{"LightningInvoice":"lnbc1"}}"#;
-        assert!(serde_json::from_str::<InvoiceNetwork>(mismatched).is_err());
-        let mismatched = format!(
-            r#"{{"network":"lightning","target":{{"XOnlyPubKey":"{}"}}}}"#,
+    }
+
+    #[test]
+    fn invoice_networks_reject_tagged_targets() {
+        let key = ritualistic::SecretKey::from_bytes([3; 32])
+            .unwrap()
+            .pubkey();
+        let tagged = format!(
+            r#"{{"network":"cashu::localhost","target":{{"XOnlyPubKey":"{}"}}}}"#,
             key.to_hex()
         );
-        assert!(serde_json::from_str::<InvoiceNetwork>(&mismatched).is_err());
+        assert!(serde_json::from_str::<InvoiceNetwork>(&tagged).is_err());
     }
 
     #[test]
@@ -1189,7 +1193,7 @@ mod tests {
                 "expires_at": 3000,
                 "networks": [{{
                     "network": "cashu::localhost",
-                    "target": {{"XOnlyPubKey": "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"}}
+                    "target": "17162c921dc4d2518f9a101db33695df1afb56ab82f5ff3e5da6eec3ca5cd917"
                 }}],
                 "description": null,
                 "payee": "{payee}"

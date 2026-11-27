@@ -22,7 +22,7 @@ by these keys.
 
 ## 2. Transport
 
-Peers talk over iroh with the ALPN `cassis-hop/9`. Each request is one
+Peers talk over iroh with the ALPN `cassis-hop/10`. Each request is one
 JSON message on its own stream, answered by exactly one response.
 
 A payment over a route of `n` routers runs:
