@@ -3,8 +3,9 @@
 //!
 //! Routers announce every directed pair of networks they bridge as a
 //! kind-35515 event whose `d` tag is `<from>-><to>`. Payers fetch the
-//! recent ones, find the cheapest chain of hops from their network to
-//! one the invoice accepts, and plan per-leg amounts and expiries.
+//! recent ones, find the best chain of hops from their network to one
+//! the invoice accepts, counting both fees and how long each hop waits,
+//! and plan per-leg amounts and expiries.
 //!
 //! Routers moving test money (test mints, signet, testnets...) add a
 //! [`TEST_MONEY_TAG`] tag, so explorers and payers can tell their
@@ -35,6 +36,11 @@ pub const ANNOUNCEMENT_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// gets its full minimum after the time spent preparing, executing and
 /// committing, and with some clock slack.
 pub const DELTA_OVERSHOOT_SECS: u64 = 60;
+
+/// How much one second of a route's expected wait is worth in msat when
+/// choosing between routes: 0.3 satoshi. A hop must save at least this
+/// much per second of extra wait to make a slower route worth taking.
+pub const WAIT_PENALTY_MSAT_PER_SEC: u64 = 300;
 
 /// Relays route announcements are published to and fetched from.
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &["wss://nostr.wine"];
@@ -225,6 +231,13 @@ pub fn fee_msat(base_msat: u64, ppm: u64, amount_msat: u64) -> u64 {
     (base_msat as u128)
         .saturating_add(proportional)
         .min(u64::MAX as u128) as u64
+}
+
+/// The route search's cost of carrying `needed_msat` over a route
+/// expected to take `wait_secs`: its amount plus the time penalty at
+/// [`WAIT_PENALTY_MSAT_PER_SEC`].
+pub fn route_cost_msat(needed_msat: u64, wait_secs: u64) -> u64 {
+    needed_msat.saturating_add(wait_secs.saturating_mul(WAIT_PENALTY_MSAT_PER_SEC))
 }
 
 /// Recent route announcements from `relays`, newest per router and
@@ -451,8 +464,13 @@ impl RouteAnnouncement {
 /// cannot make it run for long.
 const MAX_ROUTE_EXPANSIONS: usize = 10_000;
 
-/// The `n` cheapest chains of hops carrying `amount_msat` from `from`
-/// to `to`, cheapest first. A single empty route when `from == to`.
+/// The `n` best chains of hops carrying `amount_msat` from `from` to
+/// `to`, best first. A single empty route when `from == to`.
+///
+/// "Best" counts both what the payment costs and how long it takes: a
+/// chain's cost is its amount plus its expected wait at
+/// [`WAIT_PENALTY_MSAT_PER_SEC`]. A slower hop therefore only wins when
+/// it saves at least that much per second of extra wait.
 ///
 /// Hops in `skip_hops`, and every hop of the routers in
 /// `skip_routers` (e.g. ones that failed an earlier attempt), are left
@@ -462,8 +480,8 @@ const MAX_ROUTE_EXPANSIONS: usize = 10_000;
 ///
 /// Searches backwards from the destination, where the amount is known,
 /// so every hop's fee is computed on the amount it actually forwards.
-/// Adding a hop never makes a route cheaper, so routes come out of the
-/// search in order of cost.
+/// Adding a hop never makes a route cheaper or faster, so routes come
+/// out of the search in order of cost.
 pub fn find_routes(
     announcements: &[RouteAnnouncement],
     from: &NetworkId,
@@ -481,19 +499,22 @@ pub fn find_routes(
         .filter(|hop| !skip_routers.contains(&hop.node_pubkey) && !skip_hops.contains(&hop.id()))
         .collect();
     /// The end of a route, from the network `at` to `to`: the amount
-    /// needed when entering `at`, and its hops backwards.
+    /// needed when entering `at`, its expected wait, and its hops
+    /// backwards.
     struct Partial<'a> {
         needed: u64,
+        wait_secs: u64,
         at: &'a NetworkId,
         hops: Vec<&'a RouteAnnouncement>,
     }
     let mut partials = vec![Partial {
         needed: amount_msat,
+        wait_secs: 0,
         at: to,
         hops: Vec::new(),
     }];
-    // Cheapest first, then fewest hops, then first found.
-    let mut queue = BinaryHeap::from([Reverse((amount_msat, 0, 0))]);
+    // Best first, then fewest hops, then first found.
+    let mut queue = BinaryHeap::from([Reverse((route_cost_msat(amount_msat, 0), 0, 0))]);
     let mut routes = Vec::new();
     // Whether a hop was left out only for the amount being too small.
     let mut too_small = false;
@@ -515,7 +536,7 @@ pub fn find_routes(
             );
             continue;
         }
-        let (needed, at) = (partial.needed, partial.at);
+        let (needed, wait_secs, at) = (partial.needed, partial.wait_secs, partial.at);
         let mut extended = Vec::new();
         for hop in hops.iter().filter(|hop| hop.to == *at) {
             let visited = hop.from == *to
@@ -537,13 +558,14 @@ pub fn find_routes(
             route.push(*hop);
             extended.push(Partial {
                 needed: upstream,
+                wait_secs: wait_secs.saturating_add(hop.expected_wait_secs()),
                 at: &hop.from,
                 hops: route,
             });
         }
         for partial in extended {
             queue.push(Reverse((
-                partial.needed,
+                route_cost_msat(partial.needed, partial.wait_secs),
                 partial.hops.len(),
                 partials.len(),
             )));
@@ -796,13 +818,26 @@ mod tests {
     }
 
     #[test]
-    fn prefers_the_cheapest_route() {
+    fn prefers_the_cheaper_route_when_it_is_fast_enough() {
         let graph = [
-            hop(1, "a", "c", 10_000, 0),
-            hop(2, "a", "b", 100, 0),
-            hop(3, "b", "c", 100, 0),
+            hop(1, "cashu::a", "cashu::c", 10_000, 0),
+            hop(2, "cashu::a", "cashu::b", 100, 0),
+            hop(3, "cashu::b", "cashu::c", 100, 0),
         ];
-        assert_eq!(route(&graph, "a", "c").unwrap(), vec![2, 3]);
+        assert_eq!(route(&graph, "cashu::a", "cashu::c").unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn prefers_a_faster_route_when_the_fee_gap_is_small() {
+        let graph = [
+            // Cheaper in fees, but a minute slower.
+            hop(1, "cashu::a", "rootstock", 0, 0),
+            hop(2, "rootstock", "cashu::c", 0, 0),
+            // A little more expensive, but much faster.
+            hop(3, "cashu::a", "fedimint::fed1q", 1_000, 0),
+            hop(4, "fedimint::fed1q", "cashu::c", 1_000, 0),
+        ];
+        assert_eq!(route(&graph, "cashu::a", "cashu::c").unwrap(), vec![3, 4]);
     }
 
     #[test]
@@ -868,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_routes_cheapest_first() {
+    fn lists_routes_best_first() {
         let graph = [
             hop(1, "a", "c", 300, 0),
             hop(2, "a", "b", 100, 0),
@@ -877,13 +912,15 @@ mod tests {
             hop(5, "b", "c", 150, 0),
         ];
         let none = HashSet::new();
+        // One-hop routes win despite their higher fees: the two-hop
+        // ones pay a wait penalty for their extra hop.
         assert_eq!(
             routes(&graph, "a", "c", 10, &none, &[]).unwrap(),
-            vec![vec![2, 3], vec![2, 5], vec![1], vec![4]]
+            vec![vec![1], vec![4], vec![2, 3], vec![2, 5]]
         );
         assert_eq!(
             routes(&graph, "a", "c", 2, &none, &[]).unwrap(),
-            vec![vec![2, 3], vec![2, 5]]
+            vec![vec![1], vec![4]]
         );
         assert!(routes(&graph, "a", "c", 0, &none, &[]).unwrap().is_empty());
     }
@@ -897,10 +934,11 @@ mod tests {
             hop(3, "a", "b", 50, 0),
         ];
         let none = HashSet::new();
-        // Router 1 cannot take both hops; one of them can go.
+        // Router 1 cannot take both hops; one of them can go. The
+        // one-hop route wins on wait, despite its fee.
         assert_eq!(
             routes(&graph, "a", "c", 10, &none, &[]).unwrap(),
-            vec![vec![3, 1], vec![2]]
+            vec![vec![2], vec![3, 1]]
         );
         let one_hop = HashSet::from([graph[1].id()]);
         assert_eq!(

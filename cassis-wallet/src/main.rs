@@ -40,7 +40,7 @@ use cassis_wallet::node::{
     DEFAULT_MAX_ROUTES, OfflineEndpoints, authorize_gateway, create_gateway_invoice,
     redeem_offline_payments,
 };
-use cassis_wallet::{Home, Node, NodeConfig};
+use cassis_wallet::{DEFAULT_SETTLE_INTERVAL, Home, Node, NodeConfig};
 use clap::{Parser, Subcommand};
 use iroh_base::PublicKey;
 use std::path::PathBuf;
@@ -228,7 +228,8 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_MAX_ROUTES)]
         max_routes: usize,
     },
-    /// Show the cheapest announced route between two networks.
+    /// Show the best announced route between two networks, counting
+    /// fees and expected wait.
     Route {
         #[arg(long)]
         from: String,
@@ -402,6 +403,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     db: home.db.clone(),
                     span,
                     serve: false,
+                    settle_interval: DEFAULT_SETTLE_INTERVAL,
                 },
                 networks,
             )
@@ -553,6 +555,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     db: home.db.clone(),
                     span,
                     serve: false,
+                    settle_interval: DEFAULT_SETTLE_INTERVAL,
                 },
                 vec![sender],
             )
@@ -724,6 +727,7 @@ async fn serve(home: &Home, span: &Span) -> Result<Node, String> {
             db: home.db.clone(),
             span: span.clone(),
             serve: true,
+            settle_interval: DEFAULT_SETTLE_INTERVAL,
         },
         networks,
     )

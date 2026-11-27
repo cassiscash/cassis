@@ -136,6 +136,16 @@ impl PayRoute {
         self.plan.amounts[0]
     }
 
+    /// Expected seconds the route's hops add, not counting the payer's
+    /// first funding or the payee's claim; zero for a direct route (see
+    /// [`RouteAnnouncement::expected_wait_secs`]).
+    pub fn expected_wait_secs(&self) -> u64 {
+        self.hops
+            .iter()
+            .map(RouteAnnouncement::expected_wait_secs)
+            .sum()
+    }
+
     /// Whether the route pays `invoice` from `from`.
     fn check(&self, invoice: &Invoice, from: &NetworkId) -> Result<(), String> {
         if invoice.target_for(&self.network).is_none() {
@@ -184,8 +194,9 @@ fn direct_route(invoice: &Invoice, from: &NetworkId) -> Result<Option<PayRoute>,
     }))
 }
 
-/// The `n` cheapest routes over `announcements` from `from` to any
-/// network of `invoice`, cheapest first. `Err` when there is none.
+/// The `n` best routes over `announcements` from `from` to any network
+/// of `invoice`, best first: fees and expected wait both count (see
+/// [`routing::find_routes`]). `Err` when there is none.
 fn invoice_routes(
     invoice: &Invoice,
     from: &NetworkId,
@@ -227,7 +238,12 @@ fn invoice_routes(
             }
         }
     }
-    routes.sort_by_key(PayRoute::cost_msat);
+    routes.sort_by_key(|route| {
+        (
+            routing::route_cost_msat(route.cost_msat(), route.expected_wait_secs()),
+            route.hops.len(),
+        )
+    });
     routes.truncate(n);
     if routes.is_empty() && n > 0 {
         return Err(match errors.as_slice() {
@@ -303,7 +319,7 @@ impl Node {
         Ok(last.expect("at least one attempt ran"))
     }
 
-    /// Pay `invoice` from this node's `from` network over the cheapest
+    /// Pay `invoice` from this node's `from` network over the best
     /// of [`Node::find_routes`], skipping the routers in `skip`: a
     /// caller whose attempt failed at a hop retries with that hop's
     /// [`FailedHop::node`] added. See [`Node::pay_with_route`].
@@ -323,11 +339,12 @@ impl Node {
         self.pay_with_route(invoice, from, &routes[0]).await
     }
 
-    /// The `n` cheapest ways to pay `invoice` from this node's `from`
-    /// network, cheapest first: the direct one alone when the invoice
+    /// The `n` best ways to pay `invoice` from this node's `from`
+    /// network, best first: the direct one alone when the invoice
     /// accepts `from`, else routes through the routers announced on
-    /// `relays` to any network it accepts. Hops in `skip_hops` and every
-    /// hop of the routers in `skip_routers` are left out (see
+    /// `relays` to any network it accepts. Fees and expected wait both
+    /// count (see [`routing::find_routes`]). Hops in `skip_hops` and
+    /// every hop of the routers in `skip_routers` are left out (see
     /// [`routing::find_routes`]).
     ///
     /// `Err` when there is none, saying why.
