@@ -36,7 +36,7 @@ use cassis_wallet::node::{
     OfflineEndpoints, RedeemReport, authorize_gateway, create_gateway_invoice,
     redeem_offline_payments,
 };
-use cassis_wallet::{Node, NodeConfig, open_db};
+use cassis_wallet::{DEFAULT_SETTLE_INTERVAL, Node, NodeConfig, open_db};
 use futures::future::BoxFuture;
 use hyperb_cassis_wallet::{Host, WalletAdmin};
 use hypereffect::json;
@@ -393,6 +393,7 @@ async fn setup() -> Setup {
             db: open_db(&temp_dir("payer")).unwrap(),
             span: Span::none(),
             serve: false,
+            settle_interval: DEFAULT_SETTLE_INTERVAL,
         },
         vec![MockNetwork::new(1, &ledger)],
     )

@@ -41,7 +41,7 @@ use admin::Admin;
 use cassis_admin::{RESTART_GRACE, Refresh, Server, reexec, shutdown_signal};
 use cassis_routerd::db::Db;
 use cassis_routerd::router::Router;
-use cassis_wallet::{Node, NodeConfig};
+use cassis_wallet::{DEFAULT_SETTLE_INTERVAL, Node, NodeConfig};
 use clap::Parser;
 use config::Config;
 use hyperb_cassis_wallet::{ConfigFile, WalletAdmin};
@@ -107,6 +107,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             db: wallet,
             span: span.clone(),
             serve: true,
+            settle_interval: DEFAULT_SETTLE_INTERVAL,
         },
         opened,
     )

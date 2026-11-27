@@ -7,8 +7,6 @@ use cassis_core::{Bytes32, NetworkId, unix_now};
 use std::time::Duration;
 use tracing::{info, warn};
 
-const SETTLE_INTERVAL: Duration = Duration::from_secs(10);
-
 /// What became of an outgoing HTLC this round.
 pub enum Outcome {
     Pending,
@@ -17,8 +15,8 @@ pub enum Outcome {
 }
 
 impl Node {
-    pub(super) async fn settle_loop(self) {
-        let mut ticker = tokio::time::interval(SETTLE_INTERVAL);
+    pub(super) async fn settle_loop(self, interval: Duration) {
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;

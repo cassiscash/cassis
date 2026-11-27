@@ -15,7 +15,7 @@ use cassis_core::{
 use cassis_routerd::db::{Db as RouterDb, HopState};
 use cassis_routerd::router::{RouteOffer, Router, RoutingPolicy};
 use cassis_wallet::db::{PendingPaymentHash, TransactionHash};
-use cassis_wallet::{Node, NodeConfig, open_db};
+use cassis_wallet::{DEFAULT_SETTLE_INTERVAL, Node, NodeConfig, open_db};
 use ritualistic::server::{CustomRelay, RelayInternals};
 use ritualistic::{Event, Filter};
 use std::collections::HashMap;
@@ -216,6 +216,7 @@ async fn start_node(name: &str, networks: Vec<Arc<dyn Network>>) -> (Node, NodeK
             db: open_db(&dir(name)).unwrap(),
             span: Span::none(),
             serve: true,
+            settle_interval: DEFAULT_SETTLE_INTERVAL,
         },
         networks,
     )

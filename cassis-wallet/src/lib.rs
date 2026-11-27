@@ -15,4 +15,4 @@ pub mod node;
 pub mod stored;
 
 pub use home::{Home, open_db, routine_checks};
-pub use node::{Node, NodeConfig};
+pub use node::{DEFAULT_SETTLE_INTERVAL, Node, NodeConfig};

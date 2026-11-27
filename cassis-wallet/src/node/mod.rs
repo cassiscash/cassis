@@ -52,6 +52,9 @@ pub use verify::{Unverified, verify_incoming};
 pub const INLINE_WAIT: Duration = Duration::from_secs(5);
 /// How often an incoming HTLC that does not verify yet is verified again.
 pub const VERIFY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a serving node drives its journaled HTLCs, unless
+/// [`NodeConfig::settle_interval`] says otherwise.
+pub const DEFAULT_SETTLE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct NodeConfig {
     pub keys: NodeKeys,
@@ -63,6 +66,10 @@ pub struct NodeConfig {
     /// and settle journaled HTLCs in the background. Without it the node
     /// can only pay, from an ephemeral endpoint.
     pub serve: bool,
+    /// How often to check the HTLCs this node funded: claim what the payee
+    /// claimed, refund what expired. Defaults to
+    /// [`DEFAULT_SETTLE_INTERVAL`].
+    pub settle_interval: Duration,
 }
 
 /// Handle to a running node. Cheap to clone.
@@ -101,6 +108,7 @@ impl Node {
         networks: Vec<Arc<dyn Network>>,
     ) -> Result<Self, String> {
         let transport = Transport::bind(config.serve.then_some(config.keys.iroh)).await?;
+        let settle_interval = config.settle_interval;
         let node = Self(Arc::new(Inner {
             keys: config.keys,
             db: config.db,
@@ -128,7 +136,7 @@ impl Node {
             });
             let transport = node.0.transport.clone();
             node.spawn(async move { transport.serve(handler).await });
-            node.spawn(node.clone().settle_loop());
+            node.spawn(node.clone().settle_loop(settle_interval));
         }
         Ok(node)
     }
