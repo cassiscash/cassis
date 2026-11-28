@@ -65,10 +65,12 @@ use lwk_wollet::elements::{
     TxOutSecrets, Txid,
 };
 use lwk_wollet::{Network as LwkNetwork, Wollet, WolletBuilder, WolletDescriptor};
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{Span, debug, info, warn};
 
@@ -88,6 +90,18 @@ const FEE_RATE_SATS_KVB: f32 = 100.0;
 /// Also the BIP-125 boundary: any input sequence *below* this value
 /// signals replace-by-fee, which the 0-conf trust model forbids.
 pub const NON_FINAL_SEQUENCE: u32 = 0xFFFF_FFFE;
+/// How long the coins our own broadcasts spend stay out of coin
+/// selection unless a scan reports them spent first: the scanning
+/// server can lag the one we broadcast to, and a scan that has not
+/// seen our spend yet reports its coins unspent again.
+const SPENT_HOLD_SECS: u64 = 600;
+/// Node rejections of a transaction whose inputs are already spent or
+/// unknown: the wallet picked coins from a stale view.
+const STALE_INPUT_REJECTIONS: [&str; 3] = [
+    "bad-txns-inputs-missingorspent",
+    "txn-mempool-conflict",
+    "missing-inputs",
+];
 /// Propagation pause replacing the 0-conf coverage wait on testnet,
 /// which the 0-conf service does not observe.
 const TESTNET_PROPAGATION_WAIT_SECS: u64 = 5;
@@ -348,9 +362,12 @@ pub struct LiquidAdapter {
     /// Full 33-byte claim pubkey.
     claim_pk_full: BtcPublicKey,
     wollet: Mutex<Wollet>,
-    /// Held while a lockup picks wallet coins and spends them, so that
-    /// two never pick the same ones.
+    /// Held while a wallet-funded transaction syncs, picks wallet coins
+    /// and spends them, so that two never pick the same ones.
     funding: Mutex<()>,
+    /// Coins spent by our own broadcasts, kept out of coin selection
+    /// for [`SPENT_HOLD_SECS`] or until a scan reports them spent.
+    spent: std::sync::Mutex<HashMap<OutPoint, Instant>>,
     esplora: Mutex<EsploraClient>,
     waterfalls: Mutex<EsploraClient>,
     http: reqwest::Client,
@@ -458,6 +475,7 @@ impl LiquidAdapter {
             claim_pk_full,
             wollet: Mutex::new(wollet),
             funding: Mutex::new(()),
+            spent: std::sync::Mutex::new(HashMap::new()),
             esplora: Mutex::new(EsploraClient::new(network, esplora_url)),
             waterfalls: Mutex::new(waterfalls),
             http,
@@ -516,23 +534,134 @@ impl LiquidAdapter {
         }
     }
 
+    /// Rescan the wallet and apply the result. The wallet stays locked
+    /// from the scan to the apply: a transaction applied in between
+    /// would make LWK reject the update as made on a different state.
     async fn sync_wallet(&self) -> Result<(), NetworkError> {
         let mut waterfalls = self.waterfalls.lock().await;
-        let wollet = self.wollet.lock().await;
-        let update = waterfalls
+        let mut wollet = self.wollet.lock().await;
+        if let Some(update) = waterfalls
             .full_scan(&wollet)
             .await
-            .map_err(error_from_lwk)?;
-        drop(waterfalls);
+            .map_err(error_from_lwk)?
+        {
+            wollet.apply_update(update).map_err(error_from_lwk)?;
+        }
+        let unspent: Vec<OutPoint> = wollet
+            .utxos()
+            .map_err(error_from_lwk)?
+            .iter()
+            .map(|utxo| utxo.outpoint)
+            .collect();
         drop(wollet);
-        if let Some(update) = update {
-            self.wollet
+        let hold = Duration::from_secs(SPENT_HOLD_SECS);
+        self.spent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|outpoint, at| unspent.contains(outpoint) && at.elapsed() < hold);
+        Ok(())
+    }
+
+    /// Build the PSET paying `spend` from wallet coins: confirmed ones
+    /// first, so that a lockup rarely hangs on an unconfirmed parent,
+    /// and the largest first, to keep inputs and fees few. Coins are
+    /// added until LWK no longer finds them short of the amount and
+    /// the fee their own inputs add.
+    fn fund(
+        &self,
+        wollet: &Wollet,
+        spend: Spend<'_>,
+    ) -> Result<PartiallySignedTransaction, NetworkError> {
+        let policy_asset = wollet.policy_asset();
+        let mut coins: Vec<_> = {
+            let spent = self.spent.lock().unwrap_or_else(|e| e.into_inner());
+            wollet
+                .utxos()
+                .map_err(error_from_lwk)?
+                .into_iter()
+                .filter(|utxo| {
+                    utxo.unblinded.asset == policy_asset && !spent.contains_key(&utxo.outpoint)
+                })
+                .collect()
+        };
+        coins.sort_by_key(|utxo| (utxo.height.is_none(), Reverse(utxo.unblinded.value)));
+        let available: u64 = coins.iter().map(|utxo| utxo.unblinded.value).sum();
+        let mut coins = coins.into_iter();
+        let mut picked = Vec::new();
+        let mut total = 0;
+        let mut needed = spend.sats() + 1;
+        loop {
+            while total < needed {
+                let coin = coins.next().ok_or_else(|| {
+                    NetworkError::invalid(format!(
+                        "cannot pay {} sats with fees, wallet has {available} spendable",
+                        spend.sats()
+                    ))
+                })?;
+                total += coin.unblinded.value;
+                picked.push(coin.outpoint);
+            }
+            let builder = wollet
+                .tx_builder()
+                .set_wallet_utxos(picked.clone())
+                .fee_rate(Some(FEE_RATE_SATS_KVB));
+            let builder = match spend {
+                Spend::Lockup(address, sats) => {
+                    builder.add_explicit_recipient(address, sats, policy_asset)
+                }
+                Spend::Transfer(address, sats) => builder.add_lbtc_recipient(address, sats),
+            }
+            .map_err(error_from_lwk)?;
+            match builder.finish() {
+                Ok(pset) => return Ok(pset),
+                Err(lwk_wollet::Error::InsufficientFunds { missing_sats, .. }) => {
+                    needed = total + missing_sats;
+                }
+                Err(error) => return Err(error_from_lwk(error)),
+            }
+        }
+    }
+
+    /// Pay `spend` from wallet coins and broadcast it. A node rejecting
+    /// its inputs as spent or unknown means the wallet view was stale:
+    /// it is synced again and the coins picked once more.
+    async fn send_from_wallet(&self, spend: Spend<'_>) -> Result<Transaction, NetworkError> {
+        let _funding = self.funding.lock().await;
+        let mut retried = false;
+        loop {
+            self.sync_wallet().await?;
+            let mut pset = self.fund(&*self.wollet.lock().await, spend)?;
+            if matches!(spend, Spend::Lockup(..)) {
+                for input in pset.inputs_mut() {
+                    if input
+                        .sequence
+                        .is_some_and(|sequence| sequence.to_consensus_u32() < NON_FINAL_SEQUENCE)
+                    {
+                        input.sequence = Some(Sequence::from_consensus(NON_FINAL_SEQUENCE));
+                    }
+                }
+            }
+            if self.signer.sign(&mut pset).map_err(error_from_lwk)? == 0 {
+                return Err(NetworkError::network("signer produced no signatures"));
+            }
+            let tx = self
+                .wollet
                 .lock()
                 .await
-                .apply_update(update)
+                .finalize(&mut pset)
                 .map_err(error_from_lwk)?;
+            if matches!(spend, Spend::Lockup(..)) {
+                ensure_non_rbf(&tx)?;
+            }
+            match self.broadcast(&tx).await {
+                Ok(_) => return Ok(tx),
+                Err(error) if !retried && spends_stale_inputs(&error) => {
+                    warn!(parent: &self.span, "wallet coins were stale, syncing again: {error}");
+                    retried = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(())
     }
 
     async fn lbtc_balance_sat(&self) -> Result<u64, NetworkError> {
@@ -659,24 +788,24 @@ impl LiquidAdapter {
             .broadcast(tx)
             .await
             .map_err(error_from_lwk)?;
-        // Feed our own spend back into wallet state: the next build
-        // must not re-select these inputs. Esplora's scripthash scan
-        // sees mempool txs, so an immediate resync registers the spend
-        // as unconfirmed; without it the wallet happily spends the
-        // same UTXO again and the node rejects the second broadcast
-        // with `txn-mempool-conflict`. Best-effort: a failed resync
-        // only delays UTXO awareness until the next sync.
-        if let Err(error) = self.sync_wallet().await {
-            self.span.in_scope(|| {
-                warn!(target: "cassis_liquid", "post-broadcast resync failed: {error}");
-            });
+        // Feed our own spend into the wallet now rather than waiting
+        // for a scan to see it, and keep its coins out of selection
+        // while scans may still report them unspent.
+        let now = Instant::now();
+        self.spent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(tx.input.iter().map(|input| (input.previous_output, now)));
+        if let Err(error) = self.wollet.lock().await.apply_transaction(tx.clone()) {
+            warn!(parent: &self.span, "cannot apply our tx {txid} to the wallet: {error}");
         }
         Ok(txid)
     }
 
-    /// Fee-funded claim (`preimage` set) or refund (`cltv` set) of
-    /// `outpoint` (value `value_sat`), draining everything to our
-    /// wallet.
+    /// Claim (`preimage` set) or refund (`cltv` set) of `outpoint`
+    /// (value `value_sat`), draining it to our wallet less the fee. No
+    /// wallet coin is spent, so the HTLC alone decides whether it goes
+    /// through.
     async fn spend_htlc_input(
         &self,
         spec: &HtlcSpec,
@@ -709,6 +838,7 @@ impl LiquidAdapter {
             let wollet = self.wollet.lock().await;
             wollet
                 .tx_builder()
+                .set_wallet_utxos(Vec::new())
                 .add_external_utxos(vec![external])
                 .map_err(error_from_lwk)?
                 .drain_lbtc_to(&our_address)
@@ -757,34 +887,10 @@ impl LiquidAdapter {
     ) -> Result<Txid, NetworkError> {
         let to = Address::from_str(address.trim())
             .map_err(|e| NetworkError::Invalid(format!("invalid liquid address: {e}")))?;
-        let sats = sats_for_msat(amount_msat);
-        self.sync_wallet().await?;
-        let mut pset = {
-            let wollet = self.wollet.lock().await;
-            wollet
-                .tx_builder()
-                .add_lbtc_recipient(&to, sats)
-                .map_err(error_from_lwk)?
-                .fee_rate(Some(FEE_RATE_SATS_KVB))
-                .finish()
-                .map_err(error_from_lwk)?
-        };
-        let added = self
-            .signer
-            .sign(&mut pset)
-            .map_err(|e| error_from_lwk(format!("pset sign: {e}")))?;
-        if added == 0 {
-            return Err(NetworkError::Network(
-                "signer produced no signatures".into(),
-            ));
-        }
         let tx = self
-            .wollet
-            .lock()
-            .await
-            .finalize(&mut pset)
-            .map_err(error_from_lwk)?;
-        self.broadcast(&tx).await
+            .send_from_wallet(Spend::Transfer(&to, sats_for_msat(amount_msat)))
+            .await?;
+        Ok(tx.txid())
     }
 
     /// Current offchain (L-BTC wallet) balance in msat.
@@ -802,6 +908,32 @@ impl LiquidAdapter {
     pub fn esplora_url(&self) -> &str {
         &self.esplora_url
     }
+}
+
+/// A transaction paid from wallet coins.
+#[derive(Clone, Copy)]
+enum Spend<'a> {
+    /// An explicit, non-RBF lockup of this many sats to the address.
+    Lockup(&'a Address, u64),
+    /// A plain payment of this many sats to a confidential address.
+    Transfer(&'a Address, u64),
+}
+
+impl Spend<'_> {
+    fn sats(self) -> u64 {
+        match self {
+            Spend::Lockup(_, sats) | Spend::Transfer(_, sats) => sats,
+        }
+    }
+}
+
+/// Whether a broadcast failed because the node finds the inputs
+/// already spent or unknown.
+fn spends_stale_inputs(error: &NetworkError) -> bool {
+    let message = error.to_string();
+    STALE_INPUT_REJECTIONS
+        .iter()
+        .any(|rejection| message.contains(rejection))
 }
 
 /// BIP-125: a transaction signals replaceability iff any input's
@@ -1009,43 +1141,15 @@ impl Network for LiquidAdapter {
             refund_locktime,
         );
         let lockup_address = spec.lockup_address(self.network.address_params())?;
-        let funding = self.funding.lock().await;
-        self.sync_wallet().await?;
-        let mut pset = {
-            let wollet = self.wollet.lock().await;
-            wollet
-                .tx_builder()
-                .add_explicit_recipient(&lockup_address, sats, *self.network.policy_asset())
-                .map_err(error_from_lwk)?
-                .fee_rate(Some(FEE_RATE_SATS_KVB))
-                .finish()
-                .map_err(error_from_lwk)?
-        };
-        for input in pset.inputs_mut() {
-            if input
-                .sequence
-                .is_some_and(|sequence| sequence.to_consensus_u32() < NON_FINAL_SEQUENCE)
-            {
-                input.sequence = Some(Sequence::from_consensus(NON_FINAL_SEQUENCE));
-            }
-        }
-        if self.signer.sign(&mut pset).map_err(error_from_lwk)? == 0 {
-            return Err(NetworkError::network("signer produced no signatures"));
-        }
         let tx = self
-            .wollet
-            .lock()
-            .await
-            .finalize(&mut pset)
-            .map_err(error_from_lwk)?;
-        ensure_non_rbf(&tx)?;
+            .send_from_wallet(Spend::Lockup(&lockup_address, sats))
+            .await?;
+        let txid = tx.txid();
         let vout =
             tx.output
                 .iter()
                 .position(|output| output.script_pubkey == spec.lockup_script_pubkey)
                 .ok_or_else(|| NetworkError::network("lockup output missing"))? as u32;
-        let txid = self.broadcast(&tx).await?;
-        drop(funding);
         info!(
             parent: &self.span,
             "locked {sats} sats for {} until block {refund_locktime}: tx {txid}",
@@ -1096,21 +1200,12 @@ impl Network for LiquidAdapter {
 
     /// The wallet can build the lockup, fee included.
     async fn can_send(&self, amount_msat: u64) -> Result<(), NetworkError> {
-        let needed = sats_for_msat(amount_msat);
-        let available = self.lbtc_balance_sat().await?;
+        self.sync_wallet().await?;
         // The lockup is an explicit output; a confidential address would
         // be rejected by `add_explicit_recipient`.
         let address = self.next_wallet_address().await?.to_unconfidential();
         let wollet = self.wollet.lock().await;
-        wollet
-            .tx_builder()
-            .add_explicit_recipient(&address, needed, *self.network.policy_asset())
-            .and_then(|builder| builder.fee_rate(Some(FEE_RATE_SATS_KVB)).finish())
-            .map_err(|e| {
-                NetworkError::invalid(format!(
-                    "cannot lock {needed} sats with fees, wallet has {available}: {e}"
-                ))
-            })?;
+        self.fund(&wollet, Spend::Lockup(&address, sats_for_msat(amount_msat)))?;
         Ok(())
     }
 
